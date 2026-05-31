@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::ingest;
+use crate::search;
 use crate::storage::Store;
 use crate::transport;
 use anyhow::Result;
@@ -71,10 +72,26 @@ impl Cli {
                     "files_seen={} inserted={} duplicates={} errors={}",
                     stats.files_seen, stats.inserted, stats.duplicates, stats.errors
                 );
+                let projected = search::refresh(&store)?;
+                println!("projection=search_rrf_v1 projected_events={projected}");
             }
             Command::Search { query, limit, json } => {
-                let _ = (query, limit, json);
-                println!("search: not implemented yet");
+                let results = search::search(&store, &query, limit)?;
+                if json {
+                    serde_json::to_writer_pretty(std::io::stdout(), &results)?;
+                    println!();
+                } else {
+                    for result in results {
+                        println!(
+                            "{:.6}\t{}\t{}\t{}\t{}",
+                            result.score,
+                            result.source_kind,
+                            result.session_id,
+                            result.event_id,
+                            result.snippet
+                        );
+                    }
+                }
             }
             Command::Export { jsonl } => {
                 if jsonl {
@@ -91,6 +108,8 @@ impl Cli {
                         "imported={} duplicates={}",
                         stats.inserted, stats.duplicates
                     );
+                    let projected = search::refresh(&store)?;
+                    println!("projection=search_rrf_v1 projected_events={projected}");
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
