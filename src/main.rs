@@ -1,6 +1,7 @@
 mod archive;
 mod cli;
 mod config;
+mod ingest;
 mod storage;
 mod transport;
 

@@ -1,4 +1,4 @@
-use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA};
+use crate::archive::{ArchiveEnvelope, ARCHIVE_SCHEMA};
 use crate::storage::{ImportStats, Store};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
@@ -48,11 +48,3 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
     }
     Ok(stats)
 }
-
-pub fn record_to_jsonl(record: ArchiveRecord) -> Result<String> {
-    let mut out = Vec::new();
-    serde_json::to_writer(&mut out, &ArchiveEnvelope::new(record))?;
-    out.push(b'\n');
-    Ok(String::from_utf8(out)?)
-}
-

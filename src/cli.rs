@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::ingest;
 use crate::storage::Store;
 use crate::transport;
 use anyhow::Result;
@@ -18,7 +19,12 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scan configured local sources once and refresh local projections.
-    Update,
+    Update {
+        #[arg(long)]
+        max_files: Option<usize>,
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Search indexed transcripts.
     Search {
         query: String,
@@ -55,9 +61,16 @@ impl Cli {
         let config = AppConfig::load(self.data_dir)?;
         let store = Store::open(&config.data_dir)?;
         match self.command {
-            Command::Update => {
-                println!("data_dir={}", config.data_dir.display());
-                println!("update: not implemented yet");
+            Command::Update { max_files, source } => {
+                let stats = ingest::update_local(
+                    &store,
+                    &config.machine_id,
+                    ingest::UpdateOptions { max_files, source },
+                )?;
+                println!(
+                    "files_seen={} inserted={} duplicates={} errors={}",
+                    stats.files_seen, stats.inserted, stats.duplicates, stats.errors
+                );
             }
             Command::Search { query, limit, json } => {
                 let _ = (query, limit, json);
