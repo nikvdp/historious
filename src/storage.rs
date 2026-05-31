@@ -25,6 +25,23 @@ pub struct ArchiveStats {
     pub events: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct EventForProjection {
+    pub id: String,
+    pub session_id: String,
+    pub source_kind: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchRow {
+    pub event_id: String,
+    pub session_id: String,
+    pub source_kind: String,
+    pub content: String,
+    pub rank: usize,
+}
+
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
@@ -159,6 +176,139 @@ impl Store {
             })
         })
     }
+
+    pub fn refresh_search_projection(
+        &self,
+        model: &str,
+        dims: usize,
+        embed: impl Fn(&str) -> Vec<f32>,
+    ) -> Result<usize> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM events_fts", [])?;
+            tx.execute("DELETE FROM event_embeddings WHERE model = ?1", params![model])?;
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id, source_kind, content
+                 FROM events
+                 WHERE length(trim(content)) > 0
+                 ORDER BY session_id, ordinal, id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(EventForProjection {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?;
+            let mut count = 0usize;
+            for row in rows {
+                let event = row?;
+                tx.execute(
+                    "INSERT INTO events_fts (event_id, session_id, source_kind, content)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![event.id, event.session_id, event.source_kind, event.content],
+                )?;
+                let vector = embed(&event.content);
+                tx.execute(
+                    "INSERT INTO event_embeddings (event_id, model, dims, vector_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![event.id, model, dims as i64, serde_json::to_string(&vector)?],
+                )?;
+                count += 1;
+            }
+            tx.execute(
+                "INSERT INTO projection_status
+                 (projection_name, input_high_watermark, status, last_error, updated_at)
+                 VALUES ('search_rrf_v1', ?1, 'ready', NULL, ?2)
+                 ON CONFLICT(projection_name) DO UPDATE SET
+                   input_high_watermark = excluded.input_high_watermark,
+                   status = excluded.status,
+                   last_error = NULL,
+                   updated_at = excluded.updated_at",
+                params![count.to_string(), Utc::now().to_rfc3339()],
+            )?;
+            drop(stmt);
+            tx.commit()?;
+            Ok(count)
+        })
+    }
+
+    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<SearchRow>> {
+        let fts_query = fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, session_id, source_kind, snippet(events_fts, 3, '[', ']', '...', 24)
+                 FROM events_fts
+                 WHERE events_fts MATCH ?1
+                 ORDER BY bm25(events_fts)
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+                Ok(SearchRow {
+                    event_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    content: row.get(3)?,
+                    rank: 0,
+                })
+            })?;
+            let mut out = Vec::new();
+            for (idx, row) in rows.enumerate() {
+                let mut row = row?;
+                row.rank = idx + 1;
+                out.push(row);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, vector_json FROM event_embeddings WHERE model = ?1",
+            )?;
+            let rows = stmt.query_map(params![model], |row| {
+                let json: String = row.get(1)?;
+                let vector: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
+                Ok((row.get(0)?, vector))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn load_search_rows(&self, ids: &[String]) -> Result<Vec<SearchRow>> {
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, source_kind, content FROM events WHERE id = ?1",
+            )?;
+            for id in ids {
+                if let Some(row) = stmt
+                    .query_row(params![id], |row| {
+                        Ok(SearchRow {
+                            event_id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            source_kind: row.get(2)?,
+                            content: row.get(3)?,
+                            rank: 0,
+                        })
+                    })
+                    .optional()?
+                {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -230,9 +380,43 @@ fn migrate(conn: &Connection) -> Result<()> {
           last_error TEXT,
           updated_at TEXT NOT NULL
         );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+          event_id UNINDEXED,
+          session_id UNINDEXED,
+          source_kind UNINDEXED,
+          content,
+          tokenize = 'porter unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS event_embeddings (
+          event_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          dims INTEGER NOT NULL,
+          vector_json TEXT NOT NULL,
+          PRIMARY KEY (event_id, model)
+        );
         ",
     )?;
     Ok(())
+}
+
+fn fts_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .filter_map(|term| {
+            let cleaned: String = term
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"*", cleaned.replace('"', "\"\"")))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
