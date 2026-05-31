@@ -1,5 +1,8 @@
+mod archive;
 mod cli;
 mod config;
+mod storage;
+mod transport;
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,4 +19,3 @@ async fn main() -> Result<()> {
 
     cli::Cli::parse().run().await
 }
-

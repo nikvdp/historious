@@ -1,4 +1,6 @@
 use crate::config::AppConfig;
+use crate::storage::Store;
+use crate::transport;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -51,6 +53,7 @@ pub enum Command {
 impl Cli {
     pub async fn run(self) -> Result<()> {
         let config = AppConfig::load(self.data_dir)?;
+        let store = Store::open(&config.data_dir)?;
         match self.command {
             Command::Update => {
                 println!("data_dir={}", config.data_dir.display());
@@ -61,12 +64,23 @@ impl Cli {
                 println!("search: not implemented yet");
             }
             Command::Export { jsonl } => {
-                let _ = jsonl;
-                println!("export: not implemented yet");
+                if jsonl {
+                    let stdout = std::io::stdout();
+                    transport::export_jsonl(&store, stdout.lock())?;
+                } else {
+                    anyhow::bail!("only --jsonl export is supported in v0");
+                }
             }
             Command::Import { jsonl, input } => {
-                let _ = (jsonl, input);
-                println!("import: not implemented yet");
+                if jsonl {
+                    let stats = transport::import_jsonl_path(&store, &input)?;
+                    println!(
+                        "imported={} duplicates={}",
+                        stats.inserted, stats.duplicates
+                    );
+                } else {
+                    anyhow::bail!("only --jsonl import is supported in v0");
+                }
             }
             Command::Daemon => {
                 println!("daemon: not implemented yet");
@@ -75,11 +89,15 @@ impl Cli {
                 println!("serve: not implemented yet on {bind}");
             }
             Command::Status => {
+                let stats = store.stats()?;
                 println!("data_dir={}", config.data_dir.display());
-                println!("status: not implemented yet");
+                println!("db_path={}", store.db_path().display());
+                println!("sources={}", stats.sources);
+                println!("raw_artifacts={}", stats.raw_artifacts);
+                println!("sessions={}", stats.sessions);
+                println!("events={}", stats.events);
             }
         }
         Ok(())
     }
 }
-
