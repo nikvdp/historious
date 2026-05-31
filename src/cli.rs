@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::ingest;
 use crate::search;
+use crate::server;
 use crate::storage::Store;
 use crate::transport;
 use anyhow::Result;
@@ -47,11 +48,24 @@ pub enum Command {
         input: String,
     },
     /// Run the local updater continuously. No network listener is started.
-    Daemon,
+    Daemon {
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+        #[arg(long)]
+        max_files: Option<usize>,
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Opt-in HTTP server for local/peer archive exchange.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7391")]
         bind: String,
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+        #[arg(long)]
+        max_files: Option<usize>,
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Show local archive health and projection freshness.
     Status,
@@ -114,11 +128,24 @@ impl Cli {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
             }
-            Command::Daemon => {
-                println!("daemon: not implemented yet");
+            Command::Daemon {
+                interval_secs,
+                max_files,
+                source,
+            } => {
+                run_daemon(&store, &config.machine_id, interval_secs, max_files, source).await?;
             }
-            Command::Serve { bind } => {
-                println!("serve: not implemented yet on {bind}");
+            Command::Serve {
+                bind,
+                interval_secs,
+                max_files,
+                source,
+            } => {
+                let addr = bind.parse()?;
+                let server_store = store.clone();
+                let server_task = tokio::spawn(async move { server::serve(server_store, addr).await });
+                run_daemon(&store, &config.machine_id, interval_secs, max_files, source).await?;
+                server_task.abort();
             }
             Command::Status => {
                 let stats = store.stats()?;
@@ -132,4 +159,36 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+async fn run_daemon(
+    store: &Store,
+    machine_id: &str,
+    interval_secs: u64,
+    max_files: Option<usize>,
+    source: Option<String>,
+) -> Result<()> {
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    loop {
+        let stats = ingest::update_local(
+            store,
+            machine_id,
+            ingest::UpdateOptions {
+                max_files,
+                source: source.clone(),
+            },
+        )?;
+        let projected = search::refresh(store)?;
+        println!(
+            "files_seen={} inserted={} duplicates={} errors={} projected_events={}",
+            stats.files_seen, stats.inserted, stats.duplicates, stats.errors, projected
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+        }
+    }
+    Ok(())
 }

@@ -2,6 +2,7 @@ use crate::archive::{ArchiveRecord, EventRecord, RawArtifact, SessionRecord, Sou
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,7 @@ pub struct ImportStats {
     pub duplicates: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ArchiveStats {
     pub sources: u64,
     pub raw_artifacts: u64,
