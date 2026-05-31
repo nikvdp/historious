@@ -1,4 +1,4 @@
-use crate::archive::{ArchiveRecord, EventRecord, RawArtifact, SessionRecord};
+use crate::archive::{ArchiveRecord, EventRecord, RawArtifact, SessionRecord, SourceRecord};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Store {
     db_path: PathBuf,
+    blob_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,7 +30,10 @@ impl Store {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         let db_path = data_dir.join("super-cass.db");
-        let store = Self { db_path };
+        let blob_dir = data_dir.join("blobs");
+        std::fs::create_dir_all(&blob_dir)
+            .with_context(|| format!("creating blob dir {}", blob_dir.display()))?;
+        let store = Self { db_path, blob_dir };
         store.with_conn(|conn| {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -50,34 +54,44 @@ impl Store {
 
     pub fn upsert_source(&self, id: &str, kind: &str, identity: &str, path: Option<&str>) -> Result<()> {
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO sources (id, kind, identity, path, first_seen_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-                 ON CONFLICT(id) DO UPDATE SET
-                   kind = excluded.kind,
-                   identity = excluded.identity,
-                   path = excluded.path,
-                   updated_at = excluded.updated_at",
-                params![id, kind, identity, path, Utc::now().to_rfc3339()],
-            )?;
+            let now = Utc::now();
+            let source = SourceRecord {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                identity: identity.to_string(),
+                path: path.map(ToOwned::to_owned),
+                first_seen_at: now,
+                updated_at: now,
+                hash: crate::archive::stable_hash(&(id, kind, identity, path))?,
+            };
+            insert_source(conn, &source)?;
             Ok(())
         })
     }
 
     pub fn import_record(&self, record: &ArchiveRecord) -> Result<ImportStats> {
+        self.import_records(std::slice::from_ref(record))
+    }
+
+    pub fn import_records(&self, records: &[ArchiveRecord]) -> Result<ImportStats> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            let inserted = match record {
-                ArchiveRecord::RawArtifact(raw) => insert_raw_artifact(&tx, raw)?,
-                ArchiveRecord::Session(session) => insert_session(&tx, session)?,
-                ArchiveRecord::Event(event) => insert_event(&tx, event)?,
-            };
+            let mut stats = ImportStats::default();
+            for record in records {
+                let inserted = match record {
+                    ArchiveRecord::Source(source) => insert_source(&tx, source)?,
+                    ArchiveRecord::RawArtifact(raw) => insert_raw_artifact(&tx, raw, &self.blob_dir)?,
+                    ArchiveRecord::Session(session) => insert_session(&tx, session)?,
+                    ArchiveRecord::Event(event) => insert_event(&tx, event)?,
+                };
+                if inserted {
+                    stats.inserted += 1;
+                } else {
+                    stats.duplicates += 1;
+                }
+            }
             tx.commit()?;
-            Ok(if inserted {
-                ImportStats { inserted: 1, duplicates: 0 }
-            } else {
-                ImportStats { inserted: 0, duplicates: 1 }
-            })
+            Ok(stats)
         })
     }
 
@@ -86,12 +100,26 @@ impl Store {
             let mut records = Vec::new();
             {
                 let mut stmt = conn.prepare(
+                    "SELECT id, kind, identity, path, first_seen_at, updated_at, hash
+                     FROM sources ORDER BY id",
+                )?;
+                let rows = stmt.query_map([], row_source)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Source(row?));
+                }
+            }
+            {
+                let mut stmt = conn.prepare(
                     "SELECT hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at
                      FROM raw_artifacts ORDER BY first_seen_at, hash",
                 )?;
                 let rows = stmt.query_map([], row_raw_artifact)?;
                 for row in rows {
-                    records.push(ArchiveRecord::RawArtifact(row?));
+                    let mut raw = row?;
+                    if raw.content.is_empty() {
+                        raw.content = read_blob(&self.blob_dir, &raw.hash)?;
+                    }
+                    records.push(ArchiveRecord::RawArtifact(raw));
                 }
             }
             {
@@ -147,7 +175,8 @@ fn migrate(conn: &Connection) -> Result<()> {
           identity TEXT NOT NULL,
           path TEXT,
           first_seen_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          hash TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS raw_artifacts (
@@ -206,8 +235,28 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact) -> Result<bool> {
+fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
+    ensure_same_hash(conn, "sources", "id", &source.id, &source.hash)?;
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO sources
+         (id, kind, identity, path, first_seen_at, updated_at, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            source.id,
+            source.kind,
+            source.identity,
+            source.path,
+            source.first_seen_at.to_rfc3339(),
+            source.updated_at.to_rfc3339(),
+            source.hash
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact, blob_dir: &Path) -> Result<bool> {
     ensure_same_hash(conn, "raw_artifacts", "hash", &raw.hash, &raw.hash)?;
+    write_blob(blob_dir, &raw.hash, &raw.content)?;
     let changed = conn.execute(
         "INSERT OR IGNORE INTO raw_artifacts
          (hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at)
@@ -219,11 +268,34 @@ fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact) -> Result<bool> {
             raw.size,
             raw.mtime_ms,
             raw.media_type,
-            raw.content,
+            Vec::<u8>::new(),
             raw.first_seen_at.to_rfc3339()
         ],
     )?;
     Ok(changed > 0)
+}
+
+fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
+    let path = blob_path(blob_dir, hash);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating blob shard {}", parent.display()))?;
+    }
+    std::fs::write(&path, content).with_context(|| format!("writing blob {}", path.display()))
+}
+
+fn read_blob(blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
+    let path = blob_path(blob_dir, hash);
+    std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))
+}
+
+fn blob_path(blob_dir: &Path, hash: &str) -> PathBuf {
+    let clean = hash.strip_prefix("blake3:").unwrap_or(hash);
+    let shard = clean.get(0..2).unwrap_or("xx");
+    blob_dir.join(shard).join(clean)
 }
 
 fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
@@ -306,6 +378,18 @@ fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
     })
 }
 
+fn row_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRecord> {
+    Ok(SourceRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        identity: row.get(2)?,
+        path: row.get(3)?,
+        first_seen_at: parse_dt(row.get::<_, String>(4)?),
+        updated_at: parse_dt(row.get::<_, String>(5)?),
+        hash: row.get(6)?,
+    })
+}
+
 fn row_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let metadata: String = row.get(9)?;
     Ok(SessionRecord {
@@ -356,4 +440,3 @@ fn parse_dt(value: String) -> DateTime<Utc> {
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
 }
-

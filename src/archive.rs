@@ -17,6 +17,17 @@ pub struct RawArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRecord {
+    pub id: String,
+    pub kind: String,
+    pub identity: String,
+    pub path: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
     pub source_id: String,
@@ -51,6 +62,7 @@ pub struct EventRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ArchiveRecord {
+    Source(SourceRecord),
     RawArtifact(RawArtifact),
     Session(SessionRecord),
     Event(EventRecord),
@@ -59,6 +71,7 @@ pub enum ArchiveRecord {
 impl ArchiveRecord {
     pub fn id(&self) -> &str {
         match self {
+            Self::Source(record) => &record.id,
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.id,
             Self::Event(record) => &record.id,
@@ -67,6 +80,7 @@ impl ArchiveRecord {
 
     pub fn hash(&self) -> &str {
         match self {
+            Self::Source(record) => &record.hash,
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.hash,
             Self::Event(record) => &record.hash,
@@ -115,4 +129,3 @@ pub fn stable_id(parts: &[&str]) -> String {
     }
     format!("sc_{}", hasher.finalize().to_hex())
 }
-
