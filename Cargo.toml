@@ -16,7 +16,7 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -27,4 +27,3 @@ walkdir = "2.5"
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.10"
-

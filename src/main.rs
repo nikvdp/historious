@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod ingest;
 mod search;
+mod server;
 mod storage;
 mod transport;
 
