@@ -56,6 +56,13 @@ pub struct SearchRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct SearchUnitForEmbedding {
+    pub id: String,
+    pub text: String,
+    pub text_hash: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct VectorSearchRow {
     pub event_id: String,
     pub unit_id: String,
@@ -283,9 +290,11 @@ impl Store {
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
+                 LEFT JOIN search_units su
+                   ON su.event_id = e.id
                  WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND emb.event_id IS NULL
+                   AND (emb.event_id IS NULL OR su.event_id IS NULL)
                  ORDER BY e.session_id, e.ordinal, e.id",
             )?;
             let rows = stmt.query_map(params![model], |row| {
@@ -335,12 +344,15 @@ impl Store {
                 insert_search_unit(&tx, &unit)?;
                 tx.execute(
                     "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-                     VALUES (?1, ?2, ?3, ?4)",
+                     SELECT ?1, ?2, ?3, ?4
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM events_fts WHERE event_id = ?1
+                     )",
                     params![event.id, event.session_id, event.source_kind, event.content],
                 )?;
                 let vector = embed(&event.content);
                 tx.execute(
-                    "INSERT INTO event_embeddings (event_id, model, dims, vector_json)
+                    "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![
                         event.id,
@@ -395,6 +407,38 @@ impl Store {
                 let mut row = row?;
                 row.rank = idx + 1;
                 out.push(row);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn search_units_missing_embedding(
+        &self,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchUnitForEmbedding>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT su.id, su.text, su.text_hash
+                 FROM search_units su
+                 LEFT JOIN embeddings e
+                   ON e.unit_id = su.id
+                  AND e.text_hash = su.text_hash
+                  AND e.model_id = ?1
+                 WHERE e.id IS NULL
+                 ORDER BY su.occurred_at, su.session_id, su.id
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![model_id, limit as i64], |row| {
+                Ok(SearchUnitForEmbedding {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    text_hash: row.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
             }
             Ok(out)
         })

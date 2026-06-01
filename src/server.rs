@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    machine_id: String,
+    embedder: crate::embed::EmbedderConfig,
 }
 
 #[derive(Serialize)]
@@ -22,13 +24,22 @@ struct Health {
     ok: bool,
 }
 
-pub async fn serve(store: Store, addr: SocketAddr) -> Result<()> {
+pub async fn serve(
+    store: Store,
+    addr: SocketAddr,
+    machine_id: String,
+    embedder: crate::embed::EmbedderConfig,
+) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/heads", get(heads))
         .route("/export", get(export_jsonl))
         .route("/import", post(import_jsonl))
-        .with_state(AppState { store });
+        .with_state(AppState {
+            store,
+            machine_id,
+            embedder,
+        });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving sync API on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
@@ -39,7 +50,9 @@ async fn health() -> Json<Health> {
     Json(Health { ok: true })
 }
 
-async fn heads(State(state): State<AppState>) -> Result<Json<crate::storage::ArchiveStats>, ServerError> {
+async fn heads(
+    State(state): State<AppState>,
+) -> Result<Json<crate::storage::ArchiveStats>, ServerError> {
     Ok(Json(state.store.stats()?))
 }
 
@@ -59,10 +72,23 @@ async fn import_jsonl(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let stats = transport::import_jsonl_reader(&state.store, Cursor::new(body))?;
     let projected = search::refresh(&state.store)?;
+    let (embedder, degraded_reason) = match state.embedder.load() {
+        Ok(embedder) => (Some(embedder), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let embeddings = search::refresh_embeddings(
+        &state.store,
+        &state.machine_id,
+        embedder.as_deref(),
+        degraded_reason,
+    )?;
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,
         "duplicates": stats.duplicates,
         "vectors_projected": stats.vectors_projected,
+        "embedded": embeddings.embedded,
+        "embedding_vectors_projected": embeddings.vectors_projected,
+        "embedding_degraded_reason": embeddings.degraded_reason,
         "projected_events": projected
     })))
 }
