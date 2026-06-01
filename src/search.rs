@@ -1,12 +1,21 @@
 use crate::embed::Embedder;
 use crate::storage::{SearchRow, Store, VectorSearchRow};
-use anyhow::Result;
+use anyhow::{bail, Result};
+use chrono::Utc;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
+const EMBEDDING_BATCH_SIZE: usize = 64;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EmbeddingRefresh {
+    pub embedded: usize,
+    pub vectors_projected: usize,
+    pub degraded_reason: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResponse {
@@ -31,6 +40,107 @@ pub fn refresh(store: &Store) -> Result<usize> {
         crate::embed::HashEmbedder::DIMS,
         crate::embed::hash_embed,
     )
+}
+
+pub fn refresh_embeddings(
+    store: &Store,
+    machine_id: &str,
+    embedder: Option<&dyn Embedder>,
+    degraded_reason: Option<String>,
+) -> Result<EmbeddingRefresh> {
+    let Some(embedder) = embedder else {
+        return Ok(EmbeddingRefresh {
+            vectors_projected: store.refresh_vector_projection()?,
+            degraded_reason,
+            ..EmbeddingRefresh::default()
+        });
+    };
+    if !embedder.is_semantic() {
+        return Ok(EmbeddingRefresh {
+            vectors_projected: store.refresh_vector_projection()?,
+            degraded_reason: Some(
+                "embedder is not semantic; skipping durable embeddings".to_string(),
+            ),
+            ..EmbeddingRefresh::default()
+        });
+    }
+
+    let mut embedded = 0;
+    loop {
+        let units =
+            store.search_units_missing_embedding(embedder.model_id(), EMBEDDING_BATCH_SIZE)?;
+        if units.is_empty() {
+            break;
+        }
+        let texts = units
+            .iter()
+            .map(|unit| unit.text.clone())
+            .collect::<Vec<_>>();
+        let vectors = embedder.embed_batch(&texts)?;
+        if vectors.len() != units.len() {
+            bail!(
+                "embedder returned {} vectors for {} search units",
+                vectors.len(),
+                units.len()
+            );
+        }
+
+        let mut records = Vec::with_capacity(units.len());
+        for (unit, vector) in units.iter().zip(vectors) {
+            if vector.len() != embedder.dims() {
+                bail!(
+                    "embedder returned vector with {} dimensions, expected {}",
+                    vector.len(),
+                    embedder.dims()
+                );
+            }
+            let vector_blob = crate::storage::f32_vector_to_blob(&vector);
+            let vector_hash = crate::archive::blake3_hex(&vector_blob);
+            let id = crate::archive::stable_id(&[
+                "embedding",
+                &unit.id,
+                &unit.text_hash,
+                embedder.model_id(),
+            ]);
+            let hash = crate::archive::stable_hash(&(
+                &id,
+                &unit.id,
+                &unit.text_hash,
+                embedder.model_id(),
+                embedder.dims(),
+                &vector_hash,
+            ))?;
+            records.push(crate::archive::ArchiveRecord::Embedding(
+                crate::archive::EmbeddingRecord {
+                    id,
+                    unit_id: unit.id.clone(),
+                    text_hash: unit.text_hash.clone(),
+                    model_id: embedder.model_id().to_string(),
+                    dims: embedder.dims() as u32,
+                    vector_hash,
+                    vector: vector_blob,
+                    producer_machine_id: machine_id.to_string(),
+                    embedded_at: Utc::now(),
+                    metadata: serde_json::json!({
+                        "provider": "local",
+                        "projection": "semantic_embedding_v1"
+                    }),
+                    hash,
+                },
+            ));
+        }
+        let stats = store.import_records(&records)?;
+        embedded += stats.inserted;
+        if units.len() < EMBEDDING_BATCH_SIZE {
+            break;
+        }
+    }
+
+    Ok(EmbeddingRefresh {
+        embedded,
+        vectors_projected: store.refresh_vector_projection()?,
+        degraded_reason: None,
+    })
 }
 
 pub fn search(
@@ -263,6 +373,49 @@ mod tests {
         );
         assert_eq!(response.results[0].event_id, unit.event_id);
         assert_eq!(response.results[0].semantic_rank, None);
+    }
+
+    #[test]
+    fn refresh_embeddings_creates_durable_vectors_for_missing_search_units() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unit = import_event_and_project(&store, "semantic refresh target");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(13),
+        };
+
+        let refresh = refresh_embeddings(&store, "machine_fixture", Some(&embedder), None)
+            .expect("refresh embeddings");
+
+        assert_eq!(refresh.embedded, 1);
+        assert_eq!(refresh.vectors_projected, 1);
+        assert_eq!(refresh.degraded_reason, None);
+        assert_eq!(store.stats().expect("stats").embeddings, 1);
+        let hits = store
+            .vector_search("fixture-semantic-384", &unit_vector(13), 5)
+            .expect("vector search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].unit_id, unit.id);
+    }
+
+    #[test]
+    fn refresh_embeddings_skips_hash_fallback_as_degraded_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        import_event_and_project(&store, "hash fallback should not become semantic");
+        let hash = crate::embed::HashEmbedder;
+
+        let refresh = refresh_embeddings(&store, "machine_fixture", Some(&hash), None)
+            .expect("refresh embeddings");
+
+        assert_eq!(refresh.embedded, 0);
+        assert_eq!(refresh.vectors_projected, 0);
+        assert_eq!(
+            refresh.degraded_reason.as_deref(),
+            Some("embedder is not semantic; skipping durable embeddings")
+        );
+        assert_eq!(store.stats().expect("stats").embeddings, 0);
     }
 
     fn import_event_and_project(store: &Store, search_text: &str) -> SearchUnitRecord {

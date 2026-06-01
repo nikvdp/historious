@@ -92,14 +92,22 @@ impl Cli {
                 );
                 let projected = search::refresh(&store)?;
                 println!("projection=search_rrf_v1 projected_events={projected}");
-                let vectors_projected = store.refresh_vector_projection()?;
-                println!("projection=sqlite_vec_384 inserted_vectors={vectors_projected}");
+                let (embedder, degraded_reason) = load_embedder(&config);
+                let embeddings = search::refresh_embeddings(
+                    &store,
+                    &config.machine_id,
+                    embedder.as_deref(),
+                    degraded_reason,
+                )?;
+                println!(
+                    "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+                    embeddings.embedded,
+                    embeddings.vectors_projected,
+                    embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
+                );
             }
             Command::Search { query, limit, json } => {
-                let (embedder, degraded_reason) = match config.embedder.load() {
-                    Ok(embedder) => (Some(embedder), None),
-                    Err(err) => (None, Some(err.to_string())),
-                };
+                let (embedder, degraded_reason) = load_embedder(&config);
                 let response =
                     search::search(&store, &query, limit, embedder.as_deref(), degraded_reason)?;
                 if json {
@@ -138,6 +146,19 @@ impl Cli {
                     );
                     let projected = search::refresh(&store)?;
                     println!("projection=search_rrf_v1 projected_events={projected}");
+                    let (embedder, degraded_reason) = load_embedder(&config);
+                    let embeddings = search::refresh_embeddings(
+                        &store,
+                        &config.machine_id,
+                        embedder.as_deref(),
+                        degraded_reason,
+                    )?;
+                    println!(
+                        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+                        embeddings.embedded,
+                        embeddings.vectors_projected,
+                        embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
+                    );
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
@@ -147,7 +168,15 @@ impl Cli {
                 max_files,
                 source,
             } => {
-                run_daemon(&store, &config.machine_id, interval_secs, max_files, source).await?;
+                run_daemon(
+                    &store,
+                    &config.machine_id,
+                    config.embedder.clone(),
+                    interval_secs,
+                    max_files,
+                    source,
+                )
+                .await?;
             }
             Command::Serve {
                 bind,
@@ -157,9 +186,20 @@ impl Cli {
             } => {
                 let addr = bind.parse()?;
                 let server_store = store.clone();
-                let server_task =
-                    tokio::spawn(async move { server::serve(server_store, addr).await });
-                run_daemon(&store, &config.machine_id, interval_secs, max_files, source).await?;
+                let server_machine_id = config.machine_id.clone();
+                let server_embedder = config.embedder.clone();
+                let server_task = tokio::spawn(async move {
+                    server::serve(server_store, addr, server_machine_id, server_embedder).await
+                });
+                run_daemon(
+                    &store,
+                    &config.machine_id,
+                    config.embedder.clone(),
+                    interval_secs,
+                    max_files,
+                    source,
+                )
+                .await?;
                 server_task.abort();
             }
             Command::Status => {
@@ -206,6 +246,7 @@ impl Cli {
 async fn run_daemon(
     store: &Store,
     machine_id: &str,
+    embedder_config: crate::embed::EmbedderConfig,
     interval_secs: u64,
     max_files: Option<usize>,
     source: Option<String>,
@@ -221,16 +262,20 @@ async fn run_daemon(
             },
         )?;
         let projected = search::refresh(store)?;
-        let vectors_projected = store.refresh_vector_projection()?;
+        let (embedder, degraded_reason) = load_embedder_config(&embedder_config);
+        let embeddings =
+            search::refresh_embeddings(store, machine_id, embedder.as_deref(), degraded_reason)?;
         println!(
-            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={} inserted_vectors={}",
+            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={} embedded={} inserted_vectors={} degraded_reason={}",
             stats.files_seen,
             stats.skipped_unchanged,
             stats.inserted,
             stats.duplicates,
             stats.errors,
             projected,
-            vectors_projected
+            embeddings.embedded,
+            embeddings.vectors_projected,
+            embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
         );
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
@@ -240,4 +285,17 @@ async fn run_daemon(
         }
     }
     Ok(())
+}
+
+fn load_embedder(config: &AppConfig) -> (Option<Box<dyn crate::embed::Embedder>>, Option<String>) {
+    load_embedder_config(&config.embedder)
+}
+
+fn load_embedder_config(
+    config: &crate::embed::EmbedderConfig,
+) -> (Option<Box<dyn crate::embed::Embedder>>, Option<String>) {
+    match config.load() {
+        Ok(embedder) => (Some(embedder), None),
+        Err(err) => (None, Some(err.to_string())),
+    }
 }
