@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone, Default)]
 pub struct UpdateStats {
     pub files_seen: usize,
+    pub skipped_unchanged: usize,
     pub inserted: usize,
     pub duplicates: usize,
     pub errors: usize,
@@ -111,6 +112,21 @@ pub fn update_local(
         };
     for (_, kind, path) in iter {
         stats.files_seen += 1;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                tracing::debug!("failed to read metadata for {}: {err}", path.display());
+                stats.errors += 1;
+                continue;
+            }
+        };
+        let size = metadata.len();
+        let mtime_ms = file_mtime_ms(&metadata);
+        let path_text = path.to_string_lossy().to_string();
+        if store.raw_artifact_is_current(&path_text, size, mtime_ms)? {
+            stats.skipped_unchanged += 1;
+            continue;
+        }
         match ingest_file(store, machine_id, kind, &path) {
             Ok(delta) => {
                 stats.inserted += delta.inserted;
@@ -171,11 +187,7 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
 
     let metadata =
         fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
-    let mtime_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as i64);
+    let mtime_ms = file_mtime_ms(&metadata);
     let mut records = Vec::new();
     records.push(ArchiveRecord::RawArtifact(RawArtifact {
         hash: raw_hash.clone(),
@@ -601,6 +613,14 @@ fn snippet(input: &str, max_chars: usize) -> String {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn file_mtime_ms(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
 }
 
 #[cfg(test)]

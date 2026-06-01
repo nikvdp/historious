@@ -83,8 +83,12 @@ impl Cli {
                     ingest::UpdateOptions { max_files, source },
                 )?;
                 println!(
-                    "files_seen={} inserted={} duplicates={} errors={}",
-                    stats.files_seen, stats.inserted, stats.duplicates, stats.errors
+                    "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={}",
+                    stats.files_seen,
+                    stats.skipped_unchanged,
+                    stats.inserted,
+                    stats.duplicates,
+                    stats.errors
                 );
                 let projected = search::refresh(&store)?;
                 println!("projection=search_rrf_v1 projected_events={projected}");
@@ -180,8 +184,13 @@ async fn run_daemon(
         )?;
         let projected = search::refresh(store)?;
         println!(
-            "files_seen={} inserted={} duplicates={} errors={} projected_events={}",
-            stats.files_seen, stats.inserted, stats.duplicates, stats.errors, projected
+            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={}",
+            stats.files_seen,
+            stats.skipped_unchanged,
+            stats.inserted,
+            stats.duplicates,
+            stats.errors,
+            projected
         );
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
