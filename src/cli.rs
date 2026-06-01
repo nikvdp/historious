@@ -133,13 +133,11 @@ impl Cli {
                 if jsonl {
                     let stats = transport::import_jsonl_path(&store, &input)?;
                     println!(
-                        "imported={} duplicates={}",
-                        stats.inserted, stats.duplicates
+                        "imported={} duplicates={} inserted_vectors={}",
+                        stats.inserted, stats.duplicates, stats.vectors_projected
                     );
                     let projected = search::refresh(&store)?;
                     println!("projection=search_rrf_v1 projected_events={projected}");
-                    let vectors_projected = store.refresh_vector_projection()?;
-                    println!("projection=sqlite_vec_384 inserted_vectors={vectors_projected}");
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }

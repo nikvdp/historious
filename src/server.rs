@@ -62,6 +62,7 @@ async fn import_jsonl(
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,
         "duplicates": stats.duplicates,
+        "vectors_projected": stats.vectors_projected,
         "projected_events": projected
     })))
 }
@@ -86,4 +87,3 @@ impl IntoResponse for ServerError {
             .into_response()
     }
 }
-
