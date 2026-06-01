@@ -60,12 +60,46 @@ pub struct EventRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchUnitRecord {
+    pub id: String,
+    pub event_id: String,
+    pub session_id: String,
+    pub source_id: String,
+    pub machine_id: String,
+    pub source_kind: String,
+    pub role: Option<String>,
+    pub search_kind: String,
+    pub text: String,
+    pub text_hash: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub metadata: Value,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRecord {
+    pub id: String,
+    pub unit_id: String,
+    pub text_hash: String,
+    pub model_id: String,
+    pub dims: u32,
+    pub vector_hash: String,
+    pub vector: Vec<u8>,
+    pub producer_machine_id: String,
+    pub embedded_at: DateTime<Utc>,
+    pub metadata: Value,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ArchiveRecord {
     Source(SourceRecord),
     RawArtifact(RawArtifact),
     Session(SessionRecord),
     Event(EventRecord),
+    SearchUnit(SearchUnitRecord),
+    Embedding(EmbeddingRecord),
 }
 
 impl ArchiveRecord {
@@ -75,6 +109,8 @@ impl ArchiveRecord {
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.id,
             Self::Event(record) => &record.id,
+            Self::SearchUnit(record) => &record.id,
+            Self::Embedding(record) => &record.id,
         }
     }
 
@@ -84,6 +120,8 @@ impl ArchiveRecord {
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.hash,
             Self::Event(record) => &record.hash,
+            Self::SearchUnit(record) => &record.hash,
+            Self::Embedding(record) => &record.hash,
         }
     }
 }

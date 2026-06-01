@@ -1,4 +1,7 @@
-use crate::archive::{ArchiveRecord, EventRecord, RawArtifact, SessionRecord, SourceRecord};
+use crate::archive::{
+    ArchiveRecord, EmbeddingRecord, EventRecord, RawArtifact, SearchUnitRecord, SessionRecord,
+    SourceRecord,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -24,14 +27,22 @@ pub struct ArchiveStats {
     pub raw_artifacts: u64,
     pub sessions: u64,
     pub events: u64,
+    pub search_units: u64,
+    pub embeddings: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct EventForProjection {
     pub id: String,
     pub session_id: String,
+    pub source_id: String,
+    pub machine_id: String,
     pub source_kind: String,
+    pub role: Option<String>,
+    pub search_kind: String,
     pub content: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub text_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +120,8 @@ impl Store {
                     }
                     ArchiveRecord::Session(session) => insert_session(&tx, session)?,
                     ArchiveRecord::Event(event) => insert_event(&tx, event)?,
+                    ArchiveRecord::SearchUnit(unit) => insert_search_unit(&tx, unit)?,
+                    ArchiveRecord::Embedding(embedding) => insert_embedding(&tx, embedding)?,
                 };
                 if inserted {
                     stats.inserted += 1;
@@ -171,6 +184,28 @@ impl Store {
                     records.push(ArchiveRecord::Event(row?));
                 }
             }
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_id, session_id, source_id, machine_id, source_kind, role,
+                            search_kind, text, text_hash, occurred_at, metadata_json, hash
+                     FROM search_units ORDER BY session_id, id",
+                )?;
+                let rows = stmt.query_map([], row_search_unit)?;
+                for row in rows {
+                    records.push(ArchiveRecord::SearchUnit(row?));
+                }
+            }
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id, unit_id, text_hash, model_id, dims, vector_hash, vector,
+                            producer_machine_id, embedded_at, metadata_json, hash
+                     FROM embeddings ORDER BY model_id, unit_id",
+                )?;
+                let rows = stmt.query_map([], row_embedding)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Embedding(row?));
+                }
+            }
             Ok(records)
         })
     }
@@ -182,6 +217,8 @@ impl Store {
                 raw_artifacts: count(conn, "raw_artifacts")?,
                 sessions: count(conn, "sessions")?,
                 events: count(conn, "events")?,
+                search_units: count(conn, "search_units")?,
+                embeddings: count(conn, "embeddings")?,
             })
         })
     }
@@ -223,8 +260,13 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT e.id,
                         e.session_id,
+                        e.source_id,
+                        e.machine_id,
                         e.source_kind,
-                        json_extract(e.metadata_json, '$.search_text')
+                        e.role,
+                        json_extract(e.metadata_json, '$.search_kind'),
+                        json_extract(e.metadata_json, '$.search_text'),
+                        e.occurred_at
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
@@ -234,15 +276,50 @@ impl Store {
                  ORDER BY e.session_id, e.ordinal, e.id",
             )?;
             let rows = stmt.query_map(params![model], |row| {
+                let content: String = row.get(7)?;
                 Ok(EventForProjection {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
-                    source_kind: row.get(2)?,
-                    content: row.get(3)?,
+                    source_id: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    source_kind: row.get(4)?,
+                    role: row.get(5)?,
+                    search_kind: row.get(6)?,
+                    text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                    content,
+                    occurred_at: parse_opt_dt(row.get(8)?),
                 })
             })?;
             for row in rows {
                 let event = row?;
+                let unit_id =
+                    crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
+                let unit_hash = crate::archive::stable_hash(&(
+                    &unit_id,
+                    &event.id,
+                    &event.text_hash,
+                    &event.content,
+                    &event.search_kind,
+                ))?;
+                let unit = SearchUnitRecord {
+                    id: unit_id,
+                    event_id: event.id.clone(),
+                    session_id: event.session_id.clone(),
+                    source_id: event.source_id.clone(),
+                    machine_id: event.machine_id.clone(),
+                    source_kind: event.source_kind.clone(),
+                    role: event.role.clone(),
+                    search_kind: event.search_kind.clone(),
+                    text: event.content.clone(),
+                    text_hash: event.text_hash.clone(),
+                    occurred_at: event.occurred_at,
+                    metadata: serde_json::json!({
+                        "derived_from": "event.search_text",
+                        "projection": "search_unit_v1"
+                    }),
+                    hash: unit_hash,
+                };
+                insert_search_unit(&tx, &unit)?;
                 tx.execute(
                     "INSERT INTO events_fts (event_id, session_id, source_kind, content)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -433,6 +510,49 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_ordinal
           ON events(session_id, ordinal);
 
+        CREATE TABLE IF NOT EXISTS search_units (
+          id TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          role TEXT,
+          search_kind TEXT NOT NULL,
+          text TEXT NOT NULL,
+          text_hash TEXT NOT NULL,
+          occurred_at TEXT,
+          metadata_json TEXT NOT NULL,
+          hash TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_units_event
+          ON search_units(event_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_units_text_hash
+          ON search_units(text_hash);
+
+        CREATE TABLE IF NOT EXISTS embeddings (
+          id TEXT PRIMARY KEY,
+          unit_id TEXT NOT NULL,
+          text_hash TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          dims INTEGER NOT NULL,
+          vector_hash TEXT NOT NULL,
+          vector BLOB NOT NULL,
+          producer_machine_id TEXT NOT NULL,
+          embedded_at TEXT NOT NULL,
+          metadata_json TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          UNIQUE(unit_id, text_hash, model_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_embeddings_model
+          ON embeddings(model_id);
+
+        CREATE INDEX IF NOT EXISTS idx_embeddings_unit
+          ON embeddings(unit_id);
+
         CREATE TABLE IF NOT EXISTS projection_status (
           projection_name TEXT PRIMARY KEY,
           input_high_watermark TEXT NOT NULL DEFAULT '',
@@ -594,6 +714,56 @@ fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
     Ok(changed > 0)
 }
 
+fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool> {
+    ensure_same_hash(conn, "search_units", "id", &unit.id, &unit.hash)?;
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO search_units
+         (id, event_id, session_id, source_id, machine_id, source_kind, role, search_kind,
+          text, text_hash, occurred_at, metadata_json, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            unit.id,
+            unit.event_id,
+            unit.session_id,
+            unit.source_id,
+            unit.machine_id,
+            unit.source_kind,
+            unit.role,
+            unit.search_kind,
+            unit.text,
+            unit.text_hash,
+            opt_dt(unit.occurred_at),
+            unit.metadata.to_string(),
+            unit.hash
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+fn insert_embedding(conn: &Connection, embedding: &EmbeddingRecord) -> Result<bool> {
+    ensure_same_hash(conn, "embeddings", "id", &embedding.id, &embedding.hash)?;
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO embeddings
+         (id, unit_id, text_hash, model_id, dims, vector_hash, vector,
+          producer_machine_id, embedded_at, metadata_json, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            embedding.id,
+            embedding.unit_id,
+            embedding.text_hash,
+            embedding.model_id,
+            embedding.dims as i64,
+            embedding.vector_hash,
+            embedding.vector,
+            embedding.producer_machine_id,
+            embedding.embedded_at.to_rfc3339(),
+            embedding.metadata.to_string(),
+            embedding.hash
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 fn ensure_same_hash(
     conn: &Connection,
     table: &str,
@@ -687,6 +857,42 @@ fn row_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
         occurred_at: parse_opt_dt(row.get(10)?),
         metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
         hash: row.get(12)?,
+    })
+}
+
+fn row_search_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchUnitRecord> {
+    let metadata: String = row.get(11)?;
+    Ok(SearchUnitRecord {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        session_id: row.get(2)?,
+        source_id: row.get(3)?,
+        machine_id: row.get(4)?,
+        source_kind: row.get(5)?,
+        role: row.get(6)?,
+        search_kind: row.get(7)?,
+        text: row.get(8)?,
+        text_hash: row.get(9)?,
+        occurred_at: parse_opt_dt(row.get(10)?),
+        metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+        hash: row.get(12)?,
+    })
+}
+
+fn row_embedding(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingRecord> {
+    let metadata: String = row.get(9)?;
+    Ok(EmbeddingRecord {
+        id: row.get(0)?,
+        unit_id: row.get(1)?,
+        text_hash: row.get(2)?,
+        model_id: row.get(3)?,
+        dims: row.get::<_, i64>(4)? as u32,
+        vector_hash: row.get(5)?,
+        vector: row.get(6)?,
+        producer_machine_id: row.get(7)?,
+        embedded_at: parse_dt(row.get::<_, String>(8)?),
+        metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+        hash: row.get(10)?,
     })
 }
 
