@@ -32,8 +32,6 @@ pub struct EventForProjection {
     pub session_id: String,
     pub source_kind: String,
     pub content: String,
-    pub fts_present: bool,
-    pub embedding_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,16 +224,13 @@ impl Store {
                 "SELECT e.id,
                         e.session_id,
                         e.source_kind,
-                        json_extract(e.metadata_json, '$.search_text'),
-                        fts.event_id IS NOT NULL,
-                        emb.event_id IS NOT NULL
+                        json_extract(e.metadata_json, '$.search_text')
                  FROM events e
-                 LEFT JOIN events_fts fts ON fts.event_id = e.id
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
                  WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND (fts.event_id IS NULL OR emb.event_id IS NULL)
+                   AND emb.event_id IS NULL
                  ORDER BY e.session_id, e.ordinal, e.id",
             )?;
             let rows = stmt.query_map(params![model], |row| {
@@ -244,32 +239,26 @@ impl Store {
                     session_id: row.get(1)?,
                     source_kind: row.get(2)?,
                     content: row.get(3)?,
-                    fts_present: row.get(4)?,
-                    embedding_present: row.get(5)?,
                 })
             })?;
             for row in rows {
                 let event = row?;
-                if !event.fts_present {
-                    tx.execute(
-                        "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![event.id, event.session_id, event.source_kind, event.content],
-                    )?;
-                }
-                if !event.embedding_present {
-                    let vector = embed(&event.content);
-                    tx.execute(
-                        "INSERT INTO event_embeddings (event_id, model, dims, vector_json)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            event.id,
-                            model,
-                            dims as i64,
-                            serde_json::to_string(&vector)?
-                        ],
-                    )?;
-                }
+                tx.execute(
+                    "INSERT INTO events_fts (event_id, session_id, source_kind, content)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![event.id, event.session_id, event.source_kind, event.content],
+                )?;
+                let vector = embed(&event.content);
+                tx.execute(
+                    "INSERT INTO event_embeddings (event_id, model, dims, vector_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        event.id,
+                        model,
+                        dims as i64,
+                        serde_json::to_string(&vector)?
+                    ],
+                )?;
             }
             let projected_events = count_projected_events(&tx, model)?;
             tx.execute(
@@ -629,17 +618,13 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
 }
 
 fn count_projected_events(conn: &Connection, model: &str) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM event_embeddings emb
-         WHERE emb.model = ?1
-           AND EXISTS (
-             SELECT 1 FROM events_fts fts WHERE fts.event_id = emb.event_id
-           )",
+    let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
+    let embedding_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM event_embeddings WHERE model = ?1",
         params![model],
         |row| row.get(0),
     )?;
-    Ok(count as usize)
+    Ok(fts_count.min(embedding_count) as usize)
 }
 
 fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
