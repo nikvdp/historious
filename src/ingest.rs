@@ -602,3 +602,69 @@ fn snippet(input: &str, max_chars: usize) -> String {
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexes_user_message_text() {
+        let line = parsed_line(
+            0,
+            json!({
+                "type": "message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "search this exact request"}]
+                }
+            }),
+            0,
+            1,
+        );
+
+        assert!(line.search_indexable);
+        assert_eq!(line.search_kind, "user");
+        assert_eq!(line.search_text, "search this exact request");
+    }
+
+    #[test]
+    fn does_not_index_tool_output_text() {
+        let line = parsed_line(
+            0,
+            json!({
+                "type": "tool_result",
+                "role": "tool",
+                "content": [{"type": "text", "text": "noisy command output"}],
+                "tool_use_id": "toolu_123"
+            }),
+            0,
+            1,
+        );
+
+        assert!(!line.search_indexable);
+        assert!(line.search_text.is_empty());
+        assert_eq!(line.search_skip_reason.as_deref(), Some("tool event"));
+    }
+
+    #[test]
+    fn indexes_hermes_message_arrays_without_tools() {
+        let line = parsed_line(
+            0,
+            json!({
+                "session_id": "session-1",
+                "messages": [
+                    {"role": "system", "content": "do not index system text"},
+                    {"role": "user", "content": "human question"},
+                    {"role": "tool", "content": "tool answer"},
+                    {"role": "assistant", "content": "assistant answer"}
+                ]
+            }),
+            0,
+            1,
+        );
+
+        assert!(line.search_indexable);
+        assert_eq!(line.search_kind, "conversation");
+        assert_eq!(line.search_text, "human question\nassistant answer");
+    }
+}
