@@ -1,3 +1,4 @@
+use crate::embed::EmbedderConfig;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub data_dir: PathBuf,
     pub machine_id: String,
+    pub embedder: EmbedderConfig,
 }
 
 impl AppConfig {
@@ -17,7 +19,12 @@ impl AppConfig {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         let machine_id = load_machine_id(&data_dir)?;
-        Ok(Self { data_dir, machine_id })
+        let embedder = EmbedderConfig::from_env(&data_dir);
+        Ok(Self {
+            data_dir,
+            machine_id,
+            embedder,
+        })
     }
 }
 

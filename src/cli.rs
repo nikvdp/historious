@@ -153,12 +153,37 @@ impl Cli {
             }
             Command::Status => {
                 let stats = store.stats()?;
+                let embedder = config.embedder.status_without_loading();
                 println!("data_dir={}", config.data_dir.display());
                 println!("db_path={}", store.db_path().display());
                 println!("sources={}", stats.sources);
                 println!("raw_artifacts={}", stats.raw_artifacts);
                 println!("sessions={}", stats.sessions);
                 println!("events={}", stats.events);
+                println!("search_units={}", stats.search_units);
+                println!("embeddings={}", stats.embeddings);
+                println!(
+                    "query_embedder={} semantic={} available={} degraded_reason={}",
+                    embedder.provider,
+                    embedder.semantic,
+                    embedder.available,
+                    embedder.degraded_reason.unwrap_or_else(|| "none".to_string())
+                );
+                if std::env::var("SUPER_CASS_PROBE_EMBEDDER").as_deref() == Ok("1") {
+                    match config.embedder.load() {
+                        Ok(loaded) => match loaded.embed_one("super cass query embedder probe") {
+                            Ok(vector) => println!(
+                                "query_embedder_probe=ready model_id={} dims={} semantic={} sample_dims={}",
+                                loaded.model_id(),
+                                loaded.dims(),
+                                loaded.is_semantic(),
+                                vector.len()
+                            ),
+                            Err(err) => println!("query_embedder_probe=degraded reason={err:#}"),
+                        },
+                        Err(err) => println!("query_embedder_probe=degraded reason={err:#}"),
+                    }
+                }
             }
         }
         Ok(())

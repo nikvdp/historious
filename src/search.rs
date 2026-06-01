@@ -3,8 +3,6 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
-const MODEL: &str = "hash-embed-v1";
-const DIMS: usize = 256;
 const RRF_K: f64 = 60.0;
 
 #[derive(Debug, Clone, Serialize)]
@@ -19,7 +17,11 @@ pub struct SearchResult {
 }
 
 pub fn refresh(store: &Store) -> Result<usize> {
-    store.refresh_search_projection(MODEL, DIMS, embed)
+    store.refresh_search_projection(
+        crate::embed::HashEmbedder::MODEL_ID,
+        crate::embed::HashEmbedder::DIMS,
+        crate::embed::hash_embed,
+    )
 }
 
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -42,9 +44,9 @@ fn semantic_search(
     if candidate_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let query_vector = embed(query);
+    let query_vector = crate::embed::hash_embed(query);
     let mut scored = store
-        .embeddings_for_ids(MODEL, candidate_ids)?
+        .embeddings_for_ids(crate::embed::HashEmbedder::MODEL_ID, candidate_ids)?
         .into_iter()
         .map(|(id, vector)| (id, dot(&query_vector, &vector)))
         .collect::<Vec<_>>();
@@ -115,34 +117,6 @@ fn fuse(lexical: Vec<SearchRow>, semantic: Vec<SearchRow>, limit: usize) -> Vec<
     results.sort_by(|left, right| right.score.total_cmp(&left.score));
     results.truncate(limit);
     results
-}
-
-fn embed(text: &str) -> Vec<f32> {
-    let mut vector = vec![0.0f32; DIMS];
-    for token in tokens(text) {
-        let hash = blake3::hash(token.as_bytes());
-        let bytes = hash.as_bytes();
-        let idx = u16::from_le_bytes([bytes[0], bytes[1]]) as usize % DIMS;
-        let sign = if bytes[2] & 1 == 0 { 1.0 } else { -1.0 };
-        vector[idx] += sign;
-    }
-    normalize(&mut vector);
-    vector
-}
-
-fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_ascii_lowercase())
-}
-
-fn normalize(vector: &mut [f32]) {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for value in vector {
-            *value /= norm;
-        }
-    }
 }
 
 fn dot(left: &[f32], right: &[f32]) -> f32 {
