@@ -1,7 +1,7 @@
 use crate::storage::{SearchRow, Store};
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const MODEL: &str = "hash-embed-v1";
 const DIMS: usize = 256;
@@ -23,15 +23,28 @@ pub fn refresh(store: &Store) -> Result<usize> {
 }
 
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    let lexical = store.search_fts(query, limit.saturating_mul(5).max(limit))?;
-    let semantic = semantic_search(store, query, limit.saturating_mul(5).max(limit))?;
+    let candidate_limit = limit.saturating_mul(50).max(200);
+    let lexical = store.search_fts(query, candidate_limit)?;
+    let candidate_ids = lexical
+        .iter()
+        .map(|row| row.event_id.clone())
+        .collect::<Vec<_>>();
+    let semantic = semantic_search(store, query, &candidate_ids, candidate_limit)?;
     Ok(fuse(lexical, semantic, limit))
 }
 
-fn semantic_search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchRow>> {
+fn semantic_search(
+    store: &Store,
+    query: &str,
+    candidate_ids: &[String],
+    limit: usize,
+) -> Result<Vec<SearchRow>> {
+    if candidate_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let query_vector = embed(query);
     let mut scored = store
-        .all_embeddings(MODEL)?
+        .embeddings_for_ids(MODEL, candidate_ids)?
         .into_iter()
         .map(|(id, vector)| (id, dot(&query_vector, &vector)))
         .collect::<Vec<_>>();
@@ -65,7 +78,11 @@ fn fuse(lexical: Vec<SearchRow>, semantic: Vec<SearchRow>, limit: usize) -> Vec<
     }
 
     let mut acc: HashMap<String, Acc> = HashMap::new();
+    let mut seen_lexical = HashSet::new();
     for row in lexical {
+        if !seen_lexical.insert(row.event_id.clone()) {
+            continue;
+        }
         let entry = acc.entry(row.event_id.clone()).or_default();
         entry.score += 1.0 / (RRF_K + row.rank as f64);
         entry.lexical_rank = Some(row.rank);
