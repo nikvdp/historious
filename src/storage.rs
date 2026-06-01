@@ -321,18 +321,30 @@ impl Store {
         })
     }
 
-    pub fn all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>> {
+    pub fn embeddings_for_ids(
+        &self,
+        model: &str,
+        ids: &[String],
+    ) -> Result<Vec<(String, Vec<f32>)>> {
         self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT event_id, vector_json FROM event_embeddings WHERE model = ?1")?;
-            let rows = stmt.query_map(params![model], |row| {
-                let json: String = row.get(1)?;
-                let vector: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
-                Ok((row.get(0)?, vector))
-            })?;
             let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
+            let mut stmt = conn.prepare(
+                "SELECT vector_json
+                 FROM event_embeddings
+                 WHERE event_id = ?1 AND model = ?2",
+            )?;
+            let mut seen = std::collections::HashSet::new();
+            for id in ids {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Some(json) = stmt
+                    .query_row(params![id, model], |row| row.get::<_, String>(0))
+                    .optional()?
+                {
+                    let vector: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
+                    out.push((id.clone(), vector));
+                }
             }
             Ok(out)
         })
@@ -342,9 +354,12 @@ impl Store {
         self.with_conn(|conn| {
             let mut out = Vec::new();
             let mut stmt = conn.prepare(
-                "SELECT event_id, session_id, source_kind, content
-                 FROM events_fts
-                 WHERE event_id = ?1",
+                "SELECT id,
+                        session_id,
+                        source_kind,
+                        COALESCE(NULLIF(json_extract(metadata_json, '$.search_text'), ''), content)
+                 FROM events
+                 WHERE id = ?1",
             )?;
             for id in ids {
                 if let Some(row) = stmt
@@ -472,7 +487,7 @@ fn fts_query(input: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" OR ")
+        .join(" ")
 }
 
 fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
