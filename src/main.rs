@@ -1,6 +1,7 @@
 mod archive;
 mod cli;
 mod config;
+mod embed;
 mod ingest;
 mod search;
 mod server;
