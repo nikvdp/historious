@@ -54,6 +54,17 @@ pub struct SearchRow {
     pub rank: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct VectorSearchRow {
+    pub event_id: String,
+    pub unit_id: String,
+    pub session_id: String,
+    pub source_kind: String,
+    pub content: String,
+    pub distance: f64,
+    pub rank: usize,
+}
+
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
@@ -72,6 +83,7 @@ impl Store {
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        load_sqlite_vec();
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("opening database {}", self.db_path.display()))?;
         f(&conn)
@@ -446,6 +458,78 @@ impl Store {
             Ok(out)
         })
     }
+
+    pub fn refresh_vector_projection(&self) -> Result<usize> {
+        self.with_conn(|conn| {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO vec_embeddings_384(rowid, embedding)
+                 SELECT rowid, vector
+                 FROM embeddings
+                 WHERE dims = 384",
+                [],
+            )?;
+            Ok(inserted)
+        })
+    }
+
+    pub fn vector_search(
+        &self,
+        model_id: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<VectorSearchRow>> {
+        if query_vector.len() != 384 {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT su.event_id,
+                        e.unit_id,
+                        su.session_id,
+                        su.source_kind,
+                        su.text,
+                        vec_embeddings_384.distance
+                 FROM vec_embeddings_384
+                 JOIN embeddings e ON e.rowid = vec_embeddings_384.rowid
+                 JOIN search_units su ON su.id = e.unit_id
+                 WHERE vec_embeddings_384.embedding MATCH ?1
+                   AND k = ?2
+                   AND e.model_id = ?3
+                 ORDER BY vec_embeddings_384.distance",
+            )?;
+            let rows = stmt.query_map(
+                params![f32_vector_to_blob(query_vector), limit as i64, model_id],
+                |row| {
+                    Ok(VectorSearchRow {
+                        event_id: row.get(0)?,
+                        unit_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        source_kind: row.get(3)?,
+                        content: row.get(4)?,
+                        distance: row.get(5)?,
+                        rank: 0,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for (idx, row) in rows.enumerate() {
+                let mut row = row?;
+                row.rank = idx + 1;
+                out.push(row);
+            }
+            Ok(out)
+        })
+    }
+}
+
+fn load_sqlite_vec() {
+    use rusqlite::ffi::sqlite3_auto_extension;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -576,9 +660,30 @@ fn migrate(conn: &Connection) -> Result<()> {
           vector_json TEXT NOT NULL,
           PRIMARY KEY (event_id, model)
         );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings_384
+          USING vec0(embedding float[384]);
         ",
     )?;
     Ok(())
+}
+
+pub fn f32_vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+pub fn f32_vector_from_blob(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        bail!("invalid f32 vector byte length {}", bytes.len());
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 fn fts_query(input: &str) -> String {
@@ -910,4 +1015,99 @@ fn parse_dt(value: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&value)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::{stable_hash, stable_id, EmbeddingRecord, SearchUnitRecord};
+    use serde_json::json;
+
+    #[test]
+    fn sqlite_vec_search_returns_synced_embedding_without_fts_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let unit = fixture_search_unit("conversation about distributed memories");
+        let embedding = fixture_embedding(&unit, unit_vector(0));
+        store
+            .import_records(&[
+                ArchiveRecord::SearchUnit(unit.clone()),
+                ArchiveRecord::Embedding(embedding),
+            ])
+            .expect("import records");
+        store.refresh_vector_projection().expect("refresh vectors");
+
+        let hits = store
+            .vector_search("fixture-semantic-384", &unit_vector(0), 5)
+            .expect("vector search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, "event_vector");
+        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(hits[0].session_id, "session_vector");
+        assert_eq!(hits[0].source_kind, "codex");
+        assert_eq!(hits[0].content, "conversation about distributed memories");
+        assert!(hits[0].distance <= 0.001);
+    }
+
+    #[test]
+    fn f32_vector_blob_round_trip_preserves_values() {
+        let vector = vec![1.0, -0.25, 0.5];
+        let blob = f32_vector_to_blob(&vector);
+        let decoded = f32_vector_from_blob(&blob).expect("decode vector");
+        assert_eq!(decoded, vector);
+    }
+
+    fn fixture_search_unit(text: &str) -> SearchUnitRecord {
+        let text_hash = crate::archive::blake3_hex(text.as_bytes());
+        let id = stable_id(&["search_unit", "event_vector", &text_hash]);
+        let hash = stable_hash(&(&id, "event_vector", &text_hash, text)).expect("unit hash");
+        SearchUnitRecord {
+            id,
+            event_id: "event_vector".to_string(),
+            session_id: "session_vector".to_string(),
+            source_id: "source_vector".to_string(),
+            machine_id: "machine_a".to_string(),
+            source_kind: "codex".to_string(),
+            role: Some("assistant".to_string()),
+            search_kind: "assistant".to_string(),
+            text: text.to_string(),
+            text_hash,
+            occurred_at: None,
+            metadata: json!({"fixture": true}),
+            hash,
+        }
+    }
+
+    fn fixture_embedding(unit: &SearchUnitRecord, vector: Vec<f32>) -> EmbeddingRecord {
+        let vector_blob = f32_vector_to_blob(&vector);
+        let vector_hash = crate::archive::blake3_hex(&vector_blob);
+        let id = stable_id(&[
+            "embedding",
+            &unit.id,
+            &unit.text_hash,
+            "fixture-semantic-384",
+        ]);
+        let hash = stable_hash(&(&id, &unit.id, &unit.text_hash, &vector_hash))
+            .expect("embedding hash");
+        EmbeddingRecord {
+            id,
+            unit_id: unit.id.clone(),
+            text_hash: unit.text_hash.clone(),
+            model_id: "fixture-semantic-384".to_string(),
+            dims: 384,
+            vector_hash,
+            vector: vector_blob,
+            producer_machine_id: "machine_b".to_string(),
+            embedded_at: Utc::now(),
+            metadata: json!({"fixture": true}),
+            hash,
+        }
+    }
+
+    fn unit_vector(index: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; 384];
+        vector[index] = 1.0;
+        vector
+    }
 }
