@@ -92,14 +92,24 @@ impl Cli {
                 );
                 let projected = search::refresh(&store)?;
                 println!("projection=search_rrf_v1 projected_events={projected}");
+                let vectors_projected = store.refresh_vector_projection()?;
+                println!("projection=sqlite_vec_384 inserted_vectors={vectors_projected}");
             }
             Command::Search { query, limit, json } => {
-                let results = search::search(&store, &query, limit)?;
+                let (embedder, degraded_reason) = match config.embedder.load() {
+                    Ok(embedder) => (Some(embedder), None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+                let response =
+                    search::search(&store, &query, limit, embedder.as_deref(), degraded_reason)?;
                 if json {
-                    serde_json::to_writer_pretty(std::io::stdout(), &results)?;
+                    serde_json::to_writer_pretty(std::io::stdout(), &response)?;
                     println!();
                 } else {
-                    for result in results {
+                    if let Some(reason) = &response.degraded_reason {
+                        eprintln!("search degraded: {reason}");
+                    }
+                    for result in response.results {
                         println!(
                             "{:.6}\t{}\t{}\t{}\t{}",
                             result.score,
@@ -128,6 +138,8 @@ impl Cli {
                     );
                     let projected = search::refresh(&store)?;
                     println!("projection=search_rrf_v1 projected_events={projected}");
+                    let vectors_projected = store.refresh_vector_projection()?;
+                    println!("projection=sqlite_vec_384 inserted_vectors={vectors_projected}");
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
@@ -147,7 +159,8 @@ impl Cli {
             } => {
                 let addr = bind.parse()?;
                 let server_store = store.clone();
-                let server_task = tokio::spawn(async move { server::serve(server_store, addr).await });
+                let server_task =
+                    tokio::spawn(async move { server::serve(server_store, addr).await });
                 run_daemon(&store, &config.machine_id, interval_secs, max_files, source).await?;
                 server_task.abort();
             }
@@ -167,7 +180,9 @@ impl Cli {
                     embedder.provider,
                     embedder.semantic,
                     embedder.available,
-                    embedder.degraded_reason.unwrap_or_else(|| "none".to_string())
+                    embedder
+                        .degraded_reason
+                        .unwrap_or_else(|| "none".to_string())
                 );
                 if std::env::var("SUPER_CASS_PROBE_EMBEDDER").as_deref() == Ok("1") {
                     match config.embedder.load() {
@@ -208,14 +223,16 @@ async fn run_daemon(
             },
         )?;
         let projected = search::refresh(store)?;
+        let vectors_projected = store.refresh_vector_projection()?;
         println!(
-            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={}",
+            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={} inserted_vectors={}",
             stats.files_seen,
             stats.skipped_unchanged,
             stats.inserted,
             stats.duplicates,
             stats.errors,
-            projected
+            projected,
+            vectors_projected
         );
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
