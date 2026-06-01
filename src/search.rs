@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
-const EMBEDDING_BATCH_SIZE: usize = 64;
+const EMBEDDING_BATCH_SIZE: usize = 512;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingRefresh {
