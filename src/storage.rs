@@ -507,8 +507,9 @@ impl Store {
 
     pub fn refresh_vector_projection(&self) -> Result<usize> {
         self.with_conn(|conn| {
+            conn.execute("DELETE FROM vec_embeddings_384", [])?;
             let inserted = conn.execute(
-                "INSERT OR IGNORE INTO vec_embeddings_384(rowid, embedding)
+                "INSERT INTO vec_embeddings_384(rowid, embedding)
                  SELECT rowid, vector
                  FROM embeddings
                  WHERE dims = 384",
@@ -1095,6 +1096,31 @@ mod tests {
         assert_eq!(hits[0].source_kind, "codex");
         assert_eq!(hits[0].content, "conversation about distributed memories");
         assert!(hits[0].distance <= 0.001);
+    }
+
+    #[test]
+    fn vector_projection_refresh_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let unit = fixture_search_unit("idempotent vector projection");
+        let embedding = fixture_embedding(&unit, unit_vector(2));
+        store
+            .import_records(&[
+                ArchiveRecord::SearchUnit(unit.clone()),
+                ArchiveRecord::Embedding(embedding),
+            ])
+            .expect("import records");
+
+        assert_eq!(store.refresh_vector_projection().expect("first refresh"), 1);
+        assert_eq!(
+            store.refresh_vector_projection().expect("second refresh"),
+            1
+        );
+        let hits = store
+            .vector_search("fixture-semantic-384", &unit_vector(2), 5)
+            .expect("vector search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].unit_id, unit.id);
     }
 
     #[test]
