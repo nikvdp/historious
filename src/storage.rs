@@ -399,66 +399,6 @@ impl Store {
         })
     }
 
-    pub fn embeddings_for_ids(
-        &self,
-        model: &str,
-        ids: &[String],
-    ) -> Result<Vec<(String, Vec<f32>)>> {
-        self.with_conn(|conn| {
-            let mut out = Vec::new();
-            let mut stmt = conn.prepare(
-                "SELECT vector_json
-                 FROM event_embeddings
-                 WHERE event_id = ?1 AND model = ?2",
-            )?;
-            let mut seen = std::collections::HashSet::new();
-            for id in ids {
-                if !seen.insert(id) {
-                    continue;
-                }
-                if let Some(json) = stmt
-                    .query_row(params![id, model], |row| row.get::<_, String>(0))
-                    .optional()?
-                {
-                    let vector: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
-                    out.push((id.clone(), vector));
-                }
-            }
-            Ok(out)
-        })
-    }
-
-    pub fn load_projected_search_rows(&self, ids: &[String]) -> Result<Vec<SearchRow>> {
-        self.with_conn(|conn| {
-            let mut out = Vec::new();
-            let mut stmt = conn.prepare(
-                "SELECT id,
-                        session_id,
-                        source_kind,
-                        COALESCE(NULLIF(json_extract(metadata_json, '$.search_text'), ''), content)
-                 FROM events
-                 WHERE id = ?1",
-            )?;
-            for id in ids {
-                if let Some(row) = stmt
-                    .query_row(params![id], |row| {
-                        Ok(SearchRow {
-                            event_id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_kind: row.get(2)?,
-                            content: row.get(3)?,
-                            rank: 0,
-                        })
-                    })
-                    .optional()?
-                {
-                    out.push(row);
-                }
-            }
-            Ok(out)
-        })
-    }
-
     pub fn refresh_vector_projection(&self) -> Result<usize> {
         self.with_conn(|conn| {
             let inserted = conn.execute(
@@ -676,6 +616,7 @@ pub fn f32_vector_to_blob(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+#[cfg(test)]
 pub fn f32_vector_from_blob(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % std::mem::size_of::<f32>() != 0 {
         bail!("invalid f32 vector byte length {}", bytes.len());
@@ -1088,8 +1029,8 @@ mod tests {
             &unit.text_hash,
             "fixture-semantic-384",
         ]);
-        let hash = stable_hash(&(&id, &unit.id, &unit.text_hash, &vector_hash))
-            .expect("embedding hash");
+        let hash =
+            stable_hash(&(&id, &unit.id, &unit.text_hash, &vector_hash)).expect("embedding hash");
         EmbeddingRecord {
             id,
             unit_id: unit.id.clone(),
