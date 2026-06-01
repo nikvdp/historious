@@ -70,7 +70,13 @@ impl Store {
         &self.db_path
     }
 
-    pub fn upsert_source(&self, id: &str, kind: &str, identity: &str, path: Option<&str>) -> Result<()> {
+    pub fn upsert_source(
+        &self,
+        id: &str,
+        kind: &str,
+        identity: &str,
+        path: Option<&str>,
+    ) -> Result<()> {
         self.with_conn(|conn| {
             let now = Utc::now();
             let source = SourceRecord {
@@ -98,7 +104,9 @@ impl Store {
             for record in records {
                 let inserted = match record {
                     ArchiveRecord::Source(source) => insert_source(&tx, source)?,
-                    ArchiveRecord::RawArtifact(raw) => insert_raw_artifact(&tx, raw, &self.blob_dir)?,
+                    ArchiveRecord::RawArtifact(raw) => {
+                        insert_raw_artifact(&tx, raw, &self.blob_dir)?
+                    }
                     ArchiveRecord::Session(session) => insert_session(&tx, session)?,
                     ArchiveRecord::Event(event) => insert_event(&tx, event)?,
                 };
@@ -187,11 +195,18 @@ impl Store {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute("DELETE FROM events_fts", [])?;
-            tx.execute("DELETE FROM event_embeddings WHERE model = ?1", params![model])?;
+            tx.execute(
+                "DELETE FROM event_embeddings WHERE model = ?1",
+                params![model],
+            )?;
             let mut stmt = tx.prepare(
-                "SELECT id, session_id, source_kind, content
+                "SELECT id,
+                        session_id,
+                        source_kind,
+                        json_extract(metadata_json, '$.search_text')
                  FROM events
-                 WHERE length(trim(content)) > 0
+                 WHERE json_extract(metadata_json, '$.search_indexable') = 1
+                   AND length(trim(json_extract(metadata_json, '$.search_text'))) > 0
                  ORDER BY session_id, ordinal, id",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -214,7 +229,12 @@ impl Store {
                 tx.execute(
                     "INSERT INTO event_embeddings (event_id, model, dims, vector_json)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![event.id, model, dims as i64, serde_json::to_string(&vector)?],
+                    params![
+                        event.id,
+                        model,
+                        dims as i64,
+                        serde_json::to_string(&vector)?
+                    ],
                 )?;
                 count += 1;
             }
@@ -269,9 +289,8 @@ impl Store {
 
     pub fn all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT event_id, vector_json FROM event_embeddings WHERE model = ?1",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT event_id, vector_json FROM event_embeddings WHERE model = ?1")?;
             let rows = stmt.query_map(params![model], |row| {
                 let json: String = row.get(1)?;
                 let vector: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
@@ -285,11 +304,13 @@ impl Store {
         })
     }
 
-    pub fn load_search_rows(&self, ids: &[String]) -> Result<Vec<SearchRow>> {
+    pub fn load_projected_search_rows(&self, ids: &[String]) -> Result<Vec<SearchRow>> {
         self.with_conn(|conn| {
             let mut out = Vec::new();
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, source_kind, content FROM events WHERE id = ?1",
+                "SELECT event_id, session_id, source_kind, content
+                 FROM events_fts
+                 WHERE event_id = ?1",
             )?;
             for id in ids {
                 if let Some(row) = stmt
@@ -533,9 +554,17 @@ fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
     Ok(changed > 0)
 }
 
-fn ensure_same_hash(conn: &Connection, table: &str, id_col: &str, id: &str, hash: &str) -> Result<()> {
+fn ensure_same_hash(
+    conn: &Connection,
+    table: &str,
+    id_col: &str,
+    id: &str,
+    hash: &str,
+) -> Result<()> {
     let sql = format!("SELECT hash FROM {table} WHERE {id_col} = ?1");
-    let existing: Option<String> = conn.query_row(&sql, params![id], |row| row.get(0)).optional()?;
+    let existing: Option<String> = conn
+        .query_row(&sql, params![id], |row| row.get(0))
+        .optional()?;
     if let Some(existing) = existing {
         if existing != hash {
             bail!("record {id} already exists with different hash");
@@ -616,7 +645,8 @@ fn opt_dt(value: Option<DateTime<Utc>>) -> Option<String> {
 }
 
 fn parse_opt_dt(value: Option<String>) -> Option<DateTime<Utc>> {
-    value.and_then(|text| DateTime::parse_from_rfc3339(&text).ok())
+    value
+        .and_then(|text| DateTime::parse_from_rfc3339(&text).ok())
         .map(|dt| dt.with_timezone(&Utc))
 }
 

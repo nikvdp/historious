@@ -37,13 +37,29 @@ struct ParsedLine {
     byte_offset: usize,
     byte_len: usize,
     content: String,
+    search_text: String,
+    search_kind: String,
+    search_indexable: bool,
+    search_skip_reason: Option<String>,
     role: Option<String>,
     event_type: String,
     occurred_at: Option<DateTime<Utc>>,
     external_session_id: Option<String>,
 }
 
-pub fn update_local(store: &Store, machine_id: &str, options: UpdateOptions) -> Result<UpdateStats> {
+#[derive(Debug, Clone)]
+struct SearchProjection {
+    text: String,
+    kind: String,
+    indexable: bool,
+    skip_reason: Option<String>,
+}
+
+pub fn update_local(
+    store: &Store,
+    machine_id: &str,
+    options: UpdateOptions,
+) -> Result<UpdateStats> {
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
     for root in discover_roots() {
@@ -65,7 +81,10 @@ pub fn update_local(store: &Store, machine_id: &str, options: UpdateOptions) -> 
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    tracing::debug!("skipping unreadable entry under {}: {err}", root.path.display());
+                    tracing::debug!(
+                        "skipping unreadable entry under {}: {err}",
+                        root.path.display()
+                    );
                     stats.errors += 1;
                     continue;
                 }
@@ -84,11 +103,12 @@ pub fn update_local(store: &Store, machine_id: &str, options: UpdateOptions) -> 
         }
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0));
-    let iter: Box<dyn Iterator<Item = (i128, &'static str, PathBuf)>> = if let Some(max_files) = options.max_files {
-        Box::new(candidates.into_iter().take(max_files))
-    } else {
-        Box::new(candidates.into_iter())
-    };
+    let iter: Box<dyn Iterator<Item = (i128, &'static str, PathBuf)>> =
+        if let Some(max_files) = options.max_files {
+            Box::new(candidates.into_iter().take(max_files))
+        } else {
+            Box::new(candidates.into_iter())
+        };
     for (_, kind, path) in iter {
         stats.files_seen += 1;
         match ingest_file(store, machine_id, kind, &path) {
@@ -149,7 +169,8 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
     let source_id = stable_id(&["source", kind, &path_text]);
     store.upsert_source(&source_id, kind, &path_text, Some(&path_text))?;
 
-    let metadata = fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
     let mtime_ms = metadata
         .modified()
         .ok()
@@ -233,7 +254,11 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
                 "raw_artifact_hash": raw_hash.clone(),
                 "byte_offset": byte_offset,
                 "byte_len": byte_len,
-                "capture_fidelity": "exact_local_log"
+                "capture_fidelity": "exact_local_log",
+                "search_indexable": line.search_indexable,
+                "search_kind": line.search_kind,
+                "search_text": line.search_text,
+                "search_skip_reason": line.search_skip_reason
             }),
             hash: line_hash,
         }));
@@ -274,13 +299,14 @@ fn parse_json_file(text: &str) -> Result<Vec<ParsedLine>> {
 }
 
 fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) -> ParsedLine {
-    let content = extract_text(&value).unwrap_or_else(|| value.to_string());
     let role = string_at(&value, &["role"])
         .or_else(|| string_at(&value, &["message", "role"]))
         .or_else(|| string_at(&value, &["payload", "role"]));
     let event_type = string_at(&value, &["type"])
         .or_else(|| string_at(&value, &["payload", "type"]))
         .unwrap_or_else(|| role.clone().unwrap_or_else(|| "event".to_string()));
+    let content = extract_text(&value).unwrap_or_else(|| value.to_string());
+    let search = derive_search_projection(&value, role.as_deref(), &event_type);
     let occurred_at = string_at(&value, &["timestamp"])
         .or_else(|| string_at(&value, &["created_at"]))
         .or_else(|| string_at(&value, &["message", "created_at"]))
@@ -294,10 +320,188 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         byte_offset,
         byte_len,
         content,
+        search_text: search.text,
+        search_kind: search.kind,
+        search_indexable: search.indexable,
+        search_skip_reason: search.skip_reason,
         role,
         event_type,
         occurred_at,
         external_session_id,
+    }
+}
+
+fn derive_search_projection(
+    value: &Value,
+    role: Option<&str>,
+    event_type: &str,
+) -> SearchProjection {
+    let normalized_role = role.map(str::to_ascii_lowercase);
+    let search_role = normalized_role.as_deref().or_else(|| match event_type {
+        "user" | "assistant" => Some(event_type),
+        _ => None,
+    });
+
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        let mut parts = Vec::new();
+        for message in messages {
+            let role = string_at(message, &["role"])
+                .map(|role| role.to_ascii_lowercase())
+                .unwrap_or_default();
+            if role == "user" || role == "assistant" {
+                collect_message_text(message, &mut parts);
+            }
+        }
+        return projection_from_parts(parts, "conversation", "no conversation text in messages");
+    }
+
+    match search_role {
+        Some("user") | Some("assistant") => {
+            let mut parts = Vec::new();
+            collect_conversation_text(value, &mut parts);
+            projection_from_parts(
+                parts,
+                search_role.unwrap_or("conversation"),
+                "no conversation text",
+            )
+        }
+        Some("tool") => SearchProjection::skipped("tool event"),
+        Some("system") | Some("developer") => SearchProjection::skipped("instruction event"),
+        _ => {
+            if looks_like_tool_event(value, event_type) {
+                SearchProjection::skipped("tool event")
+            } else {
+                SearchProjection::skipped("non-message event")
+            }
+        }
+    }
+}
+
+impl SearchProjection {
+    fn skipped(reason: &str) -> Self {
+        Self {
+            text: String::new(),
+            kind: "none".to_string(),
+            indexable: false,
+            skip_reason: Some(reason.to_string()),
+        }
+    }
+}
+
+fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> SearchProjection {
+    let text = normalize_parts(parts);
+    if text.is_empty() {
+        SearchProjection::skipped(empty_reason)
+    } else {
+        SearchProjection {
+            text,
+            kind: kind.to_string(),
+            indexable: true,
+            skip_reason: None,
+        }
+    }
+}
+
+fn collect_conversation_text(value: &Value, parts: &mut Vec<String>) {
+    if let Some(message) = value.get("message") {
+        collect_message_text(message, parts);
+    }
+    if let Some(payload) = value.get("payload") {
+        collect_message_text(payload, parts);
+    }
+    collect_message_text(value, parts);
+}
+
+fn collect_message_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if is_toolish_object(value) {
+                return;
+            }
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                push_text(parts, text);
+            }
+            if let Some(content) = map.get("content") {
+                collect_content_text(content, parts);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_message_text(item, parts);
+            }
+        }
+        Value::String(text) => push_text(parts, text),
+        _ => {}
+    }
+}
+
+fn collect_content_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => push_text(parts, text),
+        Value::Array(items) => {
+            for item in items {
+                if is_toolish_object(item) {
+                    continue;
+                }
+                collect_content_text(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            if is_toolish_object(value) {
+                return;
+            }
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                push_text(parts, text);
+            }
+            if let Some(content) = map.get("content") {
+                collect_content_text(content, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_tool_event(value: &Value, event_type: &str) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    event_type.contains("tool")
+        || event_type.contains("function_call")
+        || event_type.contains("exec")
+        || is_toolish_object(value)
+}
+
+fn is_toolish_object(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    let kind = map
+        .get("type")
+        .or_else(|| map.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    kind.contains("tool")
+        || kind.contains("function_call")
+        || kind.contains("tool_result")
+        || kind == "bash"
+        || map.contains_key("tool_use_id")
+        || map.contains_key("toolUseResult")
+        || map.contains_key("stdout")
+        || map.contains_key("stderr")
+}
+
+fn normalize_parts(parts: Vec<String>) -> String {
+    parts
+        .into_iter()
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_text(parts: &mut Vec<String>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(text.to_string());
     }
 }
 
@@ -314,7 +518,9 @@ fn extract_text(value: &Value) -> Option<String> {
 fn collect_text(value: &Value, parts: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            for key in ["text", "content", "output", "input", "command", "stdout", "stderr"] {
+            for key in [
+                "text", "content", "output", "input", "command", "stdout", "stderr",
+            ] {
                 if let Some(child) = map.get(key) {
                     collect_text(child, parts);
                 }
@@ -373,7 +579,11 @@ fn file_stem(path: &Path) -> String {
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| extensions.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .map(|ext| {
+            extensions
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
         .unwrap_or(false)
 }
 
