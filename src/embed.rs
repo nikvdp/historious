@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:BAAI/bge-small-en-v1.5";
+pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:snowflake/snowflake-arctic-embed-xs-q";
 pub const DEFAULT_SEMANTIC_DIMS: usize = 384;
 
 pub trait Embedder: Send + Sync {
@@ -111,7 +111,7 @@ impl FastEmbedder {
     pub fn new(model_cache: &Path) -> Result<Self> {
         std::fs::create_dir_all(model_cache)
             .with_context(|| format!("creating model cache {}", model_cache.display()))?;
-        let options = InitOptions::new(EmbeddingModel::BGESmallENV15)
+        let options = InitOptions::new(EmbeddingModel::SnowflakeArcticEmbedXSQ)
             .with_cache_dir(model_cache.to_path_buf())
             .with_show_download_progress(false);
         let model = TextEmbedding::try_new(options).context("loading fastembed model")?;
@@ -220,7 +220,10 @@ mod tests {
         let status = config.status_without_loading();
         assert!(!status.available);
         assert!(!status.semantic);
-        assert_eq!(status.degraded_reason.as_deref(), Some("query embedder disabled"));
+        assert_eq!(
+            status.degraded_reason.as_deref(),
+            Some("query embedder disabled")
+        );
     }
 
     #[test]

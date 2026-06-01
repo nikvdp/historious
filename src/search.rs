@@ -9,6 +9,7 @@ const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
 const EMBEDDING_BATCH_SIZE: usize = 512;
+const EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingRefresh {
@@ -74,7 +75,7 @@ pub fn refresh_embeddings(
         }
         let texts = units
             .iter()
-            .map(|unit| unit.text.clone())
+            .map(|unit| embedding_input(&unit.text))
             .collect::<Vec<_>>();
         let vectors = embedder.embed_batch(&texts)?;
         if vectors.len() != units.len() {
@@ -122,6 +123,7 @@ pub fn refresh_embeddings(
                     producer_machine_id: machine_id.to_string(),
                     embedded_at: Utc::now(),
                     metadata: serde_json::json!({
+                        "embedded_text_max_chars": EMBEDDING_TEXT_MAX_CHARS,
                         "provider": "local",
                         "projection": "semantic_embedding_v1"
                     }),
@@ -141,6 +143,12 @@ pub fn refresh_embeddings(
         vectors_projected: store.refresh_vector_projection()?,
         degraded_reason: None,
     })
+}
+
+fn embedding_input(text: &str) -> String {
+    text.chars()
+        .take(EMBEDDING_TEXT_MAX_CHARS)
+        .collect::<String>()
 }
 
 pub fn search(
