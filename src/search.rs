@@ -41,7 +41,7 @@ fn semantic_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Searc
         .take(limit)
         .map(|(id, _)| id)
         .collect::<Vec<_>>();
-    let mut rows = store.load_search_rows(&ids)?;
+    let mut rows = store.load_projected_search_rows(&ids)?;
     let rank_by_id = ids
         .iter()
         .enumerate()
@@ -140,4 +140,3 @@ fn snippet(input: &str, max_chars: usize) -> String {
     }
     out
 }
-
