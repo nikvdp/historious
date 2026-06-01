@@ -290,11 +290,9 @@ impl Store {
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
-                 LEFT JOIN search_units su
-                   ON su.event_id = e.id
                  WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND (emb.event_id IS NULL OR su.event_id IS NULL)
+                   AND emb.event_id IS NULL
                  ORDER BY e.session_id, e.ordinal, e.id",
             )?;
             let rows = stmt.query_map(params![model], |row| {
@@ -344,10 +342,7 @@ impl Store {
                 insert_search_unit(&tx, &unit)?;
                 tx.execute(
                     "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-                     SELECT ?1, ?2, ?3, ?4
-                     WHERE NOT EXISTS (
-                       SELECT 1 FROM events_fts WHERE event_id = ?1
-                     )",
+                     VALUES (?1, ?2, ?3, ?4)",
                     params![event.id, event.session_id, event.source_kind, event.content],
                 )?;
                 let vector = embed(&event.content);
@@ -362,6 +357,72 @@ impl Store {
                     ],
                 )?;
             }
+            drop(stmt);
+
+            let mut missing_unit_stmt = tx.prepare(
+                "SELECT e.id,
+                        e.session_id,
+                        e.source_id,
+                        e.machine_id,
+                        e.source_kind,
+                        e.role,
+                        json_extract(e.metadata_json, '$.search_kind'),
+                        json_extract(e.metadata_json, '$.search_text'),
+                        e.occurred_at
+                 FROM events e
+                 LEFT JOIN search_units su
+                   ON su.event_id = e.id
+                 WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                   AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                   AND su.event_id IS NULL
+                 ORDER BY e.session_id, e.ordinal, e.id",
+            )?;
+            let missing_unit_rows = missing_unit_stmt.query_map([], |row| {
+                let content: String = row.get(7)?;
+                Ok(EventForProjection {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    source_kind: row.get(4)?,
+                    role: row.get(5)?,
+                    search_kind: row.get(6)?,
+                    text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                    content,
+                    occurred_at: parse_opt_dt(row.get(8)?),
+                })
+            })?;
+            for row in missing_unit_rows {
+                let event = row?;
+                let unit_id =
+                    crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
+                let unit_hash = crate::archive::stable_hash(&(
+                    &unit_id,
+                    &event.id,
+                    &event.text_hash,
+                    &event.content,
+                    &event.search_kind,
+                ))?;
+                let unit = SearchUnitRecord {
+                    id: unit_id,
+                    event_id: event.id.clone(),
+                    session_id: event.session_id.clone(),
+                    source_id: event.source_id.clone(),
+                    machine_id: event.machine_id.clone(),
+                    source_kind: event.source_kind.clone(),
+                    role: event.role.clone(),
+                    search_kind: event.search_kind.clone(),
+                    text: event.content.clone(),
+                    text_hash: event.text_hash.clone(),
+                    occurred_at: event.occurred_at,
+                    metadata: serde_json::json!({
+                        "derived_from": "event.search_text",
+                        "projection": "search_unit_v1"
+                    }),
+                    hash: unit_hash,
+                };
+                insert_search_unit(&tx, &unit)?;
+            }
             let projected_events = count_projected_events(&tx, model)?;
             tx.execute(
                 "INSERT INTO projection_status
@@ -374,7 +435,7 @@ impl Store {
                    updated_at = excluded.updated_at",
                 params![projected_events.to_string(), Utc::now().to_rfc3339()],
             )?;
-            drop(stmt);
+            drop(missing_unit_stmt);
             tx.commit()?;
             Ok(projected_events)
         })
