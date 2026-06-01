@@ -471,8 +471,10 @@ fn fts_query(input: &str) -> String {
                 .collect();
             if cleaned.is_empty() {
                 None
-            } else {
+            } else if cleaned.chars().count() >= 4 {
                 Some(format!("\"{}\"*", cleaned.replace('"', "\"\"")))
+            } else {
+                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
             }
         })
         .collect::<Vec<_>>()
