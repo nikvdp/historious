@@ -19,6 +19,7 @@ pub struct Store {
 pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
+    pub vectors_projected: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
