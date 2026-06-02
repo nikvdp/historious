@@ -50,6 +50,19 @@ pub enum Command {
         #[arg(long)]
         no_color: bool,
     },
+    /// Print surrounding transcript context for an event or search unit.
+    Expand {
+        #[arg(long, conflicts_with = "search_unit")]
+        event: Option<String>,
+        #[arg(long = "search-unit", conflicts_with = "event")]
+        search_unit: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        before: usize,
+        #[arg(long, default_value_t = 5)]
+        after: usize,
+        #[arg(long)]
+        no_color: bool,
+    },
     /// Export canonical archive records as JSONL.
     Export {
         #[arg(long)]
@@ -191,6 +204,20 @@ impl Cli {
                     let color = !no_color && std::io::stdout().is_terminal();
                     print_search_results(&query, &response.results, &columns, color);
                 }
+            }
+            Command::Expand {
+                event,
+                search_unit,
+                before,
+                after,
+                no_color,
+            } => {
+                let event_id = resolve_expand_event_id(&store, event, search_unit)?;
+                let context = store
+                    .events_around_event(&event_id, before, after)?
+                    .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                let color = !no_color && std::io::stdout().is_terminal();
+                print!("{}", crate::transcript::render_context(&context, color));
             }
             Command::Export {
                 jsonl,
@@ -355,6 +382,22 @@ fn resolve_columns(
         columns.retain(|candidate| *candidate != column);
     }
     Ok(columns)
+}
+
+fn resolve_expand_event_id(
+    store: &Store,
+    event: Option<String>,
+    search_unit: Option<String>,
+) -> Result<String> {
+    match (event, search_unit) {
+        (Some(event_id), None) => Ok(event_id),
+        (None, Some(unit_id)) => store
+            .search_unit_by_id(&unit_id)?
+            .map(|unit| unit.event_id)
+            .ok_or_else(|| anyhow::anyhow!("search unit not found: {unit_id}")),
+        (None, None) => bail!("expand requires --event <id> or --search-unit <id>"),
+        (Some(_), Some(_)) => bail!("expand accepts either --event or --search-unit, not both"),
+    }
 }
 
 fn parse_columns_opt(input: Option<String>) -> Result<Vec<Column>> {
