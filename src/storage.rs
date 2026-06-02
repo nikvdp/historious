@@ -78,6 +78,14 @@ pub struct VectorSearchRow {
     pub rank: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscriptContext {
+    pub session: SessionRecord,
+    pub target_event: EventRecord,
+    pub events: Vec<EventRecord>,
+    pub target_index: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ArchiveExportFilter {
     pub sources: Vec<String>,
@@ -718,6 +726,75 @@ impl Store {
         })
     }
 
+    pub fn session_by_id(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
+                        started_at, updated_at, metadata_json, hash
+                 FROM sessions
+                 WHERE id = ?1",
+                params![session_id],
+                row_session,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn event_by_id(&self, event_id: &str) -> Result<Option<EventRecord>> {
+        self.with_conn(|conn| event_by_id(conn, event_id))
+    }
+
+    pub fn search_unit_by_id(&self, unit_id: &str) -> Result<Option<SearchUnitRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, event_id, session_id, source_id, machine_id, source_kind, role,
+                        search_kind, text, text_hash, occurred_at, metadata_json, hash
+                 FROM search_units
+                 WHERE id = ?1",
+                params![unit_id],
+                row_search_unit,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn events_for_session(&self, session_id: &str) -> Result<Vec<EventRecord>> {
+        self.with_conn(|conn| events_for_session(conn, session_id))
+    }
+
+    pub fn events_around_event(
+        &self,
+        event_id: &str,
+        before: usize,
+        after: usize,
+    ) -> Result<Option<TranscriptContext>> {
+        self.with_conn(|conn| {
+            let Some(target_event) = event_by_id(conn, event_id)? else {
+                return Ok(None);
+            };
+            let Some(session) = session_by_id(conn, &target_event.session_id)? else {
+                return Ok(None);
+            };
+            let session_events = events_for_session(conn, &target_event.session_id)?;
+            let Some(target_index) = session_events
+                .iter()
+                .position(|candidate| candidate.id == target_event.id)
+            else {
+                return Ok(None);
+            };
+            let start = target_index.saturating_sub(before);
+            let end = (target_index + after + 1).min(session_events.len());
+            Ok(Some(TranscriptContext {
+                session,
+                target_event,
+                events: session_events[start..end].to_vec(),
+                target_index: target_index - start,
+            }))
+        })
+    }
+
     pub fn search_units_missing_embedding(
         &self,
         model_id: &str,
@@ -827,6 +904,48 @@ fn load_sqlite_vec() {
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
+}
+
+fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
+    conn.query_row(
+        "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
+                started_at, updated_at, metadata_json, hash
+         FROM sessions
+         WHERE id = ?1",
+        params![session_id],
+        row_session,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn event_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventRecord>> {
+    conn.query_row(
+        "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
+                event_type, role, content, raw_artifact_hash, occurred_at, metadata_json, hash
+         FROM events
+         WHERE id = ?1",
+        params![event_id],
+        row_event,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn events_for_session(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
+                event_type, role, content, raw_artifact_hash, occurred_at, metadata_json, hash
+         FROM events
+         WHERE session_id = ?1
+         ORDER BY ordinal, id",
+    )?;
+    let rows = stmt.query_map(params![session_id], row_event)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn normalized_ids(ids: &[String]) -> Vec<String> {
@@ -1656,6 +1775,107 @@ mod tests {
             })
             .expect("session metadata");
         assert_eq!(metadata["workspace_path"], "/tmp/repo");
+    }
+
+    #[test]
+    fn transcript_lookup_returns_ordered_session_events_and_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_transcript");
+        let session = fixture_session("session_transcript", &source.id);
+        let mut first = fixture_event("event_first", &session.id, &source.id, 10, None, "hash_1");
+        first.content = "first message".to_string();
+        let mut middle =
+            fixture_event("event_middle", &session.id, &source.id, 20, None, "hash_2");
+        middle.content = "middle message".to_string();
+        let mut last = fixture_event("event_last", &session.id, &source.id, 30, None, "hash_3");
+        last.content = "last message".to_string();
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session.clone()),
+                ArchiveRecord::Event(last),
+                ArchiveRecord::Event(first.clone()),
+                ArchiveRecord::Event(middle.clone()),
+            ])
+            .expect("import transcript");
+
+        let loaded_session = store
+            .session_by_id(&session.id)
+            .expect("session lookup")
+            .expect("session exists");
+        let loaded_event = store
+            .event_by_id(&middle.id)
+            .expect("event lookup")
+            .expect("event exists");
+        let events = store
+            .events_for_session(&session.id)
+            .expect("session events");
+        let context = store
+            .events_around_event(&middle.id, 1, 1)
+            .expect("context lookup")
+            .expect("context exists");
+
+        assert_eq!(loaded_session.id, session.id);
+        assert_eq!(loaded_event.content, "middle message");
+        assert_eq!(
+            events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+            vec!["event_first", "event_middle", "event_last"]
+        );
+        assert_eq!(context.session.id, session.id);
+        assert_eq!(context.target_event.id, middle.id);
+        assert_eq!(context.target_index, 1);
+        assert_eq!(
+            context
+                .events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first message", "middle message", "last message"]
+        );
+    }
+
+    #[test]
+    fn transcript_lookup_handles_missing_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+
+        assert!(store
+            .session_by_id("missing_session")
+            .expect("session lookup")
+            .is_none());
+        assert!(store
+            .event_by_id("missing_event")
+            .expect("event lookup")
+            .is_none());
+        assert!(store
+            .search_unit_by_id("missing_unit")
+            .expect("unit lookup")
+            .is_none());
+        assert!(store
+            .events_around_event("missing_event", 2, 2)
+            .expect("context lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn search_unit_lookup_resolves_viewer_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = fixture_archive_records();
+        let expected_unit = records.iter().find_map(|record| match record {
+            ArchiveRecord::SearchUnit(unit) => Some(unit.clone()),
+            _ => None,
+        });
+        store.import_records(&records).expect("import records");
+
+        let unit = store
+            .search_unit_by_id(&expected_unit.as_ref().expect("fixture unit").id)
+            .expect("unit lookup")
+            .expect("unit exists");
+
+        assert_eq!(unit.event_id, "event_vector");
+        assert_eq!(unit.session_id, "session_vector");
     }
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
