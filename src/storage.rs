@@ -4,7 +4,7 @@ use crate::archive::{
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -231,6 +231,144 @@ impl Store {
                 }
             }
             Ok(records)
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn export_records_for_session_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<ArchiveRecord>> {
+        let session_ids = normalized_ids(session_ids);
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let mut records = Vec::new();
+            let placeholders = placeholders(session_ids.len());
+            {
+                let sql = format!(
+                    "SELECT id, kind, identity, path, first_seen_at, updated_at, hash
+                     FROM sources
+                     WHERE id IN (
+                       SELECT source_id FROM sessions WHERE id IN ({placeholders})
+                       UNION
+                       SELECT source_id FROM events WHERE session_id IN ({placeholders})
+                       UNION
+                       SELECT source_id FROM search_units WHERE session_id IN ({placeholders})
+                       UNION
+                       SELECT source_id FROM raw_artifacts
+                       WHERE hash IN (
+                         SELECT raw_artifact_hash FROM events
+                         WHERE session_id IN ({placeholders}) AND raw_artifact_hash IS NOT NULL
+                       )
+                     )
+                     ORDER BY id"
+                );
+                let params = repeated_id_params(&session_ids, 4);
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(params), row_source)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Source(row?));
+                }
+            }
+            {
+                let sql = format!(
+                    "SELECT hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at
+                     FROM raw_artifacts
+                     WHERE hash IN (
+                       SELECT raw_artifact_hash FROM events
+                       WHERE session_id IN ({placeholders}) AND raw_artifact_hash IS NOT NULL
+                     )
+                     ORDER BY first_seen_at, hash"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_raw_artifact)?;
+                for row in rows {
+                    let mut raw = row?;
+                    if raw.content.is_empty() {
+                        raw.content = read_blob(&self.blob_dir, &raw.hash)?;
+                    }
+                    records.push(ArchiveRecord::RawArtifact(raw));
+                }
+            }
+            {
+                let sql = format!(
+                    "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
+                            started_at, updated_at, metadata_json, hash
+                     FROM sessions
+                     WHERE id IN ({placeholders})
+                     ORDER BY id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_session)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Session(row?));
+                }
+            }
+            {
+                let sql = format!(
+                    "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
+                            event_type, role, content, raw_artifact_hash, occurred_at,
+                            metadata_json, hash
+                     FROM events
+                     WHERE session_id IN ({placeholders})
+                     ORDER BY session_id, ordinal, id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_event)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Event(row?));
+                }
+            }
+            {
+                let sql = format!(
+                    "SELECT id, event_id, session_id, source_id, machine_id, source_kind, role,
+                            search_kind, text, text_hash, occurred_at, metadata_json, hash
+                     FROM search_units
+                     WHERE session_id IN ({placeholders})
+                     ORDER BY session_id, id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_search_unit)?;
+                for row in rows {
+                    records.push(ArchiveRecord::SearchUnit(row?));
+                }
+            }
+            {
+                let sql = format!(
+                    "SELECT e.id, e.unit_id, e.text_hash, e.model_id, e.dims, e.vector_hash, e.vector,
+                            e.producer_machine_id, e.embedded_at, e.metadata_json, e.hash
+                     FROM embeddings e
+                     JOIN search_units su ON su.id = e.unit_id
+                     WHERE su.session_id IN ({placeholders})
+                     ORDER BY e.model_id, e.unit_id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_embedding)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Embedding(row?));
+                }
+            }
+            Ok(records)
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn event_ids_for_hash(&self, hash: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM events WHERE hash = ?1 ORDER BY id")?;
+            let rows = stmt.query_map(params![hash], |row| row.get(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
         })
     }
 
@@ -597,6 +735,37 @@ fn load_sqlite_vec() {
     });
 }
 
+#[allow(dead_code)]
+fn normalized_ids(ids: &[String]) -> Vec<String> {
+    let mut ids = ids
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[allow(dead_code)]
+fn placeholders(count: usize) -> String {
+    std::iter::repeat("?")
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[allow(dead_code)]
+fn repeated_id_params(ids: &[String], repeats: usize) -> Vec<&str> {
+    let mut out = Vec::with_capacity(ids.len() * repeats);
+    for _ in 0..repeats {
+        for id in ids {
+            out.push(id.as_str());
+        }
+    }
+    out
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -626,6 +795,9 @@ fn migrate(conn: &Connection) -> Result<()> {
           first_seen_at TEXT NOT NULL
         );
 
+        CREATE INDEX IF NOT EXISTS idx_raw_artifacts_source
+          ON raw_artifacts(source_id);
+
         CREATE TABLE IF NOT EXISTS sessions (
           id TEXT PRIMARY KEY,
           source_id TEXT NOT NULL,
@@ -639,6 +811,12 @@ fn migrate(conn: &Connection) -> Result<()> {
           metadata_json TEXT NOT NULL,
           hash TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_hash
+          ON sessions(hash);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_workspace_path
+          ON sessions(json_extract(metadata_json, '$.workspace_path'));
 
         CREATE TABLE IF NOT EXISTS events (
           id TEXT PRIMARY KEY,
@@ -659,6 +837,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_ordinal
           ON events(session_id, ordinal);
 
+        CREATE INDEX IF NOT EXISTS idx_events_hash
+          ON events(hash);
+
+        CREATE INDEX IF NOT EXISTS idx_events_raw_artifact_hash
+          ON events(raw_artifact_hash);
+
         CREATE TABLE IF NOT EXISTS search_units (
           id TEXT PRIMARY KEY,
           event_id TEXT NOT NULL,
@@ -677,6 +861,9 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_search_units_event
           ON search_units(event_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_units_session
+          ON search_units(session_id);
 
         CREATE INDEX IF NOT EXISTS idx_search_units_text_hash
           ON search_units(text_hash);
@@ -701,6 +888,12 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_embeddings_unit
           ON embeddings(unit_id);
+
+        CREATE INDEX IF NOT EXISTS idx_embeddings_text_hash
+          ON embeddings(text_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_embeddings_vector_hash
+          ON embeddings(vector_hash);
 
         CREATE TABLE IF NOT EXISTS projection_status (
           projection_name TEXT PRIMARY KEY,
@@ -1086,7 +1279,10 @@ fn parse_dt(value: String) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{stable_hash, stable_id, EmbeddingRecord, SearchUnitRecord};
+    use crate::archive::{
+        stable_hash, stable_id, EmbeddingRecord, EventRecord, RawArtifact, SearchUnitRecord,
+        SessionRecord, SourceRecord,
+    };
     use serde_json::json;
 
     #[test]
@@ -1147,6 +1343,183 @@ mod tests {
         let blob = f32_vector_to_blob(&vector);
         let decoded = f32_vector_from_blob(&blob).expect("decode vector");
         assert_eq!(decoded, vector);
+    }
+
+    #[test]
+    fn repeated_import_dedupes_same_archive_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = fixture_archive_records();
+
+        let first = store.import_records(&records).expect("first import");
+        let second = store.import_records(&records).expect("second import");
+
+        assert_eq!(first.inserted, records.len());
+        assert_eq!(first.duplicates, 0);
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.duplicates, records.len());
+    }
+
+    #[test]
+    fn same_id_with_different_hash_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut source = fixture_source("source_conflict");
+        store
+            .import_record(&ArchiveRecord::Source(source.clone()))
+            .expect("first import");
+        source.hash = "blake3:different".to_string();
+
+        let err = store
+            .import_record(&ArchiveRecord::Source(source))
+            .expect_err("conflicting hash should fail");
+
+        assert!(err
+            .to_string()
+            .contains("already exists with different hash"));
+    }
+
+    #[test]
+    fn event_ids_for_hash_finds_canonical_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let hash = stable_hash(&json!({"message": "same"})).expect("hash");
+        let event_a = fixture_event("event_a", "session_a", "source_a", 1, None, &hash);
+        let event_b = fixture_event("event_b", "session_b", "source_b", 1, None, &hash);
+        store
+            .import_records(&[ArchiveRecord::Event(event_b), ArchiveRecord::Event(event_a)])
+            .expect("import events");
+
+        let ids = store.event_ids_for_hash(&hash).expect("hash lookup");
+
+        assert_eq!(ids, vec!["event_a".to_string(), "event_b".to_string()]);
+    }
+
+    #[test]
+    fn session_scoped_export_includes_dependency_closure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = fixture_archive_records();
+        let other_session = fixture_session("session_other", "source_other");
+        store
+            .import_records(&records)
+            .expect("import selected records");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_other")),
+                ArchiveRecord::Session(other_session),
+            ])
+            .expect("import other session");
+
+        let exported = store
+            .export_records_for_session_ids(&["session_vector".to_string()])
+            .expect("scoped export");
+
+        assert!(record_id_exists(&exported, "source_vector"));
+        assert!(record_id_exists(&exported, "session_vector"));
+        assert!(record_id_exists(&exported, "event_vector"));
+        assert!(record_id_exists(&exported, "raw_fixture"));
+        assert!(record_id_exists(&exported, "session_vector"));
+        assert!(exported.iter().any(|record| match record {
+            ArchiveRecord::SearchUnit(unit) =>
+                unit.id == fixture_search_unit("conversation about distributed memories").id,
+            _ => false,
+        }));
+        assert!(exported
+            .iter()
+            .any(|record| matches!(record, ArchiveRecord::Embedding(_))));
+        assert!(!record_id_exists(&exported, "session_other"));
+    }
+
+    fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
+        records.iter().any(|record| record.id() == id)
+    }
+
+    fn fixture_archive_records() -> Vec<ArchiveRecord> {
+        let unit = fixture_search_unit("conversation about distributed memories");
+        let embedding = fixture_embedding(&unit, unit_vector(0));
+        let raw = fixture_raw_artifact("source_vector");
+        vec![
+            ArchiveRecord::Source(fixture_source("source_vector")),
+            ArchiveRecord::RawArtifact(raw.clone()),
+            ArchiveRecord::Session(fixture_session("session_vector", "source_vector")),
+            ArchiveRecord::Event(fixture_event(
+                "event_vector",
+                "session_vector",
+                "source_vector",
+                1,
+                Some(&raw.hash),
+                "event_hash_vector",
+            )),
+            ArchiveRecord::SearchUnit(unit),
+            ArchiveRecord::Embedding(embedding),
+        ]
+    }
+
+    fn fixture_source(id: &str) -> SourceRecord {
+        SourceRecord {
+            id: id.to_string(),
+            kind: "codex".to_string(),
+            identity: id.to_string(),
+            path: Some(format!("/tmp/{id}.jsonl")),
+            first_seen_at: Utc::now(),
+            updated_at: Utc::now(),
+            hash: stable_hash(&(id, "source")).expect("source hash"),
+        }
+    }
+
+    fn fixture_raw_artifact(source_id: &str) -> RawArtifact {
+        RawArtifact {
+            hash: "raw_fixture".to_string(),
+            source_id: source_id.to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            size: 7,
+            mtime_ms: Some(1),
+            media_type: "application/jsonl".to_string(),
+            content: b"fixture".to_vec(),
+            first_seen_at: Utc::now(),
+        }
+    }
+
+    fn fixture_session(id: &str, source_id: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            source_id: source_id.to_string(),
+            machine_id: "machine_a".to_string(),
+            source_kind: "codex".to_string(),
+            external_id: id.to_string(),
+            title: Some("fixture session".to_string()),
+            status: "open".to_string(),
+            started_at: None,
+            updated_at: None,
+            metadata: json!({"workspace_path": "/tmp/repo"}),
+            hash: stable_hash(&(id, source_id, "session")).expect("session hash"),
+        }
+    }
+
+    fn fixture_event(
+        id: &str,
+        session_id: &str,
+        source_id: &str,
+        ordinal: i64,
+        raw_artifact_hash: Option<&str>,
+        hash: &str,
+    ) -> EventRecord {
+        EventRecord {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            source_id: source_id.to_string(),
+            machine_id: "machine_a".to_string(),
+            source_kind: "codex".to_string(),
+            ordinal,
+            event_type: "message".to_string(),
+            role: Some("assistant".to_string()),
+            content: "conversation about distributed memories".to_string(),
+            raw_artifact_hash: raw_artifact_hash.map(ToOwned::to_owned),
+            occurred_at: None,
+            metadata: json!({"fixture": true}),
+            hash: hash.to_string(),
+        }
     }
 
     fn fixture_search_unit(text: &str) -> SearchUnitRecord {
