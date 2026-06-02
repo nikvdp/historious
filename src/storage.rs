@@ -52,6 +52,8 @@ pub struct SearchRow {
     pub session_id: String,
     pub source_kind: String,
     pub content: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub session_title: Option<String>,
     pub rank: usize,
 }
 
@@ -69,6 +71,8 @@ pub struct VectorSearchRow {
     pub session_id: String,
     pub source_kind: String,
     pub content: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub session_title: Option<String>,
     pub distance: f64,
     pub rank: usize,
 }
@@ -448,8 +452,15 @@ impl Store {
         }
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT event_id, session_id, source_kind, snippet(events_fts, 3, '[', ']', '...', 24)
+                "SELECT events_fts.event_id,
+                        events_fts.session_id,
+                        events_fts.source_kind,
+                        snippet(events_fts, 3, '', '', '...', 24),
+                        e.occurred_at,
+                        s.title
                  FROM events_fts
+                 JOIN events e ON e.id = events_fts.event_id
+                 LEFT JOIN sessions s ON s.id = events_fts.session_id
                  WHERE events_fts MATCH ?1
                  ORDER BY bm25(events_fts)
                  LIMIT ?2",
@@ -460,6 +471,8 @@ impl Store {
                     session_id: row.get(1)?,
                     source_kind: row.get(2)?,
                     content: row.get(3)?,
+                    occurred_at: parse_opt_dt(row.get(4)?),
+                    session_title: row.get(5)?,
                     rank: 0,
                 })
             })?;
@@ -535,10 +548,13 @@ impl Store {
                         su.session_id,
                         su.source_kind,
                         su.text,
+                        su.occurred_at,
+                        s.title,
                         vec_embeddings_384.distance
                  FROM vec_embeddings_384
                  JOIN embeddings e ON e.rowid = vec_embeddings_384.rowid
                  JOIN search_units su ON su.id = e.unit_id
+                 LEFT JOIN sessions s ON s.id = su.session_id
                  WHERE vec_embeddings_384.embedding MATCH ?1
                    AND k = ?2
                    AND e.model_id = ?3
@@ -553,7 +569,9 @@ impl Store {
                         session_id: row.get(2)?,
                         source_kind: row.get(3)?,
                         content: row.get(4)?,
-                        distance: row.get(5)?,
+                        occurred_at: parse_opt_dt(row.get(5)?),
+                        session_title: row.get(6)?,
+                        distance: row.get(7)?,
                         rank: 0,
                     })
                 },
