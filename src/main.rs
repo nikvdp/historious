@@ -6,6 +6,7 @@ mod ingest;
 mod search;
 mod server;
 mod storage;
+mod transcript;
 mod transport;
 
 use anyhow::Result;
