@@ -50,6 +50,8 @@ pub enum Command {
         recency_bias: f64,
         #[arg(long)]
         no_color: bool,
+        #[arg(long)]
+        fzf: bool,
     },
     /// Print surrounding transcript context for an event or search unit.
     Expand {
@@ -197,6 +199,7 @@ impl Cli {
                 sort,
                 recency_bias,
                 no_color,
+                fzf,
             } => {
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let response = search::search(
@@ -209,6 +212,12 @@ impl Cli {
                 if json {
                     serde_json::to_writer_pretty(std::io::stdout(), &response)?;
                     println!();
+                } else if fzf {
+                    if let Some(reason) = &response.degraded_reason {
+                        eprintln!("search degraded: {reason}");
+                    }
+                    let color = !no_color;
+                    run_fzf_search(&config, &query, &response.results, color)?;
                 } else {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
@@ -482,6 +491,100 @@ fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) ->
     Ok(())
 }
 
+fn run_fzf_search(
+    config: &AppConfig,
+    query: &str,
+    results: &[search::SearchResult],
+    color: bool,
+) -> Result<()> {
+    if results.is_empty() {
+        println!("No results for: \"{query}\"");
+        return Ok(());
+    }
+    if !command_exists("fzf") {
+        bail!(
+            "fzf is not installed. Use `super-cass search {}` and then `super-cass expand --event <id>` or `super-cass show <session-id> --event <event-id>`.",
+            shell_quote(query)
+        );
+    }
+    let current_exe = std::env::current_exe()?;
+    let exe = shell_quote(&current_exe.to_string_lossy());
+    let data_dir = shell_quote(&config.data_dir.to_string_lossy());
+    let preview = format!("{exe} --data-dir {data_dir} expand --event {{6}} --before 3 --after 5");
+    let open = format!("{exe} --data-dir {data_dir} show {{5}} --event {{6}}");
+    let mut child = ProcessCommand::new("fzf")
+        .arg("--ansi")
+        .arg("--delimiter")
+        .arg("\t")
+        .arg("--with-nth")
+        .arg("1,2,3,4")
+        .arg("--header")
+        .arg("Source\tMatch\tWhen\tPreview")
+        .arg("--preview")
+        .arg(preview)
+        .arg("--bind")
+        .arg(format!("enter:execute({open})+abort"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(fzf_rows(results, color).as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn fzf_rows(results: &[search::SearchResult], color: bool) -> String {
+    let mut rows = String::new();
+    for result in results {
+        rows.push_str(&fzf_row(result, color));
+        rows.push('\n');
+    }
+    rows
+}
+
+fn fzf_row(result: &search::SearchResult, color: bool) -> String {
+    [
+        clean_fzf_field(&result.source_kind),
+        clean_fzf_field(&color_match(
+            match result.match_type {
+                search::MatchType::Lexical => "lexical",
+                search::MatchType::Semantic => "semantic",
+                search::MatchType::Hybrid => "hybrid",
+            },
+            color,
+        )),
+        clean_fzf_field(
+            &result
+                .occurred_at
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        clean_fzf_field(&result.snippet),
+        clean_fzf_field(&result.session_id),
+        clean_fzf_field(&result.event_id),
+    ]
+    .join("\t")
+}
+
+fn clean_fzf_field(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn command_exists(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths).find(|path| {
+                let candidate = path.join(command);
+                candidate.is_file()
+            })
+        })
+        .is_some()
+}
+
 fn write_stdout(output: &str) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match stdout.write_all(output.as_bytes()) {
@@ -489,6 +592,13 @@ fn write_stdout(output: &str) -> Result<()> {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 fn pager_command(target_event_id: Option<&str>) -> Option<ProcessCommand> {
@@ -831,5 +941,36 @@ mod tests {
                 Column::Event
             ]
         );
+    }
+
+    #[test]
+    fn fzf_row_keeps_stable_ids_hidden_after_visible_fields() {
+        let result = search::SearchResult {
+            match_type: search::MatchType::Hybrid,
+            event_id: "event_1".to_string(),
+            session_id: "session_1".to_string(),
+            source_kind: "codex".to_string(),
+            score: 0.5,
+            lexical_rank: Some(1),
+            semantic_rank: Some(2),
+            occurred_at: None,
+            session_title: None,
+            snippet: "preview with\nnew line".to_string(),
+        };
+
+        let row = fzf_row(&result, false);
+        let fields = row.split('\t').collect::<Vec<_>>();
+
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields[0], "codex");
+        assert_eq!(fields[1], "hybrid");
+        assert_eq!(fields[3], "preview with new line");
+        assert_eq!(fields[4], "session_1");
+        assert_eq!(fields[5], "event_1");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_single_quotes() {
+        assert_eq!(shell_quote("/tmp/a path/it's"), "'/tmp/a path/it'\\''s'");
     }
 }
