@@ -4,9 +4,10 @@ use crate::archive::{
 use crate::storage::{ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::Map;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +55,17 @@ struct SearchProjection {
     kind: String,
     indexable: bool,
     skip_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceIdentity {
+    workspace_path: String,
+    workspace_root: String,
+    cwd: Option<String>,
+    git_repo: Option<String>,
+    git_branch: Option<String>,
+    source: String,
+    confidence: String,
 }
 
 pub fn update_local(
@@ -217,6 +229,7 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
         .find(|line| line.role.as_deref() == Some("user") && !line.content.trim().is_empty())
         .or_else(|| lines.iter().find(|line| !line.content.trim().is_empty()))
         .map(|line| snippet(&line.content, 100));
+    let workspace = session_workspace(kind, path, &lines);
     let session_hash = stable_hash(&(kind, &source_id, &external_session_id, &path_text))?;
     records.push(ArchiveRecord::Session(SessionRecord {
         id: session_id.clone(),
@@ -228,11 +241,7 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
         status: "open".to_string(),
         started_at: lines.iter().find_map(|line| line.occurred_at),
         updated_at: lines.iter().rev().find_map(|line| line.occurred_at),
-        metadata: json!({
-            "path": path_text,
-            "capture_fidelity": "exact_local_log",
-            "parser": "generic_json_event_v1"
-        }),
+        metadata: session_metadata(&path_text, workspace.as_ref()),
         hash: session_hash,
     }));
 
@@ -276,6 +285,222 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
         }));
     }
     store.import_records(&records)
+}
+
+fn session_metadata(path_text: &str, workspace: Option<&WorkspaceIdentity>) -> Value {
+    let mut metadata = Map::new();
+    metadata.insert("path".to_string(), json!(path_text));
+    metadata.insert("capture_fidelity".to_string(), json!("exact_local_log"));
+    metadata.insert("parser".to_string(), json!("generic_json_event_v1"));
+    if let Some(workspace) = workspace {
+        metadata.insert(
+            "workspace_path".to_string(),
+            json!(&workspace.workspace_path),
+        );
+        metadata.insert(
+            "workspace_root".to_string(),
+            json!(&workspace.workspace_root),
+        );
+        metadata.insert(
+            "workspace_confidence".to_string(),
+            json!(&workspace.confidence),
+        );
+        metadata.insert("workspace_source".to_string(), json!(&workspace.source));
+        if let Some(cwd) = &workspace.cwd {
+            metadata.insert("cwd".to_string(), json!(cwd));
+        }
+        if let Some(git_repo) = &workspace.git_repo {
+            metadata.insert("git_repo".to_string(), json!(git_repo));
+        }
+        if let Some(git_branch) = &workspace.git_branch {
+            metadata.insert("git_branch".to_string(), json!(git_branch));
+        }
+        metadata.insert(
+            "workspace".to_string(),
+            json!({
+                "path": &workspace.workspace_path,
+                "root": &workspace.workspace_root,
+                "cwd": &workspace.cwd,
+                "git_repo": &workspace.git_repo,
+                "git_branch": &workspace.git_branch,
+                "source": &workspace.source,
+                "confidence": &workspace.confidence
+            }),
+        );
+    }
+    Value::Object(metadata)
+}
+
+fn session_workspace(
+    kind: &str,
+    source_path: &Path,
+    lines: &[ParsedLine],
+) -> Option<WorkspaceIdentity> {
+    lines
+        .iter()
+        .find_map(|line| workspace_from_value(&line.value))
+        .or_else(|| workspace_from_source_path(kind, source_path))
+}
+
+fn workspace_from_value(value: &Value) -> Option<WorkspaceIdentity> {
+    let (raw_path, source) = workspace_path_candidate(value)?;
+    let cwd = normalize_path_text(&raw_path)?;
+    let workspace_root = git_root_for(&cwd).unwrap_or_else(|| cwd.clone());
+    Some(WorkspaceIdentity {
+        workspace_path: workspace_root.clone(),
+        workspace_root,
+        cwd: Some(cwd),
+        git_repo: git_repo_candidate(value),
+        git_branch: git_branch_candidate(value),
+        source,
+        confidence: "direct".to_string(),
+    })
+}
+
+fn workspace_path_candidate(value: &Value) -> Option<(String, String)> {
+    for (path, source) in [
+        (&["cwd"][..], "cwd"),
+        (
+            &["current_working_directory"][..],
+            "current_working_directory",
+        ),
+        (&["workspace"][..], "workspace"),
+        (&["workspace_path"][..], "workspace_path"),
+        (&["project_path"][..], "project_path"),
+        (&["repo_path"][..], "repo_path"),
+        (&["payload", "cwd"][..], "payload.cwd"),
+        (
+            &["payload", "current_working_directory"][..],
+            "payload.current_working_directory",
+        ),
+        (&["payload", "workspace"][..], "payload.workspace"),
+        (&["payload", "workspace_path"][..], "payload.workspace_path"),
+        (&["payload", "project_path"][..], "payload.project_path"),
+        (&["payload", "repo_path"][..], "payload.repo_path"),
+        (&["payload", "git", "root"][..], "payload.git.root"),
+        (
+            &["turn_context", "payload", "cwd"][..],
+            "turn_context.payload.cwd",
+        ),
+        (&["git", "root"][..], "git.root"),
+    ] {
+        if let Some(value) = string_at(value, path).filter(|text| looks_like_path(text)) {
+            return Some((value, source.to_string()));
+        }
+    }
+    None
+}
+
+fn git_repo_candidate(value: &Value) -> Option<String> {
+    for path in [
+        &["git_repo"][..],
+        &["git_remote"][..],
+        &["repository_url"][..],
+        &["repo_url"][..],
+        &["payload", "git_repo"][..],
+        &["payload", "git_remote"][..],
+        &["payload", "repository_url"][..],
+        &["payload", "repo_url"][..],
+        &["payload", "git", "remote"][..],
+        &["payload", "git", "repository_url"][..],
+        &["git", "remote"][..],
+        &["git", "repository_url"][..],
+    ] {
+        if let Some(value) = string_at(value, path).filter(|text| !text.trim().is_empty()) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn git_branch_candidate(value: &Value) -> Option<String> {
+    for path in [
+        &["gitBranch"][..],
+        &["git_branch"][..],
+        &["branch"][..],
+        &["payload", "gitBranch"][..],
+        &["payload", "git_branch"][..],
+        &["payload", "branch"][..],
+        &["payload", "git", "branch"][..],
+        &["git", "branch"][..],
+    ] {
+        if let Some(value) = string_at(value, path).filter(|text| !text.trim().is_empty()) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn workspace_from_source_path(kind: &str, source_path: &Path) -> Option<WorkspaceIdentity> {
+    if kind != "claude_code" {
+        return None;
+    }
+    let project_dir = source_path.parent()?.file_name()?.to_str()?;
+    let decoded = decode_claude_project_dir(project_dir)?;
+    let workspace_path = normalize_path_text(&decoded).unwrap_or(decoded);
+    Some(WorkspaceIdentity {
+        workspace_path: workspace_path.clone(),
+        workspace_root: workspace_path,
+        cwd: None,
+        git_repo: None,
+        git_branch: None,
+        source: "source_path.claude_project_dir".to_string(),
+        confidence: "inferred".to_string(),
+    })
+}
+
+fn decode_claude_project_dir(name: &str) -> Option<String> {
+    let stripped = name.strip_prefix('-')?;
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", stripped.replace('-', "/")))
+}
+
+fn normalize_path_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let expanded = raw
+        .strip_prefix("~/")
+        .and_then(|rest| home_dir().map(|home| home.join(rest)))
+        .unwrap_or_else(|| PathBuf::from(raw));
+    if let Ok(canonical) = expanded.canonicalize() {
+        return Some(canonical.to_string_lossy().to_string());
+    }
+    Some(clean_path(&expanded).to_string_lossy().to_string())
+}
+
+fn git_root_for(path: &str) -> Option<String> {
+    let mut cursor = PathBuf::from(path);
+    loop {
+        if cursor.join(".git").exists() {
+            return Some(cursor.to_string_lossy().to_string());
+        }
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+fn looks_like_path(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with('/') || text.starts_with("~/")
 }
 
 fn parse_jsonl(text: &str) -> Result<Vec<ParsedLine>> {
@@ -686,5 +911,97 @@ mod tests {
         assert!(line.search_indexable);
         assert_eq!(line.search_kind, "conversation");
         assert_eq!(line.search_text, "human question\nassistant answer");
+    }
+
+    #[test]
+    fn extracts_workspace_from_codex_payload_cwd() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = temp.path().join("repo");
+        let nested = repo.join("subdir");
+        fs::create_dir_all(repo.join(".git")).expect("create git dir");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let workspace = workspace_from_value(&json!({
+            "payload": {
+                "cwd": nested,
+                "git": {
+                    "branch": "main",
+                    "remote": "git@example.com:example/repo.git"
+                }
+            }
+        }))
+        .expect("workspace");
+        let expected_repo = repo.canonicalize().expect("canonical repo");
+        let expected_nested = nested.canonicalize().expect("canonical nested");
+
+        assert_eq!(
+            workspace.cwd.as_deref(),
+            Some(expected_nested.to_str().unwrap())
+        );
+        assert_eq!(workspace.workspace_root, expected_repo.to_string_lossy());
+        assert_eq!(workspace.workspace_path, expected_repo.to_string_lossy());
+        assert_eq!(workspace.git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            workspace.git_repo.as_deref(),
+            Some("git@example.com:example/repo.git")
+        );
+        assert_eq!(workspace.source, "payload.cwd");
+        assert_eq!(workspace.confidence, "direct");
+    }
+
+    #[test]
+    fn extracts_workspace_from_claude_top_level_cwd() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace_path = temp.path().join("claude-project");
+        fs::create_dir_all(&workspace_path).expect("create workspace");
+
+        let workspace = workspace_from_value(&json!({
+            "cwd": workspace_path,
+            "gitBranch": "feature-sync"
+        }))
+        .expect("workspace");
+        let expected_workspace = workspace_path.canonicalize().expect("canonical workspace");
+
+        assert_eq!(
+            workspace.workspace_path,
+            expected_workspace.to_string_lossy().to_string()
+        );
+        assert_eq!(workspace.git_branch.as_deref(), Some("feature-sync"));
+        assert_eq!(workspace.source, "cwd");
+    }
+
+    #[test]
+    fn falls_back_to_claude_project_directory() {
+        let source_path =
+            Path::new("/home/example/.claude/projects/-home-example-workspace-project-alpha/session.jsonl");
+
+        let workspace = workspace_from_source_path("claude_code", source_path).expect("workspace");
+
+        assert_eq!(workspace.workspace_path, "/home/example/workspace/project/alpha");
+        assert_eq!(workspace.cwd, None);
+        assert_eq!(workspace.source, "source_path.claude_project_dir");
+        assert_eq!(workspace.confidence, "inferred");
+    }
+
+    #[test]
+    fn session_metadata_includes_flat_and_nested_workspace_fields() {
+        let workspace = WorkspaceIdentity {
+            workspace_path: "/repo".to_string(),
+            workspace_root: "/repo".to_string(),
+            cwd: Some("/repo/subdir".to_string()),
+            git_repo: Some("git@example.com:example/repo.git".to_string()),
+            git_branch: Some("main".to_string()),
+            source: "payload.cwd".to_string(),
+            confidence: "direct".to_string(),
+        };
+
+        let metadata = session_metadata("/logs/session.jsonl", Some(&workspace));
+
+        assert_eq!(metadata["workspace_path"], "/repo");
+        assert_eq!(metadata["workspace_root"], "/repo");
+        assert_eq!(metadata["cwd"], "/repo/subdir");
+        assert_eq!(metadata["git_branch"], "main");
+        assert_eq!(metadata["workspace"]["path"], "/repo");
+        assert_eq!(metadata["workspace"]["source"], "payload.cwd");
     }
 }
