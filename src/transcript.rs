@@ -9,7 +9,13 @@ pub fn render_context(context: &TranscriptContext, color: bool) -> String {
     out.push('\n');
     out.push('\n');
     for (idx, event) in context.events.iter().enumerate() {
-        push_event(&mut out, event, idx == context.target_index, color);
+        push_event(
+            &mut out,
+            event,
+            idx == context.target_index,
+            color,
+            RenderMode::Preview,
+        );
     }
     out
 }
@@ -29,6 +35,7 @@ pub fn render_session(
             event,
             target_event_id == Some(event.id.as_str()),
             color,
+            RenderMode::Full,
         );
     }
     out
@@ -50,7 +57,19 @@ fn push_session_header(out: &mut String, session: &SessionRecord, label: &str) {
     }
 }
 
-fn push_event(out: &mut String, event: &EventRecord, target: bool, color: bool) {
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Preview,
+    Full,
+}
+
+fn push_event(
+    out: &mut String,
+    event: &EventRecord,
+    target: bool,
+    color: bool,
+    mode: RenderMode,
+) {
     let marker = if target { "=> " } else { "   " };
     if target && color {
         out.push_str("\x1b[1;36m");
@@ -74,8 +93,19 @@ fn push_event(out: &mut String, event: &EventRecord, target: bool, color: bool) 
         out.push_str("\x1b[0m");
     }
     out.push('\n');
-    out.push_str(&event.content);
+    if should_compact_preview_event(event, target, mode) {
+        out.push_str("[non-message event omitted from context preview; use show for full raw transcript]");
+    } else {
+        out.push_str(&event.content);
+    }
     out.push_str("\n\n");
+}
+
+fn should_compact_preview_event(event: &EventRecord, target: bool, mode: RenderMode) -> bool {
+    matches!(mode, RenderMode::Preview)
+        && !target
+        && event.role.is_none()
+        && (event.content.trim_start().starts_with('{') || event.content.chars().count() > 1200)
 }
 
 #[cfg(test)]
@@ -106,6 +136,27 @@ mod tests {
         assert!(rendered.contains("session: session_test"));
         assert!(rendered.contains("=> event:event_two ordinal:2"));
         assert!(rendered.contains("middle full content\nwith newline"));
+    }
+
+    #[test]
+    fn context_compacts_neighboring_raw_events() {
+        let session = fixture_session();
+        let context = TranscriptContext {
+            session,
+            target_event: fixture_event("event_two", 2, "target"),
+            events: vec![
+                fixture_raw_event("event_raw", 1, "{\"payload\":{\"arguments\":\"large\"}}"),
+                fixture_event("event_two", 2, "target"),
+            ],
+            target_index: 1,
+        };
+
+        let rendered = render_context(&context, false);
+
+        assert!(rendered.contains("event:event_raw"));
+        assert!(rendered.contains("non-message event omitted"));
+        assert!(!rendered.contains("\"arguments\""));
+        assert!(rendered.contains("target"));
     }
 
     #[test]
@@ -158,5 +209,11 @@ mod tests {
             metadata: json!({}),
             hash: stable_hash(&(id, ordinal, content)).expect("event hash"),
         }
+    }
+
+    fn fixture_raw_event(id: &str, ordinal: i64, content: &str) -> EventRecord {
+        let mut event = fixture_event(id, ordinal, content);
+        event.role = None;
+        event
     }
 }
