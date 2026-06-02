@@ -6,7 +6,8 @@ use crate::storage::Store;
 use crate::transport;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
+use std::process::{Command as ProcessCommand, Stdio};
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -60,6 +61,18 @@ pub enum Command {
         before: usize,
         #[arg(long, default_value_t = 5)]
         after: usize,
+        #[arg(long)]
+        no_color: bool,
+    },
+    /// Render a full session transcript.
+    Show {
+        session: String,
+        #[arg(long, conflicts_with = "search_unit")]
+        event: Option<String>,
+        #[arg(long = "search-unit", conflicts_with = "event")]
+        search_unit: Option<String>,
+        #[arg(long)]
+        no_pager: bool,
         #[arg(long)]
         no_color: bool,
     },
@@ -217,7 +230,39 @@ impl Cli {
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
                 let color = !no_color && std::io::stdout().is_terminal();
-                print!("{}", crate::transcript::render_context(&context, color));
+                write_stdout(&crate::transcript::render_context(&context, color))?;
+            }
+            Command::Show {
+                session,
+                event,
+                search_unit,
+                no_pager,
+                no_color,
+            } => {
+                let target_event_id = resolve_optional_event_id(&store, event, search_unit)?;
+                if let Some(event_id) = &target_event_id {
+                    let event = store
+                        .event_by_id(event_id)?
+                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                    if event.session_id != session {
+                        bail!(
+                            "event {event_id} belongs to session {}, not {session}",
+                            event.session_id
+                        );
+                    }
+                }
+                let session_record = store
+                    .session_by_id(&session)?
+                    .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+                let events = store.events_for_session(&session)?;
+                let color = !no_color && std::io::stdout().is_terminal();
+                let rendered = crate::transcript::render_session(
+                    &session_record,
+                    &events,
+                    target_event_id.as_deref(),
+                    color,
+                );
+                page_or_print(&rendered, target_event_id.as_deref(), no_pager)?;
             }
             Command::Export {
                 jsonl,
@@ -398,6 +443,67 @@ fn resolve_expand_event_id(
         (None, None) => bail!("expand requires --event <id> or --search-unit <id>"),
         (Some(_), Some(_)) => bail!("expand accepts either --event or --search-unit, not both"),
     }
+}
+
+fn resolve_optional_event_id(
+    store: &Store,
+    event: Option<String>,
+    search_unit: Option<String>,
+) -> Result<Option<String>> {
+    match (event, search_unit) {
+        (Some(event_id), None) => Ok(Some(event_id)),
+        (None, Some(unit_id)) => store
+            .search_unit_by_id(&unit_id)?
+            .map(|unit| Some(unit.event_id))
+            .ok_or_else(|| anyhow::anyhow!("search unit not found: {unit_id}")),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => bail!("show accepts either --event or --search-unit, not both"),
+    }
+}
+
+fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) -> Result<()> {
+    if no_pager || !std::io::stdout().is_terminal() {
+        return write_stdout(output);
+    }
+    let Some(mut pager) = pager_command(target_event_id) else {
+        return write_stdout(output);
+    };
+    match pager.stdin(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(output.as_bytes())?;
+            }
+            let _ = child.wait();
+        }
+        Err(_) => {
+            write_stdout(output)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_stdout(output: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout.write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn pager_command(target_event_id: Option<&str>) -> Option<ProcessCommand> {
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+    let mut parts = pager.split_whitespace();
+    let program = parts.next()?;
+    let mut command = ProcessCommand::new(program);
+    command.args(parts);
+    if program.ends_with("less") {
+        command.arg("-R");
+        if let Some(event_id) = target_event_id {
+            command.arg(format!("+/event:{event_id}"));
+        }
+    }
+    Some(command)
 }
 
 fn parse_columns_opt(input: Option<String>) -> Result<Vec<Column>> {
