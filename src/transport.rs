@@ -150,7 +150,7 @@ mod tests {
         let response = crate::search::search(
             &machine_a,
             "offline convergence",
-            5,
+            crate::search::SearchOptions::new(5, crate::search::SortMode::Relevance, 0.0),
             None,
             Some("query embedder disabled".to_string()),
         )

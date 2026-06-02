@@ -4,8 +4,9 @@ use crate::search;
 use crate::server;
 use crate::storage::Store;
 use crate::transport;
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Result};
+use clap::{Parser, Subcommand, ValueEnum};
+use std::io::IsTerminal;
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -34,6 +35,20 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        verbose: bool,
+        #[arg(long)]
+        cols: Option<String>,
+        #[arg(long)]
+        include: Option<String>,
+        #[arg(long)]
+        exclude: Option<String>,
+        #[arg(long, value_enum, default_value_t = SearchSort::Relevance)]
+        sort: SearchSort,
+        #[arg(long, default_value_t = 0.0)]
+        recency_bias: f64,
+        #[arg(long)]
+        no_color: bool,
     },
     /// Export canonical archive records as JSONL.
     Export {
@@ -71,6 +86,37 @@ pub enum Command {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SearchSort {
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+impl From<SearchSort> for search::SortMode {
+    fn from(value: SearchSort) -> Self {
+        match value {
+            SearchSort::Relevance => search::SortMode::Relevance,
+            SearchSort::Newest => search::SortMode::Newest,
+            SearchSort::Oldest => search::SortMode::Oldest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Source,
+    Match,
+    When,
+    Title,
+    Preview,
+    Score,
+    Lex,
+    Sem,
+    Event,
+    Session,
+}
+
 impl Cli {
     pub async fn run(self) -> Result<()> {
         let config = AppConfig::load(self.data_dir)?;
@@ -106,10 +152,26 @@ impl Cli {
                     embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
                 );
             }
-            Command::Search { query, limit, json } => {
+            Command::Search {
+                query,
+                limit,
+                json,
+                verbose,
+                cols,
+                include,
+                exclude,
+                sort,
+                recency_bias,
+                no_color,
+            } => {
                 let (embedder, degraded_reason) = load_embedder(&config);
-                let response =
-                    search::search(&store, &query, limit, embedder.as_deref(), degraded_reason)?;
+                let response = search::search(
+                    &store,
+                    &query,
+                    search::SearchOptions::new(limit, sort.into(), recency_bias),
+                    embedder.as_deref(),
+                    degraded_reason,
+                )?;
                 if json {
                     serde_json::to_writer_pretty(std::io::stdout(), &response)?;
                     println!();
@@ -117,16 +179,9 @@ impl Cli {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
                     }
-                    for result in response.results {
-                        println!(
-                            "{:.6}\t{}\t{}\t{}\t{}",
-                            result.score,
-                            result.source_kind,
-                            result.session_id,
-                            result.event_id,
-                            result.snippet
-                        );
-                    }
+                    let columns = resolve_columns(verbose, cols, include, exclude)?;
+                    let color = !no_color && std::io::stdout().is_terminal();
+                    print_search_results(&query, &response.results, &columns, color);
                 }
             }
             Command::Export { jsonl } => {
@@ -243,6 +298,269 @@ impl Cli {
     }
 }
 
+fn resolve_columns(
+    verbose: bool,
+    cols: Option<String>,
+    include: Option<String>,
+    exclude: Option<String>,
+) -> Result<Vec<Column>> {
+    if let Some(cols) = cols {
+        return parse_columns(&cols);
+    }
+    let mut columns = if verbose {
+        vec![
+            Column::Source,
+            Column::Match,
+            Column::Score,
+            Column::Lex,
+            Column::Sem,
+            Column::When,
+            Column::Title,
+            Column::Preview,
+            Column::Session,
+            Column::Event,
+        ]
+    } else {
+        vec![Column::Source, Column::Match, Column::When, Column::Preview]
+    };
+    for column in parse_columns_opt(include)? {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    for column in parse_columns_opt(exclude)? {
+        columns.retain(|candidate| *candidate != column);
+    }
+    Ok(columns)
+}
+
+fn parse_columns_opt(input: Option<String>) -> Result<Vec<Column>> {
+    input
+        .map(|text| parse_columns(&text))
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn parse_columns(input: &str) -> Result<Vec<Column>> {
+    let mut columns = Vec::new();
+    for raw in input.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("ids") {
+            columns.push(Column::Session);
+            columns.push(Column::Event);
+            continue;
+        }
+        columns.push(parse_column(name)?);
+    }
+    if columns.is_empty() {
+        bail!("no columns selected");
+    }
+    Ok(columns)
+}
+
+fn parse_column(name: &str) -> Result<Column> {
+    match name.to_ascii_lowercase().as_str() {
+        "source" => Ok(Column::Source),
+        "match" => Ok(Column::Match),
+        "when" | "time" | "date" => Ok(Column::When),
+        "title" => Ok(Column::Title),
+        "preview" | "snippet" => Ok(Column::Preview),
+        "score" => Ok(Column::Score),
+        "lex" | "lexical" => Ok(Column::Lex),
+        "sem" | "semantic" => Ok(Column::Sem),
+        "event" | "event_id" => Ok(Column::Event),
+        "session" | "session_id" => Ok(Column::Session),
+        _ => bail!(
+            "unknown column '{name}'. Available columns: source,match,when,title,preview,score,lex,sem,event,session,ids"
+        ),
+    }
+}
+
+fn print_search_results(
+    query: &str,
+    results: &[search::SearchResult],
+    columns: &[Column],
+    color: bool,
+) {
+    if results.is_empty() {
+        println!("No results for: \"{query}\"");
+        return;
+    }
+    let rows = results
+        .iter()
+        .map(|result| {
+            columns
+                .iter()
+                .map(|column| cell_value(*column, result))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let widths = columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            rows.iter()
+                .map(|row| row[idx].chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(column_header(*column).chars().count())
+        })
+        .collect::<Vec<_>>();
+
+    for (idx, column) in columns.iter().enumerate() {
+        let header = column_header(*column);
+        print_cell(
+            header,
+            widths[idx],
+            idx + 1 == columns.len(),
+            color,
+            Style::Header,
+        );
+    }
+    println!();
+
+    let terms = query_terms(query);
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            let is_last = idx + 1 == columns.len();
+            let rendered = match columns[idx] {
+                Column::Match => color_match(value, color),
+                Column::Preview => highlight_terms(value, &terms, color),
+                _ => value.to_string(),
+            };
+            print_rendered_cell(&rendered, value.chars().count(), widths[idx], is_last);
+        }
+        println!();
+    }
+}
+
+fn cell_value(column: Column, result: &search::SearchResult) -> String {
+    match column {
+        Column::Source => result.source_kind.clone(),
+        Column::Match => match result.match_type {
+            search::MatchType::Lexical => "lexical".to_string(),
+            search::MatchType::Semantic => "semantic".to_string(),
+            search::MatchType::Hybrid => "hybrid".to_string(),
+        },
+        Column::When => result
+            .occurred_at
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        Column::Title => truncate_cell(
+            &result
+                .session_title
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            72,
+        ),
+        Column::Preview => result.snippet.clone(),
+        Column::Score => format!("{:.6}", result.score),
+        Column::Lex => rank_cell(result.lexical_rank),
+        Column::Sem => rank_cell(result.semantic_rank),
+        Column::Event => result.event_id.clone(),
+        Column::Session => result.session_id.clone(),
+    }
+}
+
+fn rank_cell(rank: Option<usize>) -> String {
+    rank.map(|rank| rank.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn truncate_cell(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut out = input
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn column_header(column: Column) -> &'static str {
+    match column {
+        Column::Source => "Source",
+        Column::Match => "Match",
+        Column::When => "When",
+        Column::Title => "Title",
+        Column::Preview => "Preview",
+        Column::Score => "Score",
+        Column::Lex => "Lex",
+        Column::Sem => "Sem",
+        Column::Event => "Event",
+        Column::Session => "Session",
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Style {
+    Header,
+}
+
+fn print_cell(text: &str, width: usize, is_last: bool, color: bool, style: Style) {
+    let rendered = match style {
+        Style::Header if color => format!("\x1b[2m{text}\x1b[0m"),
+        _ => text.to_string(),
+    };
+    print_rendered_cell(&rendered, text.chars().count(), width, is_last);
+}
+
+fn print_rendered_cell(rendered: &str, visible_width: usize, width: usize, is_last: bool) {
+    if is_last {
+        print!("{rendered}");
+    } else {
+        print!(
+            "{rendered}{}",
+            " ".repeat(width.saturating_sub(visible_width) + 2)
+        );
+    }
+}
+
+fn color_match(value: &str, color: bool) -> String {
+    if !color {
+        return value.to_string();
+    }
+    let code = match value {
+        "hybrid" => "32",
+        "lexical" => "34",
+        "semantic" => "35",
+        _ => "0",
+    };
+    format!("\x1b[{code}m{value}\x1b[0m")
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .filter(|part| part.chars().count() >= 2)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn highlight_terms(input: &str, terms: &[String], color: bool) -> String {
+    if !color || terms.is_empty() {
+        return input.to_string();
+    }
+    input
+        .split_whitespace()
+        .map(|word| {
+            let normalized = word
+                .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+                .to_ascii_lowercase();
+            if terms.iter().any(|term| normalized.contains(term)) {
+                format!("\x1b[1;33m{word}\x1b[0m")
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn run_daemon(
     store: &Store,
     machine_id: &str,
@@ -297,5 +615,49 @@ fn load_embedder_config(
     match config.load() {
         Ok(embedder) => (Some(embedder), None),
         Err(err) => (None, Some(err.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_cols_controls_order() {
+        let columns = resolve_columns(
+            false,
+            Some("source,score,preview".to_string()),
+            Some("ids".to_string()),
+            None,
+        )
+        .expect("columns");
+
+        assert_eq!(
+            columns,
+            vec![Column::Source, Column::Score, Column::Preview]
+        );
+    }
+
+    #[test]
+    fn include_and_exclude_modify_default_columns() {
+        let columns = resolve_columns(
+            false,
+            None,
+            Some("score,ids".to_string()),
+            Some("when".to_string()),
+        )
+        .expect("columns");
+
+        assert_eq!(
+            columns,
+            vec![
+                Column::Source,
+                Column::Match,
+                Column::Preview,
+                Column::Score,
+                Column::Session,
+                Column::Event
+            ]
+        );
     }
 }
