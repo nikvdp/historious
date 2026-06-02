@@ -54,6 +54,14 @@ pub enum Command {
     Export {
         #[arg(long)]
         jsonl: bool,
+        #[arg(long)]
+        source: Vec<String>,
+        #[arg(long)]
+        workspace: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        session: Vec<String>,
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Import canonical archive records from JSONL.
     Import {
@@ -184,10 +192,25 @@ impl Cli {
                     print_search_results(&query, &response.results, &columns, color);
                 }
             }
-            Command::Export { jsonl } => {
+            Command::Export {
+                jsonl,
+                source,
+                workspace,
+                session,
+                since,
+            } => {
                 if jsonl {
                     let stdout = std::io::stdout();
-                    transport::export_jsonl(&store, stdout.lock())?;
+                    let filter = crate::storage::ArchiveExportFilter {
+                        sources: source,
+                        workspaces: workspace
+                            .iter()
+                            .map(|path| transport::normalize_workspace_arg(path))
+                            .collect(),
+                        sessions: session,
+                        since: transport::parse_since_arg(since.as_deref())?,
+                    };
+                    transport::export_jsonl_filtered(&store, &filter, stdout.lock())?;
                 } else {
                     anyhow::bail!("only --jsonl export is supported in v0");
                 }
