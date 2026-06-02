@@ -489,6 +489,22 @@ impl Store {
         })
     }
 
+    pub fn session_workspace_metadata_missing_for_path(&self, path: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM sessions
+                   WHERE json_extract(metadata_json, '$.path') = ?1
+                     AND json_extract(metadata_json, '$.workspace_path') IS NULL
+                 )",
+                params![path],
+                |row| row.get(0),
+            )?;
+            Ok(exists != 0)
+        })
+    }
+
     pub fn refresh_search_projection(
         &self,
         model: &str,
@@ -1195,7 +1211,31 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
             session.hash
         ],
     )?;
+    if changed == 0 {
+        enrich_session_metadata(conn, session)?;
+    }
     Ok(changed > 0)
+}
+
+fn enrich_session_metadata(conn: &Connection, session: &SessionRecord) -> Result<()> {
+    if !metadata_has_workspace(&session.metadata) {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions
+         SET metadata_json = ?2
+         WHERE id = ?1
+           AND json_extract(metadata_json, '$.workspace_path') IS NULL",
+        params![session.id, session.metadata.to_string()],
+    )?;
+    Ok(())
+}
+
+fn metadata_has_workspace(metadata: &Value) -> bool {
+    metadata
+        .get("workspace_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
@@ -1575,6 +1615,47 @@ mod tests {
             .iter()
             .any(|record| matches!(record, ArchiveRecord::Embedding(_))));
         assert!(!record_id_exists(&exported, "session_other"));
+    }
+
+    #[test]
+    fn duplicate_session_import_enriches_missing_workspace_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut legacy = fixture_session("session_legacy", "source_legacy");
+        legacy.metadata = json!({"path": "/tmp/legacy.jsonl"});
+        let mut enriched = legacy.clone();
+        enriched.metadata = json!({
+            "path": "/tmp/legacy.jsonl",
+            "workspace_path": "/tmp/repo",
+            "workspace_root": "/tmp/repo"
+        });
+
+        store
+            .import_record(&ArchiveRecord::Session(legacy))
+            .expect("legacy import");
+        assert!(store
+            .session_workspace_metadata_missing_for_path("/tmp/legacy.jsonl")
+            .expect("missing workspace"));
+        let stats = store
+            .import_record(&ArchiveRecord::Session(enriched))
+            .expect("enriched duplicate import");
+
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.duplicates, 1);
+        assert!(!store
+            .session_workspace_metadata_missing_for_path("/tmp/legacy.jsonl")
+            .expect("workspace refreshed"));
+        let records = store.export_records().expect("export records");
+        let metadata = records
+            .iter()
+            .find_map(|record| match record {
+                ArchiveRecord::Session(session) if session.id == "session_legacy" => {
+                    Some(&session.metadata)
+                }
+                _ => None,
+            })
+            .expect("session metadata");
+        assert_eq!(metadata["workspace_path"], "/tmp/repo");
     }
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
