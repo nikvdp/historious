@@ -135,7 +135,10 @@ pub fn update_local(
         let size = metadata.len();
         let mtime_ms = file_mtime_ms(&metadata);
         let path_text = path.to_string_lossy().to_string();
-        if store.raw_artifact_is_current(&path_text, size, mtime_ms)? {
+        let raw_current = store.raw_artifact_is_current(&path_text, size, mtime_ms)?;
+        let needs_workspace_refresh =
+            raw_current && store.session_workspace_metadata_missing_for_path(&path_text)?;
+        if raw_current && !needs_workspace_refresh {
             stats.skipped_unchanged += 1;
             continue;
         }
