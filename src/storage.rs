@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,33 @@ pub struct VectorSearchRow {
     pub session_title: Option<String>,
     pub distance: f64,
     pub rank: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveExportFilter {
+    pub sources: Vec<String>,
+    pub workspaces: Vec<String>,
+    pub sessions: Vec<String>,
+    pub since: Option<DateTime<Utc>>,
+}
+
+impl ArchiveExportFilter {
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+            && self.workspaces.is_empty()
+            && self.sessions.is_empty()
+            && self.since.is_none()
+    }
+}
+
+#[derive(Debug)]
+struct SessionFilterRow {
+    id: String,
+    source_kind: String,
+    started_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    latest_event_at: Option<DateTime<Utc>>,
+    metadata: Value,
 }
 
 impl Store {
@@ -234,7 +262,6 @@ impl Store {
         })
     }
 
-    #[allow(dead_code)]
     pub fn export_records_for_session_ids(
         &self,
         session_ids: &[String],
@@ -367,6 +394,57 @@ impl Store {
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn session_ids_for_export_filter(
+        &self,
+        filter: &ArchiveExportFilter,
+    ) -> Result<Vec<String>> {
+        if filter.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sources = normalized_string_set(&filter.sources);
+        let workspaces = normalized_string_set(&filter.workspaces);
+        let sessions = normalized_string_set(&filter.sessions);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.id,
+                        s.source_kind,
+                        s.started_at,
+                        s.updated_at,
+                        MAX(e.occurred_at),
+                        s.metadata_json
+                 FROM sessions s
+                 LEFT JOIN events e ON e.session_id = s.id
+                 GROUP BY s.id
+                 ORDER BY s.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let metadata: String = row.get(5)?;
+                Ok(SessionFilterRow {
+                    id: row.get(0)?,
+                    source_kind: row.get(1)?,
+                    started_at: parse_opt_dt(row.get(2)?),
+                    updated_at: parse_opt_dt(row.get(3)?),
+                    latest_event_at: parse_opt_dt(row.get(4)?),
+                    metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let row = row?;
+                if session_matches_export_filter(
+                    &row,
+                    &sources,
+                    &workspaces,
+                    &sessions,
+                    filter.since,
+                ) {
+                    out.push(row.id);
+                }
             }
             Ok(out)
         })
@@ -735,7 +813,6 @@ fn load_sqlite_vec() {
     });
 }
 
-#[allow(dead_code)]
 fn normalized_ids(ids: &[String]) -> Vec<String> {
     let mut ids = ids
         .iter()
@@ -747,7 +824,77 @@ fn normalized_ids(ids: &[String]) -> Vec<String> {
     ids
 }
 
-#[allow(dead_code)]
+fn normalized_string_set(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn session_matches_export_filter(
+    row: &SessionFilterRow,
+    sources: &HashSet<String>,
+    workspaces: &HashSet<String>,
+    sessions: &HashSet<String>,
+    since: Option<DateTime<Utc>>,
+) -> bool {
+    if !sessions.is_empty() && !sessions.contains(&row.id) {
+        return false;
+    }
+    if !sources.is_empty() && !sources.contains(&row.source_kind) {
+        return false;
+    }
+    if !workspaces.is_empty()
+        && !session_workspace_values(&row.metadata).iter().any(|value| {
+            workspaces
+                .iter()
+                .any(|workspace| path_matches_scope(value, workspace))
+        })
+    {
+        return false;
+    }
+    if let Some(since) = since {
+        let latest = [row.updated_at, row.latest_event_at, row.started_at]
+            .into_iter()
+            .flatten()
+            .max();
+        if latest.is_none_or(|latest| latest < since) {
+            return false;
+        }
+    }
+    true
+}
+
+fn session_workspace_values(metadata: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    for key in ["workspace_path", "workspace_root", "cwd"] {
+        if let Some(value) = metadata.get(key).and_then(Value::as_str) {
+            values.push(value.to_string());
+        }
+    }
+    if let Some(workspace) = metadata.get("workspace") {
+        for key in ["path", "root", "cwd"] {
+            if let Some(value) = workspace.get(key).and_then(Value::as_str) {
+                values.push(value.to_string());
+            }
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn path_matches_scope(value: &str, scope: &str) -> bool {
+    let value = value.trim_end_matches('/');
+    let scope = scope.trim_end_matches('/');
+    value == scope
+        || value
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat("?")
         .take(count)
@@ -755,7 +902,6 @@ fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
-#[allow(dead_code)]
 fn repeated_id_params(ids: &[String], repeats: usize) -> Vec<&str> {
     let mut out = Vec::with_capacity(ids.len() * repeats);
     for _ in 0..repeats {
