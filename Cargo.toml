@@ -3,6 +3,10 @@ name = "super-cass"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["semantic-fastembed"]
+semantic-fastembed = ["dep:fastembed"]
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.7"
@@ -10,7 +14,7 @@ blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "5.0"
-fastembed = { version = "5.15.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "5.15.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 hex = "0.4"
 notify = "6.1"
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "functions"] }

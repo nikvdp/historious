@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+#[cfg(feature = "semantic-fastembed")]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "semantic-fastembed")]
 use std::sync::Mutex;
 
 pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:snowflake/snowflake-arctic-embed-xs-q";
@@ -71,9 +73,9 @@ impl EmbedderConfig {
                 provider: "fastembed".to_string(),
                 model_id: Some(DEFAULT_SEMANTIC_MODEL_ID.to_string()),
                 dims: Some(DEFAULT_SEMANTIC_DIMS),
-                semantic: true,
-                available: true,
-                degraded_reason: None,
+                semantic: cfg!(feature = "semantic-fastembed"),
+                available: cfg!(feature = "semantic-fastembed"),
+                degraded_reason: fastembed_unavailable_reason(),
             },
             EmbedderProvider::HashFallback => EmbedderStatus {
                 provider: "hash".to_string(),
@@ -96,17 +98,39 @@ impl EmbedderConfig {
 
     pub fn load(&self) -> Result<Box<dyn Embedder>> {
         match self.provider {
-            EmbedderProvider::FastEmbed => Ok(Box::new(FastEmbedder::new(&self.model_cache)?)),
+            EmbedderProvider::FastEmbed => load_fastembed(&self.model_cache),
             EmbedderProvider::HashFallback => Ok(Box::new(HashEmbedder)),
             EmbedderProvider::Disabled => anyhow::bail!("query embedder disabled"),
         }
     }
 }
 
+#[cfg(feature = "semantic-fastembed")]
+fn fastembed_unavailable_reason() -> Option<String> {
+    None
+}
+
+#[cfg(not(feature = "semantic-fastembed"))]
+fn fastembed_unavailable_reason() -> Option<String> {
+    Some("fastembed support was not compiled; rebuild with the semantic-fastembed feature".to_string())
+}
+
+#[cfg(feature = "semantic-fastembed")]
+fn load_fastembed(model_cache: &Path) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(FastEmbedder::new(model_cache)?))
+}
+
+#[cfg(not(feature = "semantic-fastembed"))]
+fn load_fastembed(_model_cache: &Path) -> Result<Box<dyn Embedder>> {
+    anyhow::bail!("fastembed support was not compiled; rebuild with the semantic-fastembed feature")
+}
+
+#[cfg(feature = "semantic-fastembed")]
 pub struct FastEmbedder {
     model: Mutex<TextEmbedding>,
 }
 
+#[cfg(feature = "semantic-fastembed")]
 impl FastEmbedder {
     pub fn new(model_cache: &Path) -> Result<Self> {
         std::fs::create_dir_all(model_cache)
@@ -121,6 +145,7 @@ impl FastEmbedder {
     }
 }
 
+#[cfg(feature = "semantic-fastembed")]
 impl Embedder for FastEmbedder {
     fn model_id(&self) -> &str {
         DEFAULT_SEMANTIC_MODEL_ID
