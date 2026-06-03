@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
-const DEFAULT_FZF_LIMIT: usize = 200;
+const DEFAULT_FZF_LIMIT: usize = 25;
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -58,7 +58,7 @@ pub enum Command {
         #[arg(
             short,
             long,
-            help = "Maximum number of results to show; defaults to 10, or 200 with --fzf"
+            help = "Maximum number of results to show; defaults to 10, or 25 with --fzf"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Print structured JSON with refs for follow-up commands")]
@@ -420,9 +420,6 @@ impl Cli {
                         },
                     )?;
                 } else if fzf_rows {
-                    if let Some(reason) = &response.degraded_reason {
-                        eprintln!("search degraded: {reason}");
-                    }
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let color = !no_color;
@@ -1772,7 +1769,7 @@ fn run_fzf_search(
     let after_flag = optional_shell_flag("--after", after);
     let before_flag = optional_shell_flag("--before", before);
     let reload = format!(
-        "{exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{after_flag}{before_flag}{color_flag} -- {{q}}",
+        "env SUPER_CASS_EMBEDDER=disabled {exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{after_flag}{before_flag}{color_flag} -- {{q}}",
         sort.as_str()
     );
     let preview = format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5");
@@ -1794,7 +1791,7 @@ fn run_fzf_search(
         .arg("--bind")
         .arg(format!("start:reload({reload})"))
         .arg("--bind")
-        .arg(format!("change:reload({reload})"))
+        .arg(format!("change:reload(sleep 0.12; {reload})"))
         .arg("--bind")
         .arg(format!("enter:execute({open})+abort"))
         .arg("--bind")
