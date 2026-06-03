@@ -6,6 +6,7 @@ use crate::storage::{RecentResultRefInput, Store};
 use crate::transport;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -28,6 +29,8 @@ pub enum Command {
         max_files: Option<usize>,
         #[arg(long)]
         source: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Search indexed transcripts.
     Search {
@@ -145,6 +148,8 @@ pub enum Command {
     Import {
         #[arg(long)]
         jsonl: bool,
+        #[arg(long)]
+        json: bool,
         #[arg(default_value = "-")]
         input: String,
     },
@@ -169,7 +174,10 @@ pub enum Command {
         source: Option<String>,
     },
     /// Show local archive health and projection freshness.
-    Status,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -217,35 +225,17 @@ impl Cli {
         let config = AppConfig::load(self.data_dir)?;
         let store = Store::open(&config.data_dir)?;
         match self.command {
-            Command::Update { max_files, source } => {
-                let stats = ingest::update_local(
-                    &store,
-                    &config.machine_id,
-                    ingest::UpdateOptions { max_files, source },
-                )?;
-                println!(
-                    "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={}",
-                    stats.files_seen,
-                    stats.skipped_unchanged,
-                    stats.inserted,
-                    stats.duplicates,
-                    stats.errors
-                );
-                let projected = search::refresh(&store)?;
-                println!("projection=search_rrf_v1 projected_events={projected}");
-                let (embedder, degraded_reason) = load_embedder(&config);
-                let embeddings = search::refresh_embeddings(
-                    &store,
-                    &config.machine_id,
-                    embedder.as_deref(),
-                    degraded_reason,
-                )?;
-                println!(
-                    "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
-                    embeddings.embedded,
-                    embeddings.vectors_projected,
-                    embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
-                );
+            Command::Update {
+                max_files,
+                source,
+                json,
+            } => {
+                let output = run_update_once(&store, &config, max_files, source)?;
+                if json {
+                    crate::output::write_success("update", output, Default::default())?;
+                } else {
+                    print_update_output(&output);
+                }
             }
             Command::Search {
                 query,
@@ -379,15 +369,10 @@ impl Cli {
                     anyhow::bail!("only --jsonl export is supported in v0");
                 }
             }
-            Command::Import { jsonl, input } => {
+            Command::Import { jsonl, json, input } => {
                 if jsonl {
                     let stats = transport::import_jsonl_path(&store, &input)?;
-                    println!(
-                        "imported={} duplicates={} inserted_vectors={}",
-                        stats.inserted, stats.duplicates, stats.vectors_projected
-                    );
                     let projected = search::refresh(&store)?;
-                    println!("projection=search_rrf_v1 projected_events={projected}");
                     let (embedder, degraded_reason) = load_embedder(&config);
                     let embeddings = search::refresh_embeddings(
                         &store,
@@ -395,12 +380,18 @@ impl Cli {
                         embedder.as_deref(),
                         degraded_reason,
                     )?;
-                    println!(
-                        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
-                        embeddings.embedded,
-                        embeddings.vectors_projected,
-                        embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
-                    );
+                    let output = ImportOutput {
+                        import: stats,
+                        search_projection: SearchProjectionOutput {
+                            projected_events: projected,
+                        },
+                        embeddings,
+                    };
+                    if json {
+                        crate::output::write_success("import", output, Default::default())?;
+                    } else {
+                        print_import_output(&output);
+                    }
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
@@ -444,40 +435,12 @@ impl Cli {
                 .await?;
                 server_task.abort();
             }
-            Command::Status => {
-                let stats = store.stats()?;
-                let embedder = config.embedder.status_without_loading();
-                println!("data_dir={}", config.data_dir.display());
-                println!("db_path={}", store.db_path().display());
-                println!("sources={}", stats.sources);
-                println!("raw_artifacts={}", stats.raw_artifacts);
-                println!("sessions={}", stats.sessions);
-                println!("events={}", stats.events);
-                println!("search_units={}", stats.search_units);
-                println!("embeddings={}", stats.embeddings);
-                println!(
-                    "query_embedder={} semantic={} available={} degraded_reason={}",
-                    embedder.provider,
-                    embedder.semantic,
-                    embedder.available,
-                    embedder
-                        .degraded_reason
-                        .unwrap_or_else(|| "none".to_string())
-                );
-                if std::env::var("SUPER_CASS_PROBE_EMBEDDER").as_deref() == Ok("1") {
-                    match config.embedder.load() {
-                        Ok(loaded) => match loaded.embed_one("super cass query embedder probe") {
-                            Ok(vector) => println!(
-                                "query_embedder_probe=ready model_id={} dims={} semantic={} sample_dims={}",
-                                loaded.model_id(),
-                                loaded.dims(),
-                                loaded.is_semantic(),
-                                vector.len()
-                            ),
-                            Err(err) => println!("query_embedder_probe=degraded reason={err:#}"),
-                        },
-                        Err(err) => println!("query_embedder_probe=degraded reason={err:#}"),
-                    }
+            Command::Status { json } => {
+                let output = status_output(&store, &config)?;
+                if json {
+                    crate::output::write_success("status", output, Default::default())?;
+                } else {
+                    print_status_output(&output);
                 }
             }
         }
@@ -497,12 +460,216 @@ impl Command {
             Command::Import { .. } => "import",
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
-            Command::Status => "status",
+            Command::Status { .. } => "status",
         }
     }
 
     fn wants_structured_errors(&self) -> bool {
-        matches!(self, Command::Search { json: true, .. })
+        matches!(
+            self,
+            Command::Update { json: true, .. }
+                | Command::Search { json: true, .. }
+                | Command::Import { json: true, .. }
+                | Command::Status { json: true, .. }
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateOutput {
+    ingest: ingest::UpdateStats,
+    search_projection: SearchProjectionOutput,
+    embeddings: search::EmbeddingRefresh,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportOutput {
+    import: crate::storage::ImportStats,
+    search_projection: SearchProjectionOutput,
+    embeddings: search::EmbeddingRefresh,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchProjectionOutput {
+    projected_events: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusOutput {
+    data_dir: String,
+    db_path: String,
+    stats: crate::storage::ArchiveStats,
+    query_embedder: crate::embed::EmbedderStatus,
+    query_embedder_probe: Option<EmbedderProbeOutput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct EmbedderProbeOutput {
+    status: EmbedderProbeStatus,
+    model_id: Option<String>,
+    dims: Option<usize>,
+    semantic: Option<bool>,
+    sample_dims: Option<usize>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EmbedderProbeStatus {
+    Ready,
+    Degraded,
+}
+
+fn run_update_once(
+    store: &Store,
+    config: &AppConfig,
+    max_files: Option<usize>,
+    source: Option<String>,
+) -> Result<UpdateOutput> {
+    let ingest = ingest::update_local(
+        store,
+        &config.machine_id,
+        ingest::UpdateOptions { max_files, source },
+    )?;
+    let projected = search::refresh(store)?;
+    let (embedder, degraded_reason) = load_embedder(config);
+    let embeddings = search::refresh_embeddings(
+        store,
+        &config.machine_id,
+        embedder.as_deref(),
+        degraded_reason,
+    )?;
+    Ok(UpdateOutput {
+        ingest,
+        search_projection: SearchProjectionOutput {
+            projected_events: projected,
+        },
+        embeddings,
+    })
+}
+
+fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
+    Ok(StatusOutput {
+        data_dir: config.data_dir.display().to_string(),
+        db_path: store.db_path().display().to_string(),
+        stats: store.stats()?,
+        query_embedder: config.embedder.status_without_loading(),
+        query_embedder_probe: embedder_probe_output(config),
+    })
+}
+
+fn embedder_probe_output(config: &AppConfig) -> Option<EmbedderProbeOutput> {
+    if std::env::var("SUPER_CASS_PROBE_EMBEDDER").as_deref() != Ok("1") {
+        return None;
+    }
+    Some(match config.embedder.load() {
+        Ok(loaded) => match loaded.embed_one("super cass query embedder probe") {
+            Ok(vector) => EmbedderProbeOutput {
+                status: EmbedderProbeStatus::Ready,
+                model_id: Some(loaded.model_id().to_string()),
+                dims: Some(loaded.dims()),
+                semantic: Some(loaded.is_semantic()),
+                sample_dims: Some(vector.len()),
+                reason: None,
+            },
+            Err(err) => degraded_probe(err),
+        },
+        Err(err) => degraded_probe(err),
+    })
+}
+
+fn degraded_probe(err: impl std::fmt::Display) -> EmbedderProbeOutput {
+    EmbedderProbeOutput {
+        status: EmbedderProbeStatus::Degraded,
+        model_id: None,
+        dims: None,
+        semantic: None,
+        sample_dims: None,
+        reason: Some(format!("{err:#}")),
+    }
+}
+
+fn print_update_output(output: &UpdateOutput) {
+    println!(
+        "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={}",
+        output.ingest.files_seen,
+        output.ingest.skipped_unchanged,
+        output.ingest.inserted,
+        output.ingest.duplicates,
+        output.ingest.errors
+    );
+    println!(
+        "projection=search_rrf_v1 projected_events={}",
+        output.search_projection.projected_events
+    );
+    println!(
+        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+        output.embeddings.embedded,
+        output.embeddings.vectors_projected,
+        output
+            .embeddings
+            .degraded_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    );
+}
+
+fn print_import_output(output: &ImportOutput) {
+    println!(
+        "imported={} duplicates={} inserted_vectors={}",
+        output.import.inserted, output.import.duplicates, output.import.vectors_projected
+    );
+    println!(
+        "projection=search_rrf_v1 projected_events={}",
+        output.search_projection.projected_events
+    );
+    println!(
+        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+        output.embeddings.embedded,
+        output.embeddings.vectors_projected,
+        output
+            .embeddings
+            .degraded_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    );
+}
+
+fn print_status_output(output: &StatusOutput) {
+    println!("data_dir={}", output.data_dir);
+    println!("db_path={}", output.db_path);
+    println!("sources={}", output.stats.sources);
+    println!("raw_artifacts={}", output.stats.raw_artifacts);
+    println!("sessions={}", output.stats.sessions);
+    println!("events={}", output.stats.events);
+    println!("search_units={}", output.stats.search_units);
+    println!("embeddings={}", output.stats.embeddings);
+    println!(
+        "query_embedder={} semantic={} available={} degraded_reason={}",
+        output.query_embedder.provider,
+        output.query_embedder.semantic,
+        output.query_embedder.available,
+        output
+            .query_embedder
+            .degraded_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    );
+    if let Some(probe) = &output.query_embedder_probe {
+        match probe.status {
+            EmbedderProbeStatus::Ready => println!(
+                "query_embedder_probe=ready model_id={} dims={} semantic={} sample_dims={}",
+                probe.model_id.as_deref().unwrap_or("unknown"),
+                probe.dims.unwrap_or(0),
+                probe.semantic.unwrap_or(false),
+                probe.sample_dims.unwrap_or(0)
+            ),
+            EmbedderProbeStatus::Degraded => println!(
+                "query_embedder_probe=degraded reason={}",
+                probe.reason.as_deref().unwrap_or("unknown")
+            ),
+        }
     }
 }
 

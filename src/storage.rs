@@ -18,7 +18,7 @@ pub struct Store {
     blob_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
