@@ -517,6 +517,41 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
+    fn raw_artifact_current_query_plan(&self) -> Result<String> {
+        self.with_conn(|conn| {
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 SELECT size, mtime_ms
+                 FROM raw_artifacts
+                 WHERE path = ?1
+                 ORDER BY first_seen_at DESC
+                 LIMIT 1",
+                ["/tmp/fixture.jsonl"],
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn search_index_missing_rows_query_plan(&self) -> Result<String> {
+        self.with_conn(|conn| {
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 SELECT e.id
+                 FROM events e
+                 LEFT JOIN event_embeddings emb
+                   ON emb.event_id = e.id AND emb.model = ?1
+                 WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                   AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                   AND emb.event_id IS NULL
+                 ORDER BY e.session_id, e.ordinal, e.id",
+                ["hash-embed-v1"],
+            )
+        })
+    }
+
     pub fn session_workspace_metadata_missing_for_path(&self, path: &str) -> Result<bool> {
         self.with_conn(|conn| {
             let exists: i64 = conn.query_row(
@@ -1678,6 +1713,17 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+#[cfg(test)]
+fn query_plan<const N: usize>(conn: &Connection, sql: &str, params: [&str; N]) -> Result<String> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, String>(3))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out.join("\n"))
+}
+
 fn count_indexed_events(conn: &Connection, model: &str) -> Result<usize> {
     let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
     let embedding_count: i64 = conn.query_row(
@@ -1883,6 +1929,28 @@ mod tests {
         assert_eq!(first.duplicates, 0);
         assert_eq!(second.inserted, 0);
         assert_eq!(second.duplicates, records.len());
+    }
+
+    #[test]
+    fn update_hot_path_query_plans_are_visible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+
+        let raw_plan = store
+            .raw_artifact_current_query_plan()
+            .expect("raw artifact plan");
+        let index_plan = store
+            .search_index_missing_rows_query_plan()
+            .expect("search index plan");
+
+        assert!(
+            raw_plan.contains("SCAN raw_artifacts"),
+            "unexpected raw artifact freshness plan:\n{raw_plan}"
+        );
+        assert!(
+            index_plan.contains("SCAN e") || index_plan.contains("SCAN events"),
+            "unexpected search index missing-row plan:\n{index_plan}"
+        );
     }
 
     #[test]

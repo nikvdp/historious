@@ -855,6 +855,7 @@ fn file_mtime_ms(metadata: &fs::Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Store;
 
     #[test]
     fn indexes_user_message_text() {
@@ -1007,5 +1008,60 @@ mod tests {
         assert_eq!(metadata["git_branch"], "main");
         assert_eq!(metadata["workspace"]["path"], "/repo");
         assert_eq!(metadata["workspace"]["source"], "payload.cwd");
+    }
+
+    #[test]
+    fn append_like_ingest_reports_small_deltas_for_changed_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("session.jsonl");
+        fs::write(&log_path, fixture_line("session-1", "first question")).expect("write first log");
+
+        let first =
+            ingest_file(&store, "machine_fixture", "codex", &log_path).expect("first ingest");
+        let metadata = fs::metadata(&log_path).expect("first metadata");
+        let current = store
+            .raw_artifact_is_current(
+                &log_path.to_string_lossy(),
+                metadata.len(),
+                file_mtime_ms(&metadata),
+            )
+            .expect("freshness check");
+
+        assert_eq!(first.inserted, 3);
+        assert_eq!(first.duplicates, 0);
+        assert!(current);
+
+        fs::write(
+            &log_path,
+            format!(
+                "{}{}",
+                fixture_line("session-1", "first question"),
+                fixture_line("session-1", "second question")
+            ),
+        )
+        .expect("append second log line");
+        let second =
+            ingest_file(&store, "machine_fixture", "codex", &log_path).expect("second ingest");
+        let stats = store.stats().expect("stats");
+
+        assert_eq!(second.inserted, 2);
+        assert_eq!(second.duplicates, 2);
+        assert_eq!(stats.raw_artifacts, 2);
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.events, 2);
+    }
+
+    fn fixture_line(session_id: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "session_id": session_id,
+                "type": "message",
+                "role": "user",
+                "content": text,
+                "timestamp": "2026-06-03T00:00:00Z"
+            })
+        )
     }
 }
