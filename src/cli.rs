@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -123,7 +123,7 @@ pub enum Command {
         #[arg(
             long,
             default_value = DEFAULT_SERVER_URL,
-            help = "Base URL for a running `super-cass serve` process"
+            help = "Base URL for the local search server; tui starts it when needed"
         )]
         server: String,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
@@ -2313,7 +2313,7 @@ fn run_tui_search(
 ) -> Result<()> {
     ensure_fzf_available()?;
     ensure_curl_available()?;
-    ensure_server_available(server)?;
+    let _server = ensure_server_available(config, server)?;
     let reload = tui_reload_command(server, limit, sort, recency_bias, after, before)?;
     let preview = fzf_preview_command(config, color);
     let open = fzf_open_command(config, color);
@@ -2427,12 +2427,38 @@ fn ensure_fzf_available() -> Result<()> {
 
 fn ensure_curl_available() -> Result<()> {
     if !command_exists("curl") {
-        bail!("curl is not installed; tui uses curl to query `super-cass serve`");
+        bail!("curl is not installed; tui uses curl to query the local search server");
     }
     Ok(())
 }
 
-fn ensure_server_available(server: &str) -> Result<()> {
+struct StartedServer {
+    child: Child,
+}
+
+impl Drop for StartedServer {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn ensure_server_available(config: &AppConfig, server: &str) -> Result<Option<StartedServer>> {
+    if server_health_available(server)? {
+        return Ok(None);
+    }
+    let Some(bind) = local_server_bind_addr(server) else {
+        let health_url = server_url(server, "health")?;
+        bail!("could not reach super-cass server at {health_url}");
+    };
+    let mut started = start_local_server(config, &bind)?;
+    wait_for_started_server(server, &mut started)?;
+    Ok(Some(started))
+}
+
+fn server_health_available(server: &str) -> Result<bool> {
     let health_url = server_url(server, "health")?;
     let status = ProcessCommand::new("curl")
         .arg("-fsS")
@@ -2442,12 +2468,37 @@ fn ensure_server_available(server: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    if !status.success() {
-        bail!(
-            "could not reach super-cass server at {health_url}; start one with `super-cass serve`"
-        );
+    Ok(status.success())
+}
+
+fn start_local_server(config: &AppConfig, bind: &str) -> Result<StartedServer> {
+    eprintln!("Starting local super-cass server at {bind}...");
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("super-cass"));
+    let child = ProcessCommand::new(exe)
+        .arg("--data-dir")
+        .arg(&config.data_dir)
+        .arg("serve")
+        .arg("--bind")
+        .arg(bind)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(StartedServer { child })
+}
+
+fn wait_for_started_server(server: &str, started: &mut StartedServer) -> Result<()> {
+    for _ in 0..40 {
+        if server_health_available(server)? {
+            return Ok(());
+        }
+        if let Some(status) = started.child.try_wait()? {
+            bail!("local super-cass server exited before it became ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    Ok(())
+    let health_url = server_url(server, "health")?;
+    bail!("local super-cass server did not become ready at {health_url}")
 }
 
 fn server_url(server: &str, path: &str) -> Result<String> {
@@ -2456,6 +2507,26 @@ fn server_url(server: &str, path: &str) -> Result<String> {
         bail!("server URL cannot be empty");
     }
     Ok(format!("{}/{}", server.trim_end_matches('/'), path))
+}
+
+fn local_server_bind_addr(server: &str) -> Option<String> {
+    let server = server.trim().trim_end_matches('/');
+    let without_scheme = server
+        .strip_prefix("http://")
+        .or_else(|| server.strip_prefix("https://"))?;
+    if without_scheme.contains('/') {
+        return None;
+    }
+    if let Some(rest) = without_scheme.strip_prefix("127.0.0.1:") {
+        return Some(format!("127.0.0.1:{rest}"));
+    }
+    if let Some(rest) = without_scheme.strip_prefix("localhost:") {
+        return Some(format!("127.0.0.1:{rest}"));
+    }
+    if let Some(rest) = without_scheme.strip_prefix("[::1]:") {
+        return Some(format!("[::1]:{rest}"));
+    }
+    None
 }
 
 fn preview_scroll_bind(key: &str, action: &str, count: usize) -> String {
@@ -3045,6 +3116,24 @@ mod tests {
         assert!(command.contains("sort=newest"));
         assert!(command.contains("recency_bias=0.25"));
         assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn tui_auto_start_only_targets_local_servers() {
+        assert_eq!(
+            local_server_bind_addr("http://127.0.0.1:7391").as_deref(),
+            Some("127.0.0.1:7391")
+        );
+        assert_eq!(
+            local_server_bind_addr("http://localhost:7391").as_deref(),
+            Some("127.0.0.1:7391")
+        );
+        assert_eq!(
+            local_server_bind_addr("http://[::1]:7391").as_deref(),
+            Some("[::1]:7391")
+        );
+        assert_eq!(local_server_bind_addr("https://example.com:7391"), None);
+        assert_eq!(local_server_bind_addr("http://127.0.0.1:7391/path"), None);
     }
 
     #[test]
