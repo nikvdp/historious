@@ -102,20 +102,20 @@ pub enum Command {
         no_color: bool,
         #[arg(
             long,
-            help = "Browse this query's fixed result set with fzf; use live-search for live querying"
+            help = "Browse this query's fixed result set with fzf; use tui for the interactive terminal UI"
         )]
         fzf: bool,
         #[arg(long, hide = true)]
         fzf_rows: bool,
     },
-    /// Search through a running local server with a live fzf picker.
-    LiveSearch {
+    /// Open the interactive terminal search UI.
+    Tui {
         #[arg(help = "Initial query for the picker")]
         query: Option<String>,
         #[arg(
             short,
             long,
-            help = "Maximum number of live results to show",
+            help = "Maximum number of results to show",
             default_value_t = DEFAULT_LIVE_SEARCH_LIMIT
         )]
         limit: usize,
@@ -408,7 +408,7 @@ impl Cli {
                 let limit = search_limit(limit, fzf);
                 let query = query.unwrap_or_default();
                 if query.trim().is_empty() && fzf {
-                    bail!("search --fzf requires a query; use `super-cass live-search` for live interactive search");
+                    bail!("search --fzf requires a query; use `super-cass tui` for live interactive search");
                 }
                 if query.trim().is_empty() && !fzf_rows {
                     bail!("search requires a query");
@@ -477,7 +477,7 @@ impl Cli {
                     print_search_results(&query, &response.results, &refs, &columns, color);
                 }
             }
-            Command::LiveSearch {
+            Command::Tui {
                 query,
                 limit,
                 server,
@@ -488,13 +488,13 @@ impl Cli {
                 no_color,
             } => {
                 if robot {
-                    bail!("--robot cannot be combined with live-search");
+                    bail!("--robot cannot be combined with tui");
                 }
                 let after_bound =
                     parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
                 let before_bound =
                     parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
-                run_live_fzf_search(
+                run_tui_search(
                     &config,
                     query.as_deref().unwrap_or_default(),
                     &server,
@@ -711,7 +711,7 @@ impl Command {
         match self {
             Command::Update { .. } => "update",
             Command::Search { .. } => "search",
-            Command::LiveSearch { .. } => "live-search",
+            Command::Tui { .. } => "tui",
             Command::Show { .. } => "show",
             Command::Expand { .. } => "expand",
             Command::Transcript { .. } => "transcript",
@@ -1853,7 +1853,7 @@ fn run_static_fzf_search(config: &AppConfig, query: &str, rows: &str, color: boo
     Ok(())
 }
 
-fn run_live_fzf_search(
+fn run_tui_search(
     config: &AppConfig,
     query: &str,
     server: &str,
@@ -1867,7 +1867,7 @@ fn run_live_fzf_search(
     ensure_fzf_available()?;
     ensure_curl_available()?;
     ensure_server_available(server)?;
-    let reload = live_search_reload_command(server, limit, sort, recency_bias, after, before)?;
+    let reload = tui_reload_command(server, limit, sort, recency_bias, after, before)?;
     let preview = fzf_preview_command(config, color);
     let open = fzf_open_command(config, color);
     let mut child = base_fzf_command()
@@ -1938,7 +1938,7 @@ fn fzf_open_command(config: &AppConfig, color: bool) -> String {
     format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}")
 }
 
-fn live_search_reload_command(
+fn tui_reload_command(
     server: &str,
     limit: usize,
     sort: SearchSort,
@@ -1980,7 +1980,7 @@ fn ensure_fzf_available() -> Result<()> {
 
 fn ensure_curl_available() -> Result<()> {
     if !command_exists("curl") {
-        bail!("curl is not installed; live-search uses curl to query `super-cass serve`");
+        bail!("curl is not installed; tui uses curl to query `super-cass serve`");
     }
     Ok(())
 }
@@ -2534,16 +2534,15 @@ mod tests {
     }
 
     #[test]
-    fn live_search_accepts_missing_starting_query() {
-        let cli =
-            Cli::try_parse_from(["super-cass", "live-search"]).expect("parse live fzf search");
+    fn tui_accepts_missing_starting_query() {
+        let cli = Cli::try_parse_from(["super-cass", "tui"]).expect("parse tui search");
 
         match cli.command {
-            Command::LiveSearch { query, limit, .. } => {
+            Command::Tui { query, limit, .. } => {
                 assert_eq!(query, None);
                 assert_eq!(limit, DEFAULT_LIVE_SEARCH_LIMIT);
             }
-            _ => panic!("expected live-search command"),
+            _ => panic!("expected tui command"),
         }
     }
 
@@ -2585,7 +2584,7 @@ mod tests {
         let after = DateTime::parse_from_rfc3339("2026-04-20T00:00:00Z")
             .expect("after")
             .with_timezone(&Utc);
-        let command = live_search_reload_command(
+        let command = tui_reload_command(
             DEFAULT_SERVER_URL,
             25,
             SearchSort::Newest,
