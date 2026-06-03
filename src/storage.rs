@@ -35,6 +35,12 @@ pub struct ArchiveStats {
     pub embeddings: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SourceFileStatus {
+    pub raw_current: bool,
+    pub needs_workspace_refresh: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EventForProjection {
     pub id: String,
@@ -491,29 +497,30 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn raw_artifact_is_current(
         &self,
         path: &str,
         size: u64,
         mtime_ms: Option<i64>,
     ) -> Result<bool> {
+        self.with_conn(|conn| raw_artifact_is_current(conn, path, size, mtime_ms))
+    }
+
+    pub fn source_file_status(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ms: Option<i64>,
+    ) -> Result<SourceFileStatus> {
         self.with_conn(|conn| {
-            let existing: Option<(i64, Option<i64>)> = conn
-                .query_row(
-                    "SELECT size, mtime_ms
-                     FROM raw_artifacts
-                     WHERE path = ?1
-                     ORDER BY first_seen_at DESC
-                     LIMIT 1",
-                    params![path],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            Ok(existing
-                .map(|(stored_size, stored_mtime)| {
-                    stored_size == size as i64 && stored_mtime == mtime_ms
-                })
-                .unwrap_or(false))
+            let raw_current = raw_artifact_is_current(conn, path, size, mtime_ms)?;
+            let needs_workspace_refresh =
+                raw_current && session_workspace_metadata_missing_for_path(conn, path)?;
+            Ok(SourceFileStatus {
+                raw_current,
+                needs_workspace_refresh,
+            })
         })
     }
 
@@ -552,20 +559,26 @@ impl Store {
         })
     }
 
-    pub fn session_workspace_metadata_missing_for_path(&self, path: &str) -> Result<bool> {
+    #[cfg(test)]
+    fn workspace_refresh_query_plan(&self) -> Result<String> {
         self.with_conn(|conn| {
-            let exists: i64 = conn.query_row(
-                "SELECT EXISTS(
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
                    SELECT 1
                    FROM sessions
                    WHERE json_extract(metadata_json, '$.path') = ?1
                      AND json_extract(metadata_json, '$.workspace_path') IS NULL
                  )",
-                params![path],
-                |row| row.get(0),
-            )?;
-            Ok(exists != 0)
+                ["/tmp/fixture.jsonl"],
+            )
         })
+    }
+
+    #[cfg(test)]
+    pub fn session_workspace_metadata_missing_for_path(&self, path: &str) -> Result<bool> {
+        self.with_conn(|conn| session_workspace_metadata_missing_for_path(conn, path))
     }
 
     pub fn refresh_search_index(
@@ -1319,6 +1332,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_artifacts_source
           ON raw_artifacts(source_id);
 
+        CREATE INDEX IF NOT EXISTS idx_raw_artifacts_path_first_seen
+          ON raw_artifacts(path, first_seen_at DESC);
+
         CREATE TABLE IF NOT EXISTS sessions (
           id TEXT PRIMARY KEY,
           source_id TEXT NOT NULL,
@@ -1338,6 +1354,12 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_sessions_workspace_path
           ON sessions(json_extract(metadata_json, '$.workspace_path'));
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_metadata_path_workspace
+          ON sessions(
+            json_extract(metadata_json, '$.path'),
+            json_extract(metadata_json, '$.workspace_path')
+          );
 
         CREATE TABLE IF NOT EXISTS events (
           id TEXT PRIMARY KEY,
@@ -1713,6 +1735,42 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+fn raw_artifact_is_current(
+    conn: &Connection,
+    path: &str,
+    size: u64,
+    mtime_ms: Option<i64>,
+) -> Result<bool> {
+    let existing: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT size, mtime_ms
+             FROM raw_artifacts
+             WHERE path = ?1
+             ORDER BY first_seen_at DESC
+             LIMIT 1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(existing
+        .map(|(stored_size, stored_mtime)| stored_size == size as i64 && stored_mtime == mtime_ms)
+        .unwrap_or(false))
+}
+
+fn session_workspace_metadata_missing_for_path(conn: &Connection, path: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM sessions
+           WHERE json_extract(metadata_json, '$.path') = ?1
+             AND json_extract(metadata_json, '$.workspace_path') IS NULL
+         )",
+        params![path],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 #[cfg(test)]
 fn query_plan<const N: usize>(conn: &Connection, sql: &str, params: [&str; N]) -> Result<String> {
     let mut stmt = conn.prepare(sql)?;
@@ -1939,13 +1997,20 @@ mod tests {
         let raw_plan = store
             .raw_artifact_current_query_plan()
             .expect("raw artifact plan");
+        let workspace_plan = store
+            .workspace_refresh_query_plan()
+            .expect("workspace refresh plan");
         let index_plan = store
             .search_index_missing_rows_query_plan()
             .expect("search index plan");
 
         assert!(
-            raw_plan.contains("SCAN raw_artifacts"),
+            raw_plan.contains("SEARCH raw_artifacts"),
             "unexpected raw artifact freshness plan:\n{raw_plan}"
+        );
+        assert!(
+            workspace_plan.contains("SEARCH sessions"),
+            "unexpected workspace refresh plan:\n{workspace_plan}"
         );
         assert!(
             index_plan.contains("SCAN e") || index_plan.contains("SCAN events"),
