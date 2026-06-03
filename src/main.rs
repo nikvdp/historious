@@ -6,6 +6,7 @@ mod ingest;
 mod output;
 mod search;
 mod server;
+mod skills;
 mod storage;
 mod transcript;
 mod transport;
