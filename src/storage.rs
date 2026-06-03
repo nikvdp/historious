@@ -10,6 +10,8 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const RECENT_RESULT_REF_LIMIT: usize = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct Store {
     db_path: PathBuf,
@@ -84,6 +86,15 @@ pub struct TranscriptContext {
     pub target_event: EventRecord,
     pub events: Vec<EventRecord>,
     pub target_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentResultRefInput {
+    pub event_id: String,
+    pub session_id: String,
+    pub source_kind: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -795,6 +806,36 @@ impl Store {
         })
     }
 
+    pub fn record_recent_result_refs(
+        &self,
+        results: &[RecentResultRefInput],
+    ) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut refs = Vec::with_capacity(results.len());
+            for result in results {
+                refs.push(upsert_recent_result_ref(&tx, result)?);
+            }
+            prune_recent_result_refs(&tx, RECENT_RESULT_REF_LIMIT)?;
+            tx.commit()?;
+            Ok(refs)
+        })
+    }
+
+    pub fn event_id_for_recent_ref(&self, ref_id: &str) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT event_id
+                 FROM recent_result_refs
+                 WHERE ref = ?1",
+                params![ref_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
     pub fn search_units_missing_embedding(
         &self,
         model_id: &str,
@@ -946,6 +987,111 @@ fn events_for_session(conn: &Connection, session_id: &str) -> Result<Vec<EventRe
         out.push(row?);
     }
     Ok(out)
+}
+
+fn upsert_recent_result_ref(conn: &Connection, result: &RecentResultRefInput) -> Result<String> {
+    let now = Utc::now().to_rfc3339();
+    if let Some(existing_ref) = conn
+        .query_row(
+            "SELECT ref
+             FROM recent_result_refs
+             WHERE event_id = ?1",
+            params![result.event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if !valid_recent_ref_shape(&existing_ref) {
+            conn.execute(
+                "DELETE FROM recent_result_refs WHERE event_id = ?1",
+                params![result.event_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE recent_result_refs
+             SET session_id = ?2,
+                 source_kind = ?3,
+                 occurred_at = ?4,
+                 preview = ?5,
+                 last_seen_at = ?6,
+                 hit_count = hit_count + 1
+             WHERE event_id = ?1",
+                params![
+                    result.event_id,
+                    result.session_id,
+                    result.source_kind,
+                    opt_dt(result.occurred_at),
+                    result.preview,
+                    now
+                ],
+            )?;
+            return Ok(existing_ref);
+        }
+    }
+
+    let hash = crate::archive::blake3_hex(result.event_id.as_bytes());
+    let seed = hash.strip_prefix("blake3:").unwrap_or(&hash);
+    for len in 4..=16 {
+        let candidate = seed[..len].to_string();
+        let existing_event = conn
+            .query_row(
+                "SELECT event_id
+                 FROM recent_result_refs
+                 WHERE ref = ?1",
+                params![candidate],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_event.as_deref() == Some(result.event_id.as_str()) {
+            return Ok(candidate);
+        }
+        if existing_event.is_some() {
+            continue;
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO recent_result_refs
+             (ref, event_id, session_id, source_kind, occurred_at, preview,
+              first_seen_at, last_seen_at, hit_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
+            params![
+                candidate,
+                result.event_id,
+                result.session_id,
+                result.source_kind,
+                opt_dt(result.occurred_at),
+                result.preview,
+                now
+            ],
+        )?;
+        if inserted > 0 {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not allocate recent search ref for event {}",
+        result.event_id
+    )
+}
+
+fn valid_recent_ref_shape(ref_id: &str) -> bool {
+    (4..=16).contains(&ref_id.len())
+        && ref_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+}
+
+fn prune_recent_result_refs(conn: &Connection, limit: usize) -> Result<()> {
+    conn.execute(
+        "DELETE FROM recent_result_refs
+         WHERE ref NOT IN (
+           SELECT ref
+           FROM recent_result_refs
+           ORDER BY last_seen_at DESC, ref ASC
+           LIMIT ?1
+         )",
+        params![limit as i64],
+    )?;
+    Ok(())
 }
 
 fn normalized_ids(ids: &[String]) -> Vec<String> {
@@ -1199,6 +1345,21 @@ fn migrate(conn: &Connection) -> Result<()> {
           vector_json TEXT NOT NULL,
           PRIMARY KEY (event_id, model)
         );
+
+        CREATE TABLE IF NOT EXISTS recent_result_refs (
+          ref TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL UNIQUE,
+          session_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          occurred_at TEXT,
+          preview TEXT NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          hit_count INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_recent_result_refs_last_seen
+          ON recent_result_refs(last_seen_at);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings_384
           USING vec0(embedding float[384]);
@@ -1785,8 +1946,7 @@ mod tests {
         let session = fixture_session("session_transcript", &source.id);
         let mut first = fixture_event("event_first", &session.id, &source.id, 10, None, "hash_1");
         first.content = "first message".to_string();
-        let mut middle =
-            fixture_event("event_middle", &session.id, &source.id, 20, None, "hash_2");
+        let mut middle = fixture_event("event_middle", &session.id, &source.id, 20, None, "hash_2");
         middle.content = "middle message".to_string();
         let mut last = fixture_event("event_last", &session.id, &source.id, 30, None, "hash_3");
         last.content = "last message".to_string();
@@ -1819,7 +1979,10 @@ mod tests {
         assert_eq!(loaded_session.id, session.id);
         assert_eq!(loaded_event.content, "middle message");
         assert_eq!(
-            events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["event_first", "event_middle", "event_last"]
         );
         assert_eq!(context.session.id, session.id);
@@ -1876,6 +2039,50 @@ mod tests {
 
         assert_eq!(unit.event_id, "event_vector");
         assert_eq!(unit.session_id, "session_vector");
+    }
+
+    #[test]
+    fn recent_result_refs_reuse_event_mapping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let input = fixture_recent_ref_input("event_recent_a");
+
+        let first = store
+            .record_recent_result_refs(std::slice::from_ref(&input))
+            .expect("first refs");
+        let second = store
+            .record_recent_result_refs(std::slice::from_ref(&input))
+            .expect("second refs");
+        let event_id = store
+            .event_id_for_recent_ref(&first[0])
+            .expect("lookup ref")
+            .expect("ref exists");
+
+        assert_eq!(first, second);
+        assert_eq!(first[0].len(), 4);
+        assert_eq!(event_id, "event_recent_a");
+    }
+
+    #[test]
+    fn recent_result_refs_allocate_distinct_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let inputs = vec![
+            fixture_recent_ref_input("event_recent_a"),
+            fixture_recent_ref_input("event_recent_b"),
+        ];
+
+        let refs = store.record_recent_result_refs(&inputs).expect("refs");
+
+        assert_eq!(refs.len(), 2);
+        assert_ne!(refs[0], refs[1]);
+        assert_eq!(
+            store
+                .event_id_for_recent_ref(&refs[1])
+                .expect("lookup ref")
+                .expect("ref exists"),
+            "event_recent_b"
+        );
     }
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
@@ -1987,6 +2194,16 @@ mod tests {
             occurred_at: None,
             metadata: json!({"fixture": true}),
             hash,
+        }
+    }
+
+    fn fixture_recent_ref_input(event_id: &str) -> RecentResultRefInput {
+        RecentResultRefInput {
+            event_id: event_id.to_string(),
+            session_id: "session_recent".to_string(),
+            source_kind: "codex".to_string(),
+            occurred_at: None,
+            preview: format!("preview for {event_id}"),
         }
     }
 
