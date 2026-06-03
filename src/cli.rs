@@ -42,6 +42,8 @@ pub enum Command {
         max_files: Option<usize>,
         #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
+        #[arg(long, help = "Fully reconcile derived search and vector indexes")]
+        repair: bool,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
@@ -314,13 +316,14 @@ impl Cli {
             Command::Update {
                 max_files,
                 source,
+                repair,
                 json,
             } => {
                 if json || robot {
-                    let output = run_update_once(&store, &config, max_files, source)?;
+                    let output = run_update_once(&store, &config, max_files, source, repair)?;
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
-                    let output = run_update_once_human(&store, &config, max_files, source)?;
+                    let output = run_update_once_human(&store, &config, max_files, source, repair)?;
                     print_update_output(&output, std::io::stdout().is_terminal());
                 }
             }
@@ -814,19 +817,15 @@ fn run_update_once(
     config: &AppConfig,
     max_files: Option<usize>,
     source: Option<String>,
+    repair: bool,
 ) -> Result<UpdateOutput> {
     let ingest = ingest::update_local(
         store,
         &config.machine_id,
         ingest::UpdateOptions { max_files, source },
     )?;
-    let projected = search::refresh_incremental(store, &ingest.delta)?;
-    let embeddings = search::refresh_embeddings_incremental(
-        store,
-        &config.machine_id,
-        &config.embedder,
-        &ingest.delta,
-    )?;
+    let projected = refresh_search_after_update(store, &ingest.delta, repair)?;
+    let embeddings = refresh_embeddings_after_update(store, config, &ingest.delta, repair)?;
     Ok(UpdateOutput {
         ingest,
         search_index: SearchIndexOutput {
@@ -841,6 +840,7 @@ fn run_update_once_human(
     config: &AppConfig,
     max_files: Option<usize>,
     source: Option<String>,
+    repair: bool,
 ) -> Result<UpdateOutput> {
     let progress = ProgressUi::new();
     let scan = progress.phase("Scanning local agent logs");
@@ -855,17 +855,20 @@ fn run_update_once_human(
         format_count(ingest.inserted)
     ));
 
-    let index = progress.phase("Updating search index");
-    let projected = search::refresh_incremental(store, &ingest.delta)?;
+    let index = progress.phase(if repair {
+        "Repairing search index"
+    } else {
+        "Updating search index"
+    });
+    let projected = refresh_search_after_update(store, &ingest.delta, repair)?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
-    let embed = progress.phase("Updating embeddings");
-    let embeddings = search::refresh_embeddings_incremental(
-        store,
-        &config.machine_id,
-        &config.embedder,
-        &ingest.delta,
-    )?;
+    let embed = progress.phase(if repair {
+        "Repairing embeddings"
+    } else {
+        "Updating embeddings"
+    });
+    let embeddings = refresh_embeddings_after_update(store, config, &ingest.delta, repair)?;
     embed.finish(embedding_phase_detail(&embeddings));
 
     Ok(UpdateOutput {
@@ -875,6 +878,37 @@ fn run_update_once_human(
         },
         embeddings,
     })
+}
+
+fn refresh_search_after_update(
+    store: &Store,
+    delta: &crate::storage::ImportDelta,
+    repair: bool,
+) -> Result<usize> {
+    if repair {
+        search::refresh(store)
+    } else {
+        search::refresh_incremental(store, delta)
+    }
+}
+
+fn refresh_embeddings_after_update(
+    store: &Store,
+    config: &AppConfig,
+    delta: &crate::storage::ImportDelta,
+    repair: bool,
+) -> Result<search::EmbeddingRefresh> {
+    if repair {
+        let (embedder, degraded_reason) = load_embedder(config);
+        search::refresh_embeddings(
+            store,
+            &config.machine_id,
+            embedder.as_deref(),
+            degraded_reason,
+        )
+    } else {
+        search::refresh_embeddings_incremental(store, &config.machine_id, &config.embedder, delta)
+    }
 }
 
 fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
