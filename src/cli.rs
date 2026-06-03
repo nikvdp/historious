@@ -820,7 +820,7 @@ fn run_update_once(
         &config.machine_id,
         ingest::UpdateOptions { max_files, source },
     )?;
-    let projected = search::refresh(store)?;
+    let projected = search::refresh_incremental(store, &ingest.delta)?;
     let (embedder, degraded_reason) = load_embedder(config);
     let embeddings = search::refresh_embeddings(
         store,
@@ -857,7 +857,7 @@ fn run_update_once_human(
     ));
 
     let index = progress.phase("Updating search index");
-    let projected = search::refresh(store)?;
+    let projected = search::refresh_incremental(store, &ingest.delta)?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
@@ -881,7 +881,7 @@ fn run_update_once_human(
 
 fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let stats = transport::import_jsonl_path(store, input)?;
-    let projected = search::refresh(store)?;
+    let projected = search::refresh_incremental(store, &stats.delta)?;
     let (embedder, degraded_reason) = load_embedder(config);
     let embeddings = search::refresh_embeddings(
         store,
@@ -909,7 +909,7 @@ fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Resu
     ));
 
     let index = progress.phase("Updating search index");
-    let projected = search::refresh(store)?;
+    let projected = search::refresh_incremental(store, &stats.delta)?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
@@ -1946,7 +1946,7 @@ async fn run_daemon(
         ));
 
         let index = progress.phase("Updating search index");
-        let projected = search::refresh(store)?;
+        let projected = search::refresh_incremental(store, &stats.delta)?;
         index.finish(format!("{} events indexed", format_count(projected)));
 
         let embed = progress.phase("Updating embeddings");

@@ -1,5 +1,5 @@
 use crate::embed::Embedder;
-use crate::storage::{SearchRow, Store, VectorSearchRow};
+use crate::storage::{ImportDelta, SearchRow, Store, VectorSearchRow};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -74,6 +74,15 @@ pub fn refresh(store: &Store) -> Result<usize> {
     store.refresh_search_index(
         crate::embed::HashEmbedder::MODEL_ID,
         crate::embed::HashEmbedder::DIMS,
+        crate::embed::hash_embed,
+    )
+}
+
+pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
+    store.refresh_search_index_for_events(
+        crate::embed::HashEmbedder::MODEL_ID,
+        crate::embed::HashEmbedder::DIMS,
+        &delta.inserted_events,
         crate::embed::hash_embed,
     )
 }
@@ -383,7 +392,7 @@ mod tests {
         stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, SearchUnitRecord,
         SessionRecord, SourceRecord,
     };
-    use crate::storage::{f32_vector_to_blob, Store};
+    use crate::storage::{f32_vector_to_blob, ImportDelta, Store};
     use chrono::Utc;
     use serde_json::json;
 
@@ -568,7 +577,52 @@ mod tests {
         assert_eq!(store.stats().expect("stats").embeddings, 0);
     }
 
+    #[test]
+    fn refresh_incremental_indexes_inserted_event_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let (event_id, delta) = import_event_only(&store, "delta indexed phrase");
+
+        let indexed = refresh_incremental(&store, &delta).expect("incremental refresh");
+        let response = search(
+            &store,
+            "delta indexed",
+            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(indexed, 1);
+        assert_eq!(delta.inserted_events, vec![event_id.clone()]);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, event_id);
+    }
+
     fn import_event_and_project(store: &Store, search_text: &str) -> SearchUnitRecord {
+        let (event_id, delta) = import_event_only(store, search_text);
+        refresh_incremental(store, &delta).expect("refresh projection");
+
+        let text_hash = crate::archive::blake3_hex(search_text.as_bytes());
+        let unit_id = stable_id(&["search_unit", &event_id, &text_hash]);
+        SearchUnitRecord {
+            id: unit_id,
+            event_id,
+            session_id: stable_id(&["session", search_text]),
+            source_id: stable_id(&["source", search_text]),
+            machine_id: "machine_fixture".to_string(),
+            source_kind: "fixture".to_string(),
+            role: Some("assistant".to_string()),
+            search_kind: "assistant".to_string(),
+            text: search_text.to_string(),
+            text_hash,
+            occurred_at: None,
+            metadata: json!({}),
+            hash: "unused".to_string(),
+        }
+    }
+
+    fn import_event_only(store: &Store, search_text: &str) -> (String, ImportDelta) {
         let source = SourceRecord {
             id: stable_id(&["source", search_text]),
             kind: "fixture".to_string(),
@@ -612,32 +666,14 @@ mod tests {
             }),
             hash: event_hash,
         };
-        store
+        let stats = store
             .import_records(&[
                 ArchiveRecord::Source(source),
                 ArchiveRecord::Session(session),
                 ArchiveRecord::Event(event),
             ])
             .expect("import fixture event");
-        refresh(store).expect("refresh projection");
-
-        let text_hash = crate::archive::blake3_hex(search_text.as_bytes());
-        let unit_id = stable_id(&["search_unit", &event_id, &text_hash]);
-        SearchUnitRecord {
-            id: unit_id,
-            event_id,
-            session_id: stable_id(&["session", search_text]),
-            source_id: stable_id(&["source", search_text]),
-            machine_id: "machine_fixture".to_string(),
-            source_kind: "fixture".to_string(),
-            role: Some("assistant".to_string()),
-            search_kind: "assistant".to_string(),
-            text: search_text.to_string(),
-            text_hash,
-            occurred_at: None,
-            metadata: json!({}),
-            hash: "unused".to_string(),
-        }
+        (event_id, stats.delta)
     }
 
     fn fixture_embedding(unit: &SearchUnitRecord, vector: Vec<f32>) -> EmbeddingRecord {

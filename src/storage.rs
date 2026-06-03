@@ -773,18 +773,67 @@ impl Store {
                 insert_search_unit(&tx, &unit)?;
             }
             let indexed_events = count_indexed_events(&tx, model)?;
-            tx.execute(
-                "INSERT INTO projection_status
-                 (projection_name, input_high_watermark, status, last_error, updated_at)
-                 VALUES ('search_rrf_v1', ?1, 'ready', NULL, ?2)
-                 ON CONFLICT(projection_name) DO UPDATE SET
-                   input_high_watermark = excluded.input_high_watermark,
-                   status = excluded.status,
-                   last_error = NULL,
-                   updated_at = excluded.updated_at",
-                params![indexed_events.to_string(), Utc::now().to_rfc3339()],
-            )?;
+            update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
             drop(missing_unit_stmt);
+            tx.commit()?;
+            Ok(indexed_events)
+        })
+    }
+
+    pub fn refresh_search_index_for_events(
+        &self,
+        model: &str,
+        dims: usize,
+        event_ids: &[String],
+        embed: impl Fn(&str) -> Vec<f32>,
+    ) -> Result<usize> {
+        let event_ids = normalized_ids(event_ids);
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            if !event_ids.is_empty() {
+                let placeholders = placeholders(event_ids.len());
+                let sql = format!(
+                    "SELECT e.id,
+                            e.session_id,
+                            e.source_id,
+                            e.machine_id,
+                            e.source_kind,
+                            e.role,
+                            json_extract(e.metadata_json, '$.search_kind'),
+                            json_extract(e.metadata_json, '$.search_text'),
+                            e.occurred_at
+                     FROM events e
+                     WHERE e.id IN ({placeholders})
+                       AND json_extract(e.metadata_json, '$.search_indexable') = 1
+                       AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                     ORDER BY e.session_id, e.ordinal, e.id",
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params_from_iter(event_ids.iter().map(String::as_str)),
+                    |row| {
+                        let content: String = row.get(7)?;
+                        Ok(EventForProjection {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            source_id: row.get(2)?,
+                            machine_id: row.get(3)?,
+                            source_kind: row.get(4)?,
+                            role: row.get(5)?,
+                            search_kind: row.get(6)?,
+                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                            content,
+                            occurred_at: parse_opt_dt(row.get(8)?),
+                        })
+                    },
+                )?;
+                for row in rows {
+                    insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                }
+                drop(stmt);
+            }
+            let indexed_events = count_indexed_events(&tx, model)?;
+            update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
             tx.commit()?;
             Ok(indexed_events)
         })
@@ -1723,6 +1772,68 @@ fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool
     Ok(changed > 0)
 }
 
+fn insert_search_index_rows(
+    conn: &Connection,
+    event: &EventForProjection,
+    model: &str,
+    dims: usize,
+    embed: &impl Fn(&str) -> Vec<f32>,
+) -> Result<()> {
+    let unit_id = crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
+    let unit_hash = crate::archive::stable_hash(&(
+        &unit_id,
+        &event.id,
+        &event.text_hash,
+        &event.content,
+        &event.search_kind,
+    ))?;
+    let unit = SearchUnitRecord {
+        id: unit_id,
+        event_id: event.id.clone(),
+        session_id: event.session_id.clone(),
+        source_id: event.source_id.clone(),
+        machine_id: event.machine_id.clone(),
+        source_kind: event.source_kind.clone(),
+        role: event.role.clone(),
+        search_kind: event.search_kind.clone(),
+        text: event.content.clone(),
+        text_hash: event.text_hash.clone(),
+        occurred_at: event.occurred_at,
+        metadata: serde_json::json!({
+            "derived_from": "event.search_text",
+            "indexer": "search_unit_v1"
+        }),
+        hash: unit_hash,
+    };
+    insert_search_unit(conn, &unit)?;
+
+    let fts_exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events_fts WHERE event_id = ?1)",
+        params![event.id],
+        |row| row.get(0),
+    )?;
+    if fts_exists == 0 {
+        conn.execute(
+            "INSERT INTO events_fts (event_id, session_id, source_kind, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event.id, event.session_id, event.source_kind, event.content],
+        )?;
+    }
+
+    let vector = embed(&event.content);
+    conn.execute(
+        "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            event.id,
+            model,
+            dims as i64,
+            serde_json::to_string(&vector)?
+        ],
+    )?;
+    Ok(())
+}
+
 fn insert_embedding(conn: &Connection, embedding: &EmbeddingRecord) -> Result<bool> {
     ensure_same_hash(conn, "embeddings", "id", &embedding.id, &embedding.hash)?;
     let changed = conn.execute(
@@ -1883,6 +1994,21 @@ fn count_indexed_events(conn: &Connection, model: &str) -> Result<usize> {
         |row| row.get(0),
     )?;
     Ok(fts_count.min(embedding_count) as usize)
+}
+
+fn update_projection_status(conn: &Connection, name: &str, indexed_events: usize) -> Result<()> {
+    conn.execute(
+        "INSERT INTO projection_status
+         (projection_name, input_high_watermark, status, last_error, updated_at)
+         VALUES (?1, ?2, 'ready', NULL, ?3)
+         ON CONFLICT(projection_name) DO UPDATE SET
+           input_high_watermark = excluded.input_high_watermark,
+           status = excluded.status,
+           last_error = NULL,
+           updated_at = excluded.updated_at",
+        params![name, indexed_events.to_string(), Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
