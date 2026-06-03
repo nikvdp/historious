@@ -14,7 +14,7 @@ const EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingRefresh {
     pub embedded: usize,
-    pub vectors_projected: usize,
+    pub vectors_indexed: usize,
     pub degraded_reason: Option<String>,
 }
 
@@ -71,7 +71,7 @@ pub enum MatchType {
 }
 
 pub fn refresh(store: &Store) -> Result<usize> {
-    store.refresh_search_projection(
+    store.refresh_search_index(
         crate::embed::HashEmbedder::MODEL_ID,
         crate::embed::HashEmbedder::DIMS,
         crate::embed::hash_embed,
@@ -86,14 +86,14 @@ pub fn refresh_embeddings(
 ) -> Result<EmbeddingRefresh> {
     let Some(embedder) = embedder else {
         return Ok(EmbeddingRefresh {
-            vectors_projected: store.refresh_vector_projection()?,
+            vectors_indexed: store.refresh_vector_projection()?,
             degraded_reason,
             ..EmbeddingRefresh::default()
         });
     };
     if !embedder.is_semantic() {
         return Ok(EmbeddingRefresh {
-            vectors_projected: store.refresh_vector_projection()?,
+            vectors_indexed: store.refresh_vector_projection()?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -160,7 +160,7 @@ pub fn refresh_embeddings(
                     metadata: serde_json::json!({
                         "embedded_text_max_chars": EMBEDDING_TEXT_MAX_CHARS,
                         "provider": "local",
-                        "projection": "semantic_embedding_v1"
+                        "indexer": "semantic_embedding_v1"
                     }),
                     hash,
                 },
@@ -175,7 +175,7 @@ pub fn refresh_embeddings(
 
     Ok(EmbeddingRefresh {
         embedded,
-        vectors_projected: store.refresh_vector_projection()?,
+        vectors_indexed: store.refresh_vector_projection()?,
         degraded_reason: None,
     })
 }
@@ -226,7 +226,7 @@ fn semantic_search(
         return Ok((
             Vec::new(),
             Some(format!(
-                "query embedder dimensions {} are not supported by local vector projection",
+                "query embedder dimensions {} are not supported by the local vector index",
                 embedder.dims()
             )),
         ));
@@ -539,7 +539,7 @@ mod tests {
             .expect("refresh embeddings");
 
         assert_eq!(refresh.embedded, 1);
-        assert_eq!(refresh.vectors_projected, 1);
+        assert_eq!(refresh.vectors_indexed, 1);
         assert_eq!(refresh.degraded_reason, None);
         assert_eq!(store.stats().expect("stats").embeddings, 1);
         let hits = store
@@ -560,7 +560,7 @@ mod tests {
             .expect("refresh embeddings");
 
         assert_eq!(refresh.embedded, 0);
-        assert_eq!(refresh.vectors_projected, 0);
+        assert_eq!(refresh.vectors_indexed, 0);
         assert_eq!(
             refresh.degraded_reason.as_deref(),
             Some("embedder is not semantic; skipping durable embeddings")

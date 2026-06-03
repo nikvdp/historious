@@ -132,7 +132,7 @@ super-cass export --jsonl --since 2026-06-01
 
 ### Embedding Transfer
 
-Exports include existing embedding records by default. Imports store those embeddings and rebuild local vector projections, so the receiving machine can use compatible transferred embeddings without recreating them.
+Exports include existing embedding records by default. Imports store those embeddings and refresh the local vector index, so the receiving machine can use compatible transferred embeddings without recreating them.
 
 Round-trip through an embedding-capable box:
 
@@ -224,7 +224,7 @@ ssh gpu-box 'super-cass export --jsonl [filters]' \
 Exchange rules:
 
 - Export includes existing embeddings by default.
-- Import stores transferred embeddings and rebuilds local vector projections.
+- Import stores transferred embeddings and refreshes the local vector index.
 - Use an embedding-capable machine by piping history to it, then exporting back from it.
 - Do not include `super-cass update` in exchange flows; local log scanning is separate.
 

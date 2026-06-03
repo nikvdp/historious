@@ -13,9 +13,13 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
-#[command(about = "Local-first coding-agent transcript archive and search")]
+#[command(about = "Search and sync local coding-agent transcripts")]
 pub struct Cli {
-    #[arg(long, env = "SUPER_CASS_DATA_DIR")]
+    #[arg(
+        long,
+        env = "SUPER_CASS_DATA_DIR",
+        help = "Use a custom super-cass data directory"
+    )]
     pub data_dir: Option<std::path::PathBuf>,
     #[arg(
         long,
@@ -29,47 +33,67 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Scan configured local sources once and refresh local projections.
+    /// Scan local agent logs and update the search index.
     Update {
-        #[arg(long)]
+        #[arg(long, help = "Scan at most this many newest files")]
         max_files: Option<usize>,
-        #[arg(long)]
+        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
     /// Search indexed transcripts.
     Search {
+        #[arg(help = "Words, paths, errors, or other details to search for")]
         query: String,
-        #[arg(short, long, default_value_t = 10)]
+        #[arg(
+            short,
+            long,
+            default_value_t = 10,
+            help = "Maximum number of results to show"
+        )]
         limit: usize,
-        #[arg(long)]
+        #[arg(long, help = "Print structured JSON with refs for follow-up commands")]
         json: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show scores and full ids in table output")]
         verbose: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show exactly these columns, comma-separated")]
         cols: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Add these columns to the default output, comma-separated"
+        )]
         include: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Remove these columns from the default output, comma-separated"
+        )]
         exclude: Option<String>,
-        #[arg(long, value_enum, default_value_t = SearchSort::Relevance)]
+        #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            help = "Favor newer results, from 0.0 to 1.0"
+        )]
         recency_bias: f64,
-        #[arg(long)]
+        #[arg(long, help = "Disable colored output")]
         no_color: bool,
-        #[arg(long)]
+        #[arg(long, help = "Browse results interactively with fzf")]
         fzf: bool,
     },
-    /// Show surrounding transcript context for a search result or event.
+    /// Show nearby transcript context for a search result.
     Show {
         #[arg(
             value_name = "REF_OR_EVENT_ID",
             help = "Recent search ref or full event id"
         )]
         target: Option<String>,
-        #[arg(long, conflicts_with = "search_unit", help = "Full event id")]
+        #[arg(
+            long,
+            conflicts_with = "search_unit",
+            help = "Full event id or recent ref"
+        )]
         event: Option<String>,
         #[arg(
             long = "search-unit",
@@ -77,15 +101,15 @@ pub enum Command {
             help = "Search unit id"
         )]
         search_unit: Option<String>,
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, help = "Number of earlier events to show")]
         before: usize,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, help = "Number of later events to show")]
         after: usize,
-        #[arg(long)]
+        #[arg(long, help = "Disable colored output")]
         no_color: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
     /// Deprecated alias for `show`.
@@ -96,7 +120,11 @@ pub enum Command {
             help = "Recent search ref or full event id"
         )]
         target: Option<String>,
-        #[arg(long, conflicts_with = "search_unit", help = "Full event id")]
+        #[arg(
+            long,
+            conflicts_with = "search_unit",
+            help = "Full event id or recent ref"
+        )]
         event: Option<String>,
         #[arg(
             long = "search-unit",
@@ -104,18 +132,18 @@ pub enum Command {
             help = "Search unit id"
         )]
         search_unit: Option<String>,
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, help = "Number of earlier events to show")]
         before: usize,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, help = "Number of later events to show")]
         after: usize,
-        #[arg(long)]
+        #[arg(long, help = "Disable colored output")]
         no_color: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
-    /// Render a full source conversation transcript.
+    /// Show a full conversation transcript.
     Transcript {
         #[arg(
             value_name = "SESSION_OR_REF",
@@ -134,62 +162,68 @@ pub enum Command {
             help = "Search unit id to jump to"
         )]
         search_unit: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Print directly instead of opening a pager")]
         no_pager: bool,
-        #[arg(long)]
+        #[arg(long, help = "Disable colored output")]
         no_color: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
-    /// Export canonical archive records as JSONL.
+    /// Write history records to JSONL for backup or transfer.
     Export {
-        #[arg(long)]
+        #[arg(long, help = "Write newline-delimited JSON records")]
         jsonl: bool,
-        #[arg(long, help = "Omit embedding records from the JSONL archive stream")]
+        #[arg(long, help = "Omit embedding records from the JSONL history stream")]
         no_embeddings: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Export only one source kind, such as codex or claude_code"
+        )]
         source: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Export sessions from this workspace path")]
         workspace: Vec<std::path::PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Export this session id")]
         session: Vec<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Export sessions since an RFC3339 timestamp or YYYY-MM-DD"
+        )]
         since: Option<String>,
     },
-    /// Import canonical archive records from JSONL.
+    /// Read history records from JSONL.
     Import {
-        #[arg(long)]
+        #[arg(long, help = "Read newline-delimited JSON records")]
         jsonl: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print a structured JSON result")]
         json: bool,
-        #[arg(default_value = "-")]
+        #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
     },
-    /// Run the local updater continuously. No network listener is started.
+    /// Keep local history and search up to date.
     Daemon {
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, help = "Seconds between scans")]
         interval_secs: u64,
-        #[arg(long)]
+        #[arg(long, help = "Scan at most this many newest files each pass")]
         max_files: Option<usize>,
-        #[arg(long)]
+        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
     },
-    /// Opt-in HTTP server for local/peer archive exchange.
+    /// Serve local history over HTTP and keep it up to date.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7391")]
+        #[arg(long, default_value = "127.0.0.1:7391", help = "Address to listen on")]
         bind: String,
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, help = "Seconds between scans")]
         interval_secs: u64,
-        #[arg(long)]
+        #[arg(long, help = "Scan at most this many newest files each pass")]
         max_files: Option<usize>,
-        #[arg(long)]
+        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
     },
-    /// Show local archive health and projection freshness.
+    /// Show local history and search health.
     Status {
-        #[arg(long)]
+        #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
     /// Output agent instructions for super-cass.
@@ -483,8 +517,8 @@ impl Cli {
                     )?;
                     let output = ImportOutput {
                         import: stats,
-                        search_projection: SearchProjectionOutput {
-                            projected_events: projected,
+                        search_index: SearchIndexOutput {
+                            indexed_events: projected,
                         },
                         embeddings,
                     };
@@ -672,20 +706,20 @@ fn home_path(relative: &str) -> Result<PathBuf> {
 #[derive(Debug, Serialize)]
 struct UpdateOutput {
     ingest: ingest::UpdateStats,
-    search_projection: SearchProjectionOutput,
+    search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
 }
 
 #[derive(Debug, Serialize)]
 struct ImportOutput {
     import: crate::storage::ImportStats,
-    search_projection: SearchProjectionOutput,
+    search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
 }
 
 #[derive(Debug, Serialize)]
-struct SearchProjectionOutput {
-    projected_events: usize,
+struct SearchIndexOutput {
+    indexed_events: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -806,8 +840,8 @@ fn run_update_once(
     )?;
     Ok(UpdateOutput {
         ingest,
-        search_projection: SearchProjectionOutput {
-            projected_events: projected,
+        search_index: SearchIndexOutput {
+            indexed_events: projected,
         },
         embeddings,
     })
@@ -864,13 +898,13 @@ fn print_update_output(output: &UpdateOutput) {
         output.ingest.errors
     );
     println!(
-        "projection=search_rrf_v1 projected_events={}",
-        output.search_projection.projected_events
+        "search_index=ready indexed_events={}",
+        output.search_index.indexed_events
     );
     println!(
-        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+        "embeddings=ready embedded={} indexed_vectors={} degraded_reason={}",
         output.embeddings.embedded,
-        output.embeddings.vectors_projected,
+        output.embeddings.vectors_indexed,
         output
             .embeddings
             .degraded_reason
@@ -881,17 +915,17 @@ fn print_update_output(output: &UpdateOutput) {
 
 fn print_import_output(output: &ImportOutput) {
     println!(
-        "imported={} duplicates={} inserted_vectors={}",
-        output.import.inserted, output.import.duplicates, output.import.vectors_projected
+        "imported={} duplicates={} indexed_vectors={}",
+        output.import.inserted, output.import.duplicates, output.import.vectors_indexed
     );
     println!(
-        "projection=search_rrf_v1 projected_events={}",
-        output.search_projection.projected_events
+        "search_index=ready indexed_events={}",
+        output.search_index.indexed_events
     );
     println!(
-        "projection=semantic_embeddings embedded={} inserted_vectors={} degraded_reason={}",
+        "embeddings=ready embedded={} indexed_vectors={} degraded_reason={}",
         output.embeddings.embedded,
-        output.embeddings.vectors_projected,
+        output.embeddings.vectors_indexed,
         output
             .embeddings
             .degraded_reason
@@ -1654,7 +1688,7 @@ async fn run_daemon(
         let embeddings =
             search::refresh_embeddings(store, machine_id, embedder.as_deref(), degraded_reason)?;
         println!(
-            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} projected_events={} embedded={} inserted_vectors={} degraded_reason={}",
+            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} indexed_events={} embedded={} inserted_vectors={} degraded_reason={}",
             stats.files_seen,
             stats.skipped_unchanged,
             stats.inserted,
@@ -1662,7 +1696,7 @@ async fn run_daemon(
             stats.errors,
             projected,
             embeddings.embedded,
-            embeddings.vectors_projected,
+            embeddings.vectors_indexed,
             embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
         );
         tokio::select! {
