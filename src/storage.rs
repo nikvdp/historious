@@ -1061,6 +1061,65 @@ impl Store {
         })
     }
 
+    pub fn search_units_missing_embedding_for_delta(
+        &self,
+        model_id: &str,
+        event_ids: &[String],
+        unit_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<SearchUnitForEmbedding>> {
+        let event_ids = normalized_ids(event_ids);
+        let unit_ids = normalized_ids(unit_ids);
+        if event_ids.is_empty() && unit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let event_placeholders = placeholders(event_ids.len());
+            let unit_placeholders = placeholders(unit_ids.len());
+            let scope = match (event_ids.is_empty(), unit_ids.is_empty()) {
+                (false, false) => {
+                    format!(
+                        "(su.event_id IN ({event_placeholders}) OR su.id IN ({unit_placeholders}))"
+                    )
+                }
+                (false, true) => format!("su.event_id IN ({event_placeholders})"),
+                (true, false) => format!("su.id IN ({unit_placeholders})"),
+                (true, true) => unreachable!(),
+            };
+            let sql = format!(
+                "SELECT su.id, su.text, su.text_hash
+                 FROM search_units su
+                 LEFT JOIN embeddings e
+                   ON e.unit_id = su.id
+                  AND e.text_hash = su.text_hash
+                  AND e.model_id = ?
+                 WHERE e.id IS NULL
+                   AND {scope}
+                 ORDER BY su.occurred_at, su.session_id, su.id
+                 LIMIT ?",
+            );
+            let mut params = Vec::with_capacity(2 + event_ids.len() + unit_ids.len());
+            params.push(model_id.to_string());
+            params.extend(event_ids);
+            params.extend(unit_ids);
+            params.push(limit.to_string());
+            let mut stmt = conn.prepare(&sql)?;
+            let rows =
+                stmt.query_map(params_from_iter(params.iter().map(String::as_str)), |row| {
+                    Ok(SearchUnitForEmbedding {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        text_hash: row.get(2)?,
+                    })
+                })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn refresh_vector_projection(&self) -> Result<usize> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM vec_embeddings_384", [])?;
@@ -1072,6 +1131,43 @@ impl Store {
                 [],
             )?;
             Ok(inserted)
+        })
+    }
+
+    pub fn refresh_vector_projection_for_embeddings(
+        &self,
+        embedding_ids: &[String],
+    ) -> Result<usize> {
+        let embedding_ids = normalized_ids(embedding_ids);
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            if !embedding_ids.is_empty() {
+                let placeholders = placeholders(embedding_ids.len());
+                let delete_sql = format!(
+                    "DELETE FROM vec_embeddings_384
+                     WHERE rowid IN (
+                       SELECT rowid FROM embeddings WHERE id IN ({placeholders})
+                     )"
+                );
+                tx.execute(
+                    &delete_sql,
+                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                )?;
+                let insert_sql = format!(
+                    "INSERT INTO vec_embeddings_384(rowid, embedding)
+                     SELECT rowid, vector
+                     FROM embeddings
+                     WHERE dims = 384
+                       AND id IN ({placeholders})"
+                );
+                tx.execute(
+                    &insert_sql,
+                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                )?;
+            }
+            let count = count_vec_embeddings(&tx)?;
+            tx.commit()?;
+            Ok(count)
         })
     }
 
@@ -1881,6 +1977,13 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count as u64)
+}
+
+fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM vec_embeddings_384", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count as usize)
 }
 
 fn record_delta(record: &ArchiveRecord, inserted: bool, delta: &mut ImportDelta) {

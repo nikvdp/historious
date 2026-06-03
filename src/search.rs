@@ -1,4 +1,4 @@
-use crate::embed::Embedder;
+use crate::embed::{Embedder, EmbedderConfig};
 use crate::storage::{ImportDelta, SearchRow, Store, VectorSearchRow};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
@@ -132,48 +132,7 @@ pub fn refresh_embeddings(
 
         let mut records = Vec::with_capacity(units.len());
         for (unit, vector) in units.iter().zip(vectors) {
-            if vector.len() != embedder.dims() {
-                bail!(
-                    "embedder returned vector with {} dimensions, expected {}",
-                    vector.len(),
-                    embedder.dims()
-                );
-            }
-            let vector_blob = crate::storage::f32_vector_to_blob(&vector);
-            let vector_hash = crate::archive::blake3_hex(&vector_blob);
-            let id = crate::archive::stable_id(&[
-                "embedding",
-                &unit.id,
-                &unit.text_hash,
-                embedder.model_id(),
-            ]);
-            let hash = crate::archive::stable_hash(&(
-                &id,
-                &unit.id,
-                &unit.text_hash,
-                embedder.model_id(),
-                embedder.dims(),
-                &vector_hash,
-            ))?;
-            records.push(crate::archive::ArchiveRecord::Embedding(
-                crate::archive::EmbeddingRecord {
-                    id,
-                    unit_id: unit.id.clone(),
-                    text_hash: unit.text_hash.clone(),
-                    model_id: embedder.model_id().to_string(),
-                    dims: embedder.dims() as u32,
-                    vector_hash,
-                    vector: vector_blob,
-                    producer_machine_id: machine_id.to_string(),
-                    embedded_at: Utc::now(),
-                    metadata: serde_json::json!({
-                        "embedded_text_max_chars": EMBEDDING_TEXT_MAX_CHARS,
-                        "provider": "local",
-                        "indexer": "semantic_embedding_v1"
-                    }),
-                    hash,
-                },
-            ));
+            records.push(embedding_record(machine_id, embedder, unit, vector)?);
         }
         let stats = store.import_records(&records)?;
         embedded += stats.inserted;
@@ -189,10 +148,161 @@ pub fn refresh_embeddings(
     })
 }
 
+pub fn refresh_embeddings_incremental(
+    store: &Store,
+    machine_id: &str,
+    embedder_config: &EmbedderConfig,
+    delta: &ImportDelta,
+) -> Result<EmbeddingRefresh> {
+    let status = embedder_config.status_without_loading();
+    let mut vector_embedding_ids = delta.inserted_embeddings.clone();
+    let Some(model_id) = status.model_id.as_deref() else {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store
+                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            degraded_reason: status.degraded_reason,
+            ..EmbeddingRefresh::default()
+        });
+    };
+
+    if !status.semantic {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store
+                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            degraded_reason: status.degraded_reason.or_else(|| {
+                Some("embedder is not semantic; skipping durable embeddings".to_string())
+            }),
+            ..EmbeddingRefresh::default()
+        });
+    }
+
+    let mut first_units = store.search_units_missing_embedding_for_delta(
+        model_id,
+        &delta.inserted_events,
+        &delta.inserted_search_units,
+        EMBEDDING_BATCH_SIZE,
+    )?;
+    if first_units.is_empty() {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store
+                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            degraded_reason: status.degraded_reason,
+            ..EmbeddingRefresh::default()
+        });
+    }
+
+    let embedder = embedder_config.load()?;
+    if !embedder.is_semantic() {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store
+                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            degraded_reason: Some(
+                "embedder is not semantic; skipping durable embeddings".to_string(),
+            ),
+            ..EmbeddingRefresh::default()
+        });
+    }
+
+    let mut embedded = 0;
+    loop {
+        let units = std::mem::take(&mut first_units);
+        let texts = units
+            .iter()
+            .map(|unit| embedding_input(&unit.text))
+            .collect::<Vec<_>>();
+        let vectors = embedder.embed_batch(&texts)?;
+        if vectors.len() != units.len() {
+            bail!(
+                "embedder returned {} vectors for {} search units",
+                vectors.len(),
+                units.len()
+            );
+        }
+
+        let mut records = Vec::with_capacity(units.len());
+        for (unit, vector) in units.iter().zip(vectors) {
+            records.push(embedding_record(
+                machine_id,
+                embedder.as_ref(),
+                unit,
+                vector,
+            )?);
+        }
+        let stats = store.import_records(&records)?;
+        embedded += stats.inserted;
+        vector_embedding_ids.extend(stats.delta.inserted_embeddings);
+
+        if units.len() < EMBEDDING_BATCH_SIZE {
+            break;
+        }
+        first_units = store.search_units_missing_embedding_for_delta(
+            model_id,
+            &delta.inserted_events,
+            &delta.inserted_search_units,
+            EMBEDDING_BATCH_SIZE,
+        )?;
+        if first_units.is_empty() {
+            break;
+        }
+    }
+
+    Ok(EmbeddingRefresh {
+        embedded,
+        vectors_indexed: store.refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+        degraded_reason: status.degraded_reason,
+    })
+}
+
 fn embedding_input(text: &str) -> String {
     text.chars()
         .take(EMBEDDING_TEXT_MAX_CHARS)
         .collect::<String>()
+}
+
+fn embedding_record(
+    machine_id: &str,
+    embedder: &dyn Embedder,
+    unit: &crate::storage::SearchUnitForEmbedding,
+    vector: Vec<f32>,
+) -> Result<crate::archive::ArchiveRecord> {
+    if vector.len() != embedder.dims() {
+        bail!(
+            "embedder returned vector with {} dimensions, expected {}",
+            vector.len(),
+            embedder.dims()
+        );
+    }
+    let vector_blob = crate::storage::f32_vector_to_blob(&vector);
+    let vector_hash = crate::archive::blake3_hex(&vector_blob);
+    let id =
+        crate::archive::stable_id(&["embedding", &unit.id, &unit.text_hash, embedder.model_id()]);
+    let hash = crate::archive::stable_hash(&(
+        &id,
+        &unit.id,
+        &unit.text_hash,
+        embedder.model_id(),
+        embedder.dims(),
+        &vector_hash,
+    ))?;
+    Ok(crate::archive::ArchiveRecord::Embedding(
+        crate::archive::EmbeddingRecord {
+            id,
+            unit_id: unit.id.clone(),
+            text_hash: unit.text_hash.clone(),
+            model_id: embedder.model_id().to_string(),
+            dims: embedder.dims() as u32,
+            vector_hash,
+            vector: vector_blob,
+            producer_machine_id: machine_id.to_string(),
+            embedded_at: Utc::now(),
+            metadata: serde_json::json!({
+                "embedded_text_max_chars": EMBEDDING_TEXT_MAX_CHARS,
+                "provider": "local",
+                "indexer": "semantic_embedding_v1"
+            }),
+            hash,
+        },
+    ))
 }
 
 pub fn search(
@@ -392,6 +502,7 @@ mod tests {
         stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, SearchUnitRecord,
         SessionRecord, SourceRecord,
     };
+    use crate::embed::{EmbedderConfig, EmbedderProvider};
     use crate::storage::{f32_vector_to_blob, ImportDelta, Store};
     use chrono::Utc;
     use serde_json::json;
@@ -575,6 +686,60 @@ mod tests {
             Some("embedder is not semantic; skipping durable embeddings")
         );
         assert_eq!(store.stats().expect("stats").embeddings, 0);
+    }
+
+    #[test]
+    fn refresh_embeddings_incremental_skips_model_load_without_delta_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let config = EmbedderConfig {
+            provider: EmbedderProvider::FastEmbed,
+            model_cache: dir.path().join("models"),
+        };
+
+        let refresh = refresh_embeddings_incremental(
+            &store,
+            "machine_fixture",
+            &config,
+            &ImportDelta::default(),
+        )
+        .expect("refresh embeddings");
+
+        assert_eq!(refresh.embedded, 0);
+        assert_eq!(refresh.vectors_indexed, 0);
+    }
+
+    #[test]
+    fn refresh_embeddings_incremental_indexes_transferred_embedding_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unit = import_event_and_project(&store, "transferred vector target");
+        let stats = store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &unit,
+                unit_vector(17),
+            )))
+            .expect("embedding import");
+        let config = EmbedderConfig {
+            provider: EmbedderProvider::Disabled,
+            model_cache: dir.path().join("models"),
+        };
+
+        let refresh =
+            refresh_embeddings_incremental(&store, "machine_fixture", &config, &stats.delta)
+                .expect("refresh embeddings");
+        let hits = store
+            .vector_search("fixture-semantic-384", &unit_vector(17), 5)
+            .expect("vector search");
+
+        assert_eq!(refresh.embedded, 0);
+        assert_eq!(refresh.vectors_indexed, 1);
+        assert_eq!(
+            refresh.degraded_reason.as_deref(),
+            Some("query embedder disabled")
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].unit_id, unit.id);
     }
 
     #[test]
