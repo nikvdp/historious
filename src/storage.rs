@@ -23,6 +23,42 @@ pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
     pub vectors_indexed: usize,
+    #[serde(skip)]
+    pub delta: ImportDelta,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImportDelta {
+    pub inserted_sources: Vec<String>,
+    pub inserted_raw_artifacts: Vec<String>,
+    pub inserted_sessions: Vec<String>,
+    pub inserted_events: Vec<String>,
+    pub inserted_search_units: Vec<String>,
+    pub inserted_embeddings: Vec<String>,
+    pub touched_paths: Vec<String>,
+    pub touched_sessions: Vec<String>,
+    pub touched_events: Vec<String>,
+    pub touched_search_units: Vec<String>,
+    pub touched_embeddings: Vec<String>,
+}
+
+impl ImportDelta {
+    pub fn merge(&mut self, other: ImportDelta) {
+        extend_unique(&mut self.inserted_sources, other.inserted_sources);
+        extend_unique(
+            &mut self.inserted_raw_artifacts,
+            other.inserted_raw_artifacts,
+        );
+        extend_unique(&mut self.inserted_sessions, other.inserted_sessions);
+        extend_unique(&mut self.inserted_events, other.inserted_events);
+        extend_unique(&mut self.inserted_search_units, other.inserted_search_units);
+        extend_unique(&mut self.inserted_embeddings, other.inserted_embeddings);
+        extend_unique(&mut self.touched_paths, other.touched_paths);
+        extend_unique(&mut self.touched_sessions, other.touched_sessions);
+        extend_unique(&mut self.touched_events, other.touched_events);
+        extend_unique(&mut self.touched_search_units, other.touched_search_units);
+        extend_unique(&mut self.touched_embeddings, other.touched_embeddings);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -214,6 +250,7 @@ impl Store {
                 } else {
                     stats.duplicates += 1;
                 }
+                record_delta(record, inserted, &mut stats.delta);
             }
             tx.commit()?;
             Ok(stats)
@@ -1735,6 +1772,62 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+fn record_delta(record: &ArchiveRecord, inserted: bool, delta: &mut ImportDelta) {
+    match record {
+        ArchiveRecord::Source(source) => {
+            if inserted {
+                push_unique(&mut delta.inserted_sources, source.id.clone());
+            }
+        }
+        ArchiveRecord::RawArtifact(raw) => {
+            push_unique(&mut delta.touched_paths, raw.path.clone());
+            if inserted {
+                push_unique(&mut delta.inserted_raw_artifacts, raw.hash.clone());
+            }
+        }
+        ArchiveRecord::Session(session) => {
+            push_unique(&mut delta.touched_sessions, session.id.clone());
+            if inserted {
+                push_unique(&mut delta.inserted_sessions, session.id.clone());
+            }
+        }
+        ArchiveRecord::Event(event) => {
+            push_unique(&mut delta.touched_events, event.id.clone());
+            push_unique(&mut delta.touched_sessions, event.session_id.clone());
+            if inserted {
+                push_unique(&mut delta.inserted_events, event.id.clone());
+            }
+        }
+        ArchiveRecord::SearchUnit(unit) => {
+            push_unique(&mut delta.touched_search_units, unit.id.clone());
+            push_unique(&mut delta.touched_events, unit.event_id.clone());
+            push_unique(&mut delta.touched_sessions, unit.session_id.clone());
+            if inserted {
+                push_unique(&mut delta.inserted_search_units, unit.id.clone());
+            }
+        }
+        ArchiveRecord::Embedding(embedding) => {
+            push_unique(&mut delta.touched_embeddings, embedding.id.clone());
+            push_unique(&mut delta.touched_search_units, embedding.unit_id.clone());
+            if inserted {
+                push_unique(&mut delta.inserted_embeddings, embedding.id.clone());
+            }
+        }
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        push_unique(target, value);
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !target.contains(&value) {
+        target.push(value);
+    }
+}
+
 fn raw_artifact_is_current(
     conn: &Connection,
     path: &str,
@@ -1985,8 +2078,18 @@ mod tests {
 
         assert_eq!(first.inserted, records.len());
         assert_eq!(first.duplicates, 0);
+        assert_eq!(first.delta.inserted_events, vec!["event_vector"]);
+        assert_eq!(first.delta.inserted_search_units.len(), 1);
+        assert_eq!(first.delta.inserted_embeddings.len(), 1);
+        assert_eq!(first.delta.touched_sessions, vec!["session_vector"]);
+        assert_eq!(first.delta.touched_events, vec!["event_vector"]);
         assert_eq!(second.inserted, 0);
         assert_eq!(second.duplicates, records.len());
+        assert!(second.delta.inserted_events.is_empty());
+        assert_eq!(second.delta.touched_sessions, vec!["session_vector"]);
+        assert_eq!(second.delta.touched_events, vec!["event_vector"]);
+        assert_eq!(second.delta.touched_search_units.len(), 1);
+        assert_eq!(second.delta.touched_embeddings.len(), 1);
     }
 
     #[test]

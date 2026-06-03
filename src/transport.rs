@@ -154,6 +154,7 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         let delta = store.import_record(&envelope.record)?;
         stats.inserted += delta.inserted;
         stats.duplicates += delta.duplicates;
+        stats.delta.merge(delta.delta);
     }
     stats.vectors_indexed = store.refresh_vector_projection()?;
     Ok(stats)

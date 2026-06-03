@@ -1,7 +1,7 @@
 use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
-use crate::storage::{ImportStats, Store};
+use crate::storage::{ImportDelta, ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -18,6 +18,8 @@ pub struct UpdateStats {
     pub inserted: usize,
     pub duplicates: usize,
     pub errors: usize,
+    #[serde(skip)]
+    pub delta: ImportDelta,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +147,7 @@ pub fn update_local(
             Ok(delta) => {
                 stats.inserted += delta.inserted;
                 stats.duplicates += delta.duplicates;
+                stats.delta.merge(delta.delta);
             }
             Err(err) => {
                 tracing::debug!("failed to ingest {}: {err:#}", path.display());
@@ -1028,6 +1031,8 @@ mod tests {
 
         assert_eq!(first.inserted, 3);
         assert_eq!(first.duplicates, 0);
+        assert_eq!(first.delta.inserted_events.len(), 1);
+        assert_eq!(first.delta.touched_sessions.len(), 1);
         assert!(current);
 
         fs::write(
@@ -1045,6 +1050,10 @@ mod tests {
 
         assert_eq!(second.inserted, 2);
         assert_eq!(second.duplicates, 2);
+        assert_eq!(second.delta.inserted_events.len(), 1);
+        assert_eq!(second.delta.touched_events.len(), 2);
+        assert_eq!(second.delta.touched_sessions.len(), 1);
+        assert_eq!(second.delta.touched_paths.len(), 1);
         assert_eq!(stats.raw_artifacts, 2);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
