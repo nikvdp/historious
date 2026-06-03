@@ -8,6 +8,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 #[derive(Debug, Parser)]
@@ -188,6 +189,40 @@ pub enum Command {
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Output agent instructions for super-cass.
+    Onboard {
+        #[arg(long, help = "Emit only the AGENTS.md-ready block")]
+        agents_md: bool,
+    },
+    /// List, emit, and install packaged super-cass skills.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// List packaged skills embedded in super-cass.
+    List,
+    /// Print packaged skill content.
+    Emit {
+        #[arg(help = "Skill name or 'all'")]
+        name: String,
+    },
+    /// Install packaged skill content to a skills directory.
+    Install {
+        #[arg(default_value = "all", help = "Skill name or 'all'")]
+        name: String,
+        #[arg(long, help = "Skills directory root containing skill folders")]
+        dir: Option<PathBuf>,
+        #[arg(long, help = "Install to ~/.claude/skills")]
+        claude: bool,
+        #[arg(long, help = "Install to ~/.codex/skills")]
+        codex: bool,
+        #[arg(long, help = "Install to ~/.pi/agent/skills")]
+        pi: bool,
     },
 }
 
@@ -495,6 +530,14 @@ impl Cli {
                     print_status_output(&output);
                 }
             }
+            Command::Onboard { agents_md } => {
+                if agents_md {
+                    write_stdout(crate::skills::onboard_agents_md())?;
+                } else {
+                    write_stdout(&crate::skills::onboard_wrapper())?;
+                }
+            }
+            Command::Skill { command } => run_skill_command(command)?,
         }
         Ok(())
     }
@@ -513,6 +556,8 @@ impl Command {
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
+            Command::Onboard { .. } => "onboard",
+            Command::Skill { .. } => "skill",
         }
     }
 
@@ -528,6 +573,86 @@ impl Command {
                 | Command::Status { json: true, .. }
         )
     }
+}
+
+fn run_skill_command(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::List => {
+            println!("Packaged skills:");
+            for skill in crate::skills::list_skills() {
+                println!("- {}: {}", skill.name, skill.description);
+            }
+            println!();
+            println!("Install targets:");
+            println!("- --claude -> ~/.claude/skills");
+            println!("- --codex  -> ~/.codex/skills");
+            println!("- --pi     -> ~/.pi/agent/skills");
+        }
+        SkillCommand::Emit { name } => {
+            let names = crate::skills::skill_names_for_arg(&name)?;
+            for (idx, skill_name) in names.iter().enumerate() {
+                let skill = crate::skills::get_skill(skill_name).expect("known skill");
+                if names.len() > 1 {
+                    if idx > 0 {
+                        println!();
+                    }
+                    println!("### {}", skill.name);
+                }
+                write_stdout(skill.skill_md)?;
+            }
+        }
+        SkillCommand::Install {
+            name,
+            dir,
+            claude,
+            codex,
+            pi,
+        } => {
+            let roots = install_roots(dir, claude, codex, pi)?;
+            let names = crate::skills::skill_names_for_arg(&name)?;
+            for root in roots {
+                println!("Installing to {}", root.display());
+                for skill_name in &names {
+                    let skill = crate::skills::get_skill(skill_name).expect("known skill");
+                    let installed = crate::skills::install_skill(skill, &root)?;
+                    println!("Installed {} -> {}", skill.name, installed.display());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_roots(
+    dir: Option<PathBuf>,
+    claude: bool,
+    codex: bool,
+    pi: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    if let Some(dir) = dir {
+        roots.push(dir);
+    }
+    if claude {
+        roots.push(home_path(".claude/skills")?);
+    }
+    if codex {
+        roots.push(home_path(".codex/skills")?);
+    }
+    if pi {
+        roots.push(home_path(".pi/agent/skills")?);
+    }
+    roots.sort();
+    roots.dedup();
+    if roots.is_empty() {
+        bail!("specify at least one install target: --dir, --claude, --codex, or --pi");
+    }
+    Ok(roots)
+}
+
+fn home_path(relative: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(relative))
 }
 
 #[derive(Debug, Serialize)]
