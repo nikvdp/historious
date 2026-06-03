@@ -1,7 +1,9 @@
 use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA};
 use crate::storage::{ArchiveExportFilter, ImportStats, Store};
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
@@ -171,6 +173,105 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
     Ok(stats)
 }
 
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct RawBlobImportStats {
+    pub imported: usize,
+    pub duplicates: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RawBlobRecord {
+    hash: String,
+    size: u64,
+    content: String,
+}
+
+pub fn export_raw_blobs(store: &Store, hashes: &[String], mut writer: impl Write) -> Result<usize> {
+    let mut count = 0;
+    for hash in normalized_hashes(hashes) {
+        let content = store.read_raw_artifact_blob(&hash)?;
+        let record = RawBlobRecord {
+            hash,
+            size: content.len() as u64,
+            content: base64::engine::general_purpose::STANDARD.encode(content),
+        };
+        serde_json::to_writer(&mut writer, &record)?;
+        writer.write_all(b"\n")?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn import_raw_blobs_path(store: &Store, path: &str) -> Result<RawBlobImportStats> {
+    if path == "-" {
+        let stdin = io::stdin();
+        import_raw_blobs_reader(store, stdin.lock())
+    } else {
+        let file = File::open(Path::new(path)).with_context(|| format!("opening {path}"))?;
+        import_raw_blobs_reader(store, file)
+    }
+}
+
+pub fn import_raw_blobs_reader(store: &Store, reader: impl io::Read) -> Result<RawBlobImportStats> {
+    let mut stats = RawBlobImportStats::default();
+    let reader = BufReader::new(reader);
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading raw blob JSONL line {}", idx + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: RawBlobRecord = serde_json::from_str(&line)
+            .with_context(|| format!("parsing raw blob JSONL line {}", idx + 1))?;
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(&record.content)
+            .with_context(|| format!("decoding raw blob JSONL line {}", idx + 1))?;
+        if content.len() as u64 != record.size {
+            bail!(
+                "raw blob size mismatch on line {}: expected {}, got {}",
+                idx + 1,
+                record.size,
+                content.len()
+            );
+        }
+        if store.write_raw_artifact_blob(&record.hash, &content)? {
+            stats.imported += 1;
+        } else {
+            stats.duplicates += 1;
+        }
+    }
+    Ok(stats)
+}
+
+pub fn read_hashes_from_stdin() -> Result<Vec<String>> {
+    let stdin = io::stdin();
+    read_hashes(stdin.lock())
+}
+
+fn read_hashes(reader: impl io::Read) -> Result<Vec<String>> {
+    let reader = BufReader::new(reader);
+    let mut hashes = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let hash = line.trim();
+        if !hash.is_empty() {
+            hashes.push(hash.to_string());
+        }
+    }
+    Ok(hashes)
+}
+
+fn normalized_hashes(hashes: &[String]) -> Vec<String> {
+    let mut hashes = hashes
+        .iter()
+        .map(|hash| hash.trim())
+        .filter(|hash| !hash.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +279,7 @@ mod tests {
         stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, RawArtifact,
         SearchUnitRecord, SessionRecord, SourceRecord,
     };
+    use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
 
@@ -433,6 +535,89 @@ mod tests {
     }
 
     #[test]
+    fn raw_blob_export_import_fills_missing_metadata_blob() {
+        let content = b"blob fixture bytes";
+        let raw = fixture_raw_with_content_hash("source_raw", content);
+        let hash = raw.hash.clone();
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source = Store::open(source_dir.path()).expect("open source");
+        source
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::RawArtifact(raw),
+            ])
+            .expect("import source records");
+
+        let mut metadata_body = Vec::new();
+        export_jsonl_with_options(
+            &source,
+            ExportOptions {
+                include_embeddings: true,
+                include_raw_artifact_content: false,
+            },
+            &mut metadata_body,
+        )
+        .expect("export metadata");
+
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target = Store::open(target_dir.path()).expect("open target");
+        import_jsonl_reader(&target, metadata_body.as_slice()).expect("import metadata");
+        assert_eq!(
+            target
+                .missing_raw_artifact_blob_hashes(&ArchiveExportFilter::default())
+                .expect("missing blobs"),
+            vec![hash.clone()]
+        );
+
+        let mut blob_body = Vec::new();
+        export_raw_blobs(&source, std::slice::from_ref(&hash), &mut blob_body)
+            .expect("export blob");
+        let first = import_raw_blobs_reader(&target, blob_body.as_slice()).expect("import blob");
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.duplicates, 0);
+        assert!(target.raw_artifact_blob_exists(&hash));
+        assert!(target
+            .missing_raw_artifact_blob_hashes(&ArchiveExportFilter::default())
+            .expect("missing after import")
+            .is_empty());
+
+        let second =
+            import_raw_blobs_reader(&target, blob_body.as_slice()).expect("import duplicate blob");
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.duplicates, 1);
+    }
+
+    #[test]
+    fn raw_blob_import_rejects_hash_mismatch() {
+        let metadata_content = b"expected";
+        let raw = fixture_raw_with_content_hash("source_raw", metadata_content);
+        let hash = raw.hash.clone();
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target = Store::open(target_dir.path()).expect("open target");
+        target
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::RawArtifact(RawArtifact {
+                    content: Vec::new(),
+                    ..raw
+                }),
+            ])
+            .expect("import metadata");
+        let wrong_content = b"wrong";
+        let record = RawBlobRecord {
+            hash,
+            size: wrong_content.len() as u64,
+            content: base64::engine::general_purpose::STANDARD.encode(wrong_content),
+        };
+        let mut body = Vec::new();
+        serde_json::to_writer(&mut body, &record).expect("write blob record");
+        body.push(b'\n');
+
+        let err = import_raw_blobs_reader(&target, body.as_slice()).expect_err("hash mismatch");
+        assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
     fn filtered_export_options_can_omit_embeddings() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -633,6 +818,19 @@ mod tests {
             mtime_ms: Some(1),
             media_type: "application/jsonl".to_string(),
             content: b"fixture".to_vec(),
+            first_seen_at: Utc::now(),
+        }
+    }
+
+    fn fixture_raw_with_content_hash(source_id: &str, content: &[u8]) -> RawArtifact {
+        RawArtifact {
+            hash: crate::archive::blake3_hex(content),
+            source_id: source_id.to_string(),
+            path: format!("/tmp/{source_id}-raw.jsonl"),
+            size: content.len() as u64,
+            mtime_ms: Some(1),
+            media_type: "application/jsonl".to_string(),
+            content: content.to_vec(),
             first_seen_at: Utc::now(),
         }
     }
