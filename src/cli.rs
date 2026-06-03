@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::ingest;
 use crate::search;
 use crate::server;
-use crate::storage::Store;
+use crate::storage::{RecentResultRefInput, Store};
 use crate::transport;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -55,6 +55,7 @@ pub enum Command {
     },
     /// Print surrounding transcript context for an event or search unit.
     Expand {
+        target: Option<String>,
         #[arg(long, conflicts_with = "search_unit")]
         event: Option<String>,
         #[arg(long = "search-unit", conflicts_with = "event")]
@@ -141,6 +142,7 @@ impl From<SearchSort> for search::SortMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Column {
+    Ref,
     Source,
     Match,
     When,
@@ -216,25 +218,30 @@ impl Cli {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
                     }
+                    let refs =
+                        store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let color = !no_color;
-                    run_fzf_search(&config, &query, &response.results, color)?;
+                    run_fzf_search(&config, &query, &response.results, &refs, color)?;
                 } else {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
                     }
+                    let refs =
+                        store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let columns = resolve_columns(verbose, cols, include, exclude)?;
                     let color = !no_color && std::io::stdout().is_terminal();
-                    print_search_results(&query, &response.results, &columns, color);
+                    print_search_results(&query, &response.results, &refs, &columns, color);
                 }
             }
             Command::Expand {
+                target,
                 event,
                 search_unit,
                 before,
                 after,
                 no_color,
             } => {
-                let event_id = resolve_expand_event_id(&store, event, search_unit)?;
+                let event_id = resolve_expand_event_id(&store, target, event, search_unit)?;
                 let context = store
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
@@ -413,6 +420,7 @@ fn resolve_columns(
     }
     let mut columns = if verbose {
         vec![
+            Column::Ref,
             Column::Source,
             Column::Match,
             Column::Score,
@@ -425,7 +433,13 @@ fn resolve_columns(
             Column::Event,
         ]
     } else {
-        vec![Column::Source, Column::Match, Column::When, Column::Preview]
+        vec![
+            Column::Ref,
+            Column::Source,
+            Column::Match,
+            Column::When,
+            Column::Preview,
+        ]
     };
     for column in parse_columns_opt(include)? {
         if !columns.contains(&column) {
@@ -440,17 +454,19 @@ fn resolve_columns(
 
 fn resolve_expand_event_id(
     store: &Store,
+    target: Option<String>,
     event: Option<String>,
     search_unit: Option<String>,
 ) -> Result<String> {
-    match (event, search_unit) {
-        (Some(event_id), None) => Ok(event_id),
-        (None, Some(unit_id)) => store
+    match (target, event, search_unit) {
+        (Some(value), None, None) => resolve_event_ref_or_id(store, &value),
+        (None, Some(event_id), None) => resolve_event_ref_or_id(store, &event_id),
+        (None, None, Some(unit_id)) => store
             .search_unit_by_id(&unit_id)?
             .map(|unit| unit.event_id)
             .ok_or_else(|| anyhow::anyhow!("search unit not found: {unit_id}")),
-        (None, None) => bail!("expand requires --event <id> or --search-unit <id>"),
-        (Some(_), Some(_)) => bail!("expand accepts either --event or --search-unit, not both"),
+        (None, None, None) => bail!("expand requires a ref, --event <id>, or --search-unit <id>"),
+        _ => bail!("expand accepts one target: positional ref, --event, or --search-unit"),
     }
 }
 
@@ -460,7 +476,7 @@ fn resolve_optional_event_id(
     search_unit: Option<String>,
 ) -> Result<Option<String>> {
     match (event, search_unit) {
-        (Some(event_id), None) => Ok(Some(event_id)),
+        (Some(event_id), None) => Ok(Some(resolve_event_ref_or_id(store, &event_id)?)),
         (None, Some(unit_id)) => store
             .search_unit_by_id(&unit_id)?
             .map(|unit| Some(unit.event_id))
@@ -468,6 +484,16 @@ fn resolve_optional_event_id(
         (None, None) => Ok(None),
         (Some(_), Some(_)) => bail!("show accepts either --event or --search-unit, not both"),
     }
+}
+
+fn resolve_event_ref_or_id(store: &Store, value: &str) -> Result<String> {
+    if store.event_by_id(value)?.is_some() {
+        return Ok(value.to_string());
+    }
+    if let Some(event_id) = store.event_id_for_recent_ref(value)? {
+        return Ok(event_id);
+    }
+    bail!("event/ref not found: {value}")
 }
 
 fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) -> Result<()> {
@@ -491,10 +517,24 @@ fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) ->
     Ok(())
 }
 
+fn recent_ref_inputs(results: &[search::SearchResult]) -> Vec<RecentResultRefInput> {
+    results
+        .iter()
+        .map(|result| RecentResultRefInput {
+            event_id: result.event_id.clone(),
+            session_id: result.session_id.clone(),
+            source_kind: result.source_kind.clone(),
+            occurred_at: result.occurred_at,
+            preview: result.snippet.clone(),
+        })
+        .collect()
+}
+
 fn run_fzf_search(
     config: &AppConfig,
     query: &str,
     results: &[search::SearchResult],
+    refs: &[String],
     color: bool,
 ) -> Result<()> {
     if results.is_empty() {
@@ -510,16 +550,16 @@ fn run_fzf_search(
     let current_exe = std::env::current_exe()?;
     let exe = shell_quote(&current_exe.to_string_lossy());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let preview = format!("{exe} --data-dir {data_dir} expand --event {{6}} --before 3 --after 5");
-    let open = format!("{exe} --data-dir {data_dir} show {{5}} --event {{6}}");
+    let preview = format!("{exe} --data-dir {data_dir} expand --event {{7}} --before 3 --after 5");
+    let open = format!("{exe} --data-dir {data_dir} show {{6}} --event {{7}}");
     let mut child = ProcessCommand::new("fzf")
         .arg("--ansi")
         .arg("--delimiter")
         .arg("\t")
         .arg("--with-nth")
-        .arg("1,2,3,4")
+        .arg("1,2,3,4,5")
         .arg("--header")
-        .arg("Source\tMatch\tWhen\tPreview")
+        .arg("Ref\tSource\tMatch\tWhen\tPreview")
         .arg("--preview")
         .arg(preview)
         .arg("--bind")
@@ -528,7 +568,7 @@ fn run_fzf_search(
         .stdout(Stdio::null())
         .spawn()?;
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(fzf_rows(results, color).as_bytes())?;
+        stdin.write_all(fzf_rows(results, refs, color).as_bytes())?;
     }
     let status = child.wait()?;
     if !status.success() {
@@ -537,17 +577,18 @@ fn run_fzf_search(
     Ok(())
 }
 
-fn fzf_rows(results: &[search::SearchResult], color: bool) -> String {
+fn fzf_rows(results: &[search::SearchResult], refs: &[String], color: bool) -> String {
     let mut rows = String::new();
-    for result in results {
-        rows.push_str(&fzf_row(result, color));
+    for (idx, result) in results.iter().enumerate() {
+        rows.push_str(&fzf_row(result, refs.get(idx).map(String::as_str), color));
         rows.push('\n');
     }
     rows
 }
 
-fn fzf_row(result: &search::SearchResult, color: bool) -> String {
+fn fzf_row(result: &search::SearchResult, ref_id: Option<&str>, color: bool) -> String {
     [
+        clean_fzf_field(ref_id.unwrap_or("-")),
         clean_fzf_field(&result.source_kind),
         clean_fzf_field(&color_match(
             match result.match_type {
@@ -644,6 +685,7 @@ fn parse_columns(input: &str) -> Result<Vec<Column>> {
 
 fn parse_column(name: &str) -> Result<Column> {
     match name.to_ascii_lowercase().as_str() {
+        "ref" | "refs" => Ok(Column::Ref),
         "source" => Ok(Column::Source),
         "match" => Ok(Column::Match),
         "when" | "time" | "date" => Ok(Column::When),
@@ -655,7 +697,7 @@ fn parse_column(name: &str) -> Result<Column> {
         "event" | "event_id" => Ok(Column::Event),
         "session" | "session_id" => Ok(Column::Session),
         _ => bail!(
-            "unknown column '{name}'. Available columns: source,match,when,title,preview,score,lex,sem,event,session,ids"
+            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,event,session,ids"
         ),
     }
 }
@@ -663,6 +705,7 @@ fn parse_column(name: &str) -> Result<Column> {
 fn print_search_results(
     query: &str,
     results: &[search::SearchResult],
+    refs: &[String],
     columns: &[Column],
     color: bool,
 ) {
@@ -672,10 +715,11 @@ fn print_search_results(
     }
     let rows = results
         .iter()
-        .map(|result| {
+        .enumerate()
+        .map(|(idx, result)| {
             columns
                 .iter()
-                .map(|column| cell_value(*column, result))
+                .map(|column| cell_value(*column, result, refs.get(idx).map(String::as_str)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -718,8 +762,9 @@ fn print_search_results(
     }
 }
 
-fn cell_value(column: Column, result: &search::SearchResult) -> String {
+fn cell_value(column: Column, result: &search::SearchResult, ref_id: Option<&str>) -> String {
     match column {
+        Column::Ref => ref_id.unwrap_or("-").to_string(),
         Column::Source => result.source_kind.clone(),
         Column::Match => match result.match_type {
             search::MatchType::Lexical => "lexical".to_string(),
@@ -765,6 +810,7 @@ fn truncate_cell(input: &str, max_chars: usize) -> String {
 
 fn column_header(column: Column) -> &'static str {
     match column {
+        Column::Ref => "Ref",
         Column::Source => "Source",
         Column::Match => "Match",
         Column::When => "When",
@@ -933,6 +979,7 @@ mod tests {
         assert_eq!(
             columns,
             vec![
+                Column::Ref,
                 Column::Source,
                 Column::Match,
                 Column::Preview,
@@ -958,15 +1005,16 @@ mod tests {
             snippet: "preview with\nnew line".to_string(),
         };
 
-        let row = fzf_row(&result, false);
+        let row = fzf_row(&result, Some("ab3f"), false);
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 6);
-        assert_eq!(fields[0], "codex");
-        assert_eq!(fields[1], "hybrid");
-        assert_eq!(fields[3], "preview with new line");
-        assert_eq!(fields[4], "session_1");
-        assert_eq!(fields[5], "event_1");
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[0], "ab3f");
+        assert_eq!(fields[1], "codex");
+        assert_eq!(fields[2], "hybrid");
+        assert_eq!(fields[4], "preview with new line");
+        assert_eq!(fields[5], "session_1");
+        assert_eq!(fields[6], "event_1");
     }
 
     #[test]
