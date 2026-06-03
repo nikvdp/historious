@@ -4,7 +4,7 @@ use crate::search;
 use crate::server;
 use crate::storage::{RecentResultRefInput, Store};
 use crate::transport;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
@@ -13,6 +13,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_FZF_LIMIT: usize = 200;
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -50,14 +53,13 @@ pub enum Command {
     /// Search indexed transcripts.
     Search {
         #[arg(help = "Words, paths, errors, or other details to search for")]
-        query: String,
+        query: Option<String>,
         #[arg(
             short,
             long,
-            default_value_t = 10,
-            help = "Maximum number of results to show"
+            help = "Maximum number of results to show; defaults to 10, or 200 with --fzf"
         )]
-        limit: usize,
+        limit: Option<usize>,
         #[arg(long, help = "Print structured JSON with refs for follow-up commands")]
         json: bool,
         #[arg(long, help = "Show scores and full ids in table output")]
@@ -86,6 +88,8 @@ pub enum Command {
         no_color: bool,
         #[arg(long, help = "Browse results interactively with fzf")]
         fzf: bool,
+        #[arg(long, hide = true)]
+        fzf_rows: bool,
     },
     /// Show nearby transcript context for a search result.
     Show {
@@ -339,9 +343,23 @@ impl Cli {
                 recency_bias,
                 no_color,
                 fzf,
+                fzf_rows,
             } => {
                 if robot && fzf {
                     bail!("--robot cannot be combined with --fzf");
+                }
+                let limit = search_limit(limit, fzf);
+                let query = query.unwrap_or_default();
+                if query.trim().is_empty() && !fzf && !fzf_rows {
+                    bail!("search requires a query; use --fzf to start interactive search");
+                }
+                if fzf_rows && query.trim().is_empty() {
+                    return Ok(());
+                }
+                if fzf {
+                    let color = !no_color;
+                    run_fzf_search(&config, &query, limit, sort, recency_bias, color)?;
+                    return Ok(());
                 }
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias);
@@ -365,14 +383,14 @@ impl Cli {
                             ..Default::default()
                         },
                     )?;
-                } else if fzf {
+                } else if fzf_rows {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
                     }
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let color = !no_color;
-                    run_fzf_search(&config, &query, &response.results, &refs, color)?;
+                    print!("{}", fzf_rows_output(&response.results, &refs, color));
                 } else {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
@@ -1590,46 +1608,68 @@ fn recent_ref_inputs(results: &[search::SearchResult]) -> Vec<RecentResultRefInp
         .collect()
 }
 
+fn search_limit(limit: Option<usize>, fzf: bool) -> usize {
+    limit.unwrap_or(if fzf {
+        DEFAULT_FZF_LIMIT
+    } else {
+        DEFAULT_SEARCH_LIMIT
+    })
+}
+
 fn run_fzf_search(
     config: &AppConfig,
     query: &str,
-    results: &[search::SearchResult],
-    refs: &[String],
+    limit: usize,
+    sort: SearchSort,
+    recency_bias: f64,
     color: bool,
 ) -> Result<()> {
-    if results.is_empty() {
-        println!("No results for: \"{query}\"");
-        return Ok(());
-    }
     if !command_exists("fzf") {
         bail!(
-            "fzf is not installed. Use `super-cass search {}` and then `super-cass show <ref>` or `super-cass transcript <ref>`.",
-            shell_quote(query)
+            "fzf is not installed. Use `super-cass search <query>` and then `super-cass show <ref>` or `super-cass transcript <ref>`."
         );
     }
     let current_exe = std::env::current_exe()?;
     let exe = shell_quote(&current_exe.to_string_lossy());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
+    let color_flag = if color { "" } else { " --no-color" };
+    let reload = format!(
+        "{exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{color_flag} -- {{q}}",
+        sort.as_str()
+    );
     let preview = format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5");
     let open = format!("{exe} --data-dir {data_dir} transcript {{7}}");
     let mut child = ProcessCommand::new("fzf")
         .arg("--ansi")
         .arg("--delimiter")
         .arg("\t")
+        .arg("--nth")
+        .arg("1,2,3,4,5")
         .arg("--with-nth")
         .arg("1,2,3,4,5")
+        .arg("--query")
+        .arg(query)
         .arg("--header")
         .arg("Ref\tSource\tMatch\tWhen\tPreview")
         .arg("--preview")
         .arg(preview)
         .arg("--bind")
+        .arg(format!("start:reload({reload})"))
+        .arg("--bind")
+        .arg(format!("change:reload({reload})"))
+        .arg("--bind")
         .arg(format!("enter:execute({open})+abort"))
-        .stdin(Stdio::piped())
+        .arg("--bind")
+        .arg(preview_scroll_bind("shift-up", "preview-up", 10))
+        .arg("--bind")
+        .arg(preview_scroll_bind("shift-down", "preview-down", 10))
+        .arg("--bind")
+        .arg("ctrl-u:preview-half-page-up")
+        .arg("--bind")
+        .arg("ctrl-d:preview-half-page-down")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(fzf_rows(results, refs, color).as_bytes())?;
-    }
     let status = child.wait()?;
     if !status.success() {
         return Ok(());
@@ -1637,7 +1677,11 @@ fn run_fzf_search(
     Ok(())
 }
 
-fn fzf_rows(results: &[search::SearchResult], refs: &[String], color: bool) -> String {
+fn preview_scroll_bind(key: &str, action: &str, count: usize) -> String {
+    format!("{key}:{}", vec![action; count].join("+"))
+}
+
+fn fzf_rows_output(results: &[search::SearchResult], refs: &[String], color: bool) -> String {
     let mut rows = String::new();
     for (idx, result) in results.iter().enumerate() {
         rows.push_str(&fzf_row(result, refs.get(idx).map(String::as_str), color));
@@ -2024,7 +2068,7 @@ fn load_embedder_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{stable_hash, ArchiveRecord, EventRecord, SessionRecord, SourceRecord};
+    use crate::archive::{ArchiveRecord, EventRecord, SessionRecord, SourceRecord, stable_hash};
     use chrono::Utc;
     use serde_json::json;
 
@@ -2149,6 +2193,34 @@ mod tests {
         assert!(cli.robot);
         assert_eq!(cli.command_name(), "search");
         assert!(cli.wants_structured_errors());
+    }
+
+    #[test]
+    fn search_fzf_accepts_missing_starting_query() {
+        let cli = Cli::try_parse_from(["super-cass", "search", "--fzf"]).expect("parse fzf search");
+
+        match cli.command {
+            Command::Search { query, fzf, .. } => {
+                assert_eq!(query, None);
+                assert!(fzf);
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn fzf_uses_wider_default_limit_than_plain_search() {
+        assert_eq!(search_limit(None, false), DEFAULT_SEARCH_LIMIT);
+        assert_eq!(search_limit(None, true), DEFAULT_FZF_LIMIT);
+        assert_eq!(search_limit(Some(25), true), 25);
+    }
+
+    #[test]
+    fn preview_scroll_bind_repeats_standard_fzf_actions() {
+        assert_eq!(
+            preview_scroll_bind("shift-down", "preview-down", 3),
+            "shift-down:preview-down+preview-down+preview-down"
+        );
     }
 
     #[test]
