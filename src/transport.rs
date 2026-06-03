@@ -156,7 +156,8 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         stats.duplicates += delta.duplicates;
         stats.delta.merge(delta.delta);
     }
-    stats.vectors_indexed = store.refresh_vector_projection()?;
+    stats.vectors_indexed =
+        store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
     Ok(stats)
 }
 

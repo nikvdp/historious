@@ -821,12 +821,11 @@ fn run_update_once(
         ingest::UpdateOptions { max_files, source },
     )?;
     let projected = search::refresh_incremental(store, &ingest.delta)?;
-    let (embedder, degraded_reason) = load_embedder(config);
-    let embeddings = search::refresh_embeddings(
+    let embeddings = search::refresh_embeddings_incremental(
         store,
         &config.machine_id,
-        embedder.as_deref(),
-        degraded_reason,
+        &config.embedder,
+        &ingest.delta,
     )?;
     Ok(UpdateOutput {
         ingest,
@@ -861,12 +860,11 @@ fn run_update_once_human(
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
-    let (embedder, degraded_reason) = load_embedder(config);
-    let embeddings = search::refresh_embeddings(
+    let embeddings = search::refresh_embeddings_incremental(
         store,
         &config.machine_id,
-        embedder.as_deref(),
-        degraded_reason,
+        &config.embedder,
+        &ingest.delta,
     )?;
     embed.finish(embedding_phase_detail(&embeddings));
 
@@ -882,12 +880,11 @@ fn run_update_once_human(
 fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let stats = transport::import_jsonl_path(store, input)?;
     let projected = search::refresh_incremental(store, &stats.delta)?;
-    let (embedder, degraded_reason) = load_embedder(config);
-    let embeddings = search::refresh_embeddings(
+    let embeddings = search::refresh_embeddings_incremental(
         store,
         &config.machine_id,
-        embedder.as_deref(),
-        degraded_reason,
+        &config.embedder,
+        &stats.delta,
     )?;
     Ok(ImportOutput {
         import: stats,
@@ -913,12 +910,11 @@ fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Resu
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
-    let (embedder, degraded_reason) = load_embedder(config);
-    let embeddings = search::refresh_embeddings(
+    let embeddings = search::refresh_embeddings_incremental(
         store,
         &config.machine_id,
-        embedder.as_deref(),
-        degraded_reason,
+        &config.embedder,
+        &stats.delta,
     )?;
     embed.finish(embedding_phase_detail(&embeddings));
 
@@ -1950,9 +1946,12 @@ async fn run_daemon(
         index.finish(format!("{} events indexed", format_count(projected)));
 
         let embed = progress.phase("Updating embeddings");
-        let (embedder, degraded_reason) = load_embedder_config(&embedder_config);
-        let embeddings =
-            search::refresh_embeddings(store, machine_id, embedder.as_deref(), degraded_reason)?;
+        let embeddings = search::refresh_embeddings_incremental(
+            store,
+            machine_id,
+            &embedder_config,
+            &stats.delta,
+        )?;
         embed.finish(embedding_phase_detail(&embeddings));
 
         print_update_output(
