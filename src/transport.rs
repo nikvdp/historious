@@ -351,6 +351,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_artifact_export_uses_compact_content_string_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::RawArtifact(fixture_raw("source_raw", "raw_compact")),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        export_jsonl(&store, &mut body).expect("export jsonl");
+
+        let raw = jsonl_record_payload(&body, "raw_artifact").expect("raw artifact payload");
+        let content = raw.get("content").expect("content field");
+        assert!(content.is_string(), "raw content should be a base64 string");
+        assert_eq!(content.as_str(), Some("Zml4dHVyZQ=="));
+
+        let imported_dir = tempfile::tempdir().expect("import tempdir");
+        let imported = Store::open(imported_dir.path()).expect("open imported");
+        import_jsonl_reader(&imported, body.as_slice()).expect("import compact jsonl");
+        let records = imported.export_records().expect("export imported records");
+        let imported_raw = records
+            .iter()
+            .find_map(|record| match record {
+                ArchiveRecord::RawArtifact(raw) => Some(raw),
+                _ => None,
+            })
+            .expect("imported raw artifact");
+        assert_eq!(imported_raw.content, b"fixture");
+    }
+
+    #[test]
     fn filtered_export_options_can_omit_embeddings() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -432,6 +465,14 @@ mod tests {
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .any(|value| value.get("kind").and_then(|kind| kind.as_str()) == Some(kind))
+    }
+
+    fn jsonl_record_payload(body: &[u8], kind: &str) -> Option<serde_json::Value> {
+        String::from_utf8_lossy(body)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("kind").and_then(|kind| kind.as_str()) == Some(kind))
+            .and_then(|value| value.get("payload").cloned())
     }
 
     fn fixture_embedding(unit: &SearchUnitRecord) -> EmbeddingRecord {
