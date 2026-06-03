@@ -10,6 +10,9 @@ use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -313,11 +316,12 @@ impl Cli {
                 source,
                 json,
             } => {
-                let output = run_update_once(&store, &config, max_files, source)?;
                 if json || robot {
+                    let output = run_update_once(&store, &config, max_files, source)?;
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
-                    print_update_output(&output);
+                    let output = run_update_once_human(&store, &config, max_files, source)?;
+                    print_update_output(&output, std::io::stdout().is_terminal());
                 }
             }
             Command::Search {
@@ -506,26 +510,12 @@ impl Cli {
             }
             Command::Import { jsonl, json, input } => {
                 if jsonl {
-                    let stats = transport::import_jsonl_path(&store, &input)?;
-                    let projected = search::refresh(&store)?;
-                    let (embedder, degraded_reason) = load_embedder(&config);
-                    let embeddings = search::refresh_embeddings(
-                        &store,
-                        &config.machine_id,
-                        embedder.as_deref(),
-                        degraded_reason,
-                    )?;
-                    let output = ImportOutput {
-                        import: stats,
-                        search_index: SearchIndexOutput {
-                            indexed_events: projected,
-                        },
-                        embeddings,
-                    };
                     if json || robot {
+                        let output = run_import_once(&store, &config, &input)?;
                         crate::output::write_success("import", output, Default::default())?;
                     } else {
-                        print_import_output(&output);
+                        let output = run_import_once_human(&store, &config, &input)?;
+                        print_import_output(&output, std::io::stdout().is_terminal());
                     }
                 } else {
                     anyhow::bail!("only --jsonl import is supported in v0");
@@ -847,6 +837,100 @@ fn run_update_once(
     })
 }
 
+fn run_update_once_human(
+    store: &Store,
+    config: &AppConfig,
+    max_files: Option<usize>,
+    source: Option<String>,
+) -> Result<UpdateOutput> {
+    let progress = ProgressUi::new();
+    let scan = progress.phase("Scanning local agent logs");
+    let ingest = ingest::update_local(
+        store,
+        &config.machine_id,
+        ingest::UpdateOptions { max_files, source },
+    )?;
+    scan.finish(format!(
+        "{} files, {} new events",
+        format_count(ingest.files_seen),
+        format_count(ingest.inserted)
+    ));
+
+    let index = progress.phase("Updating search index");
+    let projected = search::refresh(store)?;
+    index.finish(format!("{} events indexed", format_count(projected)));
+
+    let embed = progress.phase("Updating embeddings");
+    let (embedder, degraded_reason) = load_embedder(config);
+    let embeddings = search::refresh_embeddings(
+        store,
+        &config.machine_id,
+        embedder.as_deref(),
+        degraded_reason,
+    )?;
+    embed.finish(embedding_phase_detail(&embeddings));
+
+    Ok(UpdateOutput {
+        ingest,
+        search_index: SearchIndexOutput {
+            indexed_events: projected,
+        },
+        embeddings,
+    })
+}
+
+fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
+    let stats = transport::import_jsonl_path(store, input)?;
+    let projected = search::refresh(store)?;
+    let (embedder, degraded_reason) = load_embedder(config);
+    let embeddings = search::refresh_embeddings(
+        store,
+        &config.machine_id,
+        embedder.as_deref(),
+        degraded_reason,
+    )?;
+    Ok(ImportOutput {
+        import: stats,
+        search_index: SearchIndexOutput {
+            indexed_events: projected,
+        },
+        embeddings,
+    })
+}
+
+fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
+    let progress = ProgressUi::new();
+    let import = progress.phase("Importing history stream");
+    let stats = transport::import_jsonl_path(store, input)?;
+    import.finish(format!(
+        "{} new records, {} duplicates",
+        format_count(stats.inserted),
+        format_count(stats.duplicates)
+    ));
+
+    let index = progress.phase("Updating search index");
+    let projected = search::refresh(store)?;
+    index.finish(format!("{} events indexed", format_count(projected)));
+
+    let embed = progress.phase("Updating embeddings");
+    let (embedder, degraded_reason) = load_embedder(config);
+    let embeddings = search::refresh_embeddings(
+        store,
+        &config.machine_id,
+        embedder.as_deref(),
+        degraded_reason,
+    )?;
+    embed.finish(embedding_phase_detail(&embeddings));
+
+    Ok(ImportOutput {
+        import: stats,
+        search_index: SearchIndexOutput {
+            indexed_events: projected,
+        },
+        embeddings,
+    })
+}
+
 fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
     Ok(StatusOutput {
         data_dir: config.data_dir.display().to_string(),
@@ -888,50 +972,220 @@ fn degraded_probe(err: impl std::fmt::Display) -> EmbedderProbeOutput {
     }
 }
 
-fn print_update_output(output: &UpdateOutput) {
-    println!(
-        "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={}",
-        output.ingest.files_seen,
-        output.ingest.skipped_unchanged,
-        output.ingest.inserted,
-        output.ingest.duplicates,
-        output.ingest.errors
+fn print_update_output(output: &UpdateOutput, color: bool) {
+    println!();
+    println!("{}", styled("Update complete", "1;32", color));
+    print_section(
+        "Files",
+        &[
+            ("Seen", format_count(output.ingest.files_seen)),
+            ("Unchanged", format_count(output.ingest.skipped_unchanged)),
+            ("New events", format_count(output.ingest.inserted)),
+            ("Duplicates", format_count(output.ingest.duplicates)),
+            ("Errors", format_count(output.ingest.errors)),
+        ],
+        color,
     );
-    println!(
-        "search_index=ready indexed_events={}",
-        output.search_index.indexed_events
+    print_search_summary(output.search_index.indexed_events, color);
+    print_embedding_summary(&output.embeddings, color);
+}
+
+fn print_import_output(output: &ImportOutput, color: bool) {
+    println!();
+    println!("{}", styled("Import complete", "1;32", color));
+    print_section(
+        "Records",
+        &[
+            ("New records", format_count(output.import.inserted)),
+            ("Duplicates", format_count(output.import.duplicates)),
+            (
+                "Imported vectors",
+                format_count(output.import.vectors_indexed),
+            ),
+        ],
+        color,
     );
-    println!(
-        "embeddings=ready embedded={} indexed_vectors={} degraded_reason={}",
-        output.embeddings.embedded,
-        output.embeddings.vectors_indexed,
-        output
-            .embeddings
-            .degraded_reason
-            .clone()
-            .unwrap_or_else(|| "none".to_string())
+    print_search_summary(output.search_index.indexed_events, color);
+    print_embedding_summary(&output.embeddings, color);
+}
+
+fn print_search_summary(indexed_events: usize, color: bool) {
+    print_section(
+        "Search",
+        &[("Indexed events", format_count(indexed_events))],
+        color,
     );
 }
 
-fn print_import_output(output: &ImportOutput) {
-    println!(
-        "imported={} duplicates={} indexed_vectors={}",
-        output.import.inserted, output.import.duplicates, output.import.vectors_indexed
+fn print_embedding_summary(embeddings: &search::EmbeddingRefresh, color: bool) {
+    let mode = embeddings
+        .degraded_reason
+        .as_deref()
+        .map(|reason| format!("degraded ({reason})"))
+        .unwrap_or_else(|| "ready".to_string());
+    print_section(
+        "Embeddings",
+        &[
+            ("New embeddings", format_count(embeddings.embedded)),
+            ("Indexed vectors", format_count(embeddings.vectors_indexed)),
+            ("Mode", mode),
+        ],
+        color,
     );
-    println!(
-        "search_index=ready indexed_events={}",
-        output.search_index.indexed_events
-    );
-    println!(
-        "embeddings=ready embedded={} indexed_vectors={} degraded_reason={}",
-        output.embeddings.embedded,
-        output.embeddings.vectors_indexed,
-        output
-            .embeddings
-            .degraded_reason
-            .clone()
-            .unwrap_or_else(|| "none".to_string())
-    );
+}
+
+fn print_section(title: &str, rows: &[(&str, String)], color: bool) {
+    println!();
+    println!("  {}", styled(title, "1;36", color));
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (label, value) in rows {
+        println!("    {label:<width$}  {value}");
+    }
+}
+
+fn embedding_phase_detail(embeddings: &search::EmbeddingRefresh) -> String {
+    if let Some(reason) = &embeddings.degraded_reason {
+        format!("degraded: {reason}")
+    } else {
+        format!(
+            "{} new embeddings, {} vectors indexed",
+            format_count(embeddings.embedded),
+            format_count(embeddings.vectors_indexed)
+        )
+    }
+}
+
+fn format_count(value: usize) -> String {
+    let text = value.to_string();
+    let mut out = String::with_capacity(text.len() + text.len() / 3);
+    for (idx, ch) in text.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn styled(text: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+struct ProgressUi {
+    interactive: bool,
+}
+
+impl ProgressUi {
+    fn new() -> Self {
+        Self {
+            interactive: std::io::stderr().is_terminal(),
+        }
+    }
+
+    fn phase(&self, label: &str) -> ProgressPhase {
+        ProgressPhase::start(label, self.interactive)
+    }
+}
+
+struct ProgressPhase {
+    label: String,
+    interactive: bool,
+    started: Instant,
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+    finished: bool,
+}
+
+impl ProgressPhase {
+    fn start(label: &str, interactive: bool) -> Self {
+        let started = Instant::now();
+        if interactive {
+            let label_for_thread = label.to_string();
+            let (tx, rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let frames = ["-", "\\", "|", "/"];
+                let mut idx = 0usize;
+                loop {
+                    eprint!(
+                        "\r\x1b[36m{}\x1b[0m {}",
+                        frames[idx % frames.len()],
+                        label_for_thread
+                    );
+                    let _ = std::io::stderr().flush();
+                    idx = idx.wrapping_add(1);
+                    if rx.recv_timeout(Duration::from_millis(90)).is_ok() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                label: label.to_string(),
+                interactive,
+                started,
+                stop: Some(tx),
+                handle: Some(handle),
+                finished: false,
+            }
+        } else {
+            eprintln!("{label}...");
+            Self {
+                label: label.to_string(),
+                interactive,
+                started,
+                stop: None,
+                handle: None,
+                finished: false,
+            }
+        }
+    }
+
+    fn finish(mut self, detail: String) {
+        self.stop_spinner();
+        let elapsed = format_elapsed(self.started.elapsed());
+        if self.interactive {
+            eprintln!(
+                "\r\x1b[2K\x1b[32mdone\x1b[0m {} \x1b[2m{}; {}\x1b[0m",
+                self.label, detail, elapsed
+            );
+        } else {
+            eprintln!("{} done: {} ({})", self.label, detail, elapsed);
+        }
+        self.finished = true;
+    }
+
+    fn stop_spinner(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProgressPhase {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stop_spinner();
+            if self.interactive {
+                eprint!("\r\x1b[2K");
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
 }
 
 fn print_status_output(output: &StatusOutput) {
@@ -1674,7 +1928,9 @@ async fn run_daemon(
     source: Option<String>,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let progress = ProgressUi::new();
     loop {
+        let scan = progress.phase("Scanning local agent logs");
         let stats = ingest::update_local(
             store,
             machine_id,
@@ -1683,21 +1939,31 @@ async fn run_daemon(
                 source: source.clone(),
             },
         )?;
+        scan.finish(format!(
+            "{} files, {} new events",
+            format_count(stats.files_seen),
+            format_count(stats.inserted)
+        ));
+
+        let index = progress.phase("Updating search index");
         let projected = search::refresh(store)?;
+        index.finish(format!("{} events indexed", format_count(projected)));
+
+        let embed = progress.phase("Updating embeddings");
         let (embedder, degraded_reason) = load_embedder_config(&embedder_config);
         let embeddings =
             search::refresh_embeddings(store, machine_id, embedder.as_deref(), degraded_reason)?;
-        println!(
-            "files_seen={} skipped_unchanged={} inserted={} duplicates={} errors={} indexed_events={} embedded={} inserted_vectors={} degraded_reason={}",
-            stats.files_seen,
-            stats.skipped_unchanged,
-            stats.inserted,
-            stats.duplicates,
-            stats.errors,
-            projected,
-            embeddings.embedded,
-            embeddings.vectors_indexed,
-            embeddings.degraded_reason.unwrap_or_else(|| "none".to_string())
+        embed.finish(embedding_phase_detail(&embeddings));
+
+        print_update_output(
+            &UpdateOutput {
+                ingest: stats,
+                search_index: SearchIndexOutput {
+                    indexed_events: projected,
+                },
+                embeddings,
+            },
+            std::io::stdout().is_terminal(),
         );
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
