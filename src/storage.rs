@@ -208,6 +208,64 @@ impl Store {
         blob_path(&self.blob_dir, hash).exists()
     }
 
+    pub fn missing_raw_artifact_blob_hashes(
+        &self,
+        filter: &ArchiveExportFilter,
+    ) -> Result<Vec<String>> {
+        let session_ids = if filter.is_empty() {
+            Vec::new()
+        } else {
+            self.session_ids_for_export_filter(filter)?
+        };
+        self.with_conn(|conn| {
+            let hashes = if filter.is_empty() {
+                raw_artifact_hashes(conn)?
+            } else {
+                raw_artifact_hashes_for_session_ids(conn, &session_ids)?
+            };
+            Ok(hashes
+                .into_iter()
+                .filter(|hash| !blob_path(&self.blob_dir, hash).exists())
+                .collect())
+        })
+    }
+
+    pub fn read_raw_artifact_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_artifacts WHERE hash = ?1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                bail!("raw artifact metadata not found: {hash}");
+            }
+            read_blob(&self.blob_dir, hash)
+        })
+    }
+
+    pub fn write_raw_artifact_blob(&self, hash: &str, content: &[u8]) -> Result<bool> {
+        let actual = crate::archive::blake3_hex(content);
+        if actual != hash {
+            bail!("raw artifact blob hash mismatch: expected {hash}, got {actual}");
+        }
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_artifacts WHERE hash = ?1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                bail!("raw artifact metadata not found: {hash}");
+            }
+            let already_present = blob_path(&self.blob_dir, hash).exists();
+            if !already_present {
+                write_blob(&self.blob_dir, hash, content)?;
+            }
+            Ok(!already_present)
+        })
+    }
+
     pub fn upsert_source(
         &self,
         id: &str,
@@ -1313,6 +1371,46 @@ fn events_for_session(conn: &Connection, session_id: &str) -> Result<Vec<EventRe
          ORDER BY ordinal, id",
     )?;
     let rows = stmt.query_map(params![session_id], row_event)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_hashes(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT hash FROM raw_artifacts ORDER BY first_seen_at, hash")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_hashes_for_session_ids(
+    conn: &Connection,
+    session_ids: &[String],
+) -> Result<Vec<String>> {
+    let session_ids = normalized_ids(session_ids);
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = placeholders(session_ids.len());
+    let sql = format!(
+        "SELECT hash
+         FROM raw_artifacts
+         WHERE hash IN (
+           SELECT raw_artifact_hash FROM events
+           WHERE session_id IN ({placeholders}) AND raw_artifact_hash IS NOT NULL
+         )
+         ORDER BY first_seen_at, hash"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(session_ids.iter().map(String::as_str)),
+        |row| row.get(0),
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
