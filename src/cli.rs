@@ -147,6 +147,8 @@ pub enum Command {
     Export {
         #[arg(long)]
         jsonl: bool,
+        #[arg(long, help = "Omit embedding records from the JSONL archive stream")]
+        no_embeddings: bool,
         #[arg(long)]
         source: Vec<String>,
         #[arg(long)]
@@ -312,8 +314,7 @@ impl Cli {
                 if json || robot {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
-                    let output =
-                        search_output(&query, limit, sort, recency_bias, &response, &refs);
+                    let output = search_output(&query, limit, sort, recency_bias, &response, &refs);
                     crate::output::write_success(
                         "search",
                         output,
@@ -412,7 +413,12 @@ impl Cli {
                 if json || robot {
                     crate::output::write_success(
                         "transcript",
-                        transcript_output(&store, &session_record, &events, target_event_id.as_deref())?,
+                        transcript_output(
+                            &store,
+                            &session_record,
+                            &events,
+                            target_event_id.as_deref(),
+                        )?,
                         Default::default(),
                     )?;
                 } else {
@@ -435,6 +441,7 @@ impl Cli {
             }
             Command::Export {
                 jsonl,
+                no_embeddings,
                 source,
                 workspace,
                 session,
@@ -451,7 +458,14 @@ impl Cli {
                         sessions: session,
                         since: transport::parse_since_arg(since.as_deref())?,
                     };
-                    transport::export_jsonl_filtered(&store, &filter, stdout.lock())?;
+                    transport::export_jsonl_filtered_with_options(
+                        &store,
+                        &filter,
+                        transport::ExportOptions {
+                            include_embeddings: !no_embeddings,
+                        },
+                        stdout.lock(),
+                    )?;
                 } else {
                     anyhow::bail!("only --jsonl export is supported in v0");
                 }
@@ -952,8 +966,8 @@ fn transcript_output(
     events: &[crate::archive::EventRecord],
     target_event_id: Option<&str>,
 ) -> Result<TranscriptOutput> {
-    let target_index = target_event_id
-        .and_then(|event_id| events.iter().position(|event| event.id == event_id));
+    let target_index =
+        target_event_id.and_then(|event_id| events.iter().position(|event| event.id == event_id));
     let target_ref = target_event_id
         .map(|event_id| store.recent_ref_for_event_id(event_id))
         .transpose()?
