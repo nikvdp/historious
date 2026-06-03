@@ -190,7 +190,7 @@ fn flush_import_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    let delta = store.import_records(batch)?;
+    let delta = store.import_archive_records(batch)?;
     stats.inserted += delta.inserted;
     stats.duplicates += delta.duplicates;
     stats.delta.merge(delta.delta);
@@ -409,6 +409,49 @@ mod tests {
         let second = import_jsonl_reader(&target, body.as_slice()).expect("second import");
         assert_eq!(second.inserted, 0);
         assert_eq!(second.duplicates, IMPORT_JSONL_BATCH_RECORDS + 1);
+    }
+
+    #[test]
+    fn duplicate_jsonl_import_skips_archive_touched_delta_bookkeeping() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source = Store::open(source_dir.path()).expect("open source");
+        let unit = fixture_search_unit();
+        let records = [
+            ArchiveRecord::Source(fixture_source("source_test")),
+            ArchiveRecord::Session(fixture_session("session_test", "source_test", "/tmp/repo")),
+            ArchiveRecord::Event(fixture_event(
+                "event_test",
+                "session_test",
+                "source_test",
+                None,
+            )),
+            ArchiveRecord::SearchUnit(unit.clone()),
+            ArchiveRecord::Embedding(fixture_embedding(&unit)),
+        ];
+        source
+            .import_records(&records)
+            .expect("import source records");
+        let mut body = Vec::new();
+        export_jsonl(&source, &mut body).expect("export jsonl");
+
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target = Store::open(target_dir.path()).expect("open target");
+        let first = import_jsonl_reader(&target, body.as_slice()).expect("first import");
+        assert_eq!(first.inserted, records.len());
+        assert_eq!(first.delta.inserted_events, vec!["event_test"]);
+        assert_eq!(first.delta.inserted_search_units.len(), 1);
+        assert_eq!(first.delta.inserted_embeddings.len(), 1);
+
+        let second = import_jsonl_reader(&target, body.as_slice()).expect("second import");
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.duplicates, records.len());
+        assert!(second.delta.touched_sessions.is_empty());
+        assert!(second.delta.touched_events.is_empty());
+        assert!(second.delta.touched_search_units.is_empty());
+        assert!(second.delta.touched_embeddings.is_empty());
+        assert!(second.delta.inserted_events.is_empty());
+        assert!(second.delta.inserted_search_units.is_empty());
+        assert!(second.delta.inserted_embeddings.is_empty());
     }
 
     #[test]

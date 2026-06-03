@@ -43,6 +43,12 @@ pub struct ImportDelta {
     pub touched_embeddings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportDeltaMode {
+    Full,
+    InsertedOnly,
+}
+
 impl ImportDelta {
     pub fn merge(&mut self, other: ImportDelta) {
         extend_unique(&mut self.inserted_sources, other.inserted_sources);
@@ -296,6 +302,18 @@ impl Store {
     }
 
     pub fn import_records(&self, records: &[ArchiveRecord]) -> Result<ImportStats> {
+        self.import_records_with_delta_mode(records, ImportDeltaMode::Full)
+    }
+
+    pub fn import_archive_records(&self, records: &[ArchiveRecord]) -> Result<ImportStats> {
+        self.import_records_with_delta_mode(records, ImportDeltaMode::InsertedOnly)
+    }
+
+    fn import_records_with_delta_mode(
+        &self,
+        records: &[ArchiveRecord],
+        delta_mode: ImportDeltaMode,
+    ) -> Result<ImportStats> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let mut stats = ImportStats::default();
@@ -315,7 +333,7 @@ impl Store {
                 } else {
                     stats.duplicates += 1;
                 }
-                record_delta(record, inserted, &mut stats.delta);
+                record_delta(record, inserted, delta_mode, &mut stats.delta);
             }
             tx.commit()?;
             Ok(stats)
@@ -2130,7 +2148,15 @@ fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
-fn record_delta(record: &ArchiveRecord, inserted: bool, delta: &mut ImportDelta) {
+fn record_delta(
+    record: &ArchiveRecord,
+    inserted: bool,
+    mode: ImportDeltaMode,
+    delta: &mut ImportDelta,
+) {
+    if mode == ImportDeltaMode::InsertedOnly && !inserted {
+        return;
+    }
     match record {
         ArchiveRecord::Source(source) => {
             if inserted {
@@ -2138,35 +2164,45 @@ fn record_delta(record: &ArchiveRecord, inserted: bool, delta: &mut ImportDelta)
             }
         }
         ArchiveRecord::RawArtifact(raw) => {
-            push_unique(&mut delta.touched_paths, raw.path.clone());
+            if mode == ImportDeltaMode::Full {
+                push_unique(&mut delta.touched_paths, raw.path.clone());
+            }
             if inserted {
                 push_unique(&mut delta.inserted_raw_artifacts, raw.hash.clone());
             }
         }
         ArchiveRecord::Session(session) => {
-            push_unique(&mut delta.touched_sessions, session.id.clone());
+            if mode == ImportDeltaMode::Full {
+                push_unique(&mut delta.touched_sessions, session.id.clone());
+            }
             if inserted {
                 push_unique(&mut delta.inserted_sessions, session.id.clone());
             }
         }
         ArchiveRecord::Event(event) => {
-            push_unique(&mut delta.touched_events, event.id.clone());
-            push_unique(&mut delta.touched_sessions, event.session_id.clone());
+            if mode == ImportDeltaMode::Full {
+                push_unique(&mut delta.touched_events, event.id.clone());
+                push_unique(&mut delta.touched_sessions, event.session_id.clone());
+            }
             if inserted {
                 push_unique(&mut delta.inserted_events, event.id.clone());
             }
         }
         ArchiveRecord::SearchUnit(unit) => {
-            push_unique(&mut delta.touched_search_units, unit.id.clone());
-            push_unique(&mut delta.touched_events, unit.event_id.clone());
-            push_unique(&mut delta.touched_sessions, unit.session_id.clone());
+            if mode == ImportDeltaMode::Full {
+                push_unique(&mut delta.touched_search_units, unit.id.clone());
+                push_unique(&mut delta.touched_events, unit.event_id.clone());
+                push_unique(&mut delta.touched_sessions, unit.session_id.clone());
+            }
             if inserted {
                 push_unique(&mut delta.inserted_search_units, unit.id.clone());
             }
         }
         ArchiveRecord::Embedding(embedding) => {
-            push_unique(&mut delta.touched_embeddings, embedding.id.clone());
-            push_unique(&mut delta.touched_search_units, embedding.unit_id.clone());
+            if mode == ImportDeltaMode::Full {
+                push_unique(&mut delta.touched_embeddings, embedding.id.clone());
+                push_unique(&mut delta.touched_search_units, embedding.unit_id.clone());
+            }
             if inserted {
                 push_unique(&mut delta.inserted_embeddings, embedding.id.clone());
             }
@@ -2175,6 +2211,15 @@ fn record_delta(record: &ArchiveRecord, inserted: bool, delta: &mut ImportDelta)
 }
 
 fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
+    if target.len().saturating_mul(values.len()) > 1024 {
+        let mut seen = target.iter().cloned().collect::<HashSet<_>>();
+        for value in values {
+            if seen.insert(value.clone()) {
+                target.push(value);
+            }
+        }
+        return;
+    }
     for value in values {
         push_unique(target, value);
     }
