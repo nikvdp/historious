@@ -243,6 +243,13 @@ pub enum Command {
         no_embeddings: bool,
         #[arg(
             long,
+            value_enum,
+            default_value_t = RawArtifactExportMode::Inline,
+            help = "How to include raw artifact content in JSONL exports"
+        )]
+        raw_artifacts: RawArtifactExportMode,
+        #[arg(
+            long,
             help = "Export only one source kind, such as codex or claude_code"
         )]
         source: Vec<String>,
@@ -331,6 +338,12 @@ pub enum SearchSort {
     Relevance,
     Newest,
     Oldest,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RawArtifactExportMode {
+    Inline,
+    Metadata,
 }
 
 impl From<SearchSort> for search::SortMode {
@@ -605,6 +618,7 @@ impl Cli {
             Command::Export {
                 jsonl,
                 no_embeddings,
+                raw_artifacts,
                 source,
                 workspace,
                 session,
@@ -626,6 +640,10 @@ impl Cli {
                         &filter,
                         transport::ExportOptions {
                             include_embeddings: !no_embeddings,
+                            include_raw_artifact_content: matches!(
+                                raw_artifacts,
+                                RawArtifactExportMode::Inline
+                            ),
                         },
                         stdout.lock(),
                     )?;

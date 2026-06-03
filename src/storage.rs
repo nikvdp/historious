@@ -203,6 +203,11 @@ impl Store {
         &self.db_path
     }
 
+    #[cfg(test)]
+    pub fn raw_artifact_blob_exists(&self, hash: &str) -> bool {
+        blob_path(&self.blob_dir, hash).exists()
+    }
+
     pub fn upsert_source(
         &self,
         id: &str,
@@ -258,6 +263,13 @@ impl Store {
     }
 
     pub fn export_records(&self) -> Result<Vec<ArchiveRecord>> {
+        self.export_records_with_raw_content(true)
+    }
+
+    pub fn export_records_with_raw_content(
+        &self,
+        include_raw_content: bool,
+    ) -> Result<Vec<ArchiveRecord>> {
         self.with_conn(|conn| {
             let mut records = Vec::new();
             {
@@ -278,7 +290,7 @@ impl Store {
                 let rows = stmt.query_map([], row_raw_artifact)?;
                 for row in rows {
                     let mut raw = row?;
-                    if raw.content.is_empty() {
+                    if include_raw_content && raw.content.is_empty() {
                         raw.content = read_blob(&self.blob_dir, &raw.hash)?;
                     }
                     records.push(ArchiveRecord::RawArtifact(raw));
@@ -337,6 +349,14 @@ impl Store {
         &self,
         session_ids: &[String],
     ) -> Result<Vec<ArchiveRecord>> {
+        self.export_records_for_session_ids_with_raw_content(session_ids, true)
+    }
+
+    pub fn export_records_for_session_ids_with_raw_content(
+        &self,
+        session_ids: &[String],
+        include_raw_content: bool,
+    ) -> Result<Vec<ArchiveRecord>> {
         let session_ids = normalized_ids(session_ids);
         if session_ids.is_empty() {
             return Ok(Vec::new());
@@ -385,7 +405,7 @@ impl Store {
                     stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_raw_artifact)?;
                 for row in rows {
                     let mut raw = row?;
-                    if raw.content.is_empty() {
+                    if include_raw_content && raw.content.is_empty() {
                         raw.content = read_blob(&self.blob_dir, &raw.hash)?;
                     }
                     records.push(ArchiveRecord::RawArtifact(raw));
@@ -1748,7 +1768,9 @@ fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
 
 fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact, blob_dir: &Path) -> Result<bool> {
     ensure_same_hash(conn, "raw_artifacts", "hash", &raw.hash, &raw.hash)?;
-    write_blob(blob_dir, &raw.hash, &raw.content)?;
+    if !raw.content.is_empty() {
+        write_blob(blob_dir, &raw.hash, &raw.content)?;
+    }
     let changed = conn.execute(
         "INSERT OR IGNORE INTO raw_artifacts
          (hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at)

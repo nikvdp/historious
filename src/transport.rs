@@ -16,7 +16,10 @@ pub fn export_jsonl_with_options(
     options: ExportOptions,
     mut writer: impl Write,
 ) -> Result<usize> {
-    let records = filter_export_records(store.export_records()?, options);
+    let records = filter_export_records(
+        store.export_records_with_raw_content(options.include_raw_artifact_content)?,
+        options,
+    );
     write_jsonl_records(records, &mut writer)
 }
 
@@ -44,20 +47,27 @@ pub fn export_jsonl_filtered_with_options(
         return export_jsonl_with_options(store, options, writer);
     }
     let session_ids = store.session_ids_for_export_filter(filter)?;
-    let records =
-        filter_export_records(store.export_records_for_session_ids(&session_ids)?, options);
+    let records = filter_export_records(
+        store.export_records_for_session_ids_with_raw_content(
+            &session_ids,
+            options.include_raw_artifact_content,
+        )?,
+        options,
+    );
     write_jsonl_records(records, &mut writer)
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOptions {
     pub include_embeddings: bool,
+    pub include_raw_artifact_content: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             include_embeddings: true,
+            include_raw_artifact_content: true,
         }
     }
 }
@@ -226,6 +236,7 @@ mod tests {
             &store,
             ExportOptions {
                 include_embeddings: false,
+                include_raw_artifact_content: true,
             },
             &mut lean_body,
         )
@@ -381,6 +392,44 @@ mod tests {
             })
             .expect("imported raw artifact");
         assert_eq!(imported_raw.content, b"fixture");
+        assert!(imported.raw_artifact_blob_exists("raw_compact"));
+    }
+
+    #[test]
+    fn raw_artifact_metadata_export_imports_without_blob_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::RawArtifact(fixture_raw("source_raw", "raw_metadata")),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: true,
+                include_raw_artifact_content: false,
+            },
+            &mut body,
+        )
+        .expect("export metadata jsonl");
+
+        let raw = jsonl_record_payload(&body, "raw_artifact").expect("raw artifact payload");
+        let content = raw.get("content").expect("content field");
+        assert_eq!(content.as_str(), Some(""));
+
+        let imported_dir = tempfile::tempdir().expect("import tempdir");
+        let imported = Store::open(imported_dir.path()).expect("open imported");
+        import_jsonl_reader(&imported, body.as_slice()).expect("import metadata jsonl");
+        let summary = imported
+            .raw_artifact_summary_by_hash("raw_metadata")
+            .expect("raw summary query")
+            .expect("raw metadata exists");
+        assert_eq!(summary.size, 7);
+        assert!(!imported.raw_artifact_blob_exists("raw_metadata"));
     }
 
     #[test]
@@ -409,6 +458,7 @@ mod tests {
             &filter,
             ExportOptions {
                 include_embeddings: false,
+                include_raw_artifact_content: true,
             },
             &mut body,
         )
