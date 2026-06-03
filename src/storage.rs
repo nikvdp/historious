@@ -89,6 +89,15 @@ pub struct TranscriptContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct RawArtifactSummary {
+    pub hash: String,
+    pub path: String,
+    pub size: u64,
+    pub media_type: String,
+    pub first_seen_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RecentResultRefInput {
     pub event_id: String,
     pub session_id: String,
@@ -752,8 +761,44 @@ impl Store {
         })
     }
 
+    pub fn source_by_id(&self, source_id: &str) -> Result<Option<SourceRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, kind, identity, path, first_seen_at, updated_at, hash
+                 FROM sources
+                 WHERE id = ?1",
+                params![source_id],
+                row_source,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
     pub fn event_by_id(&self, event_id: &str) -> Result<Option<EventRecord>> {
         self.with_conn(|conn| event_by_id(conn, event_id))
+    }
+
+    pub fn raw_artifact_summary_by_hash(&self, hash: &str) -> Result<Option<RawArtifactSummary>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT hash, path, size, media_type, first_seen_at
+                 FROM raw_artifacts
+                 WHERE hash = ?1",
+                params![hash],
+                |row| {
+                    Ok(RawArtifactSummary {
+                        hash: row.get(0)?,
+                        path: row.get(1)?,
+                        size: row.get::<_, u64>(2)?,
+                        media_type: row.get(3)?,
+                        first_seen_at: parse_dt(row.get(4)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
     }
 
     pub fn search_unit_by_id(&self, unit_id: &str) -> Result<Option<SearchUnitRecord>> {
@@ -829,6 +874,20 @@ impl Store {
                  FROM recent_result_refs
                  WHERE ref = ?1",
                 params![ref_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn recent_ref_for_event_id(&self, event_id: &str) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT ref
+                 FROM recent_result_refs
+                 WHERE event_id = ?1",
+                params![event_id],
                 |row| row.get(0),
             )
             .optional()
@@ -2039,6 +2098,35 @@ mod tests {
 
         assert_eq!(unit.event_id, "event_vector");
         assert_eq!(unit.session_id, "session_vector");
+    }
+
+    #[test]
+    fn viewer_origin_lookups_expose_source_raw_and_recent_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = fixture_archive_records();
+        store.import_records(&records).expect("import records");
+        store
+            .record_recent_result_refs(&[fixture_recent_ref_input("event_vector")])
+            .expect("record ref");
+
+        let source = store
+            .source_by_id("source_vector")
+            .expect("source lookup")
+            .expect("source exists");
+        let raw = store
+            .raw_artifact_summary_by_hash("raw_fixture")
+            .expect("raw lookup")
+            .expect("raw exists");
+        let ref_id = store
+            .recent_ref_for_event_id("event_vector")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        assert_eq!(source.identity, "source_vector");
+        assert_eq!(raw.path, "/tmp/session.jsonl");
+        assert_eq!(raw.media_type, "application/jsonl");
+        assert_eq!(ref_id.len(), 4);
     }
 
     #[test]

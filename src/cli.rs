@@ -66,6 +66,8 @@ pub enum Command {
         after: usize,
         #[arg(long)]
         no_color: bool,
+        #[arg(long)]
+        verbose: bool,
     },
     /// Render a full session transcript.
     Show {
@@ -78,6 +80,8 @@ pub enum Command {
         no_pager: bool,
         #[arg(long)]
         no_color: bool,
+        #[arg(long)]
+        verbose: bool,
     },
     /// Export canonical archive records as JSONL.
     Export {
@@ -240,13 +244,17 @@ impl Cli {
                 before,
                 after,
                 no_color,
+                verbose,
             } => {
                 let event_id = resolve_expand_event_id(&store, target, event, search_unit)?;
                 let context = store
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
                 let color = !no_color && std::io::stdout().is_terminal();
-                write_stdout(&crate::transcript::render_context(&context, color))?;
+                write_stdout(&crate::transcript::render_context(
+                    &context, &metadata, color,
+                ))?;
             }
             Command::Show {
                 session,
@@ -254,9 +262,10 @@ impl Cli {
                 search_unit,
                 no_pager,
                 no_color,
+                verbose,
             } => {
                 let target_event_id = resolve_optional_event_id(&store, event, search_unit)?;
-                if let Some(event_id) = &target_event_id {
+                let target_event = if let Some(event_id) = &target_event_id {
                     let event = store
                         .event_by_id(event_id)?
                         .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
@@ -266,16 +275,26 @@ impl Cli {
                             event.session_id
                         );
                     }
-                }
+                    Some(event)
+                } else {
+                    None
+                };
                 let session_record = store
                     .session_by_id(&session)?
                     .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
                 let events = store.events_for_session(&session)?;
+                let metadata = view_metadata_for_session(
+                    &store,
+                    &session_record,
+                    target_event.as_ref(),
+                    verbose,
+                )?;
                 let color = !no_color && std::io::stdout().is_terminal();
                 let rendered = crate::transcript::render_session(
                     &session_record,
                     &events,
                     target_event_id.as_deref(),
+                    &metadata,
                     color,
                 );
                 page_or_print(&rendered, target_event_id.as_deref(), no_pager)?;
@@ -494,6 +513,56 @@ fn resolve_event_ref_or_id(store: &Store, value: &str) -> Result<String> {
         return Ok(event_id);
     }
     bail!("event/ref not found: {value}")
+}
+
+fn view_metadata_for_event(
+    store: &Store,
+    event: &crate::archive::EventRecord,
+    verbose: bool,
+) -> Result<crate::transcript::ViewMetadata> {
+    let source = if verbose {
+        store.source_by_id(&event.source_id)?
+    } else {
+        None
+    };
+    let raw_artifact = if verbose {
+        event
+            .raw_artifact_hash
+            .as_deref()
+            .map(|hash| store.raw_artifact_summary_by_hash(hash))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    Ok(crate::transcript::ViewMetadata {
+        ref_id: store.recent_ref_for_event_id(&event.id)?,
+        source,
+        raw_artifact,
+        verbose,
+    })
+}
+
+fn view_metadata_for_session(
+    store: &Store,
+    session: &crate::archive::SessionRecord,
+    target_event: Option<&crate::archive::EventRecord>,
+    verbose: bool,
+) -> Result<crate::transcript::ViewMetadata> {
+    if let Some(event) = target_event {
+        return view_metadata_for_event(store, event, verbose);
+    }
+    let source = if verbose {
+        store.source_by_id(&session.source_id)?
+    } else {
+        None
+    };
+    Ok(crate::transcript::ViewMetadata {
+        ref_id: None,
+        source,
+        raw_artifact: None,
+        verbose,
+    })
 }
 
 fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) -> Result<()> {
