@@ -290,6 +290,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn import_record(&self, record: &ArchiveRecord) -> Result<ImportStats> {
         self.import_records(std::slice::from_ref(record))
     }
