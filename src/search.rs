@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
+const SQLITE_VEC_MAX_K: usize = 4096;
 const EMBEDDING_BATCH_SIZE: usize = 512;
 const EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
 
@@ -316,9 +317,10 @@ pub fn search(
         .limit
         .saturating_mul(BACKEND_LIMIT_MULTIPLIER)
         .max(BACKEND_MIN_LIMIT);
+    let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
     let lexical = store.search_fts(query, backend_limit)?;
     let (semantic, degraded_reason) =
-        semantic_search(store, query, query_embedder, degraded_reason, backend_limit)?;
+        semantic_search(store, query, query_embedder, degraded_reason, semantic_limit)?;
     Ok(SearchResponse {
         degraded_reason,
         results: fuse(lexical, semantic, options),
@@ -540,6 +542,39 @@ mod tests {
         assert_eq!(response.results[0].event_id, unit.event_id);
         assert_eq!(response.results[0].lexical_rank, None);
         assert_eq!(response.results[0].semantic_rank, Some(1));
+    }
+
+    #[test]
+    fn high_user_limit_does_not_exceed_sqlite_vec_knn_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unit = import_event_and_project(&store, "high limit semantic target");
+        store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &unit,
+                unit_vector(5),
+            )))
+            .expect("embedding");
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(5),
+        };
+        let response = search(
+            &store,
+            "semantic neighbor",
+            SearchOptions::new(1000, SortMode::Relevance, 0.0),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.degraded_reason, None);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, unit.event_id);
     }
 
     #[test]
