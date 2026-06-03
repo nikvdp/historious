@@ -1,5 +1,5 @@
 use crate::search;
-use crate::storage::Store;
+use crate::storage::{RecentResultRefInput, Store};
 use crate::transport;
 use anyhow::{bail, Result};
 use axum::body::Bytes;
@@ -141,9 +141,12 @@ async fn search_endpoint(
         state.embedder_degraded_reason.clone(),
     )?;
     if params.format.as_deref() == Some("fzf") {
+        let refs = state
+            .store
+            .record_recent_result_refs(&recent_ref_inputs(&response.results))?;
         return Ok((
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            server_fzf_rows(&response.results),
+            server_fzf_rows(&response.results, &refs),
         )
             .into_response());
     }
@@ -233,18 +236,31 @@ fn parse_rfc3339_opt(value: Option<&str>, name: &str) -> Result<Option<DateTime<
         .transpose()
 }
 
-fn server_fzf_rows(results: &[search::SearchResult]) -> String {
+fn recent_ref_inputs(results: &[search::SearchResult]) -> Vec<RecentResultRefInput> {
+    results
+        .iter()
+        .map(|result| RecentResultRefInput {
+            event_id: result.event_id.clone(),
+            session_id: result.session_id.clone(),
+            source_kind: result.source_kind.clone(),
+            occurred_at: result.occurred_at,
+            preview: result.snippet.clone(),
+        })
+        .collect()
+}
+
+fn server_fzf_rows(results: &[search::SearchResult], refs: &[String]) -> String {
     let mut rows = String::new();
-    for result in results {
-        rows.push_str(&server_fzf_row(result));
+    for (idx, result) in results.iter().enumerate() {
+        rows.push_str(&server_fzf_row(result, refs.get(idx).map(String::as_str)));
         rows.push('\n');
     }
     rows
 }
 
-fn server_fzf_row(result: &search::SearchResult) -> String {
+fn server_fzf_row(result: &search::SearchResult, ref_id: Option<&str>) -> String {
     [
-        clean_fzf_field(&short_event_ref(&result.event_id)),
+        clean_fzf_field(ref_id.unwrap_or("-")),
         clean_fzf_field(&result.source_kind),
         clean_fzf_field(match result.match_type {
             search::MatchType::Lexical => "lexical",
@@ -262,17 +278,6 @@ fn server_fzf_row(result: &search::SearchResult) -> String {
         clean_fzf_field(&result.event_id),
     ]
     .join("\t")
-}
-
-fn short_event_ref(event_id: &str) -> String {
-    event_id
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
 }
 
 fn clean_fzf_field(input: &str) -> String {
@@ -319,11 +324,11 @@ mod tests {
             snippet: "line one\nline two".to_string(),
         };
 
-        let row = server_fzf_row(&result);
+        let row = server_fzf_row(&result, Some("ab3f"));
         let fields = row.split('\t').collect::<Vec<_>>();
 
         assert_eq!(fields.len(), 7);
-        assert_eq!(fields[0], "cdef");
+        assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
         assert_eq!(fields[4], "line one line two");

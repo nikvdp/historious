@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_FZF_LIMIT: usize = 25;
+const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
+const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
 
 #[derive(Debug, Parser)]
 #[command(name = "super-cass")]
@@ -58,7 +61,7 @@ pub enum Command {
         #[arg(
             short,
             long,
-            help = "Maximum number of results to show; defaults to 10, or 25 with --fzf"
+            help = "Maximum number of results to show; defaults to 10, or 25 for static --fzf"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Print structured JSON with refs for follow-up commands")]
@@ -97,10 +100,51 @@ pub enum Command {
         before: Option<String>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
-        #[arg(long, help = "Browse results interactively with fzf")]
+        #[arg(
+            long,
+            help = "Browse this query's fixed result set with fzf; use live-search for live querying"
+        )]
         fzf: bool,
         #[arg(long, hide = true)]
         fzf_rows: bool,
+    },
+    /// Search through a running local server with a live fzf picker.
+    LiveSearch {
+        #[arg(help = "Initial query for the picker")]
+        query: Option<String>,
+        #[arg(
+            short,
+            long,
+            help = "Maximum number of live results to show",
+            default_value_t = DEFAULT_LIVE_SEARCH_LIMIT
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            default_value = DEFAULT_SERVER_URL,
+            help = "Base URL for a running `super-cass serve` process"
+        )]
+        server: String,
+        #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
+        sort: SearchSort,
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            help = "Favor newer results, from 0.0 to 1.0"
+        )]
+        recency_bias: f64,
+        #[arg(
+            long,
+            help = "Only show results at or after a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        before: Option<String>,
+        #[arg(long, help = "Disable colored preview output")]
+        no_color: bool,
     },
     /// Show nearby transcript context for a search result.
     Show {
@@ -363,8 +407,11 @@ impl Cli {
                 }
                 let limit = search_limit(limit, fzf);
                 let query = query.unwrap_or_default();
-                if query.trim().is_empty() && !fzf && !fzf_rows {
-                    bail!("search requires a query; use --fzf to start interactive search");
+                if query.trim().is_empty() && fzf {
+                    bail!("search --fzf requires a query; use `super-cass live-search` for live interactive search");
+                }
+                if query.trim().is_empty() && !fzf_rows {
+                    bail!("search requires a query");
                 }
                 if fzf_rows && query.trim().is_empty() {
                     return Ok(());
@@ -373,20 +420,6 @@ impl Cli {
                     parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
                 let before_bound =
                     parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
-                if fzf {
-                    let color = !no_color;
-                    run_fzf_search(
-                        &config,
-                        &query,
-                        limit,
-                        sort,
-                        recency_bias,
-                        after.as_deref(),
-                        before.as_deref(),
-                        color,
-                    )?;
-                    return Ok(());
-                }
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
                     .with_time_window(after_bound, before_bound);
@@ -397,7 +430,16 @@ impl Cli {
                     embedder.as_deref(),
                     degraded_reason,
                 )?;
-                if json || robot {
+                if fzf {
+                    if let Some(reason) = &response.degraded_reason {
+                        eprintln!("search degraded: {reason}");
+                    }
+                    let refs =
+                        store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
+                    let color = !no_color;
+                    let rows = fzf_rows_output(&response.results, &refs, color);
+                    run_static_fzf_search(&config, &query, &rows, color)?;
+                } else if json || robot {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let output = search_output(
@@ -434,6 +476,35 @@ impl Cli {
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
                     print_search_results(&query, &response.results, &refs, &columns, color);
                 }
+            }
+            Command::LiveSearch {
+                query,
+                limit,
+                server,
+                sort,
+                recency_bias,
+                after,
+                before,
+                no_color,
+            } => {
+                if robot {
+                    bail!("--robot cannot be combined with live-search");
+                }
+                let after_bound =
+                    parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
+                let before_bound =
+                    parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
+                run_live_fzf_search(
+                    &config,
+                    query.as_deref().unwrap_or_default(),
+                    &server,
+                    limit,
+                    sort,
+                    recency_bias,
+                    after_bound,
+                    before_bound,
+                    !no_color,
+                )?;
             }
             Command::Show {
                 target,
@@ -640,6 +711,7 @@ impl Command {
         match self {
             Command::Update { .. } => "update",
             Command::Search { .. } => "search",
+            Command::LiveSearch { .. } => "live-search",
             Command::Show { .. } => "show",
             Command::Expand { .. } => "expand",
             Command::Transcript { .. } => "transcript",
@@ -1747,41 +1819,58 @@ fn local_naive_to_utc(value: NaiveDateTime) -> Result<DateTime<Utc>> {
     }
 }
 
-fn run_fzf_search(
+fn run_static_fzf_search(config: &AppConfig, query: &str, rows: &str, color: bool) -> Result<()> {
+    ensure_fzf_available()?;
+    let preview = fzf_preview_command(config, color);
+    let open = fzf_open_command(config, color);
+    let mut child = base_fzf_command()
+        .arg("--query")
+        .arg(query)
+        .arg("--header")
+        .arg("Ref\tSource\tMatch\tWhen\tPreview")
+        .arg("--preview")
+        .arg(preview)
+        .arg("--bind")
+        .arg(format!("enter:execute({open})+abort"))
+        .arg("--bind")
+        .arg(preview_scroll_bind("shift-up", "preview-up", 10))
+        .arg("--bind")
+        .arg(preview_scroll_bind("shift-down", "preview-down", 10))
+        .arg("--bind")
+        .arg("ctrl-u:preview-half-page-up")
+        .arg("--bind")
+        .arg("ctrl-d:preview-half-page-down")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(rows.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn run_live_fzf_search(
     config: &AppConfig,
     query: &str,
+    server: &str,
     limit: usize,
     sort: SearchSort,
     recency_bias: f64,
-    after: Option<&str>,
-    before: Option<&str>,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
     color: bool,
 ) -> Result<()> {
-    if !command_exists("fzf") {
-        bail!(
-            "fzf is not installed. Use `super-cass search <query>` and then `super-cass show <ref>` or `super-cass transcript <ref>`."
-        );
-    }
-    let current_exe = std::env::current_exe()?;
-    let exe = shell_quote(&current_exe.to_string_lossy());
-    let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let color_flag = if color { "" } else { " --no-color" };
-    let after_flag = optional_shell_flag("--after", after);
-    let before_flag = optional_shell_flag("--before", before);
-    let reload = format!(
-        "env SUPER_CASS_EMBEDDER=disabled {exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{after_flag}{before_flag}{color_flag} -- {{q}}",
-        sort.as_str()
-    );
-    let preview = format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5");
-    let open = format!("{exe} --data-dir {data_dir} transcript {{7}}");
-    let mut child = ProcessCommand::new("fzf")
-        .arg("--ansi")
-        .arg("--delimiter")
-        .arg("\t")
-        .arg("--nth")
-        .arg("1,2,3,4,5")
-        .arg("--with-nth")
-        .arg("1,2,3,4,5")
+    ensure_fzf_available()?;
+    ensure_curl_available()?;
+    ensure_server_available(server)?;
+    let reload = live_search_reload_command(server, limit, sort, recency_bias, after, before)?;
+    let preview = fzf_preview_command(config, color);
+    let open = fzf_open_command(config, color);
+    let mut child = base_fzf_command()
         .arg("--query")
         .arg(query)
         .arg("--header")
@@ -1791,7 +1880,9 @@ fn run_fzf_search(
         .arg("--bind")
         .arg(format!("start:reload({reload})"))
         .arg("--bind")
-        .arg(format!("change:reload(sleep 0.12; {reload})"))
+        .arg(format!(
+            "change:reload(sleep {LIVE_SEARCH_RELOAD_DELAY_SECS}; {reload})"
+        ))
         .arg("--bind")
         .arg(format!("enter:execute({open})+abort"))
         .arg("--bind")
@@ -1812,14 +1903,116 @@ fn run_fzf_search(
     Ok(())
 }
 
-fn preview_scroll_bind(key: &str, action: &str, count: usize) -> String {
-    format!("{key}:{}", vec![action; count].join("+"))
+fn base_fzf_command() -> ProcessCommand {
+    let mut command = ProcessCommand::new("fzf");
+    command
+        .arg("--ansi")
+        .arg("--delimiter")
+        .arg("\t")
+        .arg("--nth")
+        .arg("1,2,3,4,5")
+        .arg("--with-nth")
+        .arg("1,2,3,4,5");
+    command
 }
 
-fn optional_shell_flag(flag: &str, value: Option<&str>) -> String {
-    value
-        .map(|value| format!(" {flag} {}", shell_quote(value)))
-        .unwrap_or_default()
+fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
+    let current_exe = std::env::current_exe().ok();
+    let exe = current_exe
+        .as_ref()
+        .map(|path| shell_quote(&path.to_string_lossy()))
+        .unwrap_or_else(|| "super-cass".to_string());
+    let data_dir = shell_quote(&config.data_dir.to_string_lossy());
+    let color_flag = if color { "" } else { " --no-color" };
+    format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}")
+}
+
+fn fzf_open_command(config: &AppConfig, color: bool) -> String {
+    let current_exe = std::env::current_exe().ok();
+    let exe = current_exe
+        .as_ref()
+        .map(|path| shell_quote(&path.to_string_lossy()))
+        .unwrap_or_else(|| "super-cass".to_string());
+    let data_dir = shell_quote(&config.data_dir.to_string_lossy());
+    let color_flag = if color { "" } else { " --no-color" };
+    format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}")
+}
+
+fn live_search_reload_command(
+    server: &str,
+    limit: usize,
+    sort: SearchSort,
+    recency_bias: f64,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+) -> Result<String> {
+    let search_url = shell_quote(&server_url(server, "search")?);
+    let after_arg = after
+        .map(|dt| {
+            format!(
+                " --data-urlencode {}",
+                shell_quote(&format!("after={}", dt.to_rfc3339()))
+            )
+        })
+        .unwrap_or_default();
+    let before_arg = before
+        .map(|dt| {
+            format!(
+                " --data-urlencode {}",
+                shell_quote(&format!("before={}", dt.to_rfc3339()))
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}; fi",
+        sort.as_str()
+    ))
+}
+
+fn ensure_fzf_available() -> Result<()> {
+    if !command_exists("fzf") {
+        bail!(
+            "fzf is not installed. Use `super-cass search <query>` and then `super-cass show <ref>` or `super-cass transcript <ref>`."
+        );
+    }
+    Ok(())
+}
+
+fn ensure_curl_available() -> Result<()> {
+    if !command_exists("curl") {
+        bail!("curl is not installed; live-search uses curl to query `super-cass serve`");
+    }
+    Ok(())
+}
+
+fn ensure_server_available(server: &str) -> Result<()> {
+    let health_url = server_url(server, "health")?;
+    let status = ProcessCommand::new("curl")
+        .arg("-fsS")
+        .arg("--max-time")
+        .arg("2")
+        .arg(&health_url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        bail!(
+            "could not reach super-cass server at {health_url}; start one with `super-cass serve`"
+        );
+    }
+    Ok(())
+}
+
+fn server_url(server: &str, path: &str) -> Result<String> {
+    let server = server.trim();
+    if server.is_empty() {
+        bail!("server URL cannot be empty");
+    }
+    Ok(format!("{}/{}", server.trim_end_matches('/'), path))
+}
+
+fn preview_scroll_bind(key: &str, action: &str, count: usize) -> String {
+    format!("{key}:{}", vec![action; count].join("+"))
 }
 
 fn fzf_rows_output(results: &[search::SearchResult], refs: &[String], color: bool) -> String {
@@ -2341,15 +2534,16 @@ mod tests {
     }
 
     #[test]
-    fn search_fzf_accepts_missing_starting_query() {
-        let cli = Cli::try_parse_from(["super-cass", "search", "--fzf"]).expect("parse fzf search");
+    fn live_search_accepts_missing_starting_query() {
+        let cli =
+            Cli::try_parse_from(["super-cass", "live-search"]).expect("parse live fzf search");
 
         match cli.command {
-            Command::Search { query, fzf, .. } => {
+            Command::LiveSearch { query, limit, .. } => {
                 assert_eq!(query, None);
-                assert!(fzf);
+                assert_eq!(limit, DEFAULT_LIVE_SEARCH_LIMIT);
             }
-            _ => panic!("expected search command"),
+            _ => panic!("expected live-search command"),
         }
     }
 
@@ -2387,11 +2581,24 @@ mod tests {
     }
 
     #[test]
-    fn optional_shell_flag_quotes_time_values() {
-        assert_eq!(
-            optional_shell_flag("--after", Some("3 days ago")),
-            " --after '3 days ago'"
-        );
+    fn live_reload_command_passes_normalized_time_values() {
+        let after = DateTime::parse_from_rfc3339("2026-04-20T00:00:00Z")
+            .expect("after")
+            .with_timezone(&Utc);
+        let command = live_search_reload_command(
+            DEFAULT_SERVER_URL,
+            25,
+            SearchSort::Newest,
+            0.25,
+            Some(after),
+            None,
+        )
+        .expect("reload command");
+
+        assert!(command.contains("curl -fsSG"));
+        assert!(command.contains("sort=newest"));
+        assert!(command.contains("recency_bias=0.25"));
+        assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
     }
 
     #[test]
