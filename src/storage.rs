@@ -129,6 +129,32 @@ pub struct VectorSearchRow {
     pub rank: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadSortMode {
+    Newest,
+    Oldest,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadListOptions {
+    pub limit: usize,
+    pub sort: ThreadSortMode,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub workspace_scope: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadRow {
+    pub session: SessionRecord,
+    pub event_count: u64,
+    pub first_event_at: Option<DateTime<Utc>>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub workspace_path: Option<String>,
+    pub workspace_values: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptContext {
     pub session: SessionRecord,
@@ -1062,6 +1088,76 @@ impl Store {
         self.with_conn(|conn| events_for_session(conn, session_id))
     }
 
+    pub fn list_threads(&self, options: &ThreadListOptions) -> Result<Vec<ThreadRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.id,
+                        s.source_id,
+                        s.machine_id,
+                        s.source_kind,
+                        s.external_id,
+                        s.title,
+                        s.status,
+                        s.started_at,
+                        s.updated_at,
+                        s.metadata_json,
+                        s.hash,
+                        COUNT(e.id),
+                        MIN(e.occurred_at),
+                        MAX(e.occurred_at)
+                 FROM sessions s
+                 LEFT JOIN events e ON e.session_id = s.id
+                 GROUP BY s.id
+                 ORDER BY s.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let metadata_text: String = row.get(9)?;
+                let metadata = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
+                let session = SessionRecord {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    machine_id: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    external_id: row.get(4)?,
+                    title: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: parse_opt_dt(row.get(7)?),
+                    updated_at: parse_opt_dt(row.get(8)?),
+                    metadata: metadata.clone(),
+                    hash: row.get(10)?,
+                };
+                let first_event_at = parse_opt_dt(row.get(12)?);
+                let last_event_at = parse_opt_dt(row.get(13)?);
+                let last_activity_at = [last_event_at, session.updated_at, session.started_at]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                let workspace_values = session_workspace_values(&metadata);
+                Ok(ThreadRow {
+                    session,
+                    event_count: row.get::<_, i64>(11)?.max(0) as u64,
+                    first_event_at,
+                    last_event_at,
+                    last_activity_at,
+                    workspace_path: primary_workspace_value(&metadata),
+                    workspace_values,
+                })
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let row = row?;
+                if !thread_matches_options(&row, options) {
+                    continue;
+                }
+                out.push(row);
+            }
+            sort_threads(&mut out, options.sort);
+            out.truncate(options.limit);
+            Ok(out)
+        })
+    }
+
     pub fn events_around_event(
         &self,
         event_id: &str,
@@ -1614,6 +1710,59 @@ fn session_workspace_values(metadata: &Value) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn primary_workspace_value(metadata: &Value) -> Option<String> {
+    metadata
+        .get("workspace_path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            metadata
+                .get("workspace")
+                .and_then(|workspace| workspace.get("path"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn thread_matches_options(row: &ThreadRow, options: &ThreadListOptions) -> bool {
+    if let Some(scope) = &options.workspace_scope {
+        if !row
+            .workspace_values
+            .iter()
+            .any(|value| path_matches_scope(value, scope))
+        {
+            return false;
+        }
+    }
+    if let Some(after) = options.after {
+        if row.last_activity_at.is_none_or(|last| last < after) {
+            return false;
+        }
+    }
+    if let Some(before) = options.before {
+        if row.last_activity_at.is_none_or(|last| last >= before) {
+            return false;
+        }
+    }
+    true
+}
+
+fn sort_threads(rows: &mut [ThreadRow], sort: ThreadSortMode) {
+    match sort {
+        ThreadSortMode::Newest => rows.sort_by(|left, right| {
+            right
+                .last_activity_at
+                .cmp(&left.last_activity_at)
+                .then_with(|| right.session.id.cmp(&left.session.id))
+        }),
+        ThreadSortMode::Oldest => rows.sort_by(|left, right| {
+            left.last_activity_at
+                .cmp(&right.last_activity_at)
+                .then_with(|| left.session.id.cmp(&right.session.id))
+        }),
+    }
 }
 
 fn path_matches_scope(value: &str, scope: &str) -> bool {

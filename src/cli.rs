@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::ingest;
 use crate::search;
 use crate::server;
-use crate::storage::{RecentResultRefInput, Store};
+use crate::storage::{RecentResultRefInput, Store, ThreadListOptions, ThreadSortMode};
 use crate::transport;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_THREAD_LIMIT: usize = 10;
 const DEFAULT_FZF_LIMIT: usize = 25;
 const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
@@ -144,6 +145,55 @@ pub enum Command {
         )]
         before: Option<String>,
         #[arg(long, help = "Disable colored preview output")]
+        no_color: bool,
+    },
+    /// List recent conversation threads chronologically.
+    Threads {
+        #[arg(
+            short,
+            long,
+            default_value_t = DEFAULT_THREAD_LIMIT,
+            help = "Maximum number of threads to show"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = ThreadSort::Newest,
+            help = "Sort threads by newest or oldest activity"
+        )]
+        sort: ThreadSort,
+        #[arg(
+            long,
+            help = "Only show threads active at or after a date or time, like 2026-04-20, today, or \"3 days ago\""
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            help = "Only show threads active before a date or time, like 2026-04-20, today, or \"3 days ago\""
+        )]
+        before: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before"],
+            help = "Only show threads active today"
+        )]
+        today: bool,
+        #[arg(
+            long,
+            conflicts_with = "all",
+            help = "Show threads for this folder scope instead of cwd"
+        )]
+        project: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with = "project",
+            help = "Show threads across every project"
+        )]
+        all: bool,
+        #[arg(long, help = "Print structured JSON")]
+        json: bool,
+        #[arg(long, help = "Disable colored output")]
         no_color: bool,
     },
     /// Show nearby transcript context for a search result.
@@ -386,12 +436,27 @@ pub enum RawArtifactExportMode {
     Metadata,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ThreadSort {
+    Newest,
+    Oldest,
+}
+
 impl From<SearchSort> for search::SortMode {
     fn from(value: SearchSort) -> Self {
         match value {
             SearchSort::Relevance => search::SortMode::Relevance,
             SearchSort::Newest => search::SortMode::Newest,
             SearchSort::Oldest => search::SortMode::Oldest,
+        }
+    }
+}
+
+impl From<ThreadSort> for ThreadSortMode {
+    fn from(value: ThreadSort) -> Self {
+        match value {
+            ThreadSort::Newest => ThreadSortMode::Newest,
+            ThreadSort::Oldest => ThreadSortMode::Oldest,
         }
     }
 }
@@ -558,6 +623,55 @@ impl Cli {
                     before_bound,
                     !no_color,
                 )?;
+            }
+            Command::Threads {
+                limit,
+                sort,
+                after,
+                before,
+                today,
+                project,
+                all,
+                json,
+                no_color,
+            } => {
+                let (after_bound, before_bound) = if today {
+                    (
+                        Some(parse_search_time("today", TimeFilterBound::After)?),
+                        Some(parse_search_time("today", TimeFilterBound::Before)?),
+                    )
+                } else {
+                    (
+                        parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?,
+                        parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?,
+                    )
+                };
+                let scope = resolve_thread_scope(project.as_deref(), all)?;
+                if scope.inferred {
+                    if let Some(path) = &scope.path {
+                        eprintln!(
+                            "Warning: no --project supplied; focusing on cwd: {path}. Use --all for every project."
+                        );
+                    }
+                }
+                let options = ThreadListOptions {
+                    limit,
+                    sort: sort.into(),
+                    after: after_bound,
+                    before: before_bound,
+                    workspace_scope: scope.path.clone(),
+                };
+                let threads = store.list_threads(&options)?;
+                if json || robot {
+                    crate::output::write_success(
+                        "threads",
+                        threads_output(limit, sort, after_bound, before_bound, &scope, &threads),
+                        Default::default(),
+                    )?;
+                } else {
+                    let color = !no_color && !robot && std::io::stdout().is_terminal();
+                    print_threads_output(&scope, &threads, color);
+                }
             }
             Command::Show {
                 target,
@@ -829,6 +943,7 @@ impl Command {
             Command::Update { .. } => "update",
             Command::Search { .. } => "search",
             Command::Tui { .. } => "tui",
+            Command::Threads { .. } => "threads",
             Command::Show { .. } => "show",
             Command::Expand { .. } => "expand",
             Command::Transcript { .. } => "transcript",
@@ -848,6 +963,7 @@ impl Command {
             self,
             Command::Update { json: true, .. }
                 | Command::Search { json: true, .. }
+                | Command::Threads { json: true, .. }
                 | Command::Show { json: true, .. }
                 | Command::Expand { json: true, .. }
                 | Command::Transcript { json: true, .. }
@@ -998,6 +1114,44 @@ struct SearchResultOutput {
     occurred_at: Option<chrono::DateTime<chrono::Utc>>,
     session_title: Option<String>,
     snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadsOutput {
+    options: ThreadsOptionsOutput,
+    results: Vec<ThreadOutput>,
+    next_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadsOptionsOutput {
+    limit: usize,
+    sort: &'static str,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+    scope: ThreadScopeOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadScopeOutput {
+    mode: &'static str,
+    path: Option<String>,
+    inferred: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadOutput {
+    session_id: String,
+    source_kind: String,
+    title: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    first_event_at: Option<DateTime<Utc>>,
+    last_event_at: Option<DateTime<Utc>>,
+    last_activity_at: Option<DateTime<Utc>>,
+    event_count: u64,
+    workspace_path: Option<String>,
+    workspace_values: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1508,6 +1662,44 @@ fn print_status_output(output: &StatusOutput) {
     }
 }
 
+fn print_threads_output(scope: &ThreadScope, threads: &[crate::storage::ThreadRow], color: bool) {
+    println!();
+    println!("{}", styled("Threads", "1;32", color));
+    match scope.mode {
+        ThreadScopeMode::All => println!("scope: all projects"),
+        ThreadScopeMode::Path => {
+            println!("scope: {}", scope.path.as_deref().unwrap_or("unknown"));
+        }
+    }
+    if threads.is_empty() {
+        println!();
+        println!("No threads found.");
+        return;
+    }
+    println!();
+    for thread in threads {
+        let when = thread
+            .last_activity_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}  {}  {}",
+            styled(&when, "1;36", color),
+            thread.session.source_kind,
+            thread
+                .session
+                .title
+                .as_deref()
+                .unwrap_or("(untitled thread)")
+        );
+        println!("  session: {}", thread.session.id);
+        println!("  events: {}", thread.event_count);
+        if let Some(workspace) = &thread.workspace_path {
+            println!("  project: {workspace}");
+        }
+    }
+}
+
 fn show_output(store: &Store, context: &crate::storage::TranscriptContext) -> Result<ShowOutput> {
     let before = context
         .events
@@ -1529,6 +1721,56 @@ fn show_output(store: &Store, context: &crate::storage::TranscriptContext) -> Re
         target: event_output(store, &context.target_event)?,
         after,
     })
+}
+
+fn threads_output(
+    limit: usize,
+    sort: ThreadSort,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+    scope: &ThreadScope,
+    threads: &[crate::storage::ThreadRow],
+) -> ThreadsOutput {
+    let results = threads.iter().map(thread_output).collect::<Vec<_>>();
+    ThreadsOutput {
+        options: ThreadsOptionsOutput {
+            limit,
+            sort: sort.as_str(),
+            after,
+            before,
+            scope: ThreadScopeOutput {
+                mode: scope.mode.as_str(),
+                path: scope.path.clone(),
+                inferred: scope.inferred,
+            },
+        },
+        next_commands: results
+            .first()
+            .map(|thread| {
+                vec![format!(
+                    "super-cass transcript {} --json",
+                    thread.session_id
+                )]
+            })
+            .unwrap_or_else(|| vec!["super-cass update --json".to_string()]),
+        results,
+    }
+}
+
+fn thread_output(thread: &crate::storage::ThreadRow) -> ThreadOutput {
+    ThreadOutput {
+        session_id: thread.session.id.clone(),
+        source_kind: thread.session.source_kind.clone(),
+        title: thread.session.title.clone(),
+        started_at: thread.session.started_at,
+        updated_at: thread.session.updated_at,
+        first_event_at: thread.first_event_at,
+        last_event_at: thread.last_event_at,
+        last_activity_at: thread.last_activity_at,
+        event_count: thread.event_count,
+        workspace_path: thread.workspace_path.clone(),
+        workspace_values: thread.workspace_values.clone(),
+    }
 }
 
 fn transcript_output(
@@ -1641,6 +1883,60 @@ impl SearchSort {
             SearchSort::Oldest => "oldest",
         }
     }
+}
+
+impl ThreadSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThreadSort::Newest => "newest",
+            ThreadSort::Oldest => "oldest",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ThreadScope {
+    mode: ThreadScopeMode,
+    path: Option<String>,
+    inferred: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadScopeMode {
+    All,
+    Path,
+}
+
+impl ThreadScopeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThreadScopeMode::All => "all",
+            ThreadScopeMode::Path => "path",
+        }
+    }
+}
+
+fn resolve_thread_scope(project: Option<&std::path::Path>, all: bool) -> Result<ThreadScope> {
+    if all {
+        return Ok(ThreadScope {
+            mode: ThreadScopeMode::All,
+            path: None,
+            inferred: false,
+        });
+    }
+    if let Some(project) = project {
+        return Ok(ThreadScope {
+            mode: ThreadScopeMode::Path,
+            path: Some(transport::normalize_workspace_arg(project)),
+            inferred: false,
+        });
+    }
+    let cwd = std::env::current_dir()?;
+    Ok(ThreadScope {
+        mode: ThreadScopeMode::Path,
+        path: Some(transport::normalize_workspace_arg(&cwd)),
+        inferred: true,
+    })
 }
 
 fn resolve_columns(
