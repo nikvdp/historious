@@ -205,6 +205,14 @@ enum Column {
 }
 
 impl Cli {
+    pub fn command_name(&self) -> &'static str {
+        self.command.name()
+    }
+
+    pub fn wants_structured_errors(&self) -> bool {
+        self.command.wants_structured_errors()
+    }
+
     pub async fn run(self) -> Result<()> {
         let config = AppConfig::load(self.data_dir)?;
         let store = Store::open(&config.data_dir)?;
@@ -474,6 +482,27 @@ impl Cli {
             }
         }
         Ok(())
+    }
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Update { .. } => "update",
+            Command::Search { .. } => "search",
+            Command::Show { .. } => "show",
+            Command::Expand { .. } => "expand",
+            Command::Transcript { .. } => "transcript",
+            Command::Export { .. } => "export",
+            Command::Import { .. } => "import",
+            Command::Daemon { .. } => "daemon",
+            Command::Serve { .. } => "serve",
+            Command::Status => "status",
+        }
+    }
+
+    fn wants_structured_errors(&self) -> bool {
+        matches!(self, Command::Search { json: true, .. })
     }
 }
 

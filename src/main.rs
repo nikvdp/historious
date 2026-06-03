@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod embed;
 mod ingest;
+mod output;
 mod search;
 mod server;
 mod storage;
@@ -11,9 +12,17 @@ mod transport;
 
 use anyhow::Result;
 use clap::Parser;
+use std::time::Instant;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run_main().await {
+        eprintln!("{err:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,5 +31,16 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    cli::Cli::parse().run().await
+    let started_at = Instant::now();
+    let cli = cli::Cli::parse();
+    let command = cli.command_name();
+    let structured_errors = cli.wants_structured_errors();
+    if let Err(err) = cli.run().await {
+        if structured_errors {
+            output::write_error(command, &err, None, None, Some(started_at))?;
+            std::process::exit(1);
+        }
+        return Err(err);
+    }
+    Ok(())
 }
