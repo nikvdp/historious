@@ -1,4 +1,4 @@
-use crate::archive::{ArchiveEnvelope, ARCHIVE_SCHEMA};
+use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA};
 use crate::storage::{ArchiveExportFilter, ImportStats, Store};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -11,6 +11,16 @@ pub fn export_jsonl(store: &Store, mut writer: impl Write) -> Result<usize> {
     write_jsonl_records(records, &mut writer)
 }
 
+pub fn export_jsonl_with_options(
+    store: &Store,
+    options: ExportOptions,
+    mut writer: impl Write,
+) -> Result<usize> {
+    let records = filter_export_records(store.export_records()?, options);
+    write_jsonl_records(records, &mut writer)
+}
+
+#[allow(dead_code)]
 pub fn export_jsonl_filtered(
     store: &Store,
     filter: &ArchiveExportFilter,
@@ -24,10 +34,48 @@ pub fn export_jsonl_filtered(
     write_jsonl_records(records, &mut writer)
 }
 
-fn write_jsonl_records(
-    records: Vec<crate::archive::ArchiveRecord>,
-    writer: &mut impl Write,
+pub fn export_jsonl_filtered_with_options(
+    store: &Store,
+    filter: &ArchiveExportFilter,
+    options: ExportOptions,
+    mut writer: impl Write,
 ) -> Result<usize> {
+    if filter.is_empty() {
+        return export_jsonl_with_options(store, options, writer);
+    }
+    let session_ids = store.session_ids_for_export_filter(filter)?;
+    let records =
+        filter_export_records(store.export_records_for_session_ids(&session_ids)?, options);
+    write_jsonl_records(records, &mut writer)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExportOptions {
+    pub include_embeddings: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            include_embeddings: true,
+        }
+    }
+}
+
+fn filter_export_records(
+    records: Vec<ArchiveRecord>,
+    options: ExportOptions,
+) -> Vec<ArchiveRecord> {
+    if options.include_embeddings {
+        return records;
+    }
+    records
+        .into_iter()
+        .filter(|record| !matches!(record, ArchiveRecord::Embedding(_)))
+        .collect()
+}
+
+fn write_jsonl_records(records: Vec<ArchiveRecord>, writer: &mut impl Write) -> Result<usize> {
     let count = records.len();
     for record in records {
         let envelope = ArchiveEnvelope::new(record);
@@ -156,6 +204,38 @@ mod tests {
     }
 
     #[test]
+    fn export_options_can_omit_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let unit = fixture_search_unit();
+        let embedding = fixture_embedding(&unit);
+        store
+            .import_records(&[
+                ArchiveRecord::SearchUnit(unit.clone()),
+                ArchiveRecord::Embedding(embedding),
+            ])
+            .expect("import records");
+
+        let mut default_body = Vec::new();
+        export_jsonl_with_options(&store, ExportOptions::default(), &mut default_body)
+            .expect("default export");
+        let mut lean_body = Vec::new();
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: false,
+            },
+            &mut lean_body,
+        )
+        .expect("lean export");
+
+        assert_jsonl_contains_kind(&default_body, "embedding");
+        assert_jsonl_contains_kind(&default_body, "search_unit");
+        assert!(!jsonl_contains_kind(&lean_body, "embedding"));
+        assert_jsonl_contains_kind(&lean_body, "search_unit");
+    }
+
+    #[test]
     fn embedding_record_import_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -269,6 +349,41 @@ mod tests {
     }
 
     #[test]
+    fn filtered_export_options_can_omit_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let unit = fixture_search_unit_384();
+        let embedding = fixture_embedding_384(&unit);
+        let session = fixture_session("session_sync", "source_sync", "/tmp/super-cass/repo");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_sync")),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::SearchUnit(unit),
+                ArchiveRecord::Embedding(embedding),
+            ])
+            .expect("import records");
+        let filter = ArchiveExportFilter {
+            workspaces: vec!["/tmp/super-cass/repo".to_string()],
+            ..ArchiveExportFilter::default()
+        };
+
+        let mut body = Vec::new();
+        export_jsonl_filtered_with_options(
+            &store,
+            &filter,
+            ExportOptions {
+                include_embeddings: false,
+            },
+            &mut body,
+        )
+        .expect("filtered lean export");
+
+        assert_jsonl_contains_kind(&body, "search_unit");
+        assert!(!jsonl_contains_kind(&body, "embedding"));
+    }
+
+    #[test]
     fn parse_since_accepts_rfc3339_and_date() {
         let rfc3339 = parse_since_arg(Some("2026-06-02T01:02:03Z"))
             .expect("parse rfc3339")
@@ -301,6 +416,20 @@ mod tests {
             metadata: json!({"fixture": true}),
             hash,
         }
+    }
+
+    fn assert_jsonl_contains_kind(body: &[u8], kind: &str) {
+        assert!(
+            jsonl_contains_kind(body, kind),
+            "expected JSONL to contain kind {kind}"
+        );
+    }
+
+    fn jsonl_contains_kind(body: &[u8], kind: &str) -> bool {
+        String::from_utf8_lossy(body)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|value| value.get("kind").and_then(|kind| kind.as_str()) == Some(kind))
     }
 
     fn fixture_embedding(unit: &SearchUnitRecord) -> EmbeddingRecord {
