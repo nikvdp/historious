@@ -1111,7 +1111,7 @@ impl ProgressPhase {
                 let mut idx = 0usize;
                 loop {
                     eprint!(
-                        "\r\x1b[36m{}\x1b[0m {}",
+                        "\r\x1b[36m{}\x1b[0m {}... ",
                         frames[idx % frames.len()],
                         label_for_thread
                     );
