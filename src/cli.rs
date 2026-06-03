@@ -251,16 +251,28 @@ impl Cli {
                 fzf,
             } => {
                 let (embedder, degraded_reason) = load_embedder(&config);
+                let options = search::SearchOptions::new(limit, sort.into(), recency_bias);
                 let response = search::search(
                     &store,
                     &query,
-                    search::SearchOptions::new(limit, sort.into(), recency_bias),
+                    options,
                     embedder.as_deref(),
                     degraded_reason,
                 )?;
                 if json {
-                    serde_json::to_writer_pretty(std::io::stdout(), &response)?;
-                    println!();
+                    let refs =
+                        store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
+                    let output =
+                        search_output(&query, limit, sort, recency_bias, &response, &refs);
+                    crate::output::write_success(
+                        "search",
+                        output,
+                        crate::output::EnvelopeOptions {
+                            degraded_reason: response.degraded_reason.clone(),
+                            hints: search_hints(&response.results, &refs),
+                            ..Default::default()
+                        },
+                    )?;
                 } else if fzf {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
@@ -495,6 +507,38 @@ struct SearchProjectionOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct SearchOutput {
+    query: String,
+    options: SearchOptionsOutput,
+    degraded_reason: Option<String>,
+    results: Vec<SearchResultOutput>,
+    next_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchOptionsOutput {
+    limit: usize,
+    sort: &'static str,
+    recency_bias: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResultOutput {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    match_type: search::MatchType,
+    event_id: String,
+    session_id: String,
+    source_kind: String,
+    score: f64,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    session_title: Option<String>,
+    snippet: String,
+}
+
+#[derive(Debug, Serialize)]
 struct StatusOutput {
     data_dir: String,
     db_path: String,
@@ -669,6 +713,70 @@ fn print_status_output(output: &StatusOutput) {
                 "query_embedder_probe=degraded reason={}",
                 probe.reason.as_deref().unwrap_or("unknown")
             ),
+        }
+    }
+}
+
+fn search_output(
+    query: &str,
+    limit: usize,
+    sort: SearchSort,
+    recency_bias: f64,
+    response: &search::SearchResponse,
+    refs: &[String],
+) -> SearchOutput {
+    SearchOutput {
+        query: query.to_string(),
+        options: SearchOptionsOutput {
+            limit,
+            sort: sort.as_str(),
+            recency_bias,
+        },
+        degraded_reason: response.degraded_reason.clone(),
+        results: response
+            .results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| SearchResultOutput {
+                ref_id: refs.get(idx).cloned().unwrap_or_else(|| "-".to_string()),
+                match_type: result.match_type,
+                event_id: result.event_id.clone(),
+                session_id: result.session_id.clone(),
+                source_kind: result.source_kind.clone(),
+                score: result.score,
+                lexical_rank: result.lexical_rank,
+                semantic_rank: result.semantic_rank,
+                occurred_at: result.occurred_at,
+                session_title: result.session_title.clone(),
+                snippet: result.snippet.clone(),
+            })
+            .collect(),
+        next_commands: search_hints(&response.results, refs),
+    }
+}
+
+fn search_hints(results: &[search::SearchResult], refs: &[String]) -> Vec<String> {
+    let Some(result) = results.first() else {
+        return vec!["super-cass update --json".to_string()];
+    };
+    let Some(ref_id) = refs.first() else {
+        return Vec::new();
+    };
+    vec![
+        format!("super-cass show {ref_id} --json"),
+        format!(
+            "super-cass transcript {} --at {ref_id} --json",
+            result.session_id
+        ),
+    ]
+}
+
+impl SearchSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            SearchSort::Relevance => "relevance",
+            SearchSort::Newest => "newest",
+            SearchSort::Oldest => "oldest",
         }
     }
 }
@@ -1365,6 +1473,47 @@ mod tests {
         assert_eq!(fields[4], "preview with new line");
         assert_eq!(fields[5], "session_1");
         assert_eq!(fields[6], "event_1");
+    }
+
+    #[test]
+    fn search_json_output_includes_refs_and_next_commands() {
+        let result = search::SearchResult {
+            match_type: search::MatchType::Hybrid,
+            event_id: "event_1".to_string(),
+            session_id: "session_1".to_string(),
+            source_kind: "codex".to_string(),
+            score: 0.5,
+            lexical_rank: Some(1),
+            semantic_rank: Some(2),
+            occurred_at: None,
+            session_title: Some("Session title".to_string()),
+            snippet: "useful snippet".to_string(),
+        };
+        let response = search::SearchResponse {
+            degraded_reason: None,
+            results: vec![result],
+        };
+
+        let output = search_output(
+            "workspace metadata",
+            20,
+            SearchSort::Relevance,
+            0.25,
+            &response,
+            &["ab3f".to_string()],
+        );
+        let value = serde_json::to_value(output).expect("serialize search output");
+
+        assert_eq!(value["query"], "workspace metadata");
+        assert_eq!(value["options"]["limit"], 20);
+        assert_eq!(value["options"]["sort"], "relevance");
+        assert_eq!(value["results"][0]["ref"], "ab3f");
+        assert_eq!(value["results"][0]["event_id"], "event_1");
+        assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
+        assert_eq!(
+            value["next_commands"][1],
+            "super-cass transcript session_1 --at ab3f --json"
+        );
     }
 
     #[test]
