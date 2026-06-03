@@ -12,6 +12,7 @@ pub struct RawArtifact {
     pub size: u64,
     pub mtime_ms: Option<i64>,
     pub media_type: String,
+    #[serde(with = "base64_bytes")]
     pub content: Vec<u8>,
     pub first_seen_at: DateTime<Utc>,
 }
@@ -166,4 +167,52 @@ pub fn stable_id(parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("sc_{}", hasher.finalize().to_hex())
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(BytesVisitor)
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64 string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: Error,
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: Error,
+        {
+            self.visit_str(&value)
+        }
+    }
 }

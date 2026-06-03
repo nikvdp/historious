@@ -243,6 +243,13 @@ pub enum Command {
         no_embeddings: bool,
         #[arg(
             long,
+            value_enum,
+            default_value_t = RawArtifactExportMode::Inline,
+            help = "How to include raw artifact content in JSONL exports"
+        )]
+        raw_artifacts: RawArtifactExportMode,
+        #[arg(
+            long,
             help = "Export only one source kind, such as codex or claude_code"
         )]
         source: Vec<String>,
@@ -264,6 +271,11 @@ pub enum Command {
         json: bool,
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
+    },
+    /// List, export, and import raw artifact blobs by content hash.
+    RawBlobs {
+        #[command(subcommand)]
+        command: RawBlobCommand,
     },
     /// Keep local history and search up to date.
     Daemon {
@@ -326,11 +338,52 @@ pub enum SkillCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RawBlobCommand {
+    /// List raw artifact blob hashes missing from local blob storage.
+    Missing {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Only include sessions from this source kind, such as codex or claude_code"
+        )]
+        source: Vec<String>,
+        #[arg(long, help = "Only include sessions from this workspace path")]
+        workspace: Vec<std::path::PathBuf>,
+        #[arg(long, help = "Only include this session id")]
+        session: Vec<String>,
+        #[arg(
+            long,
+            help = "Only include sessions since an RFC3339 timestamp or YYYY-MM-DD"
+        )]
+        since: Option<String>,
+    },
+    /// Write raw artifact blob records for hashes passed as args or stdin.
+    Export {
+        #[arg(help = "Raw artifact hashes; read newline-delimited hashes from stdin when omitted")]
+        hash: Vec<String>,
+    },
+    /// Read raw artifact blob records from JSONL.
+    Import {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
+        input: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SearchSort {
     Relevance,
     Newest,
     Oldest,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RawArtifactExportMode {
+    Inline,
+    Metadata,
 }
 
 impl From<SearchSort> for search::SortMode {
@@ -605,6 +658,7 @@ impl Cli {
             Command::Export {
                 jsonl,
                 no_embeddings,
+                raw_artifacts,
                 source,
                 workspace,
                 session,
@@ -626,6 +680,10 @@ impl Cli {
                         &filter,
                         transport::ExportOptions {
                             include_embeddings: !no_embeddings,
+                            include_raw_artifact_content: matches!(
+                                raw_artifacts,
+                                RawArtifactExportMode::Inline
+                            ),
                         },
                         stdout.lock(),
                     )?;
@@ -646,6 +704,65 @@ impl Cli {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
             }
+            Command::RawBlobs { command } => match command {
+                RawBlobCommand::Missing {
+                    json,
+                    source,
+                    workspace,
+                    session,
+                    since,
+                } => {
+                    let filter = crate::storage::ArchiveExportFilter {
+                        sources: source,
+                        workspaces: workspace
+                            .iter()
+                            .map(|path| transport::normalize_workspace_arg(path))
+                            .collect(),
+                        sessions: session,
+                        since: transport::parse_since_arg(since.as_deref())?,
+                    };
+                    let hashes = store.missing_raw_artifact_blob_hashes(&filter)?;
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs missing",
+                            RawBlobMissingOutput {
+                                count: hashes.len(),
+                                hashes,
+                            },
+                            Default::default(),
+                        )?;
+                    } else {
+                        for hash in hashes {
+                            println!("{hash}");
+                        }
+                    }
+                }
+                RawBlobCommand::Export { hash } => {
+                    let hashes = if hash.is_empty() {
+                        transport::read_hashes_from_stdin()?
+                    } else {
+                        hash
+                    };
+                    let stdout = std::io::stdout();
+                    transport::export_raw_blobs(&store, &hashes, stdout.lock())?;
+                }
+                RawBlobCommand::Import { json, input } => {
+                    let output = transport::import_raw_blobs_path(&store, &input)?;
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs import",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        println!(
+                            "Imported {} raw blobs, skipped {} already present",
+                            format_count(output.imported),
+                            format_count(output.duplicates)
+                        );
+                    }
+                }
+            },
             Command::Daemon {
                 interval_secs,
                 max_files,
@@ -717,6 +834,7 @@ impl Command {
             Command::Transcript { .. } => "transcript",
             Command::Export { .. } => "export",
             Command::Import { .. } => "import",
+            Command::RawBlobs { .. } => "raw-blobs",
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
@@ -734,6 +852,10 @@ impl Command {
                 | Command::Expand { json: true, .. }
                 | Command::Transcript { json: true, .. }
                 | Command::Import { json: true, .. }
+                | Command::RawBlobs {
+                    command: RawBlobCommand::Missing { json: true, .. }
+                        | RawBlobCommand::Import { json: true, .. },
+                }
                 | Command::Status { json: true, .. }
         )
     }
@@ -831,6 +953,12 @@ struct ImportOutput {
     import: crate::storage::ImportStats,
     search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
+}
+
+#[derive(Debug, Serialize)]
+struct RawBlobMissingOutput {
+    count: usize,
+    hashes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

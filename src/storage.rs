@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
+const SQLITE_BIND_CHUNK_SIZE: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -203,6 +204,69 @@ impl Store {
         &self.db_path
     }
 
+    #[cfg(test)]
+    pub fn raw_artifact_blob_exists(&self, hash: &str) -> bool {
+        blob_path(&self.blob_dir, hash).exists()
+    }
+
+    pub fn missing_raw_artifact_blob_hashes(
+        &self,
+        filter: &ArchiveExportFilter,
+    ) -> Result<Vec<String>> {
+        let session_ids = if filter.is_empty() {
+            Vec::new()
+        } else {
+            self.session_ids_for_export_filter(filter)?
+        };
+        self.with_conn(|conn| {
+            let hashes = if filter.is_empty() {
+                raw_artifact_hashes(conn)?
+            } else {
+                raw_artifact_hashes_for_session_ids(conn, &session_ids)?
+            };
+            Ok(hashes
+                .into_iter()
+                .filter(|hash| !blob_path(&self.blob_dir, hash).exists())
+                .collect())
+        })
+    }
+
+    pub fn read_raw_artifact_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_artifacts WHERE hash = ?1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                bail!("raw artifact metadata not found: {hash}");
+            }
+            read_blob(&self.blob_dir, hash)
+        })
+    }
+
+    pub fn write_raw_artifact_blob(&self, hash: &str, content: &[u8]) -> Result<bool> {
+        let actual = crate::archive::blake3_hex(content);
+        if actual != hash {
+            bail!("raw artifact blob hash mismatch: expected {hash}, got {actual}");
+        }
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_artifacts WHERE hash = ?1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                bail!("raw artifact metadata not found: {hash}");
+            }
+            let already_present = blob_path(&self.blob_dir, hash).exists();
+            if !already_present {
+                write_blob(&self.blob_dir, hash, content)?;
+            }
+            Ok(!already_present)
+        })
+    }
+
     pub fn upsert_source(
         &self,
         id: &str,
@@ -226,6 +290,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn import_record(&self, record: &ArchiveRecord) -> Result<ImportStats> {
         self.import_records(std::slice::from_ref(record))
     }
@@ -258,6 +323,13 @@ impl Store {
     }
 
     pub fn export_records(&self) -> Result<Vec<ArchiveRecord>> {
+        self.export_records_with_raw_content(true)
+    }
+
+    pub fn export_records_with_raw_content(
+        &self,
+        include_raw_content: bool,
+    ) -> Result<Vec<ArchiveRecord>> {
         self.with_conn(|conn| {
             let mut records = Vec::new();
             {
@@ -278,7 +350,7 @@ impl Store {
                 let rows = stmt.query_map([], row_raw_artifact)?;
                 for row in rows {
                     let mut raw = row?;
-                    if raw.content.is_empty() {
+                    if include_raw_content && raw.content.is_empty() {
                         raw.content = read_blob(&self.blob_dir, &raw.hash)?;
                     }
                     records.push(ArchiveRecord::RawArtifact(raw));
@@ -337,6 +409,14 @@ impl Store {
         &self,
         session_ids: &[String],
     ) -> Result<Vec<ArchiveRecord>> {
+        self.export_records_for_session_ids_with_raw_content(session_ids, true)
+    }
+
+    pub fn export_records_for_session_ids_with_raw_content(
+        &self,
+        session_ids: &[String],
+        include_raw_content: bool,
+    ) -> Result<Vec<ArchiveRecord>> {
         let session_ids = normalized_ids(session_ids);
         if session_ids.is_empty() {
             return Ok(Vec::new());
@@ -385,7 +465,7 @@ impl Store {
                     stmt.query_map(params_from_iter(session_ids.iter().map(String::as_str)), row_raw_artifact)?;
                 for row in rows {
                     let mut raw = row?;
-                    if raw.content.is_empty() {
+                    if include_raw_content && raw.content.is_empty() {
                         raw.content = read_blob(&self.blob_dir, &raw.hash)?;
                     }
                     records.push(ArchiveRecord::RawArtifact(raw));
@@ -1151,8 +1231,8 @@ impl Store {
         let embedding_ids = normalized_ids(embedding_ids);
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            if !embedding_ids.is_empty() {
-                let placeholders = placeholders(embedding_ids.len());
+            for chunk in embedding_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
+                let placeholders = placeholders(chunk.len());
                 let delete_sql = format!(
                     "DELETE FROM vec_embeddings_384
                      WHERE rowid IN (
@@ -1161,7 +1241,7 @@ impl Store {
                 );
                 tx.execute(
                     &delete_sql,
-                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                    params_from_iter(chunk.iter().map(String::as_str)),
                 )?;
                 let insert_sql = format!(
                     "INSERT INTO vec_embeddings_384(rowid, embedding)
@@ -1172,7 +1252,7 @@ impl Store {
                 );
                 tx.execute(
                     &insert_sql,
-                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                    params_from_iter(chunk.iter().map(String::as_str)),
                 )?;
             }
             let count = count_vec_embeddings(&tx)?;
@@ -1293,6 +1373,46 @@ fn events_for_session(conn: &Connection, session_id: &str) -> Result<Vec<EventRe
          ORDER BY ordinal, id",
     )?;
     let rows = stmt.query_map(params![session_id], row_event)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_hashes(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT hash FROM raw_artifacts ORDER BY first_seen_at, hash")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_hashes_for_session_ids(
+    conn: &Connection,
+    session_ids: &[String],
+) -> Result<Vec<String>> {
+    let session_ids = normalized_ids(session_ids);
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = placeholders(session_ids.len());
+    let sql = format!(
+        "SELECT hash
+         FROM raw_artifacts
+         WHERE hash IN (
+           SELECT raw_artifact_hash FROM events
+           WHERE session_id IN ({placeholders}) AND raw_artifact_hash IS NOT NULL
+         )
+         ORDER BY first_seen_at, hash"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(session_ids.iter().map(String::as_str)),
+        |row| row.get(0),
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -1748,7 +1868,9 @@ fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
 
 fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact, blob_dir: &Path) -> Result<bool> {
     ensure_same_hash(conn, "raw_artifacts", "hash", &raw.hash, &raw.hash)?;
-    write_blob(blob_dir, &raw.hash, &raw.content)?;
+    if !raw.content.is_empty() {
+        write_blob(blob_dir, &raw.hash, &raw.content)?;
+    }
     let changed = conn.execute(
         "INSERT OR IGNORE INTO raw_artifacts
          (hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at)
@@ -2308,6 +2430,29 @@ mod tests {
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);
+    }
+
+    #[test]
+    fn vector_projection_refresh_chunks_large_embedding_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = (0..(SQLITE_BIND_CHUNK_SIZE * 3))
+            .map(|idx| {
+                let unit = fixture_search_unit(&format!("chunked vector projection {idx}"));
+                ArchiveRecord::Embedding(fixture_embedding(&unit, unit_vector(idx % 384)))
+            })
+            .collect::<Vec<_>>();
+        let embedding_ids = records
+            .iter()
+            .map(|record| record.id().to_string())
+            .collect::<Vec<_>>();
+        store.import_records(&records).expect("import embeddings");
+
+        let indexed = store
+            .refresh_vector_projection_for_embeddings(&embedding_ids)
+            .expect("refresh projection");
+
+        assert_eq!(indexed, records.len());
     }
 
     #[test]
