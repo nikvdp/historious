@@ -22,7 +22,7 @@ pub struct Store {
 pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
-    pub vectors_projected: usize,
+    pub vectors_indexed: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -533,7 +533,7 @@ impl Store {
         })
     }
 
-    pub fn refresh_search_projection(
+    pub fn refresh_search_index(
         &self,
         model: &str,
         dims: usize,
@@ -599,7 +599,7 @@ impl Store {
                     occurred_at: event.occurred_at,
                     metadata: serde_json::json!({
                         "derived_from": "event.search_text",
-                        "projection": "search_unit_v1"
+                        "indexer": "search_unit_v1"
                     }),
                     hash: unit_hash,
                 };
@@ -681,13 +681,13 @@ impl Store {
                     occurred_at: event.occurred_at,
                     metadata: serde_json::json!({
                         "derived_from": "event.search_text",
-                        "projection": "search_unit_v1"
+                        "indexer": "search_unit_v1"
                     }),
                     hash: unit_hash,
                 };
                 insert_search_unit(&tx, &unit)?;
             }
-            let projected_events = count_projected_events(&tx, model)?;
+            let indexed_events = count_indexed_events(&tx, model)?;
             tx.execute(
                 "INSERT INTO projection_status
                  (projection_name, input_high_watermark, status, last_error, updated_at)
@@ -697,11 +697,11 @@ impl Store {
                    status = excluded.status,
                    last_error = NULL,
                    updated_at = excluded.updated_at",
-                params![projected_events.to_string(), Utc::now().to_rfc3339()],
+                params![indexed_events.to_string(), Utc::now().to_rfc3339()],
             )?;
             drop(missing_unit_stmt);
             tx.commit()?;
-            Ok(projected_events)
+            Ok(indexed_events)
         })
     }
 
@@ -1678,7 +1678,7 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
-fn count_projected_events(conn: &Connection, model: &str) -> Result<usize> {
+fn count_indexed_events(conn: &Connection, model: &str) -> Result<usize> {
     let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
     let embedding_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM event_embeddings WHERE model = ?1",

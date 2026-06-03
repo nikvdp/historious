@@ -155,7 +155,7 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         stats.inserted += delta.inserted;
         stats.duplicates += delta.duplicates;
     }
-    stats.vectors_projected = store.refresh_vector_projection()?;
+    stats.vectors_indexed = store.refresh_vector_projection()?;
     Ok(stats)
 }
 
@@ -278,7 +278,7 @@ mod tests {
         export_jsonl(&machine_b, &mut b_export).expect("export b");
         let sync_back = import_jsonl_reader(&machine_a, b_export.as_slice()).expect("sync back");
 
-        assert_eq!(sync_back.vectors_projected, 1);
+        assert_eq!(sync_back.vectors_indexed, 1);
         let vector_hits = machine_a
             .vector_search("fixture-semantic-384", &unit_vector_384(11), 5)
             .expect("vector search");

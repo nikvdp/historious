@@ -85,11 +85,11 @@ async fn import_jsonl(
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,
         "duplicates": stats.duplicates,
-        "vectors_projected": stats.vectors_projected,
+        "vectors_indexed": stats.vectors_indexed,
         "embedded": embeddings.embedded,
-        "embedding_vectors_projected": embeddings.vectors_projected,
+        "embedding_vectors_indexed": embeddings.vectors_indexed,
         "embedding_degraded_reason": embeddings.degraded_reason,
-        "projected_events": projected
+        "indexed_events": projected
     })))
 }
 
