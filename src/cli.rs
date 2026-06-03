@@ -336,15 +336,33 @@ pub enum Command {
         #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
     },
-    /// Serve local history over HTTP and keep it up to date.
+    /// Serve already-indexed local history over HTTP.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7391", help = "Address to listen on")]
         bind: String,
-        #[arg(long, default_value_t = 30, help = "Seconds between scans")]
+        #[arg(
+            long,
+            help = "Also keep local history up to date by scanning periodically"
+        )]
+        watch: bool,
+        #[arg(
+            long,
+            default_value_t = 30,
+            requires = "watch",
+            help = "Seconds between scans when --watch is enabled"
+        )]
         interval_secs: u64,
-        #[arg(long, help = "Scan at most this many newest files each pass")]
+        #[arg(
+            long,
+            requires = "watch",
+            help = "Scan at most this many newest files each pass"
+        )]
         max_files: Option<usize>,
-        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
+        #[arg(
+            long,
+            requires = "watch",
+            help = "Scan only one source kind, such as codex or claude_code"
+        )]
         source: Option<String>,
     },
     /// Show local history and search health.
@@ -894,27 +912,32 @@ impl Cli {
             }
             Command::Serve {
                 bind,
+                watch,
                 interval_secs,
                 max_files,
                 source,
             } => {
                 let addr = bind.parse()?;
-                let server_store = store.clone();
-                let server_machine_id = config.machine_id.clone();
-                let server_embedder = config.embedder.clone();
-                let server_task = tokio::spawn(async move {
-                    server::serve(server_store, addr, server_machine_id, server_embedder).await
-                });
-                run_daemon(
-                    &store,
-                    &config.machine_id,
-                    config.embedder.clone(),
-                    interval_secs,
-                    max_files,
-                    source,
-                )
-                .await?;
-                server_task.abort();
+                if watch {
+                    let server_store = store.clone();
+                    let server_machine_id = config.machine_id.clone();
+                    let server_embedder = config.embedder.clone();
+                    let server_task = tokio::spawn(async move {
+                        server::serve(server_store, addr, server_machine_id, server_embedder).await
+                    });
+                    run_daemon(
+                        &store,
+                        &config.machine_id,
+                        config.embedder.clone(),
+                        interval_secs,
+                        max_files,
+                        source,
+                    )
+                    .await?;
+                    server_task.abort();
+                } else {
+                    server::serve(store, addr, config.machine_id, config.embedder).await?;
+                }
             }
             Command::Status { json } => {
                 let output = status_output(&store, &config)?;
