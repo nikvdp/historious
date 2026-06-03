@@ -839,11 +839,19 @@ impl Store {
         })
     }
 
-    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<SearchRow>> {
+    pub fn search_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query(query);
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
+        let after = opt_dt(after);
+        let before = opt_dt(before);
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT events_fts.event_id,
@@ -856,10 +864,12 @@ impl Store {
                  JOIN events e ON e.id = events_fts.event_id
                  LEFT JOIN sessions s ON s.id = events_fts.session_id
                  WHERE events_fts MATCH ?1
+                   AND (?2 IS NULL OR e.occurred_at >= ?2)
+                   AND (?3 IS NULL OR e.occurred_at < ?3)
                  ORDER BY bm25(events_fts)
-                 LIMIT ?2",
+                 LIMIT ?4",
             )?;
-            let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            let rows = stmt.query_map(params![fts_query, after, before, limit as i64], |row| {
                 Ok(SearchRow {
                     event_id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -1176,10 +1186,14 @@ impl Store {
         model_id: &str,
         query_vector: &[f32],
         limit: usize,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
     ) -> Result<Vec<VectorSearchRow>> {
         if query_vector.len() != 384 {
             return Ok(Vec::new());
         }
+        let after = opt_dt(after);
+        let before = opt_dt(before);
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT su.event_id,
@@ -1197,10 +1211,18 @@ impl Store {
                  WHERE vec_embeddings_384.embedding MATCH ?1
                    AND k = ?2
                    AND e.model_id = ?3
+                   AND (?4 IS NULL OR su.occurred_at >= ?4)
+                   AND (?5 IS NULL OR su.occurred_at < ?5)
                  ORDER BY vec_embeddings_384.distance",
             )?;
             let rows = stmt.query_map(
-                params![f32_vector_to_blob(query_vector), limit as i64, model_id],
+                params![
+                    f32_vector_to_blob(query_vector),
+                    limit as i64,
+                    model_id,
+                    after,
+                    before
+                ],
                 |row| {
                     Ok(VectorSearchRow {
                         event_id: row.get(0)?,
@@ -2251,7 +2273,7 @@ mod tests {
         store.refresh_vector_projection().expect("refresh vectors");
 
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(0), 5)
+            .vector_search("fixture-semantic-384", &unit_vector(0), 5, None, None)
             .expect("vector search");
 
         assert_eq!(hits.len(), 1);
@@ -2282,7 +2304,7 @@ mod tests {
             1
         );
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(2), 5)
+            .vector_search("fixture-semantic-384", &unit_vector(2), 5, None, None)
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);

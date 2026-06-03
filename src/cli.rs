@@ -4,7 +4,8 @@ use crate::search;
 use crate::server;
 use crate::storage::{RecentResultRefInput, Store};
 use crate::transport;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
+use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
@@ -84,6 +85,16 @@ pub enum Command {
             help = "Favor newer results, from 0.0 to 1.0"
         )]
         recency_bias: f64,
+        #[arg(
+            long,
+            help = "Only show results at or after a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        before: Option<String>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
         #[arg(long, help = "Browse results interactively with fzf")]
@@ -341,6 +352,8 @@ impl Cli {
                 exclude,
                 sort,
                 recency_bias,
+                after,
+                before,
                 no_color,
                 fzf,
                 fzf_rows,
@@ -356,13 +369,27 @@ impl Cli {
                 if fzf_rows && query.trim().is_empty() {
                     return Ok(());
                 }
+                let after_bound =
+                    parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
+                let before_bound =
+                    parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
                 if fzf {
                     let color = !no_color;
-                    run_fzf_search(&config, &query, limit, sort, recency_bias, color)?;
+                    run_fzf_search(
+                        &config,
+                        &query,
+                        limit,
+                        sort,
+                        recency_bias,
+                        after.as_deref(),
+                        before.as_deref(),
+                        color,
+                    )?;
                     return Ok(());
                 }
                 let (embedder, degraded_reason) = load_embedder(&config);
-                let options = search::SearchOptions::new(limit, sort.into(), recency_bias);
+                let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
+                    .with_time_window(after_bound, before_bound);
                 let response = search::search(
                     &store,
                     &query,
@@ -373,7 +400,16 @@ impl Cli {
                 if json || robot {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
-                    let output = search_output(&query, limit, sort, recency_bias, &response, &refs);
+                    let output = search_output(
+                        &query,
+                        limit,
+                        sort,
+                        recency_bias,
+                        after_bound,
+                        before_bound,
+                        &response,
+                        &refs,
+                    );
                     crate::output::write_success(
                         "search",
                         output,
@@ -747,6 +783,8 @@ struct SearchOptionsOutput {
     limit: usize,
     sort: &'static str,
     recency_bias: f64,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1345,6 +1383,8 @@ fn search_output(
     limit: usize,
     sort: SearchSort,
     recency_bias: f64,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
     response: &search::SearchResponse,
     refs: &[String],
 ) -> SearchOutput {
@@ -1354,6 +1394,8 @@ fn search_output(
             limit,
             sort: sort.as_str(),
             recency_bias,
+            after,
+            before,
         },
         degraded_reason: response.degraded_reason.clone(),
         results: response
@@ -1616,12 +1658,106 @@ fn search_limit(limit: Option<usize>, fzf: bool) -> usize {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TimeFilterBound {
+    After,
+    Before,
+}
+
+fn parse_optional_search_time(
+    value: Option<&str>,
+    bound: TimeFilterBound,
+) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| parse_search_time(value, bound))
+        .transpose()
+}
+
+fn parse_search_time(value: &str, bound: TimeFilterBound) -> Result<DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("time filter cannot be empty");
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, format) {
+            return local_naive_to_utc(dt);
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return local_date_bound_to_utc(date, bound);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "now" => return Ok(Local::now().with_timezone(&Utc)),
+        "today" => return local_date_bound_to_utc(Local::now().date_naive(), bound),
+        "yesterday" => {
+            return local_date_bound_to_utc(
+                Local::now().date_naive() - chrono::Duration::days(1),
+                bound,
+            );
+        }
+        _ => {}
+    }
+    if let Some(dt) = parse_relative_ago(&lower)? {
+        return Ok(dt);
+    }
+    bail!("could not parse time filter: {trimmed}");
+}
+
+fn parse_relative_ago(value: &str) -> Result<Option<DateTime<Utc>>> {
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[2] != "ago" {
+        return Ok(None);
+    }
+    let amount = parts[0]
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("could not parse relative time amount: {}", parts[0]))?;
+    if amount < 0 {
+        bail!("relative time amount must be positive");
+    }
+    let duration = match parts[1].trim_end_matches('s') {
+        "minute" => chrono::Duration::minutes(amount),
+        "hour" => chrono::Duration::hours(amount),
+        "day" => chrono::Duration::days(amount),
+        "week" => chrono::Duration::weeks(amount),
+        unit => bail!("unsupported relative time unit: {unit}"),
+    };
+    Ok(Some((Local::now() - duration).with_timezone(&Utc)))
+}
+
+fn local_date_bound_to_utc(date: NaiveDate, bound: TimeFilterBound) -> Result<DateTime<Utc>> {
+    let date = match bound {
+        TimeFilterBound::After => date,
+        TimeFilterBound::Before => date
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("date is too large for --before"))?,
+    };
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow::anyhow!("could not build local day boundary"))?;
+    local_naive_to_utc(naive)
+}
+
+fn local_naive_to_utc(value: NaiveDateTime) -> Result<DateTime<Utc>> {
+    match Local.from_local_datetime(&value) {
+        LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, _) => Ok(earliest.with_timezone(&Utc)),
+        LocalResult::None => bail!("local time does not exist: {value}"),
+    }
+}
+
 fn run_fzf_search(
     config: &AppConfig,
     query: &str,
     limit: usize,
     sort: SearchSort,
     recency_bias: f64,
+    after: Option<&str>,
+    before: Option<&str>,
     color: bool,
 ) -> Result<()> {
     if !command_exists("fzf") {
@@ -1633,8 +1769,10 @@ fn run_fzf_search(
     let exe = shell_quote(&current_exe.to_string_lossy());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
     let color_flag = if color { "" } else { " --no-color" };
+    let after_flag = optional_shell_flag("--after", after);
+    let before_flag = optional_shell_flag("--before", before);
     let reload = format!(
-        "{exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{color_flag} -- {{q}}",
+        "{exe} --data-dir {data_dir} search --fzf-rows --limit {limit} --sort {} --recency-bias {recency_bias}{after_flag}{before_flag}{color_flag} -- {{q}}",
         sort.as_str()
     );
     let preview = format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5");
@@ -1679,6 +1817,12 @@ fn run_fzf_search(
 
 fn preview_scroll_bind(key: &str, action: &str, count: usize) -> String {
     format!("{key}:{}", vec![action; count].join("+"))
+}
+
+fn optional_shell_flag(flag: &str, value: Option<&str>) -> String {
+    value
+        .map(|value| format!(" {flag} {}", shell_quote(value)))
+        .unwrap_or_default()
 }
 
 fn fzf_rows_output(results: &[search::SearchResult], refs: &[String], color: bool) -> String {
@@ -2068,7 +2212,7 @@ fn load_embedder_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ArchiveRecord, EventRecord, SessionRecord, SourceRecord, stable_hash};
+    use crate::archive::{stable_hash, ArchiveRecord, EventRecord, SessionRecord, SourceRecord};
     use chrono::Utc;
     use serde_json::json;
 
@@ -2163,6 +2307,8 @@ mod tests {
             20,
             SearchSort::Relevance,
             0.25,
+            None,
+            None,
             &response,
             &["ab3f".to_string()],
         );
@@ -2171,6 +2317,8 @@ mod tests {
         assert_eq!(value["query"], "workspace metadata");
         assert_eq!(value["options"]["limit"], 20);
         assert_eq!(value["options"]["sort"], "relevance");
+        assert_eq!(value["options"]["after"], serde_json::Value::Null);
+        assert_eq!(value["options"]["before"], serde_json::Value::Null);
         assert_eq!(value["results"][0]["ref"], "ab3f");
         assert_eq!(value["results"][0]["event_id"], "event_1");
         assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
@@ -2220,6 +2368,32 @@ mod tests {
         assert_eq!(
             preview_scroll_bind("shift-down", "preview-down", 3),
             "shift-down:preview-down+preview-down+preview-down"
+        );
+    }
+
+    #[test]
+    fn date_only_time_filters_use_local_day_bounds() {
+        let after = parse_search_time("2026-04-20", TimeFilterBound::After).expect("after");
+        let before = parse_search_time("2026-04-20", TimeFilterBound::Before).expect("before");
+
+        assert!(before > after);
+        assert_eq!(before - after, chrono::Duration::days(1));
+    }
+
+    #[test]
+    fn relative_ago_time_filters_parse() {
+        let parsed = parse_search_time("3 days ago", TimeFilterBound::After).expect("relative");
+        let now = Utc::now();
+
+        assert!(parsed < now);
+        assert!(parsed > now - chrono::Duration::days(4));
+    }
+
+    #[test]
+    fn optional_shell_flag_quotes_time_values() {
+        assert_eq!(
+            optional_shell_flag("--after", Some("3 days ago")),
+            " --after '3 days ago'"
         );
     }
 

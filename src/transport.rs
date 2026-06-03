@@ -282,7 +282,7 @@ mod tests {
 
         assert_eq!(sync_back.vectors_indexed, 1);
         let vector_hits = machine_a
-            .vector_search("fixture-semantic-384", &unit_vector_384(11), 5)
+            .vector_search("fixture-semantic-384", &unit_vector_384(11), 5, None, None)
             .expect("vector search");
         assert_eq!(vector_hits.len(), 1);
         assert_eq!(vector_hits[0].unit_id, unit.id);

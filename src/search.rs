@@ -37,6 +37,8 @@ pub struct SearchOptions {
     pub limit: usize,
     pub sort: SortMode,
     pub recency_bias: f64,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
 }
 
 impl SearchOptions {
@@ -45,7 +47,19 @@ impl SearchOptions {
             limit,
             sort,
             recency_bias: recency_bias.clamp(0.0, 1.0),
+            after: None,
+            before: None,
         }
+    }
+
+    pub fn with_time_window(
+        mut self,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
+    ) -> Self {
+        self.after = after;
+        self.before = before;
+        self
     }
 }
 
@@ -318,9 +332,16 @@ pub fn search(
         .saturating_mul(BACKEND_LIMIT_MULTIPLIER)
         .max(BACKEND_MIN_LIMIT);
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
-    let lexical = store.search_fts(query, backend_limit)?;
-    let (semantic, degraded_reason) =
-        semantic_search(store, query, query_embedder, degraded_reason, semantic_limit)?;
+    let lexical = store.search_fts(query, backend_limit, options.after, options.before)?;
+    let (semantic, degraded_reason) = semantic_search(
+        store,
+        query,
+        query_embedder,
+        degraded_reason,
+        semantic_limit,
+        options.after,
+        options.before,
+    )?;
     Ok(SearchResponse {
         degraded_reason,
         results: fuse(lexical, semantic, options),
@@ -333,6 +354,8 @@ fn semantic_search(
     query_embedder: Option<&dyn Embedder>,
     degraded_reason: Option<String>,
     limit: usize,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
     let Some(embedder) = query_embedder else {
         return Ok((Vec::new(), degraded_reason));
@@ -354,7 +377,7 @@ fn semantic_search(
     }
     let query_vector = embedder.embed_one(query)?;
     let rows = store
-        .vector_search(embedder.model_id(), &query_vector, limit)?
+        .vector_search(embedder.model_id(), &query_vector, limit, after, before)?
         .into_iter()
         .map(search_row_from_vector)
         .collect();
@@ -698,7 +721,7 @@ mod tests {
         assert_eq!(refresh.degraded_reason, None);
         assert_eq!(store.stats().expect("stats").embeddings, 1);
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(13), 5)
+            .vector_search("fixture-semantic-384", &unit_vector(13), 5, None, None)
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);
@@ -764,7 +787,7 @@ mod tests {
             refresh_embeddings_incremental(&store, "machine_fixture", &config, &stats.delta)
                 .expect("refresh embeddings");
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(17), 5)
+            .vector_search("fixture-semantic-384", &unit_vector(17), 5, None, None)
             .expect("vector search");
 
         assert_eq!(refresh.embedded, 0);
@@ -829,8 +852,110 @@ mod tests {
         assert_eq!(response.results[0].event_id, event_id);
     }
 
+    #[test]
+    fn lexical_search_honors_time_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let old_time = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("old time")
+            .with_timezone(&Utc);
+        let new_time = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+            .expect("new time")
+            .with_timezone(&Utc);
+        let old_id = import_event_at(&store, "shared lexical old", Some(old_time)).0;
+        let new_id = import_event_at(&store, "shared lexical new", Some(new_time)).0;
+        refresh(&store).expect("refresh search");
+
+        let response = search(
+            &store,
+            "shared lexical",
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_time_window(
+                Some(
+                    DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+                        .expect("after")
+                        .with_timezone(&Utc),
+                ),
+                None,
+            ),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert!(response
+            .results
+            .iter()
+            .any(|result| result.event_id == new_id));
+        assert!(!response
+            .results
+            .iter()
+            .any(|result| result.event_id == old_id));
+    }
+
+    #[test]
+    fn semantic_search_honors_time_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let old_time = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("old time")
+            .with_timezone(&Utc);
+        let new_time = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+            .expect("new time")
+            .with_timezone(&Utc);
+        let old_unit = import_event_and_project_at(&store, "old semantic target", Some(old_time));
+        let new_unit = import_event_and_project_at(&store, "new semantic target", Some(new_time));
+        for unit in [&old_unit, &new_unit] {
+            store
+                .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                    unit,
+                    unit_vector(19),
+                )))
+                .expect("embedding");
+        }
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(19),
+        };
+
+        let response = search(
+            &store,
+            "conceptual neighbor",
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_time_window(
+                Some(
+                    DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+                        .expect("after")
+                        .with_timezone(&Utc),
+                ),
+                None,
+            ),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert!(response
+            .results
+            .iter()
+            .any(|result| result.event_id == new_unit.event_id));
+        assert!(!response
+            .results
+            .iter()
+            .any(|result| result.event_id == old_unit.event_id));
+    }
+
     fn import_event_and_project(store: &Store, search_text: &str) -> SearchUnitRecord {
-        let (event_id, delta) = import_event_only(store, search_text);
+        import_event_and_project_at(store, search_text, None)
+    }
+
+    fn import_event_and_project_at(
+        store: &Store,
+        search_text: &str,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> SearchUnitRecord {
+        let (event_id, delta) = import_event_at(store, search_text, occurred_at);
         refresh_incremental(store, &delta).expect("refresh projection");
 
         let text_hash = crate::archive::blake3_hex(search_text.as_bytes());
@@ -846,13 +971,21 @@ mod tests {
             search_kind: "assistant".to_string(),
             text: search_text.to_string(),
             text_hash,
-            occurred_at: None,
+            occurred_at,
             metadata: json!({}),
             hash: "unused".to_string(),
         }
     }
 
     fn import_event_only(store: &Store, search_text: &str) -> (String, ImportDelta) {
+        import_event_at(store, search_text, None)
+    }
+
+    fn import_event_at(
+        store: &Store,
+        search_text: &str,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> (String, ImportDelta) {
         let source = SourceRecord {
             id: stable_id(&["source", search_text]),
             kind: "fixture".to_string(),
@@ -888,7 +1021,7 @@ mod tests {
             role: Some("assistant".to_string()),
             content: search_text.to_string(),
             raw_artifact_hash: None,
-            occurred_at: None,
+            occurred_at,
             metadata: json!({
                 "search_indexable": true,
                 "search_kind": "assistant",
