@@ -764,6 +764,36 @@ mod tests {
         assert_eq!(response.results[0].event_id, event_id);
     }
 
+    #[test]
+    fn full_refresh_repairs_missing_search_index_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let (event_id, delta) = import_event_only(&store, "repairable indexed phrase");
+        refresh_incremental(&store, &delta).expect("initial refresh");
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM events_fts", [])?;
+                conn.execute("DELETE FROM event_embeddings", [])?;
+                conn.execute("DELETE FROM search_units", [])?;
+                Ok(())
+            })
+            .expect("damage derived rows");
+
+        let indexed = refresh(&store).expect("repair refresh");
+        let response = search(
+            &store,
+            "repairable indexed",
+            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(indexed, 1);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, event_id);
+    }
+
     fn import_event_and_project(store: &Store, search_text: &str) -> SearchUnitRecord {
         let (event_id, delta) = import_event_only(store, search_text);
         refresh_incremental(store, &delta).expect("refresh projection");
