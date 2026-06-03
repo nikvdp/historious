@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
+const SQLITE_BIND_CHUNK_SIZE: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -1229,8 +1230,8 @@ impl Store {
         let embedding_ids = normalized_ids(embedding_ids);
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            if !embedding_ids.is_empty() {
-                let placeholders = placeholders(embedding_ids.len());
+            for chunk in embedding_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
+                let placeholders = placeholders(chunk.len());
                 let delete_sql = format!(
                     "DELETE FROM vec_embeddings_384
                      WHERE rowid IN (
@@ -1239,7 +1240,7 @@ impl Store {
                 );
                 tx.execute(
                     &delete_sql,
-                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                    params_from_iter(chunk.iter().map(String::as_str)),
                 )?;
                 let insert_sql = format!(
                     "INSERT INTO vec_embeddings_384(rowid, embedding)
@@ -1250,7 +1251,7 @@ impl Store {
                 );
                 tx.execute(
                     &insert_sql,
-                    params_from_iter(embedding_ids.iter().map(String::as_str)),
+                    params_from_iter(chunk.iter().map(String::as_str)),
                 )?;
             }
             let count = count_vec_embeddings(&tx)?;
@@ -2428,6 +2429,29 @@ mod tests {
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);
+    }
+
+    #[test]
+    fn vector_projection_refresh_chunks_large_embedding_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let records = (0..(SQLITE_BIND_CHUNK_SIZE * 3))
+            .map(|idx| {
+                let unit = fixture_search_unit(&format!("chunked vector projection {idx}"));
+                ArchiveRecord::Embedding(fixture_embedding(&unit, unit_vector(idx % 384)))
+            })
+            .collect::<Vec<_>>();
+        let embedding_ids = records
+            .iter()
+            .map(|record| record.id().to_string())
+            .collect::<Vec<_>>();
+        store.import_records(&records).expect("import embeddings");
+
+        let indexed = store
+            .refresh_vector_projection_for_embeddings(&embedding_ids)
+            .expect("refresh projection");
+
+        assert_eq!(indexed, records.len());
     }
 
     #[test]
