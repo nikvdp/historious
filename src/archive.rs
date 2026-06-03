@@ -85,6 +85,7 @@ pub struct EmbeddingRecord {
     pub model_id: String,
     pub dims: u32,
     pub vector_hash: String,
+    #[serde(with = "base64_bytes")]
     pub vector: Vec<u8>,
     pub producer_machine_id: String,
     pub embedded_at: DateTime<Utc>,

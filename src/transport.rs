@@ -323,6 +323,18 @@ mod tests {
 
         let mut body = Vec::new();
         export_jsonl(&store, &mut body).expect("export jsonl");
+        let body_jsonl = String::from_utf8(body.clone()).expect("utf8 jsonl");
+        let embedding_line = body_jsonl
+            .lines()
+            .find(|line| line.contains(r#""kind":"embedding""#))
+            .expect("embedding line");
+        let embedding_json: serde_json::Value =
+            serde_json::from_str(embedding_line).expect("embedding json");
+        let expected_vector = base64::engine::general_purpose::STANDARD.encode(&embedding.vector);
+        assert_eq!(
+            embedding_json["payload"]["vector"].as_str(),
+            Some(expected_vector.as_str())
+        );
 
         let imported_dir = tempfile::tempdir().expect("import tempdir");
         let imported_store = Store::open(imported_dir.path()).expect("open imported store");
