@@ -4,13 +4,14 @@ use crate::archive::{
 use crate::storage::{ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateStats {
     pub files_seen: usize,
     pub skipped_unchanged: usize,
