@@ -201,7 +201,7 @@ fn push_event(
     out.push('\n');
     if should_compact_preview_event(event, target, mode) {
         out.push_str(
-            "[non-message event omitted from context preview; use show for full raw transcript]",
+            "[non-message event omitted from context preview; use transcript for full raw transcript]",
         );
     } else {
         out.push_str(&event.content);
