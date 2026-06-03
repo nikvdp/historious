@@ -1,22 +1,25 @@
 use crate::search;
 use crate::storage::Store;
 use crate::transport;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppState {
     store: Store,
     machine_id: String,
-    embedder: crate::embed::EmbedderConfig,
+    embedder: Option<Arc<dyn crate::embed::Embedder>>,
+    embedder_degraded_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -30,15 +33,21 @@ pub async fn serve(
     machine_id: String,
     embedder: crate::embed::EmbedderConfig,
 ) -> Result<()> {
+    let (embedder, embedder_degraded_reason) = match embedder.load() {
+        Ok(embedder) => (Some(Arc::from(embedder)), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/heads", get(heads))
+        .route("/search", get(search_endpoint))
         .route("/export", get(export_jsonl))
         .route("/import", post(import_jsonl))
         .with_state(AppState {
             store,
             machine_id,
             embedder,
+            embedder_degraded_reason,
         });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving sync API on {}", listener.local_addr()?);
@@ -66,21 +75,108 @@ async fn export_jsonl(State(state): State<AppState>) -> Result<Response, ServerE
         .into_response())
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    limit: Option<usize>,
+    sort: Option<String>,
+    recency_bias: Option<f64>,
+    after: Option<String>,
+    before: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerSearchOutput {
+    query: String,
+    options: ServerSearchOptions,
+    degraded_reason: Option<String>,
+    results: Vec<ServerSearchResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerSearchOptions {
+    limit: usize,
+    sort: String,
+    recency_bias: f64,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerSearchResult {
+    match_type: search::MatchType,
+    event_id: String,
+    session_id: String,
+    source_kind: String,
+    score: f64,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    occurred_at: Option<DateTime<Utc>>,
+    session_title: Option<String>,
+    snippet: String,
+}
+
+async fn search_endpoint(
+    State(state): State<AppState>,
+    Query(params): Query<SearchParams>,
+) -> Result<Response, ServerError> {
+    let query = params.q.unwrap_or_default();
+    if query.trim().is_empty() {
+        return Err(anyhow::anyhow!("search query is required").into());
+    }
+    let limit = params.limit.unwrap_or(25);
+    let sort = parse_sort(params.sort.as_deref())?;
+    let sort_name = sort_name(sort).to_string();
+    let recency_bias = params.recency_bias.unwrap_or(0.0);
+    let after = parse_rfc3339_opt(params.after.as_deref(), "after")?;
+    let before = parse_rfc3339_opt(params.before.as_deref(), "before")?;
+    let options =
+        search::SearchOptions::new(limit, sort, recency_bias).with_time_window(after, before);
+    let response = search::search(
+        &state.store,
+        &query,
+        options,
+        state.embedder.as_deref(),
+        state.embedder_degraded_reason.clone(),
+    )?;
+    if params.format.as_deref() == Some("fzf") {
+        return Ok((
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            server_fzf_rows(&response.results),
+        )
+            .into_response());
+    }
+    let output = ServerSearchOutput {
+        query,
+        options: ServerSearchOptions {
+            limit,
+            sort: sort_name,
+            recency_bias: recency_bias.clamp(0.0, 1.0),
+            after,
+            before,
+        },
+        degraded_reason: response.degraded_reason,
+        results: response
+            .results
+            .into_iter()
+            .map(ServerSearchResult::from)
+            .collect(),
+    };
+    Ok(Json(output).into_response())
+}
+
 async fn import_jsonl(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let stats = transport::import_jsonl_reader(&state.store, Cursor::new(body))?;
     let projected = search::refresh(&state.store)?;
-    let (embedder, degraded_reason) = match state.embedder.load() {
-        Ok(embedder) => (Some(embedder), None),
-        Err(err) => (None, Some(err.to_string())),
-    };
     let embeddings = search::refresh_embeddings(
         &state.store,
         &state.machine_id,
-        embedder.as_deref(),
-        degraded_reason,
+        state.embedder.as_deref(),
+        state.embedder_degraded_reason.clone(),
     )?;
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,
@@ -91,6 +187,96 @@ async fn import_jsonl(
         "embedding_degraded_reason": embeddings.degraded_reason,
         "indexed_events": projected
     })))
+}
+
+impl From<search::SearchResult> for ServerSearchResult {
+    fn from(result: search::SearchResult) -> Self {
+        Self {
+            match_type: result.match_type,
+            event_id: result.event_id,
+            session_id: result.session_id,
+            source_kind: result.source_kind,
+            score: result.score,
+            lexical_rank: result.lexical_rank,
+            semantic_rank: result.semantic_rank,
+            occurred_at: result.occurred_at,
+            session_title: result.session_title,
+            snippet: result.snippet,
+        }
+    }
+}
+
+fn parse_sort(value: Option<&str>) -> Result<search::SortMode> {
+    match value.unwrap_or("relevance") {
+        "relevance" => Ok(search::SortMode::Relevance),
+        "newest" => Ok(search::SortMode::Newest),
+        "oldest" => Ok(search::SortMode::Oldest),
+        value => bail!("unsupported sort mode: {value}"),
+    }
+}
+
+fn sort_name(sort: search::SortMode) -> &'static str {
+    match sort {
+        search::SortMode::Relevance => "relevance",
+        search::SortMode::Newest => "newest",
+        search::SortMode::Oldest => "oldest",
+    }
+}
+
+fn parse_rfc3339_opt(value: Option<&str>, name: &str) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|err| anyhow::anyhow!("invalid {name} timestamp: {err}"))
+        })
+        .transpose()
+}
+
+fn server_fzf_rows(results: &[search::SearchResult]) -> String {
+    let mut rows = String::new();
+    for result in results {
+        rows.push_str(&server_fzf_row(result));
+        rows.push('\n');
+    }
+    rows
+}
+
+fn server_fzf_row(result: &search::SearchResult) -> String {
+    [
+        clean_fzf_field(&short_event_ref(&result.event_id)),
+        clean_fzf_field(&result.source_kind),
+        clean_fzf_field(match result.match_type {
+            search::MatchType::Lexical => "lexical",
+            search::MatchType::Semantic => "semantic",
+            search::MatchType::Hybrid => "hybrid",
+        }),
+        clean_fzf_field(
+            &result
+                .occurred_at
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        clean_fzf_field(&result.snippet),
+        clean_fzf_field(&result.session_id),
+        clean_fzf_field(&result.event_id),
+    ]
+    .join("\t")
+}
+
+fn short_event_ref(event_id: &str) -> String {
+    event_id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn clean_fzf_field(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 struct ServerError(anyhow::Error);
@@ -111,5 +297,37 @@ impl IntoResponse for ServerError {
             format!("{}\n", self.0),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fzf_rows_include_visible_short_ref_and_hidden_ids() {
+        let result = search::SearchResult {
+            match_type: search::MatchType::Hybrid,
+            event_id: "sc_1234567890abcdef".to_string(),
+            session_id: "session_1".to_string(),
+            source_kind: "codex".to_string(),
+            score: 0.25,
+            lexical_rank: Some(1),
+            semantic_rank: Some(2),
+            occurred_at: None,
+            session_title: None,
+            snippet: "line one\nline two".to_string(),
+        };
+
+        let row = server_fzf_row(&result);
+        let fields = row.split('\t').collect::<Vec<_>>();
+
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[0], "cdef");
+        assert_eq!(fields[1], "codex");
+        assert_eq!(fields[2], "hybrid");
+        assert_eq!(fields[4], "line one line two");
+        assert_eq!(fields[5], "session_1");
+        assert_eq!(fields[6], "sc_1234567890abcdef");
     }
 }
