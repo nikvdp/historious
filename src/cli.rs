@@ -16,6 +16,11 @@ use std::process::{Command as ProcessCommand, Stdio};
 pub struct Cli {
     #[arg(long, env = "SUPER_CASS_DATA_DIR")]
     pub data_dir: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        help = "Use machine-friendly JSON output and noninteractive behavior for supported commands"
+    )]
+    pub robot: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -224,10 +229,11 @@ impl Cli {
     }
 
     pub fn wants_structured_errors(&self) -> bool {
-        self.command.wants_structured_errors()
+        self.robot || self.command.wants_structured_errors()
     }
 
     pub async fn run(self) -> Result<()> {
+        let robot = self.robot;
         let config = AppConfig::load(self.data_dir)?;
         let store = Store::open(&config.data_dir)?;
         match self.command {
@@ -237,7 +243,7 @@ impl Cli {
                 json,
             } => {
                 let output = run_update_once(&store, &config, max_files, source)?;
-                if json {
+                if json || robot {
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
                     print_update_output(&output);
@@ -256,6 +262,9 @@ impl Cli {
                 no_color,
                 fzf,
             } => {
+                if robot && fzf {
+                    bail!("--robot cannot be combined with --fzf");
+                }
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias);
                 let response = search::search(
@@ -265,7 +274,7 @@ impl Cli {
                     embedder.as_deref(),
                     degraded_reason,
                 )?;
-                if json {
+                if json || robot {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let output =
@@ -294,7 +303,7 @@ impl Cli {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let columns = resolve_columns(verbose, cols, include, exclude)?;
-                    let color = !no_color && std::io::stdout().is_terminal();
+                    let color = !no_color && !robot && std::io::stdout().is_terminal();
                     print_search_results(&query, &response.results, &refs, &columns, color);
                 }
             }
@@ -322,7 +331,7 @@ impl Cli {
                 let context = store
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                if json {
+                if json || robot {
                     crate::output::write_success(
                         "show",
                         show_output(&store, &context)?,
@@ -336,7 +345,7 @@ impl Cli {
                     )?;
                 } else {
                     let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
-                    let color = !no_color && std::io::stdout().is_terminal();
+                    let color = !no_color && !robot && std::io::stdout().is_terminal();
                     write_stdout(&crate::transcript::render_context(
                         &context, &metadata, color,
                     ))?;
@@ -365,7 +374,7 @@ impl Cli {
                             .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))
                     })
                     .transpose()?;
-                if json {
+                if json || robot {
                     crate::output::write_success(
                         "transcript",
                         transcript_output(&store, &session_record, &events, target_event_id.as_deref())?,
@@ -378,7 +387,7 @@ impl Cli {
                         target_event.as_ref(),
                         verbose,
                     )?;
-                    let color = !no_color && std::io::stdout().is_terminal();
+                    let color = !no_color && !robot && std::io::stdout().is_terminal();
                     let rendered = crate::transcript::render_session(
                         &session_record,
                         &events,
@@ -386,7 +395,7 @@ impl Cli {
                         &metadata,
                         color,
                     );
-                    page_or_print(&rendered, target_event_id.as_deref(), no_pager)?;
+                    page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
                 }
             }
             Command::Export {
@@ -430,7 +439,7 @@ impl Cli {
                         },
                         embeddings,
                     };
-                    if json {
+                    if json || robot {
                         crate::output::write_success("import", output, Default::default())?;
                     } else {
                         print_import_output(&output);
@@ -480,7 +489,7 @@ impl Cli {
             }
             Command::Status { json } => {
                 let output = status_output(&store, &config)?;
-                if json {
+                if json || robot {
                     crate::output::write_success("status", output, Default::default())?;
                 } else {
                     print_status_output(&output);
@@ -1658,6 +1667,16 @@ mod tests {
     #[test]
     fn shell_quote_handles_spaces_and_single_quotes() {
         assert_eq!(shell_quote("/tmp/a path/it's"), "'/tmp/a path/it'\\''s'");
+    }
+
+    #[test]
+    fn robot_mode_is_global_and_requests_structured_errors() {
+        let cli = Cli::try_parse_from(["super-cass", "--robot", "search", "needle"])
+            .expect("parse robot search");
+
+        assert!(cli.robot);
+        assert_eq!(cli.command_name(), "search");
+        assert!(cli.wants_structured_errors());
     }
 
     #[test]
