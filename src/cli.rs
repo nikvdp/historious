@@ -79,6 +79,8 @@ pub enum Command {
         no_color: bool,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Deprecated alias for `show`.
     #[command(hide = true)]
@@ -104,6 +106,8 @@ pub enum Command {
         no_color: bool,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Render a full source conversation transcript.
     Transcript {
@@ -130,6 +134,8 @@ pub enum Command {
         no_color: bool,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Export canonical archive records as JSONL.
     Export {
@@ -300,6 +306,7 @@ impl Cli {
                 after,
                 no_color,
                 verbose,
+                json,
             }
             | Command::Expand {
                 target,
@@ -309,16 +316,31 @@ impl Cli {
                 after,
                 no_color,
                 verbose,
+                json,
             } => {
                 let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
                 let context = store
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
-                let color = !no_color && std::io::stdout().is_terminal();
-                write_stdout(&crate::transcript::render_context(
-                    &context, &metadata, color,
-                ))?;
+                if json {
+                    crate::output::write_success(
+                        "show",
+                        show_output(&store, &context)?,
+                        crate::output::EnvelopeOptions {
+                            hints: vec![format!(
+                                "super-cass transcript {} --at {} --json",
+                                context.session.id, context.target_event.id
+                            )],
+                            ..Default::default()
+                        },
+                    )?;
+                } else {
+                    let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
+                    let color = !no_color && std::io::stdout().is_terminal();
+                    write_stdout(&crate::transcript::render_context(
+                        &context, &metadata, color,
+                    ))?;
+                }
             }
             Command::Transcript {
                 target,
@@ -327,6 +349,7 @@ impl Cli {
                 no_pager,
                 no_color,
                 verbose,
+                json,
             } => {
                 let (session, target_event_id) =
                     resolve_transcript_target(&store, &target, at, search_unit)?;
@@ -342,21 +365,29 @@ impl Cli {
                             .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))
                     })
                     .transpose()?;
-                let metadata = view_metadata_for_session(
-                    &store,
-                    &session_record,
-                    target_event.as_ref(),
-                    verbose,
-                )?;
-                let color = !no_color && std::io::stdout().is_terminal();
-                let rendered = crate::transcript::render_session(
-                    &session_record,
-                    &events,
-                    target_event_id.as_deref(),
-                    &metadata,
-                    color,
-                );
-                page_or_print(&rendered, target_event_id.as_deref(), no_pager)?;
+                if json {
+                    crate::output::write_success(
+                        "transcript",
+                        transcript_output(&store, &session_record, &events, target_event_id.as_deref())?,
+                        Default::default(),
+                    )?;
+                } else {
+                    let metadata = view_metadata_for_session(
+                        &store,
+                        &session_record,
+                        target_event.as_ref(),
+                        verbose,
+                    )?;
+                    let color = !no_color && std::io::stdout().is_terminal();
+                    let rendered = crate::transcript::render_session(
+                        &session_record,
+                        &events,
+                        target_event_id.as_deref(),
+                        &metadata,
+                        color,
+                    );
+                    page_or_print(&rendered, target_event_id.as_deref(), no_pager)?;
+                }
             }
             Command::Export {
                 jsonl,
@@ -481,6 +512,9 @@ impl Command {
             self,
             Command::Update { json: true, .. }
                 | Command::Search { json: true, .. }
+                | Command::Show { json: true, .. }
+                | Command::Expand { json: true, .. }
+                | Command::Transcript { json: true, .. }
                 | Command::Import { json: true, .. }
                 | Command::Status { json: true, .. }
         )
@@ -536,6 +570,44 @@ struct SearchResultOutput {
     occurred_at: Option<chrono::DateTime<chrono::Utc>>,
     session_title: Option<String>,
     snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShowOutput {
+    session: crate::archive::SessionRecord,
+    target_index: usize,
+    target_ref: Option<String>,
+    before: Vec<EventOutput>,
+    target: EventOutput,
+    after: Vec<EventOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct TranscriptOutput {
+    session: crate::archive::SessionRecord,
+    target_event_id: Option<String>,
+    target_ref: Option<String>,
+    target_index: Option<usize>,
+    events: Vec<EventOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventOutput {
+    event_id: String,
+    #[serde(rename = "ref")]
+    ref_id: Option<String>,
+    session_id: String,
+    source_id: String,
+    machine_id: String,
+    source_kind: String,
+    ordinal: i64,
+    event_type: String,
+    role: Option<String>,
+    content: String,
+    raw_artifact_hash: Option<String>,
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: serde_json::Value,
+    hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -715,6 +787,73 @@ fn print_status_output(output: &StatusOutput) {
             ),
         }
     }
+}
+
+fn show_output(store: &Store, context: &crate::storage::TranscriptContext) -> Result<ShowOutput> {
+    let before = context
+        .events
+        .iter()
+        .take(context.target_index)
+        .map(|event| event_output(store, event))
+        .collect::<Result<Vec<_>>>()?;
+    let after = context
+        .events
+        .iter()
+        .skip(context.target_index + 1)
+        .map(|event| event_output(store, event))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ShowOutput {
+        session: context.session.clone(),
+        target_index: context.target_index,
+        target_ref: store.recent_ref_for_event_id(&context.target_event.id)?,
+        before,
+        target: event_output(store, &context.target_event)?,
+        after,
+    })
+}
+
+fn transcript_output(
+    store: &Store,
+    session: &crate::archive::SessionRecord,
+    events: &[crate::archive::EventRecord],
+    target_event_id: Option<&str>,
+) -> Result<TranscriptOutput> {
+    let target_index = target_event_id
+        .and_then(|event_id| events.iter().position(|event| event.id == event_id));
+    let target_ref = target_event_id
+        .map(|event_id| store.recent_ref_for_event_id(event_id))
+        .transpose()?
+        .flatten();
+    let events = events
+        .iter()
+        .map(|event| event_output(store, event))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TranscriptOutput {
+        session: session.clone(),
+        target_event_id: target_event_id.map(str::to_string),
+        target_ref,
+        target_index,
+        events,
+    })
+}
+
+fn event_output(store: &Store, event: &crate::archive::EventRecord) -> Result<EventOutput> {
+    Ok(EventOutput {
+        event_id: event.id.clone(),
+        ref_id: store.recent_ref_for_event_id(&event.id)?,
+        session_id: event.session_id.clone(),
+        source_id: event.source_id.clone(),
+        machine_id: event.machine_id.clone(),
+        source_kind: event.source_kind.clone(),
+        ordinal: event.ordinal,
+        event_type: event.event_type.clone(),
+        role: event.role.clone(),
+        content: event.content.clone(),
+        raw_artifact_hash: event.raw_artifact_hash.clone(),
+        occurred_at: event.occurred_at,
+        metadata: event.metadata.clone(),
+        hash: event.hash.clone(),
+    })
 }
 
 fn search_output(
