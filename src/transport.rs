@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 
+const IMPORT_JSONL_BATCH_RECORDS: usize = 500;
+
 pub fn export_jsonl(store: &Store, mut writer: impl Write) -> Result<usize> {
     let records = store.export_records()?;
     write_jsonl_records(records, &mut writer)
@@ -146,6 +148,7 @@ pub fn import_jsonl_path(store: &Store, path: &str) -> Result<ImportStats> {
 pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
     let reader = BufReader::new(reader);
+    let mut batch = Vec::with_capacity(IMPORT_JSONL_BATCH_RECORDS);
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading JSONL line {}", idx + 1))?;
         if line.trim().is_empty() {
@@ -163,14 +166,36 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         if envelope.id != envelope.record.id() || envelope.hash != envelope.record.hash() {
             bail!("envelope identity mismatch on line {}", idx + 1);
         }
-        let delta = store.import_record(&envelope.record)?;
-        stats.inserted += delta.inserted;
-        stats.duplicates += delta.duplicates;
-        stats.delta.merge(delta.delta);
+        let is_inline_raw_artifact =
+            matches!(&envelope.record, ArchiveRecord::RawArtifact(raw) if !raw.content.is_empty());
+        if is_inline_raw_artifact && !batch.is_empty() {
+            flush_import_batch(store, &mut stats, &mut batch)?;
+        }
+        batch.push(envelope.record);
+        if batch.len() >= IMPORT_JSONL_BATCH_RECORDS || is_inline_raw_artifact {
+            flush_import_batch(store, &mut stats, &mut batch)?;
+        }
     }
+    flush_import_batch(store, &mut stats, &mut batch)?;
     stats.vectors_indexed =
         store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
     Ok(stats)
+}
+
+fn flush_import_batch(
+    store: &Store,
+    stats: &mut ImportStats,
+    batch: &mut Vec<ArchiveRecord>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let delta = store.import_records(batch)?;
+    stats.inserted += delta.inserted;
+    stats.duplicates += delta.duplicates;
+    stats.delta.merge(delta.delta);
+    batch.clear();
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -348,6 +373,30 @@ mod tests {
         assert_jsonl_contains_kind(&default_body, "search_unit");
         assert!(!jsonl_contains_kind(&lean_body, "embedding"));
         assert_jsonl_contains_kind(&lean_body, "search_unit");
+    }
+
+    #[test]
+    fn jsonl_import_batches_records_and_preserves_deduping() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source = Store::open(source_dir.path()).expect("open source");
+        let records = (0..(IMPORT_JSONL_BATCH_RECORDS + 1))
+            .map(|idx| ArchiveRecord::Source(fixture_source(&format!("source_batch_{idx}"))))
+            .collect::<Vec<_>>();
+        source
+            .import_records(&records)
+            .expect("import source records");
+        let mut body = Vec::new();
+        export_jsonl(&source, &mut body).expect("export jsonl");
+
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target = Store::open(target_dir.path()).expect("open target");
+        let first = import_jsonl_reader(&target, body.as_slice()).expect("first import");
+        assert_eq!(first.inserted, IMPORT_JSONL_BATCH_RECORDS + 1);
+        assert_eq!(first.duplicates, 0);
+
+        let second = import_jsonl_reader(&target, body.as_slice()).expect("second import");
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.duplicates, IMPORT_JSONL_BATCH_RECORDS + 1);
     }
 
     #[test]
