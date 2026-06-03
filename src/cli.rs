@@ -53,12 +53,20 @@ pub enum Command {
         #[arg(long)]
         fzf: bool,
     },
-    /// Print surrounding transcript context for an event or search unit.
-    Expand {
+    /// Show surrounding transcript context for a search result or event.
+    Show {
+        #[arg(
+            value_name = "REF_OR_EVENT_ID",
+            help = "Recent search ref or full event id"
+        )]
         target: Option<String>,
-        #[arg(long, conflicts_with = "search_unit")]
+        #[arg(long, conflicts_with = "search_unit", help = "Full event id")]
         event: Option<String>,
-        #[arg(long = "search-unit", conflicts_with = "event")]
+        #[arg(
+            long = "search-unit",
+            conflicts_with = "event",
+            help = "Search unit id"
+        )]
         search_unit: Option<String>,
         #[arg(long, default_value_t = 3)]
         before: usize,
@@ -69,12 +77,49 @@ pub enum Command {
         #[arg(long)]
         verbose: bool,
     },
-    /// Render a full session transcript.
-    Show {
-        session: String,
-        #[arg(long, conflicts_with = "search_unit")]
+    /// Deprecated alias for `show`.
+    #[command(hide = true)]
+    Expand {
+        #[arg(
+            value_name = "REF_OR_EVENT_ID",
+            help = "Recent search ref or full event id"
+        )]
+        target: Option<String>,
+        #[arg(long, conflicts_with = "search_unit", help = "Full event id")]
         event: Option<String>,
-        #[arg(long = "search-unit", conflicts_with = "event")]
+        #[arg(
+            long = "search-unit",
+            conflicts_with = "event",
+            help = "Search unit id"
+        )]
+        search_unit: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        before: usize,
+        #[arg(long, default_value_t = 5)]
+        after: usize,
+        #[arg(long)]
+        no_color: bool,
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Render a full source conversation transcript.
+    Transcript {
+        #[arg(
+            value_name = "SESSION_OR_REF",
+            help = "Session id, recent search ref, or full event id"
+        )]
+        target: String,
+        #[arg(
+            long,
+            conflicts_with = "search_unit",
+            help = "Recent search ref or full event id to jump to"
+        )]
+        at: Option<String>,
+        #[arg(
+            long = "search-unit",
+            conflicts_with = "at",
+            help = "Search unit id to jump to"
+        )]
         search_unit: Option<String>,
         #[arg(long)]
         no_pager: bool,
@@ -237,7 +282,16 @@ impl Cli {
                     print_search_results(&query, &response.results, &refs, &columns, color);
                 }
             }
-            Command::Expand {
+            Command::Show {
+                target,
+                event,
+                search_unit,
+                before,
+                after,
+                no_color,
+                verbose,
+            }
+            | Command::Expand {
                 target,
                 event,
                 search_unit,
@@ -246,7 +300,7 @@ impl Cli {
                 no_color,
                 verbose,
             } => {
-                let event_id = resolve_expand_event_id(&store, target, event, search_unit)?;
+                let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
                 let context = store
                     .events_around_event(&event_id, before, after)?
                     .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
@@ -256,33 +310,28 @@ impl Cli {
                     &context, &metadata, color,
                 ))?;
             }
-            Command::Show {
-                session,
-                event,
+            Command::Transcript {
+                target,
+                at,
                 search_unit,
                 no_pager,
                 no_color,
                 verbose,
             } => {
-                let target_event_id = resolve_optional_event_id(&store, event, search_unit)?;
-                let target_event = if let Some(event_id) = &target_event_id {
-                    let event = store
-                        .event_by_id(event_id)?
-                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                    if event.session_id != session {
-                        bail!(
-                            "event {event_id} belongs to session {}, not {session}",
-                            event.session_id
-                        );
-                    }
-                    Some(event)
-                } else {
-                    None
-                };
+                let (session, target_event_id) =
+                    resolve_transcript_target(&store, &target, at, search_unit)?;
                 let session_record = store
                     .session_by_id(&session)?
                     .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
                 let events = store.events_for_session(&session)?;
+                let target_event = target_event_id
+                    .as_deref()
+                    .map(|event_id| {
+                        store
+                            .event_by_id(event_id)?
+                            .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))
+                    })
+                    .transpose()?;
                 let metadata = view_metadata_for_session(
                     &store,
                     &session_record,
@@ -471,7 +520,7 @@ fn resolve_columns(
     Ok(columns)
 }
 
-fn resolve_expand_event_id(
+fn resolve_context_event_id(
     store: &Store,
     target: Option<String>,
     event: Option<String>,
@@ -484,24 +533,57 @@ fn resolve_expand_event_id(
             .search_unit_by_id(&unit_id)?
             .map(|unit| unit.event_id)
             .ok_or_else(|| anyhow::anyhow!("search unit not found: {unit_id}")),
-        (None, None, None) => bail!("expand requires a ref, --event <id>, or --search-unit <id>"),
-        _ => bail!("expand accepts one target: positional ref, --event, or --search-unit"),
+        (None, None, None) => bail!("show requires a ref, --event <id>, or --search-unit <id>"),
+        _ => bail!("show accepts one target: positional ref, --event, or --search-unit"),
     }
 }
 
-fn resolve_optional_event_id(
+fn resolve_transcript_target(
     store: &Store,
-    event: Option<String>,
+    target: &str,
+    at: Option<String>,
+    search_unit: Option<String>,
+) -> Result<(String, Option<String>)> {
+    if let Some(session) = store.session_by_id(target)? {
+        let target_event_id = resolve_optional_transcript_at(store, at, search_unit)?;
+        if let Some(event_id) = &target_event_id {
+            let event = store
+                .event_by_id(event_id)?
+                .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+            if event.session_id != session.id {
+                bail!(
+                    "event {event_id} belongs to session {}, not {}",
+                    event.session_id,
+                    session.id
+                );
+            }
+        }
+        return Ok((session.id, target_event_id));
+    }
+
+    if at.is_some() || search_unit.is_some() {
+        bail!("transcript accepts --at only when the target is a session id");
+    }
+    let event_id = resolve_event_ref_or_id(store, target)?;
+    let event = store
+        .event_by_id(&event_id)?
+        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+    Ok((event.session_id, Some(event.id)))
+}
+
+fn resolve_optional_transcript_at(
+    store: &Store,
+    at: Option<String>,
     search_unit: Option<String>,
 ) -> Result<Option<String>> {
-    match (event, search_unit) {
+    match (at, search_unit) {
         (Some(event_id), None) => Ok(Some(resolve_event_ref_or_id(store, &event_id)?)),
         (None, Some(unit_id)) => store
             .search_unit_by_id(&unit_id)?
             .map(|unit| Some(unit.event_id))
             .ok_or_else(|| anyhow::anyhow!("search unit not found: {unit_id}")),
         (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("show accepts either --event or --search-unit, not both"),
+        (Some(_), Some(_)) => bail!("transcript accepts either --at or --search-unit, not both"),
     }
 }
 
@@ -612,15 +694,15 @@ fn run_fzf_search(
     }
     if !command_exists("fzf") {
         bail!(
-            "fzf is not installed. Use `super-cass search {}` and then `super-cass expand --event <id>` or `super-cass show <session-id> --event <event-id>`.",
+            "fzf is not installed. Use `super-cass search {}` and then `super-cass show <ref>` or `super-cass transcript <ref>`.",
             shell_quote(query)
         );
     }
     let current_exe = std::env::current_exe()?;
     let exe = shell_quote(&current_exe.to_string_lossy());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let preview = format!("{exe} --data-dir {data_dir} expand --event {{7}} --before 3 --after 5");
-    let open = format!("{exe} --data-dir {data_dir} show {{6}} --event {{7}}");
+    let preview = format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5");
+    let open = format!("{exe} --data-dir {data_dir} transcript {{7}}");
     let mut child = ProcessCommand::new("fzf")
         .arg("--ansi")
         .arg("--delimiter")
@@ -719,8 +801,8 @@ fn pager_command(target_event_id: Option<&str>) -> Option<ProcessCommand> {
     command.args(parts);
     if program.ends_with("less") {
         command.arg("-R");
-        if let Some(event_id) = target_event_id {
-            command.arg(format!("+/event:{event_id}"));
+        if target_event_id.is_some() {
+            command.arg("+/^=>");
         }
     }
     Some(command)
@@ -1018,6 +1100,9 @@ fn load_embedder_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{stable_hash, ArchiveRecord, EventRecord, SessionRecord, SourceRecord};
+    use chrono::Utc;
+    use serde_json::json;
 
     #[test]
     fn exact_cols_controls_order() {
@@ -1089,5 +1174,94 @@ mod tests {
     #[test]
     fn shell_quote_handles_spaces_and_single_quotes() {
         assert_eq!(shell_quote("/tmp/a path/it's"), "'/tmp/a path/it'\\''s'");
+    }
+
+    #[test]
+    fn transcript_target_resolves_recent_ref_to_containing_session() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let ref_id = store
+            .recent_ref_for_event_id("event_view")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        let (session_id, event_id) =
+            resolve_transcript_target(&store, &ref_id, None, None).expect("target");
+
+        assert_eq!(session_id, "session_view");
+        assert_eq!(event_id.as_deref(), Some("event_view"));
+    }
+
+    #[test]
+    fn transcript_session_accepts_at_recent_ref() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let ref_id = store
+            .recent_ref_for_event_id("event_view")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        let (session_id, event_id) =
+            resolve_transcript_target(&store, "session_view", Some(ref_id), None).expect("target");
+
+        assert_eq!(session_id, "session_view");
+        assert_eq!(event_id.as_deref(), Some("event_view"));
+    }
+
+    fn fixture_store_with_viewer_ref() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = SourceRecord {
+            id: "source_view".to_string(),
+            kind: "codex".to_string(),
+            identity: "source_view".to_string(),
+            path: Some("/tmp/source.jsonl".to_string()),
+            first_seen_at: Utc::now(),
+            updated_at: Utc::now(),
+            hash: stable_hash(&("source_view", "source")).expect("source hash"),
+        };
+        let session = SessionRecord {
+            id: "session_view".to_string(),
+            source_id: source.id.clone(),
+            machine_id: "machine_view".to_string(),
+            source_kind: "codex".to_string(),
+            external_id: "agent_session_view".to_string(),
+            title: Some("Viewer fixture".to_string()),
+            status: "open".to_string(),
+            started_at: None,
+            updated_at: None,
+            metadata: json!({}),
+            hash: stable_hash(&("session_view", "session")).expect("session hash"),
+        };
+        let event = EventRecord {
+            id: "event_view".to_string(),
+            session_id: session.id.clone(),
+            source_id: source.id.clone(),
+            machine_id: "machine_view".to_string(),
+            source_kind: "codex".to_string(),
+            ordinal: 7,
+            event_type: "message".to_string(),
+            role: Some("assistant".to_string()),
+            content: "viewer test content".to_string(),
+            raw_artifact_hash: None,
+            occurred_at: None,
+            metadata: json!({}),
+            hash: stable_hash(&("event_view", "event")).expect("event hash"),
+        };
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event),
+            ])
+            .expect("import records");
+        store
+            .record_recent_result_refs(&[RecentResultRefInput {
+                event_id: "event_view".to_string(),
+                session_id: "session_view".to_string(),
+                source_kind: "codex".to_string(),
+                occurred_at: None,
+                preview: "viewer test content".to_string(),
+            }])
+            .expect("record recent ref");
+        (dir, store)
     }
 }
