@@ -1840,6 +1840,7 @@ struct ProgressPhase {
     started: Instant,
     detail: Option<Arc<Mutex<String>>>,
     last_update_emit: Instant,
+    emitted_update: bool,
     stop: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
     finished: bool,
@@ -1886,6 +1887,7 @@ impl ProgressPhase {
                 started,
                 detail: Some(detail),
                 last_update_emit: started,
+                emitted_update: false,
                 stop: Some(tx),
                 handle: Some(handle),
                 finished: false,
@@ -1898,6 +1900,7 @@ impl ProgressPhase {
                 started,
                 detail: None,
                 last_update_emit: started,
+                emitted_update: false,
                 stop: None,
                 handle: None,
                 finished: false,
@@ -1911,9 +1914,12 @@ impl ProgressPhase {
                 *current = detail.clone();
             }
         }
-        if !self.interactive && self.last_update_emit.elapsed() >= Duration::from_secs(2) {
+        if !self.interactive
+            && (!self.emitted_update || self.last_update_emit.elapsed() >= Duration::from_secs(2))
+        {
             eprintln!("{}: {}", self.label, detail);
             self.last_update_emit = Instant::now();
+            self.emitted_update = true;
         }
     }
 
