@@ -113,6 +113,7 @@ pub struct SearchResult {
     pub semantic_rank: Option<usize>,
     pub occurred_at: Option<DateTime<Utc>>,
     pub session_title: Option<String>,
+    pub workspace_values: Vec<String>,
     pub snippet: String,
 }
 
@@ -478,6 +479,7 @@ fn fuse(
                 semantic_rank: entry.semantic_rank,
                 occurred_at: row.occurred_at,
                 session_title: row.session_title,
+                workspace_values: row.workspace_values,
                 snippet: snippet(&row.content, 240),
             })
         })
@@ -498,6 +500,7 @@ fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
         content: row.content,
         occurred_at: row.occurred_at,
         session_title: row.session_title,
+        workspace_values: row.workspace_values,
         rank: row.rank,
     }
 }
@@ -1191,6 +1194,7 @@ mod tests {
             content: event_id.to_string(),
             occurred_at: Some(occurred_at),
             session_title: Some("fixture session".to_string()),
+            workspace_values: vec!["/tmp/fixture".to_string()],
             rank,
         }
     }

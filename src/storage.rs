@@ -106,6 +106,7 @@ pub struct SearchRow {
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub session_title: Option<String>,
+    pub workspace_values: Vec<String>,
     pub rank: usize,
 }
 
@@ -125,6 +126,7 @@ pub struct VectorSearchRow {
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub session_title: Option<String>,
+    pub workspace_values: Vec<String>,
     pub distance: f64,
     pub rank: usize,
 }
@@ -983,7 +985,8 @@ impl Store {
                         events_fts.source_kind,
                         snippet(events_fts, 3, '', '', '...', 24),
                         e.occurred_at,
-                        s.title
+                        s.title,
+                        s.metadata_json
                  FROM events_fts
                  JOIN events e ON e.id = events_fts.event_id
                  LEFT JOIN sessions s ON s.id = events_fts.session_id
@@ -1001,6 +1004,9 @@ impl Store {
                     content: row.get(3)?,
                     occurred_at: parse_opt_dt(row.get(4)?),
                     session_title: row.get(5)?,
+                    workspace_values: session_workspace_values(&parse_metadata_json(
+                        row.get::<_, Option<String>>(6)?,
+                    )),
                     rank: 0,
                 })
             })?;
@@ -1397,6 +1403,7 @@ impl Store {
                         su.text,
                         su.occurred_at,
                         s.title,
+                        s.metadata_json,
                         vec_embeddings_384.distance
                  FROM vec_embeddings_384
                  JOIN embeddings e ON e.rowid = vec_embeddings_384.rowid
@@ -1426,7 +1433,10 @@ impl Store {
                         content: row.get(4)?,
                         occurred_at: parse_opt_dt(row.get(5)?),
                         session_title: row.get(6)?,
-                        distance: row.get(7)?,
+                        workspace_values: session_workspace_values(&parse_metadata_json(
+                            row.get::<_, Option<String>>(7)?,
+                        )),
+                        distance: row.get(8)?,
                         rank: 0,
                     })
                 },
@@ -1710,6 +1720,11 @@ fn session_workspace_values(metadata: &Value) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn parse_metadata_json(text: Option<String>) -> Value {
+    text.and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null)
 }
 
 fn primary_workspace_value(metadata: &Value) -> Option<String> {
