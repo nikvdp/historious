@@ -2377,6 +2377,7 @@ dependencies = [
  "directories",
  "fastembed",
  "hex",
+ "libc",
  "notify",
  "predicates",
  "rusqlite",

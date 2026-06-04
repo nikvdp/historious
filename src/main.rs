@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod embed;
 mod ingest;
+mod memory;
 mod output;
 mod search;
 mod server;

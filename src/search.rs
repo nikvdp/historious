@@ -1,4 +1,5 @@
 use crate::embed::{Embedder, EmbedderConfig};
+use crate::memory::MemorySample;
 use crate::storage::{ImportDelta, SearchRow, Store, VectorSearchRow};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
@@ -9,14 +10,41 @@ const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
 const SQLITE_VEC_MAX_K: usize = 4096;
-const EMBEDDING_BATCH_SIZE: usize = 512;
+const EMBEDDING_BATCH_START: usize = 16;
+const EMBEDDING_BATCH_MAX: usize = 64;
+const EMBEDDING_BATCH_MIN: usize = 1;
 const EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
+const EMBEDDING_CRITICAL_AVAILABLE_BYTES: u64 = 768 * 1024 * 1024;
+const EMBEDDING_LOW_AVAILABLE_BYTES: u64 = 1536 * 1024 * 1024;
+const EMBEDDING_RSS_SPIKE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingRefresh {
     pub embedded: usize,
     pub vectors_indexed: usize,
     pub degraded_reason: Option<String>,
+    pub pending: usize,
+    pub deferred_reason: Option<String>,
+    pub batch_size_reductions: usize,
+    pub final_batch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EmbeddingProgress {
+    LoadingModel {
+        model_id: String,
+    },
+    Batch {
+        embedded: usize,
+        pending: usize,
+        batch_size: usize,
+        reductions: usize,
+        available_gib: Option<f64>,
+    },
+    Deferred {
+        pending: usize,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +191,7 @@ pub fn refresh_embeddings(
     if !embedder.is_semantic() {
         return Ok(EmbeddingRefresh {
             vectors_indexed: store.refresh_vector_projection()?,
+            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -170,42 +199,79 @@ pub fn refresh_embeddings(
         });
     }
 
-    let mut embedded = 0;
-    loop {
-        let units =
-            store.search_units_missing_embedding(embedder.model_id(), EMBEDDING_BATCH_SIZE)?;
-        if units.is_empty() {
-            break;
-        }
-        let texts = units
-            .iter()
-            .map(|unit| embedding_input(&unit.text))
-            .collect::<Vec<_>>();
-        let vectors = embedder.embed_batch(&texts)?;
-        if vectors.len() != units.len() {
-            bail!(
-                "embedder returned {} vectors for {} search units",
-                vectors.len(),
-                units.len()
-            );
-        }
+    refresh_embeddings_loaded(
+        store,
+        machine_id,
+        embedder,
+        degraded_reason,
+        EmbeddingScope::All,
+        Vec::new(),
+        |_| {},
+    )
+}
 
-        let mut records = Vec::with_capacity(units.len());
-        for (unit, vector) in units.iter().zip(vectors) {
-            records.push(embedding_record(machine_id, embedder, unit, vector)?);
-        }
-        let stats = store.import_records(&records)?;
-        embedded += stats.inserted;
-        if units.len() < EMBEDDING_BATCH_SIZE {
-            break;
-        }
+pub fn refresh_embeddings_repair_with_progress(
+    store: &Store,
+    machine_id: &str,
+    embedder_config: &EmbedderConfig,
+    mut progress: impl FnMut(&EmbeddingProgress),
+) -> Result<EmbeddingRefresh> {
+    let status = embedder_config.status_without_loading();
+    let Some(model_id) = status.model_id.as_deref() else {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store.refresh_vector_projection()?,
+            degraded_reason: status.degraded_reason,
+            ..EmbeddingRefresh::default()
+        });
+    };
+    if !status.semantic {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store.refresh_vector_projection()?,
+            pending: store.search_units_missing_embedding_count(model_id)?,
+            degraded_reason: status.degraded_reason.or_else(|| {
+                Some("embedder is not semantic; skipping durable embeddings".to_string())
+            }),
+            ..EmbeddingRefresh::default()
+        });
     }
-
-    Ok(EmbeddingRefresh {
-        embedded,
-        vectors_indexed: store.refresh_vector_projection()?,
-        degraded_reason: None,
-    })
+    if let Some(reason) = memory_model_load_defer_reason(crate::memory::sample_memory()) {
+        let pending = store.search_units_missing_embedding_count(model_id)?;
+        progress(&EmbeddingProgress::Deferred {
+            pending,
+            reason: reason.clone(),
+        });
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store.refresh_vector_projection()?,
+            degraded_reason: status.degraded_reason,
+            pending,
+            deferred_reason: Some(reason),
+            final_batch_size: Some(EMBEDDING_BATCH_START),
+            ..EmbeddingRefresh::default()
+        });
+    }
+    progress(&EmbeddingProgress::LoadingModel {
+        model_id: model_id.to_string(),
+    });
+    let embedder = embedder_config.load()?;
+    if !embedder.is_semantic() {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store.refresh_vector_projection()?,
+            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
+            degraded_reason: Some(
+                "embedder is not semantic; skipping durable embeddings".to_string(),
+            ),
+            ..EmbeddingRefresh::default()
+        });
+    }
+    refresh_embeddings_loaded(
+        store,
+        machine_id,
+        embedder.as_ref(),
+        status.degraded_reason,
+        EmbeddingScope::All,
+        Vec::new(),
+        progress,
+    )
 }
 
 pub fn refresh_embeddings_incremental(
@@ -214,8 +280,18 @@ pub fn refresh_embeddings_incremental(
     embedder_config: &EmbedderConfig,
     delta: &ImportDelta,
 ) -> Result<EmbeddingRefresh> {
+    refresh_embeddings_incremental_with_progress(store, machine_id, embedder_config, delta, |_| {})
+}
+
+pub fn refresh_embeddings_incremental_with_progress(
+    store: &Store,
+    machine_id: &str,
+    embedder_config: &EmbedderConfig,
+    delta: &ImportDelta,
+    mut progress: impl FnMut(&EmbeddingProgress),
+) -> Result<EmbeddingRefresh> {
     let status = embedder_config.status_without_loading();
-    let mut vector_embedding_ids = delta.inserted_embeddings.clone();
+    let vector_embedding_ids = delta.inserted_embeddings.clone();
     let Some(model_id) = status.model_id.as_deref() else {
         return Ok(EmbeddingRefresh {
             vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
@@ -238,15 +314,15 @@ pub fn refresh_embeddings_incremental(
         model_id,
         &delta.inserted_events,
         &delta.inserted_search_units,
-        EMBEDDING_BATCH_SIZE,
+        EMBEDDING_BATCH_START,
     )?;
     if first_units.is_empty() {
         if store.search_units_need_embedding(model_id)? {
-            return refresh_embeddings_incremental_repair(
+            return refresh_embeddings_repair_with_progress(
                 store,
                 machine_id,
                 embedder_config,
-                status.degraded_reason,
+                progress,
             );
         }
         return Ok(EmbeddingRefresh {
@@ -256,11 +332,30 @@ pub fn refresh_embeddings_incremental(
         });
     }
 
+    if let Some(reason) = memory_model_load_defer_reason(crate::memory::sample_memory()) {
+        let pending = store.search_units_missing_embedding_count(model_id)?;
+        progress(&EmbeddingProgress::Deferred {
+            pending,
+            reason: reason.clone(),
+        });
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
+            degraded_reason: status.degraded_reason,
+            pending,
+            deferred_reason: Some(reason),
+            final_batch_size: Some(EMBEDDING_BATCH_START),
+            ..EmbeddingRefresh::default()
+        });
+    }
+    progress(&EmbeddingProgress::LoadingModel {
+        model_id: model_id.to_string(),
+    });
     let embedder = embedder_config.load()?;
     if !embedder.is_semantic() {
         return Ok(EmbeddingRefresh {
             vectors_indexed: store
                 .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -268,63 +363,42 @@ pub fn refresh_embeddings_incremental(
         });
     }
 
-    let mut embedded = 0;
-    loop {
-        let units = std::mem::take(&mut first_units);
-        let texts = units
-            .iter()
-            .map(|unit| embedding_input(&unit.text))
-            .collect::<Vec<_>>();
-        let vectors = embedder.embed_batch(&texts)?;
-        if vectors.len() != units.len() {
-            bail!(
-                "embedder returned {} vectors for {} search units",
-                vectors.len(),
-                units.len()
-            );
-        }
+    let refresh = refresh_embeddings_loaded(
+        store,
+        machine_id,
+        embedder.as_ref(),
+        status.degraded_reason.clone(),
+        EmbeddingScope::Delta {
+            event_ids: &delta.inserted_events,
+            unit_ids: &delta.inserted_search_units,
+            first_units: Some(std::mem::take(&mut first_units)),
+        },
+        vector_embedding_ids,
+        &mut progress,
+    )?;
 
-        let mut records = Vec::with_capacity(units.len());
-        for (unit, vector) in units.iter().zip(vectors) {
-            records.push(embedding_record(
-                machine_id,
-                embedder.as_ref(),
-                unit,
-                vector,
-            )?);
-        }
-        let stats = store.import_records(&records)?;
-        embedded += stats.inserted;
-        vector_embedding_ids.extend(stats.delta.inserted_embeddings);
-
-        if units.len() < EMBEDDING_BATCH_SIZE {
-            break;
-        }
-        first_units = store.search_units_missing_embedding_for_delta(
-            model_id,
-            &delta.inserted_events,
-            &delta.inserted_search_units,
-            EMBEDDING_BATCH_SIZE,
-        )?;
-        if first_units.is_empty() {
-            break;
-        }
-    }
-
-    if store.search_units_need_embedding(model_id)? {
-        return refresh_embeddings(
+    if refresh.pending > 0 && refresh.deferred_reason.is_none() {
+        let repair = refresh_embeddings_loaded(
             store,
             machine_id,
-            Some(embedder.as_ref()),
+            embedder.as_ref(),
             status.degraded_reason,
-        );
+            EmbeddingScope::All,
+            Vec::new(),
+            &mut progress,
+        )?;
+        return Ok(EmbeddingRefresh {
+            embedded: refresh.embedded + repair.embedded,
+            vectors_indexed: repair.vectors_indexed,
+            degraded_reason: repair.degraded_reason,
+            pending: repair.pending,
+            deferred_reason: repair.deferred_reason,
+            batch_size_reductions: refresh.batch_size_reductions + repair.batch_size_reductions,
+            final_batch_size: repair.final_batch_size,
+        });
     }
 
-    Ok(EmbeddingRefresh {
-        embedded,
-        vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
-        degraded_reason: status.degraded_reason,
-    })
+    Ok(refresh)
 }
 
 fn refresh_vector_projection_incremental(store: &Store, embedding_ids: &[String]) -> Result<usize> {
@@ -336,23 +410,232 @@ fn refresh_vector_projection_incremental(store: &Store, embedding_ids: &[String]
     }
 }
 
-fn refresh_embeddings_incremental_repair(
+enum EmbeddingScope<'a> {
+    All,
+    Delta {
+        event_ids: &'a [String],
+        unit_ids: &'a [String],
+        first_units: Option<Vec<crate::storage::SearchUnitForEmbedding>>,
+    },
+}
+
+fn refresh_embeddings_loaded(
     store: &Store,
     machine_id: &str,
-    embedder_config: &EmbedderConfig,
+    embedder: &dyn Embedder,
     degraded_reason: Option<String>,
+    mut scope: EmbeddingScope<'_>,
+    mut vector_embedding_ids: Vec<String>,
+    mut progress: impl FnMut(&EmbeddingProgress),
 ) -> Result<EmbeddingRefresh> {
-    let embedder = embedder_config.load()?;
-    if !embedder.is_semantic() {
-        return Ok(EmbeddingRefresh {
-            vectors_indexed: store.refresh_vector_projection()?,
-            degraded_reason: Some(
-                "embedder is not semantic; skipping durable embeddings".to_string(),
-            ),
-            ..EmbeddingRefresh::default()
+    let mut embedded = 0;
+    let mut controller = AdaptiveEmbeddingBatch::new();
+    loop {
+        if let Some(reason) = controller.defer_reason(crate::memory::sample_memory()) {
+            let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+            progress(&EmbeddingProgress::Deferred {
+                pending,
+                reason: reason.clone(),
+            });
+            return Ok(EmbeddingRefresh {
+                embedded,
+                vectors_indexed: refresh_vector_projection_incremental(
+                    store,
+                    &vector_embedding_ids,
+                )?,
+                degraded_reason,
+                pending,
+                deferred_reason: Some(reason),
+                batch_size_reductions: controller.reductions,
+                final_batch_size: Some(controller.batch_size),
+            });
+        }
+
+        let units = match &mut scope {
+            EmbeddingScope::All => {
+                store.search_units_missing_embedding(embedder.model_id(), controller.batch_size)?
+            }
+            EmbeddingScope::Delta {
+                event_ids,
+                unit_ids,
+                first_units,
+            } => first_units.take().map(Ok).unwrap_or_else(|| {
+                store.search_units_missing_embedding_for_delta(
+                    embedder.model_id(),
+                    event_ids,
+                    unit_ids,
+                    controller.batch_size,
+                )
+            })?,
+        };
+        if units.is_empty() {
+            break;
+        }
+        let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+        progress(&EmbeddingProgress::Batch {
+            embedded,
+            pending,
+            batch_size: controller.batch_size,
+            reductions: controller.reductions,
+            available_gib: crate::memory::sample_memory().and_then(MemorySample::available_gib),
         });
+        let texts = units
+            .iter()
+            .map(|unit| embedding_input(&unit.text))
+            .collect::<Vec<_>>();
+        let before = crate::memory::sample_memory();
+        let vectors = match embedder.embed_batch(&texts, controller.batch_size) {
+            Ok(vectors) => vectors,
+            Err(err) if controller.can_reduce() && is_memory_like_error(&err) => {
+                controller.reduce();
+                tracing::debug!(
+                    "embedding batch failed with memory-like error; reducing batch size to {}: {err:#}",
+                    controller.batch_size
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if vectors.len() != units.len() {
+            bail!(
+                "embedder returned {} vectors for {} search units",
+                vectors.len(),
+                units.len()
+            );
+        }
+
+        let mut records = Vec::with_capacity(units.len());
+        for (unit, vector) in units.iter().zip(vectors) {
+            records.push(embedding_record(machine_id, embedder, unit, vector)?);
+        }
+        let stats = store.import_records(&records)?;
+        embedded += stats.inserted;
+        vector_embedding_ids.extend(stats.delta.inserted_embeddings);
+        controller.observe(before, crate::memory::sample_memory());
     }
-    refresh_embeddings(store, machine_id, Some(embedder.as_ref()), degraded_reason)
+
+    let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+    Ok(EmbeddingRefresh {
+        embedded,
+        vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
+        degraded_reason,
+        pending,
+        batch_size_reductions: controller.reductions,
+        final_batch_size: Some(controller.batch_size),
+        ..EmbeddingRefresh::default()
+    })
+}
+
+struct AdaptiveEmbeddingBatch {
+    batch_size: usize,
+    reductions: usize,
+    stable_batches: usize,
+}
+
+impl AdaptiveEmbeddingBatch {
+    fn new() -> Self {
+        Self {
+            batch_size: EMBEDDING_BATCH_START,
+            reductions: 0,
+            stable_batches: 0,
+        }
+    }
+
+    fn can_reduce(&self) -> bool {
+        self.batch_size > EMBEDDING_BATCH_MIN
+    }
+
+    fn reduce(&mut self) {
+        let reduced = (self.batch_size / 2).max(EMBEDDING_BATCH_MIN);
+        if reduced < self.batch_size {
+            self.batch_size = reduced;
+            self.reductions += 1;
+            self.stable_batches = 0;
+        }
+    }
+
+    fn observe(&mut self, before: Option<MemorySample>, after: Option<MemorySample>) {
+        if memory_sample_is_low(after) || rss_spiked(before, after) {
+            self.reduce();
+            return;
+        }
+        self.stable_batches += 1;
+        if self.stable_batches >= 6 && self.batch_size < EMBEDDING_BATCH_MAX {
+            self.batch_size = (self.batch_size * 2).min(EMBEDDING_BATCH_MAX);
+            self.stable_batches = 0;
+        }
+    }
+
+    fn defer_reason(&mut self, sample: Option<MemorySample>) -> Option<String> {
+        if memory_sample_is_critical(sample) {
+            if self.can_reduce() {
+                self.reduce();
+                None
+            } else {
+                Some(memory_pressure_reason(sample))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+fn memory_sample_is_critical(sample: Option<MemorySample>) -> bool {
+    sample
+        .and_then(|sample| {
+            sample.available_bytes.map(|available| {
+                available < EMBEDDING_CRITICAL_AVAILABLE_BYTES
+                    || sample
+                        .total_bytes
+                        .is_some_and(|total| available < total.saturating_div(20))
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn memory_sample_is_low(sample: Option<MemorySample>) -> bool {
+    sample
+        .and_then(|sample| {
+            sample.available_bytes.map(|available| {
+                available < EMBEDDING_LOW_AVAILABLE_BYTES
+                    || sample
+                        .total_bytes
+                        .is_some_and(|total| available < total.saturating_div(10))
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn rss_spiked(before: Option<MemorySample>, after: Option<MemorySample>) -> bool {
+    let Some(before) = before.and_then(|sample| sample.process_rss_bytes) else {
+        return false;
+    };
+    let Some(after) = after.and_then(|sample| sample.process_rss_bytes) else {
+        return false;
+    };
+    after.saturating_sub(before) > EMBEDDING_RSS_SPIKE_BYTES
+}
+
+fn memory_model_load_defer_reason(sample: Option<MemorySample>) -> Option<String> {
+    memory_sample_is_low(sample).then(|| memory_pressure_reason(sample))
+}
+
+fn memory_pressure_reason(sample: Option<MemorySample>) -> String {
+    let Some(sample) = sample else {
+        return "memory pressure detected".to_string();
+    };
+    if let Some(available) = sample.available_gib() {
+        format!("memory pressure: only {available:.1} GiB appears available")
+    } else {
+        "memory pressure detected".to_string()
+    }
+}
+
+fn is_memory_like_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    ["memory", "alloc", "oom", "resource exhausted"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn embedding_input(text: &str) -> String {
@@ -893,6 +1176,7 @@ mod tests {
         let config = EmbedderConfig {
             provider: EmbedderProvider::FastEmbed,
             model_cache: dir.path().join("models"),
+            intra_threads: 1,
         };
 
         let refresh = refresh_embeddings_incremental(
@@ -921,6 +1205,7 @@ mod tests {
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
             model_cache: dir.path().join("models"),
+            intra_threads: 1,
         };
 
         let refresh =
@@ -954,6 +1239,7 @@ mod tests {
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
             model_cache: dir.path().join("models"),
+            intra_threads: 1,
         };
 
         let refresh = refresh_embeddings_incremental(
@@ -1369,7 +1655,7 @@ mod tests {
             true
         }
 
-        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        fn embed_batch(&self, texts: &[String], _batch_size: usize) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
         }
     }

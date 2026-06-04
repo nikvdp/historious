@@ -13,10 +13,10 @@ pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;
     fn dims(&self) -> usize;
     fn is_semantic(&self) -> bool;
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed_batch(&self, texts: &[String], batch_size: usize) -> Result<Vec<Vec<f32>>>;
 
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
-        let embeddings = self.embed_batch(&[text.to_string()])?;
+        let embeddings = self.embed_batch(&[text.to_string()], 1)?;
         embeddings
             .into_iter()
             .next()
@@ -28,6 +28,7 @@ pub trait Embedder: Send + Sync {
 pub struct EmbedderConfig {
     pub provider: EmbedderProvider,
     pub model_cache: PathBuf,
+    pub intra_threads: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +62,15 @@ impl EmbedderConfig {
         let model_cache = std::env::var_os("SUPER_CASS_MODEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("models").join("fastembed"));
+        let intra_threads = std::env::var("SUPER_CASS_EMBEDDER_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(default_intra_threads);
         Self {
             provider,
             model_cache,
+            intra_threads,
         }
     }
 
@@ -98,11 +105,18 @@ impl EmbedderConfig {
 
     pub fn load(&self) -> Result<Box<dyn Embedder>> {
         match self.provider {
-            EmbedderProvider::FastEmbed => load_fastembed(&self.model_cache),
+            EmbedderProvider::FastEmbed => load_fastembed(&self.model_cache, self.intra_threads),
             EmbedderProvider::HashFallback => Ok(Box::new(HashEmbedder)),
             EmbedderProvider::Disabled => anyhow::bail!("query embedder disabled"),
         }
     }
+}
+
+fn default_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 2)
 }
 
 #[cfg(feature = "semantic-fastembed")]
@@ -112,16 +126,19 @@ fn fastembed_unavailable_reason() -> Option<String> {
 
 #[cfg(not(feature = "semantic-fastembed"))]
 fn fastembed_unavailable_reason() -> Option<String> {
-    Some("fastembed support was not compiled; rebuild with the semantic-fastembed feature".to_string())
+    Some(
+        "fastembed support was not compiled; rebuild with the semantic-fastembed feature"
+            .to_string(),
+    )
 }
 
 #[cfg(feature = "semantic-fastembed")]
-fn load_fastembed(model_cache: &Path) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(FastEmbedder::new(model_cache)?))
+fn load_fastembed(model_cache: &Path, intra_threads: usize) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(FastEmbedder::new(model_cache, intra_threads)?))
 }
 
 #[cfg(not(feature = "semantic-fastembed"))]
-fn load_fastembed(_model_cache: &Path) -> Result<Box<dyn Embedder>> {
+fn load_fastembed(_model_cache: &Path, _intra_threads: usize) -> Result<Box<dyn Embedder>> {
     anyhow::bail!("fastembed support was not compiled; rebuild with the semantic-fastembed feature")
 }
 
@@ -132,11 +149,12 @@ pub struct FastEmbedder {
 
 #[cfg(feature = "semantic-fastembed")]
 impl FastEmbedder {
-    pub fn new(model_cache: &Path) -> Result<Self> {
+    pub fn new(model_cache: &Path, intra_threads: usize) -> Result<Self> {
         std::fs::create_dir_all(model_cache)
             .with_context(|| format!("creating model cache {}", model_cache.display()))?;
         let options = InitOptions::new(EmbeddingModel::SnowflakeArcticEmbedXSQ)
             .with_cache_dir(model_cache.to_path_buf())
+            .with_intra_threads(intra_threads.max(1))
             .with_show_download_progress(false);
         let model = TextEmbedding::try_new(options).context("loading fastembed model")?;
         Ok(Self {
@@ -159,13 +177,13 @@ impl Embedder for FastEmbedder {
         true
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&self, texts: &[String], batch_size: usize) -> Result<Vec<Vec<f32>>> {
         let mut model = self
             .model
             .lock()
             .map_err(|_| anyhow::anyhow!("fastembed model lock poisoned"))?;
         model
-            .embed(texts, None)
+            .embed(texts, Some(batch_size.max(1)))
             .context("embedding text with fastembed")
     }
 }
@@ -191,7 +209,7 @@ impl Embedder for HashEmbedder {
         false
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&self, texts: &[String], _batch_size: usize) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|text| hash_embed(text)).collect())
     }
 }
@@ -241,6 +259,7 @@ mod tests {
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
             model_cache: PathBuf::from("unused"),
+            intra_threads: 1,
         };
         let status = config.status_without_loading();
         assert!(!status.available);
