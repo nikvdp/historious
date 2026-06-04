@@ -941,6 +941,39 @@ mod tests {
     }
 
     #[test]
+    fn refresh_embeddings_incremental_repairs_vector_projection_after_empty_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unit = import_event_and_project(&store, "empty delta vector target");
+        store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &unit,
+                unit_vector(23),
+            )))
+            .expect("embedding import");
+        let config = EmbedderConfig {
+            provider: EmbedderProvider::Disabled,
+            model_cache: dir.path().join("models"),
+        };
+
+        let refresh = refresh_embeddings_incremental(
+            &store,
+            "machine_fixture",
+            &config,
+            &ImportDelta::default(),
+        )
+        .expect("refresh embeddings");
+        let hits = store
+            .vector_search("fixture-semantic-384", &unit_vector(23), 5, None, None)
+            .expect("vector search");
+
+        assert_eq!(refresh.embedded, 0);
+        assert_eq!(refresh.vectors_indexed, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].unit_id, unit.id);
+    }
+
+    #[test]
     fn refresh_incremental_indexes_inserted_event_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -958,6 +991,61 @@ mod tests {
 
         assert_eq!(indexed, 1);
         assert_eq!(delta.inserted_events, vec![event_id.clone()]);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, event_id);
+    }
+
+    #[test]
+    fn refresh_incremental_indexes_large_inserted_event_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let (event_ids, delta) = import_many_events(&store, 1200, "chunked indexed phrase");
+
+        let indexed = refresh_incremental(&store, &delta).expect("incremental refresh");
+        let response = search(
+            &store,
+            "chunked indexed phrase 1199",
+            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(indexed, event_ids.len());
+        assert_eq!(delta.inserted_events.len(), event_ids.len());
+        assert!(response
+            .results
+            .iter()
+            .any(|result| result.event_id == event_ids[1199]));
+    }
+
+    #[test]
+    fn refresh_incremental_repairs_missing_index_rows_after_empty_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let (event_id, delta) = import_event_only(&store, "empty delta repair phrase");
+        refresh_incremental(&store, &delta).expect("initial refresh");
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM events_fts", [])?;
+                conn.execute("DELETE FROM event_embeddings", [])?;
+                conn.execute("DELETE FROM search_units", [])?;
+                Ok(())
+            })
+            .expect("damage derived rows");
+
+        let indexed = refresh_incremental(&store, &ImportDelta::default())
+            .expect("empty delta repair refresh");
+        let response = search(
+            &store,
+            "empty delta repair",
+            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(indexed, 1);
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].event_id, event_id);
     }
@@ -1119,6 +1207,65 @@ mod tests {
 
     fn import_event_only(store: &Store, search_text: &str) -> (String, ImportDelta) {
         import_event_at(store, search_text, None)
+    }
+
+    fn import_many_events(store: &Store, count: usize, label: &str) -> (Vec<String>, ImportDelta) {
+        let source = SourceRecord {
+            id: stable_id(&["source", label]),
+            kind: "fixture".to_string(),
+            identity: label.to_string(),
+            path: None,
+            first_seen_at: Utc::now(),
+            updated_at: Utc::now(),
+            hash: stable_hash(&("source", label)).expect("source hash"),
+        };
+        let session = SessionRecord {
+            id: stable_id(&["session", label]),
+            source_id: source.id.clone(),
+            machine_id: "machine_fixture".to_string(),
+            source_kind: "fixture".to_string(),
+            external_id: label.to_string(),
+            title: None,
+            status: "closed".to_string(),
+            started_at: None,
+            updated_at: None,
+            metadata: json!({}),
+            hash: stable_hash(&("session", label)).expect("session hash"),
+        };
+        let mut event_ids = Vec::with_capacity(count);
+        let mut records = vec![
+            ArchiveRecord::Source(source.clone()),
+            ArchiveRecord::Session(session.clone()),
+        ];
+        for idx in 0..count {
+            let search_text = format!("{label} {idx}");
+            let event_id = stable_id(&["event", label, &idx.to_string()]);
+            let event_hash = stable_hash(&("event", label, idx)).expect("event hash");
+            records.push(ArchiveRecord::Event(EventRecord {
+                id: event_id.clone(),
+                session_id: session.id.clone(),
+                source_id: source.id.clone(),
+                machine_id: "machine_fixture".to_string(),
+                source_kind: "fixture".to_string(),
+                ordinal: idx as i64,
+                event_type: "assistant".to_string(),
+                role: Some("assistant".to_string()),
+                content: search_text.clone(),
+                raw_artifact_hash: None,
+                occurred_at: None,
+                metadata: json!({
+                    "search_indexable": true,
+                    "search_kind": "assistant",
+                    "search_text": search_text
+                }),
+                hash: event_hash,
+            }));
+            event_ids.push(event_id);
+        }
+        let stats = store
+            .import_records(&records)
+            .expect("import fixture events");
+        (event_ids, stats.delta)
     }
 
     fn import_event_at(
