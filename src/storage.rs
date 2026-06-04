@@ -917,8 +917,8 @@ impl Store {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             if !event_ids.is_empty() {
-                let placeholders = placeholders(event_ids.len());
-                let sql = format!(
+                prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
+                let mut stmt = tx.prepare(
                     "SELECT e.id,
                             e.session_id,
                             e.source_id,
@@ -929,30 +929,27 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at
                      FROM events e
-                     WHERE e.id IN ({placeholders})
-                       AND json_extract(e.metadata_json, '$.search_indexable') = 1
+                     JOIN temp_search_index_event_ids scope
+                       ON scope.id = e.id
+                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
                      ORDER BY e.session_id, e.ordinal, e.id",
-                );
-                let mut stmt = tx.prepare(&sql)?;
-                let rows = stmt.query_map(
-                    params_from_iter(event_ids.iter().map(String::as_str)),
-                    |row| {
-                        let content: String = row.get(7)?;
-                        Ok(EventForProjection {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            machine_id: row.get(3)?,
-                            source_kind: row.get(4)?,
-                            role: row.get(5)?,
-                            search_kind: row.get(6)?,
-                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                            content,
-                            occurred_at: parse_opt_dt(row.get(8)?),
-                        })
-                    },
                 )?;
+                let rows = stmt.query_map([], |row| {
+                    let content: String = row.get(7)?;
+                    Ok(EventForProjection {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        machine_id: row.get(3)?,
+                        source_kind: row.get(4)?,
+                        role: row.get(5)?,
+                        search_kind: row.get(6)?,
+                        text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                        content,
+                        occurred_at: parse_opt_dt(row.get(8)?),
+                    })
+                })?;
                 for row in rows {
                     insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
                 }
@@ -963,6 +960,10 @@ impl Store {
             tx.commit()?;
             Ok(indexed_events)
         })
+    }
+
+    pub fn search_index_needs_repair(&self, model: &str) -> Result<bool> {
+        self.with_conn(|conn| search_index_needs_repair(conn, model))
     }
 
     pub fn search_fts(
@@ -1284,50 +1285,41 @@ impl Store {
             return Ok(Vec::new());
         }
         self.with_conn(|conn| {
-            let event_placeholders = placeholders(event_ids.len());
-            let unit_placeholders = placeholders(unit_ids.len());
-            let scope = match (event_ids.is_empty(), unit_ids.is_empty()) {
-                (false, false) => {
-                    format!(
-                        "(su.event_id IN ({event_placeholders}) OR su.id IN ({unit_placeholders}))"
-                    )
-                }
-                (false, true) => format!("su.event_id IN ({event_placeholders})"),
-                (true, false) => format!("su.id IN ({unit_placeholders})"),
-                (true, true) => unreachable!(),
-            };
-            let sql = format!(
+            prepare_temp_id_scope(conn, "temp_delta_event_ids", &event_ids)?;
+            prepare_temp_id_scope(conn, "temp_delta_search_unit_ids", &unit_ids)?;
+            let mut stmt = conn.prepare(
                 "SELECT su.id, su.text, su.text_hash
                  FROM search_units su
+                 LEFT JOIN temp_delta_event_ids event_scope
+                   ON event_scope.id = su.event_id
+                 LEFT JOIN temp_delta_search_unit_ids unit_scope
+                   ON unit_scope.id = su.id
                  LEFT JOIN embeddings e
                    ON e.unit_id = su.id
                   AND e.text_hash = su.text_hash
                   AND e.model_id = ?
                  WHERE e.id IS NULL
-                   AND {scope}
+                   AND (event_scope.id IS NOT NULL OR unit_scope.id IS NOT NULL)
                  ORDER BY su.occurred_at, su.session_id, su.id
                  LIMIT ?",
-            );
-            let mut params = Vec::with_capacity(2 + event_ids.len() + unit_ids.len());
-            params.push(model_id.to_string());
-            params.extend(event_ids);
-            params.extend(unit_ids);
-            params.push(limit.to_string());
-            let mut stmt = conn.prepare(&sql)?;
-            let rows =
-                stmt.query_map(params_from_iter(params.iter().map(String::as_str)), |row| {
-                    Ok(SearchUnitForEmbedding {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        text_hash: row.get(2)?,
-                    })
-                })?;
+            )?;
+            let rows = stmt.query_map(params![model_id, limit as i64], |row| {
+                Ok(SearchUnitForEmbedding {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    text_hash: row.get(2)?,
+                })
+            })?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
             }
             Ok(out)
         })
+    }
+
+    pub fn search_units_need_embedding(&self, model_id: &str) -> Result<bool> {
+        self.with_conn(|conn| search_units_need_embedding(conn, model_id))
     }
 
     pub fn refresh_vector_projection(&self) -> Result<usize> {
@@ -1379,6 +1371,10 @@ impl Store {
             tx.commit()?;
             Ok(count)
         })
+    }
+
+    pub fn vector_projection_needs_repair(&self) -> Result<bool> {
+        self.with_conn(vector_projection_needs_repair)
     }
 
     pub fn vector_search(
@@ -1794,6 +1790,29 @@ fn placeholders(count: usize) -> String {
         .take(count)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Result<()> {
+    match table {
+        "temp_search_index_event_ids" | "temp_delta_event_ids" | "temp_delta_search_unit_ids" => {}
+        _ => bail!("unsupported temporary id scope table: {table}"),
+    }
+    conn.execute(
+        &format!("CREATE TEMP TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY) WITHOUT ROWID"),
+        [],
+    )?;
+    conn.execute(&format!("DELETE FROM {table}"), [])?;
+    for chunk in ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
+        let values = std::iter::repeat("(?)")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO {table} (id) VALUES {values}"),
+            params_from_iter(chunk.iter().map(String::as_str)),
+        )?;
+    }
+    Ok(())
 }
 
 fn repeated_id_params(ids: &[String], repeats: usize) -> Vec<&str> {
@@ -2310,6 +2329,67 @@ fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
         row.get(0)
     })?;
     Ok(count as usize)
+}
+
+fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM events e
+           LEFT JOIN search_units su
+             ON su.event_id = e.id
+           LEFT JOIN events_fts fts
+             ON fts.event_id = e.id
+           LEFT JOIN event_embeddings emb
+             ON emb.event_id = e.id AND emb.model = ?1
+           WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+             AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+             AND (
+               su.event_id IS NULL
+               OR fts.event_id IS NULL
+               OR emb.event_id IS NULL
+             )
+           LIMIT 1
+         )",
+        params![model],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM search_units su
+           LEFT JOIN embeddings e
+             ON e.unit_id = su.id
+            AND e.text_hash = su.text_hash
+            AND e.model_id = ?1
+           WHERE e.id IS NULL
+           LIMIT 1
+         )",
+        params![model_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn vector_projection_needs_repair(conn: &Connection) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM embeddings e
+           LEFT JOIN vec_embeddings_384 v
+             ON v.rowid = e.rowid
+           WHERE e.dims = 384
+             AND v.rowid IS NULL
+           LIMIT 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn record_delta(
