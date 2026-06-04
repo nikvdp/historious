@@ -102,6 +102,14 @@ pub enum Command {
             help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
         )]
         before: Option<String>,
+        #[arg(long, help = "Only show results from this exact machine id")]
+        machine: Option<String>,
+        #[arg(
+            long,
+            alias = "host",
+            help = "Only show results from machine ids generated for this hostname"
+        )]
+        hostname: Option<String>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
         #[arg(
@@ -149,6 +157,14 @@ pub enum Command {
             help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
         )]
         before: Option<String>,
+        #[arg(long, help = "Only show results from this exact machine id")]
+        machine: Option<String>,
+        #[arg(
+            long,
+            alias = "host",
+            help = "Only show results from machine ids generated for this hostname"
+        )]
+        hostname: Option<String>,
         #[arg(long, help = "Disable colored preview output")]
         no_color: bool,
     },
@@ -538,6 +554,7 @@ enum Column {
     Score,
     Lex,
     Sem,
+    Machine,
     Event,
     Session,
 }
@@ -583,6 +600,8 @@ impl Cli {
                 recency_bias,
                 after,
                 before,
+                machine,
+                hostname,
                 no_color,
                 fzf,
                 fzf_rows,
@@ -611,7 +630,8 @@ impl Cli {
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
                     .with_mode(mode)
-                    .with_time_window(after_bound, before_bound);
+                    .with_time_window(after_bound, before_bound)
+                    .with_machine_filter(machine.clone(), hostname.clone());
                 let response = search::search(
                     &store,
                     &query,
@@ -639,6 +659,8 @@ impl Cli {
                         recency_bias,
                         after_bound,
                         before_bound,
+                        machine.clone(),
+                        hostname.clone(),
                         &response,
                         &refs,
                     );
@@ -676,6 +698,8 @@ impl Cli {
                 recency_bias,
                 after,
                 before,
+                machine,
+                hostname,
                 no_color,
             } => {
                 if robot {
@@ -698,6 +722,8 @@ impl Cli {
                     recency_bias,
                     after_bound,
                     before_bound,
+                    machine,
+                    hostname,
                     !no_color,
                 )?;
             }
@@ -1203,6 +1229,8 @@ struct SearchOptionsOutput {
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine: Option<String>,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1212,6 +1240,7 @@ struct SearchResultOutput {
     match_type: search::MatchType,
     event_id: String,
     session_id: String,
+    machine_id: String,
     source_kind: String,
     score: f64,
     lexical_rank: Option<usize>,
@@ -2168,6 +2197,8 @@ fn search_output(
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine: Option<String>,
+    hostname: Option<String>,
     response: &search::SearchResponse,
     refs: &[String],
 ) -> SearchOutput {
@@ -2180,6 +2211,8 @@ fn search_output(
             recency_bias,
             after,
             before,
+            machine,
+            hostname,
         },
         degraded_reason: response.degraded_reason.clone(),
         results: response
@@ -2191,6 +2224,7 @@ fn search_output(
                 match_type: result.match_type,
                 event_id: result.event_id.clone(),
                 session_id: result.session_id.clone(),
+                machine_id: result.machine_id.clone(),
                 source_kind: result.source_kind.clone(),
                 score: result.score,
                 lexical_rank: result.lexical_rank,
@@ -2305,6 +2339,7 @@ fn resolve_columns(
             Column::When,
             Column::Title,
             Column::Preview,
+            Column::Machine,
             Column::Session,
             Column::Event,
         ]
@@ -2633,12 +2668,24 @@ fn run_tui_search(
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine: Option<String>,
+    hostname: Option<String>,
     color: bool,
 ) -> Result<()> {
     ensure_fzf_available()?;
     ensure_curl_available()?;
     let _server = ensure_server_available(config, server)?;
-    let reload = tui_reload_command(server, limit, sort, mode, recency_bias, after, before)?;
+    let reload = tui_reload_command(
+        server,
+        limit,
+        sort,
+        mode,
+        recency_bias,
+        after,
+        before,
+        machine.as_deref(),
+        hostname.as_deref(),
+    )?;
     let preview = fzf_preview_command(config, color);
     let open = fzf_open_command(config, color);
     let mut child = base_fzf_command()
@@ -2681,7 +2728,7 @@ fn base_fzf_command() -> ProcessCommand {
         .arg("--delimiter")
         .arg("\t")
         .arg("--nth")
-        .arg("1,2,3,4,5,8,9")
+        .arg("1,2,3,4,5,8,9,10")
         .arg("--with-nth")
         .arg("1,2,3,4,5");
     command
@@ -2725,6 +2772,8 @@ fn tui_reload_command(
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine: Option<&str>,
+    hostname: Option<&str>,
 ) -> Result<String> {
     let search_url = shell_quote(&server_url(server, "search")?);
     let after_arg = after
@@ -2743,8 +2792,26 @@ fn tui_reload_command(
             )
         })
         .unwrap_or_default();
+    let machine_arg = machine
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            format!(
+                " --data-urlencode {}",
+                shell_quote(&format!("machine={value}"))
+            )
+        })
+        .unwrap_or_default();
+    let hostname_arg = hostname
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            format!(
+                " --data-urlencode {}",
+                shell_quote(&format!("hostname={value}"))
+            )
+        })
+        .unwrap_or_default();
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}; fi",
+        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}; fi",
         sort.as_str(),
         mode.as_str()
     ))
@@ -2899,6 +2966,7 @@ fn fzf_row(result: &search::SearchResult, ref_id: Option<&str>, color: bool) -> 
         clean_fzf_field(&result.event_id),
         clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
         clean_fzf_field(&result.workspace_values.join(" ")),
+        clean_fzf_field(&result.machine_id),
     ]
     .join("\t")
 }
@@ -2986,10 +3054,11 @@ fn parse_column(name: &str) -> Result<Column> {
         "score" => Ok(Column::Score),
         "lex" | "lexical" => Ok(Column::Lex),
         "sem" | "semantic" => Ok(Column::Sem),
+        "machine" | "machine_id" => Ok(Column::Machine),
         "event" | "event_id" => Ok(Column::Event),
         "session" | "session_id" => Ok(Column::Session),
         _ => bail!(
-            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,event,session,ids"
+            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,machine,event,session,ids"
         ),
     }
 }
@@ -3078,6 +3147,7 @@ fn cell_value(column: Column, result: &search::SearchResult, ref_id: Option<&str
         Column::Score => format!("{:.6}", result.score),
         Column::Lex => rank_cell(result.lexical_rank),
         Column::Sem => rank_cell(result.semantic_rank),
+        Column::Machine => result.machine_id.clone(),
         Column::Event => result.event_id.clone(),
         Column::Session => result.session_id.clone(),
     }
@@ -3111,6 +3181,7 @@ fn column_header(column: Column) -> &'static str {
         Column::Score => "Score",
         Column::Lex => "Lex",
         Column::Sem => "Sem",
+        Column::Machine => "Machine",
         Column::Event => "Event",
         Column::Session => "Session",
     }

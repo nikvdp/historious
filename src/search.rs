@@ -92,7 +92,7 @@ impl SearchMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub limit: usize,
     pub sort: SortMode,
@@ -100,6 +100,8 @@ pub struct SearchOptions {
     pub recency_bias: f64,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
+    pub machine_id: Option<String>,
+    pub machine_id_prefix: Option<String>,
 }
 
 impl SearchOptions {
@@ -111,6 +113,8 @@ impl SearchOptions {
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after: None,
             before: None,
+            machine_id: None,
+            machine_id_prefix: None,
         }
     }
 
@@ -128,6 +132,18 @@ impl SearchOptions {
         self.before = before;
         self
     }
+
+    pub fn with_machine_filter(
+        mut self,
+        machine_id: Option<String>,
+        hostname: Option<String>,
+    ) -> Self {
+        self.machine_id = machine_id.filter(|value| !value.trim().is_empty());
+        self.machine_id_prefix = hostname
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("machine_{}_", sanitize_machine_hostname(&value)));
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +151,7 @@ pub struct SearchResult {
     pub match_type: MatchType,
     pub event_id: String,
     pub session_id: String,
+    pub machine_id: String,
     pub source_kind: String,
     pub score: f64,
     pub lexical_rank: Option<usize>,
@@ -638,6 +655,20 @@ fn is_memory_like_error(err: &anyhow::Error) -> bool {
         .any(|needle| text.contains(needle))
 }
 
+fn sanitize_machine_hostname(input: &str) -> String {
+    input
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn embedding_input(text: &str) -> String {
     text.chars()
         .take(EMBEDDING_TEXT_MAX_CHARS)
@@ -703,7 +734,14 @@ pub fn search(
         .max(BACKEND_MIN_LIMIT);
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
     let lexical = if options.mode.includes_lexical() {
-        store.search_fts(query, backend_limit, options.after, options.before)?
+        store.search_fts(
+            query,
+            backend_limit,
+            options.after,
+            options.before,
+            options.machine_id.as_deref(),
+            options.machine_id_prefix.as_deref(),
+        )?
     } else {
         Vec::new()
     };
@@ -716,6 +754,8 @@ pub fn search(
             semantic_limit,
             options.after,
             options.before,
+            options.machine_id.as_deref(),
+            options.machine_id_prefix.as_deref(),
         )?
     } else {
         (Vec::new(), None)
@@ -734,6 +774,8 @@ fn semantic_search(
     limit: usize,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine_id: Option<&str>,
+    machine_id_prefix: Option<&str>,
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
     let Some(embedder) = query_embedder else {
         return Ok((Vec::new(), degraded_reason));
@@ -755,7 +797,15 @@ fn semantic_search(
     }
     let query_vector = embedder.embed_one(query)?;
     let rows = store
-        .vector_search(embedder.model_id(), &query_vector, limit, after, before)?
+        .vector_search(
+            embedder.model_id(),
+            &query_vector,
+            limit,
+            after,
+            before,
+            machine_id,
+            machine_id_prefix,
+        )?
         .into_iter()
         .map(search_row_from_vector)
         .collect();
@@ -803,6 +853,7 @@ fn fuse(
                 match_type: match_type(entry.lexical_rank, entry.semantic_rank),
                 event_id: row.event_id,
                 session_id: row.session_id,
+                machine_id: row.machine_id,
                 source_kind: row.source_kind,
                 score: entry.score,
                 lexical_rank: entry.lexical_rank,
@@ -826,6 +877,7 @@ fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
     SearchRow {
         event_id: row.event_id,
         session_id: row.session_id,
+        machine_id: row.machine_id,
         source_kind: row.source_kind,
         content: row.content,
         occurred_at: row.occurred_at,
