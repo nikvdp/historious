@@ -83,6 +83,8 @@ pub enum Command {
         exclude: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
+        #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
+        mode: Option<SearchModeArg>,
         #[arg(
             long,
             default_value_t = 0.0,
@@ -128,6 +130,8 @@ pub enum Command {
         server: String,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
+        #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
+        mode: Option<SearchModeArg>,
         #[arg(
             long,
             default_value_t = 0.0,
@@ -449,6 +453,13 @@ pub enum SearchSort {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SearchModeArg {
+    Hybrid,
+    Lexical,
+    Semantic,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RawArtifactExportMode {
     Inline,
     Metadata,
@@ -466,6 +477,16 @@ impl From<SearchSort> for search::SortMode {
             SearchSort::Relevance => search::SortMode::Relevance,
             SearchSort::Newest => search::SortMode::Newest,
             SearchSort::Oldest => search::SortMode::Oldest,
+        }
+    }
+}
+
+impl From<SearchModeArg> for search::SearchMode {
+    fn from(value: SearchModeArg) -> Self {
+        match value {
+            SearchModeArg::Hybrid => search::SearchMode::Hybrid,
+            SearchModeArg::Lexical => search::SearchMode::Lexical,
+            SearchModeArg::Semantic => search::SearchMode::Semantic,
         }
     }
 }
@@ -531,6 +552,7 @@ impl Cli {
                 include,
                 exclude,
                 sort,
+                mode,
                 recency_bias,
                 after,
                 before,
@@ -556,8 +578,12 @@ impl Cli {
                     parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
                 let before_bound =
                     parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
+                let mode = mode
+                    .map(search::SearchMode::from)
+                    .unwrap_or(config.default_search_mode);
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
+                    .with_mode(mode)
                     .with_time_window(after_bound, before_bound);
                 let response = search::search(
                     &store,
@@ -582,6 +608,7 @@ impl Cli {
                         &query,
                         limit,
                         sort,
+                        mode,
                         recency_bias,
                         after_bound,
                         before_bound,
@@ -618,6 +645,7 @@ impl Cli {
                 limit,
                 server,
                 sort,
+                mode,
                 recency_bias,
                 after,
                 before,
@@ -630,12 +658,16 @@ impl Cli {
                     parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
                 let before_bound =
                     parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
+                let mode = mode
+                    .map(search::SearchMode::from)
+                    .unwrap_or(config.default_search_mode);
                 run_tui_search(
                     &config,
                     query.as_deref().unwrap_or_default(),
                     &server,
                     limit,
                     sort,
+                    mode,
                     recency_bias,
                     after_bound,
                     before_bound,
@@ -921,9 +953,17 @@ impl Cli {
                 if watch {
                     let server_store = store.clone();
                     let server_machine_id = config.machine_id.clone();
+                    let default_search_mode = config.default_search_mode;
                     let server_embedder = config.embedder.clone();
                     let server_task = tokio::spawn(async move {
-                        server::serve(server_store, addr, server_machine_id, server_embedder).await
+                        server::serve(
+                            server_store,
+                            addr,
+                            server_machine_id,
+                            default_search_mode,
+                            server_embedder,
+                        )
+                        .await
                     });
                     run_daemon(
                         &store,
@@ -936,7 +976,14 @@ impl Cli {
                     .await?;
                     server_task.abort();
                 } else {
-                    server::serve(store, addr, config.machine_id, config.embedder).await?;
+                    server::serve(
+                        store,
+                        addr,
+                        config.machine_id,
+                        config.default_search_mode,
+                        config.embedder,
+                    )
+                    .await?;
                 }
             }
             Command::Status { json } => {
@@ -1118,6 +1165,7 @@ struct SearchOutput {
 struct SearchOptionsOutput {
     limit: usize,
     sort: &'static str,
+    mode: &'static str,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -1844,6 +1892,7 @@ fn search_output(
     query: &str,
     limit: usize,
     sort: SearchSort,
+    mode: search::SearchMode,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -1855,6 +1904,7 @@ fn search_output(
         options: SearchOptionsOutput {
             limit,
             sort: sort.as_str(),
+            mode: mode.as_str(),
             recency_bias,
             after,
             before,
@@ -2306,6 +2356,7 @@ fn run_tui_search(
     server: &str,
     limit: usize,
     sort: SearchSort,
+    mode: search::SearchMode,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -2314,7 +2365,7 @@ fn run_tui_search(
     ensure_fzf_available()?;
     ensure_curl_available()?;
     let _server = ensure_server_available(config, server)?;
-    let reload = tui_reload_command(server, limit, sort, recency_bias, after, before)?;
+    let reload = tui_reload_command(server, limit, sort, mode, recency_bias, after, before)?;
     let preview = fzf_preview_command(config, color);
     let open = fzf_open_command(config, color);
     let mut child = base_fzf_command()
@@ -2389,6 +2440,7 @@ fn tui_reload_command(
     server: &str,
     limit: usize,
     sort: SearchSort,
+    mode: search::SearchMode,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -2411,8 +2463,9 @@ fn tui_reload_command(
         })
         .unwrap_or_default();
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}; fi",
-        sort.as_str()
+        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}; fi",
+        sort.as_str(),
+        mode.as_str()
     ))
 }
 
@@ -3014,6 +3067,7 @@ mod tests {
             "workspace metadata",
             20,
             SearchSort::Relevance,
+            search::SearchMode::Semantic,
             0.25,
             None,
             None,
@@ -3025,6 +3079,7 @@ mod tests {
         assert_eq!(value["query"], "workspace metadata");
         assert_eq!(value["options"]["limit"], 20);
         assert_eq!(value["options"]["sort"], "relevance");
+        assert_eq!(value["options"]["mode"], "semantic");
         assert_eq!(value["options"]["after"], serde_json::Value::Null);
         assert_eq!(value["options"]["before"], serde_json::Value::Null);
         assert_eq!(value["results"][0]["ref"], "ab3f");
@@ -3106,6 +3161,7 @@ mod tests {
             DEFAULT_SERVER_URL,
             25,
             SearchSort::Newest,
+            search::SearchMode::Lexical,
             0.25,
             Some(after),
             None,
@@ -3114,6 +3170,7 @@ mod tests {
 
         assert!(command.contains("curl -fsSG"));
         assert!(command.contains("sort=newest"));
+        assert!(command.contains("mode=lexical"));
         assert!(command.contains("recency_bias=0.25"));
         assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
     }

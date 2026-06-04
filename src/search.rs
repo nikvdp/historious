@@ -2,7 +2,7 @@ use crate::embed::{Embedder, EmbedderConfig};
 use crate::storage::{ImportDelta, SearchRow, Store, VectorSearchRow};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const RRF_K: f64 = 60.0;
@@ -32,10 +32,43 @@ pub enum SortMode {
     Oldest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    Hybrid,
+    Lexical,
+    Semantic,
+}
+
+impl Default for SearchMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Lexical => "lexical",
+            SearchMode::Semantic => "semantic",
+        }
+    }
+
+    fn includes_lexical(self) -> bool {
+        matches!(self, SearchMode::Hybrid | SearchMode::Lexical)
+    }
+
+    fn includes_semantic(self) -> bool {
+        matches!(self, SearchMode::Hybrid | SearchMode::Semantic)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchOptions {
     pub limit: usize,
     pub sort: SortMode,
+    pub mode: SearchMode,
     pub recency_bias: f64,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
@@ -46,10 +79,16 @@ impl SearchOptions {
         Self {
             limit,
             sort,
+            mode: SearchMode::Hybrid,
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after: None,
             before: None,
         }
+    }
+
+    pub fn with_mode(mut self, mode: SearchMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn with_time_window(
@@ -332,16 +371,24 @@ pub fn search(
         .saturating_mul(BACKEND_LIMIT_MULTIPLIER)
         .max(BACKEND_MIN_LIMIT);
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
-    let lexical = store.search_fts(query, backend_limit, options.after, options.before)?;
-    let (semantic, degraded_reason) = semantic_search(
-        store,
-        query,
-        query_embedder,
-        degraded_reason,
-        semantic_limit,
-        options.after,
-        options.before,
-    )?;
+    let lexical = if options.mode.includes_lexical() {
+        store.search_fts(query, backend_limit, options.after, options.before)?
+    } else {
+        Vec::new()
+    };
+    let (semantic, degraded_reason) = if options.mode.includes_semantic() {
+        semantic_search(
+            store,
+            query,
+            query_embedder,
+            degraded_reason,
+            semantic_limit,
+            options.after,
+            options.before,
+        )?
+    } else {
+        (Vec::new(), None)
+    };
     Ok(SearchResponse {
         degraded_reason,
         results: fuse(lexical, semantic, options),
@@ -659,6 +706,49 @@ mod tests {
         );
         assert_eq!(response.results[0].event_id, unit.event_id);
         assert_eq!(response.results[0].semantic_rank, None);
+    }
+
+    #[test]
+    fn lexical_mode_skips_semantic_degraded_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unit = import_event_and_project(&store, "lexical mode phrase");
+
+        let response = search(
+            &store,
+            "lexical mode",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Lexical),
+            None,
+            Some("query embedder disabled".to_string()),
+        )
+        .expect("search");
+
+        assert_eq!(response.degraded_reason, None);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, unit.event_id);
+        assert_eq!(response.results[0].match_type, MatchType::Lexical);
+    }
+
+    #[test]
+    fn semantic_mode_skips_lexical_only_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        import_event_and_project(&store, "semantic mode lexical phrase");
+
+        let response = search(
+            &store,
+            "semantic mode lexical",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            None,
+            Some("query embedder disabled".to_string()),
+        )
+        .expect("search");
+
+        assert_eq!(
+            response.degraded_reason.as_deref(),
+            Some("query embedder disabled")
+        );
+        assert!(response.results.is_empty());
     }
 
     #[test]
