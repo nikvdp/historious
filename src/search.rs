@@ -1260,6 +1260,71 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_embedding_batch_reduces_when_memory_is_low() {
+        let mut batch = AdaptiveEmbeddingBatch::new();
+
+        batch.observe(memory_sample(16, 8, 512), memory_sample(16, 1, 1024));
+
+        assert_eq!(batch.batch_size, 8);
+        assert_eq!(batch.reductions, 1);
+    }
+
+    #[test]
+    fn adaptive_embedding_batch_defers_after_reaching_minimum_on_critical_memory() {
+        let mut batch = AdaptiveEmbeddingBatch::new();
+        let critical = memory_sample(16, 0, 512);
+
+        while batch.can_reduce() {
+            assert!(batch.defer_reason(critical).is_none());
+        }
+        let reason = batch.defer_reason(critical).expect("defer reason");
+
+        assert_eq!(batch.batch_size, 1);
+        assert_eq!(batch.reductions, 4);
+        assert!(reason.contains("memory pressure"));
+    }
+
+    #[test]
+    fn adaptive_embedding_batch_grows_after_stable_memory() {
+        let mut batch = AdaptiveEmbeddingBatch::new();
+
+        for _ in 0..6 {
+            batch.observe(memory_sample(16, 12, 512), memory_sample(16, 12, 512));
+        }
+
+        assert_eq!(batch.batch_size, 32);
+        assert_eq!(batch.reductions, 0);
+    }
+
+    #[test]
+    fn model_load_defers_on_low_memory_before_fastembed_is_loaded() {
+        assert!(memory_model_load_defer_reason(memory_sample(16, 1, 512)).is_some());
+        assert!(memory_model_load_defer_reason(memory_sample(16, 8, 512)).is_none());
+    }
+
+    #[test]
+    fn rss_spike_counts_as_batch_pressure() {
+        assert!(rss_spiked(
+            memory_sample(16, 8, 512),
+            memory_sample(16, 8, 1200)
+        ));
+        assert!(!rss_spiked(
+            memory_sample(16, 8, 512),
+            memory_sample(16, 8, 700)
+        ));
+    }
+
+    #[test]
+    fn memory_like_embedding_errors_are_detected_case_insensitively() {
+        assert!(is_memory_like_error(&anyhow::anyhow!(
+            "Resource exhausted while allocating tensor"
+        )));
+        assert!(!is_memory_like_error(&anyhow::anyhow!(
+            "network download failed"
+        )));
+    }
+
+    #[test]
     fn refresh_incremental_indexes_inserted_event_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -1658,6 +1723,18 @@ mod tests {
         fn embed_batch(&self, texts: &[String], _batch_size: usize) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
         }
+    }
+
+    fn memory_sample(
+        total_gib: u64,
+        available_gib: u64,
+        process_rss_mib: u64,
+    ) -> Option<MemorySample> {
+        Some(MemorySample {
+            total_bytes: Some(total_gib * 1024 * 1024 * 1024),
+            available_bytes: Some(available_gib * 1024 * 1024 * 1024),
+            process_rss_bytes: Some(process_rss_mib * 1024 * 1024),
+        })
     }
 
     fn unit_vector(index: usize) -> Vec<f32> {
