@@ -3299,6 +3299,37 @@ mod tests {
     }
 
     #[test]
+    fn embedding_progress_detail_reports_pending_batch_and_memory() {
+        let detail = embedding_progress_detail(&search::EmbeddingProgress::Batch {
+            embedded: 1200,
+            pending: 3400,
+            batch_size: 8,
+            reductions: 2,
+            available_gib: Some(1.2),
+        });
+
+        assert_eq!(
+            detail,
+            "1,200 embedded, 3,400 pending, batch 8, reduced, 1.2 GiB available"
+        );
+    }
+
+    #[test]
+    fn embedding_phase_detail_reports_deferred_pending_work() {
+        let detail = embedding_phase_detail(&search::EmbeddingRefresh {
+            embedded: 16,
+            pending: 42,
+            deferred_reason: Some("memory pressure: only 0.6 GiB appears available".to_string()),
+            ..search::EmbeddingRefresh::default()
+        });
+
+        assert_eq!(
+            detail,
+            "deferred: memory pressure: only 0.6 GiB appears available; 42 pending, 16 new embeddings"
+        );
+    }
+
+    #[test]
     fn fzf_row_keeps_stable_ids_hidden_after_visible_fields() {
         let result = search::SearchResult {
             match_type: search::MatchType::Hybrid,

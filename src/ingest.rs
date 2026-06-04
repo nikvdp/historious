@@ -1220,6 +1220,41 @@ mod tests {
         assert_eq!(stats.events, 2);
     }
 
+    #[test]
+    fn source_summaries_track_found_and_selected_files_by_kind() {
+        let mut summaries = Vec::new();
+        push_found_source_file(&mut summaries, "codex");
+        push_found_source_file(&mut summaries, "hermes");
+        push_found_source_file(&mut summaries, "codex");
+        let candidates = vec![
+            UpdateCandidate {
+                modified: 3,
+                kind: "codex",
+                path: PathBuf::from("codex-1.jsonl"),
+            },
+            UpdateCandidate {
+                modified: 2,
+                kind: "hermes",
+                path: PathBuf::from("hermes-1.json"),
+            },
+        ];
+
+        mark_selected_source_files(&mut summaries, &candidates);
+
+        let codex = summaries
+            .iter()
+            .find(|summary| summary.kind == "codex")
+            .expect("codex summary");
+        let hermes = summaries
+            .iter()
+            .find(|summary| summary.kind == "hermes")
+            .expect("hermes summary");
+        assert_eq!(codex.found_files, 2);
+        assert_eq!(codex.selected_files, 1);
+        assert_eq!(hermes.found_files, 1);
+        assert_eq!(hermes.selected_files, 1);
+    }
+
     fn fixture_line(session_id: &str, text: &str) -> String {
         format!(
             "{}\n",
