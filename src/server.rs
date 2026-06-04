@@ -18,6 +18,7 @@ use std::sync::Arc;
 struct AppState {
     store: Store,
     machine_id: String,
+    default_search_mode: search::SearchMode,
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
     embedder_degraded_reason: Option<String>,
 }
@@ -31,6 +32,7 @@ pub async fn serve(
     store: Store,
     addr: SocketAddr,
     machine_id: String,
+    default_search_mode: search::SearchMode,
     embedder: crate::embed::EmbedderConfig,
 ) -> Result<()> {
     let (embedder, embedder_degraded_reason) = match embedder.load() {
@@ -46,6 +48,7 @@ pub async fn serve(
         .with_state(AppState {
             store,
             machine_id,
+            default_search_mode,
             embedder,
             embedder_degraded_reason,
         });
@@ -80,6 +83,7 @@ struct SearchParams {
     q: Option<String>,
     limit: Option<usize>,
     sort: Option<String>,
+    mode: Option<String>,
     recency_bias: Option<f64>,
     after: Option<String>,
     before: Option<String>,
@@ -98,6 +102,7 @@ struct ServerSearchOutput {
 struct ServerSearchOptions {
     limit: usize,
     sort: String,
+    mode: String,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -128,11 +133,13 @@ async fn search_endpoint(
     let limit = params.limit.unwrap_or(25);
     let sort = parse_sort(params.sort.as_deref())?;
     let sort_name = sort_name(sort).to_string();
+    let mode = parse_mode(params.mode.as_deref())?.unwrap_or(state.default_search_mode);
     let recency_bias = params.recency_bias.unwrap_or(0.0);
     let after = parse_rfc3339_opt(params.after.as_deref(), "after")?;
     let before = parse_rfc3339_opt(params.before.as_deref(), "before")?;
-    let options =
-        search::SearchOptions::new(limit, sort, recency_bias).with_time_window(after, before);
+    let options = search::SearchOptions::new(limit, sort, recency_bias)
+        .with_mode(mode)
+        .with_time_window(after, before);
     let response = search::search(
         &state.store,
         &query,
@@ -155,6 +162,7 @@ async fn search_endpoint(
         options: ServerSearchOptions {
             limit,
             sort: sort_name,
+            mode: mode.as_str().to_string(),
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after,
             before,
@@ -215,6 +223,16 @@ fn parse_sort(value: Option<&str>) -> Result<search::SortMode> {
         "newest" => Ok(search::SortMode::Newest),
         "oldest" => Ok(search::SortMode::Oldest),
         value => bail!("unsupported sort mode: {value}"),
+    }
+}
+
+fn parse_mode(value: Option<&str>) -> Result<Option<search::SearchMode>> {
+    match value {
+        None => Ok(None),
+        Some("hybrid") => Ok(Some(search::SearchMode::Hybrid)),
+        Some("lexical") => Ok(Some(search::SearchMode::Lexical)),
+        Some("semantic") => Ok(Some(search::SearchMode::Semantic)),
+        Some(value) => bail!("unsupported search mode: {value}"),
     }
 }
 
