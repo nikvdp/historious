@@ -29,10 +29,50 @@ pub struct UpdateOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateSourceSummary {
+    pub kind: String,
+    pub found_files: usize,
+    pub selected_files: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpdateProgress {
+    Discovered {
+        sources: Vec<UpdateSourceSummary>,
+        selected_files: usize,
+    },
+    Processing {
+        kind: String,
+        path: PathBuf,
+        file_index: usize,
+        total_files: usize,
+        source_file_index: usize,
+        source_file_count: usize,
+        stats: UpdateStats,
+    },
+    CompletedFile {
+        kind: String,
+        path: PathBuf,
+        file_index: usize,
+        total_files: usize,
+        source_file_index: usize,
+        source_file_count: usize,
+        stats: UpdateStats,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct SourceRoot {
     kind: &'static str,
     path: PathBuf,
     extensions: &'static [&'static str],
+}
+
+#[derive(Debug, Clone)]
+struct UpdateCandidate {
+    modified: i128,
+    kind: &'static str,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -76,8 +116,18 @@ pub fn update_local(
     machine_id: &str,
     options: UpdateOptions,
 ) -> Result<UpdateStats> {
+    update_local_with_progress(store, machine_id, options, |_| {})
+}
+
+pub fn update_local_with_progress(
+    store: &Store,
+    machine_id: &str,
+    options: UpdateOptions,
+    mut progress: impl FnMut(&UpdateProgress),
+) -> Result<UpdateStats> {
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
+    let mut source_summaries = Vec::new();
     for root in discover_roots() {
         if options
             .source
@@ -115,23 +165,66 @@ pub fn update_local(
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis() as i128)
                 .unwrap_or(0);
-            candidates.push((modified, root.kind, entry.path().to_path_buf()));
+            push_found_source_file(&mut source_summaries, root.kind);
+            candidates.push(UpdateCandidate {
+                modified,
+                kind: root.kind,
+                path: entry.path().to_path_buf(),
+            });
         }
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
-    let iter: Box<dyn Iterator<Item = (i128, &'static str, PathBuf)>> =
-        if let Some(max_files) = options.max_files {
-            Box::new(candidates.into_iter().take(max_files))
-        } else {
-            Box::new(candidates.into_iter())
-        };
-    for (_, kind, path) in iter {
+    candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
+    if let Some(max_files) = options.max_files {
+        candidates.truncate(max_files);
+    }
+    mark_selected_source_files(&mut source_summaries, &candidates);
+    progress(&UpdateProgress::Discovered {
+        sources: source_summaries
+            .iter()
+            .map(|source| UpdateSourceSummary {
+                kind: source.kind.to_string(),
+                found_files: source.found_files,
+                selected_files: source.selected_files,
+            })
+            .collect(),
+        selected_files: candidates.len(),
+    });
+
+    let total_files = candidates.len();
+    let mut source_seen = Vec::new();
+    for (idx, candidate) in candidates.into_iter().enumerate() {
+        let kind = candidate.kind;
+        let path = candidate.path;
         stats.files_seen += 1;
+        let source_file_index = increment_source_seen(&mut source_seen, kind);
+        let source_file_count = source_summaries
+            .iter()
+            .find(|source| source.kind == kind)
+            .map(|source| source.selected_files)
+            .unwrap_or(0);
+        progress(&UpdateProgress::Processing {
+            kind: kind.to_string(),
+            path: path.clone(),
+            file_index: idx + 1,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats: stats.clone(),
+        });
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) => {
                 tracing::debug!("failed to read metadata for {}: {err}", path.display());
                 stats.errors += 1;
+                progress(&UpdateProgress::CompletedFile {
+                    kind: kind.to_string(),
+                    path,
+                    file_index: idx + 1,
+                    total_files,
+                    source_file_index,
+                    source_file_count,
+                    stats: stats.clone(),
+                });
                 continue;
             }
         };
@@ -141,6 +234,15 @@ pub fn update_local(
         let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
         if file_status.raw_current && !file_status.needs_workspace_refresh {
             stats.skipped_unchanged += 1;
+            progress(&UpdateProgress::CompletedFile {
+                kind: kind.to_string(),
+                path,
+                file_index: idx + 1,
+                total_files,
+                source_file_index,
+                source_file_count,
+                stats: stats.clone(),
+            });
             continue;
         }
         match ingest_file(store, machine_id, kind, &path) {
@@ -154,8 +256,67 @@ pub fn update_local(
                 stats.errors += 1;
             }
         }
+        progress(&UpdateProgress::CompletedFile {
+            kind: kind.to_string(),
+            path,
+            file_index: idx + 1,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats: stats.clone(),
+        });
     }
     Ok(stats)
+}
+
+#[derive(Debug, Clone)]
+struct MutableSourceSummary {
+    kind: &'static str,
+    found_files: usize,
+    selected_files: usize,
+}
+
+fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &'static str) {
+    if let Some(summary) = summaries.iter_mut().find(|summary| summary.kind == kind) {
+        summary.found_files += 1;
+    } else {
+        summaries.push(MutableSourceSummary {
+            kind,
+            found_files: 1,
+            selected_files: 0,
+        });
+    }
+}
+
+fn mark_selected_source_files(
+    summaries: &mut [MutableSourceSummary],
+    candidates: &[UpdateCandidate],
+) {
+    for summary in summaries.iter_mut() {
+        summary.selected_files = 0;
+    }
+    for candidate in candidates {
+        if let Some(summary) = summaries
+            .iter_mut()
+            .find(|summary| summary.kind == candidate.kind)
+        {
+            summary.selected_files += 1;
+        }
+    }
+}
+
+fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &'static str) -> usize {
+    if let Some(summary) = seen.iter_mut().find(|summary| summary.kind == kind) {
+        summary.found_files += 1;
+        summary.found_files
+    } else {
+        seen.push(MutableSourceSummary {
+            kind,
+            found_files: 1,
+            selected_files: 0,
+        });
+        1
+    }
 }
 
 fn discover_roots() -> Vec<SourceRoot> {

@@ -9,9 +9,10 @@ use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, U
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1355,16 +1356,19 @@ fn run_update_once_human(
     repair: bool,
 ) -> Result<UpdateOutput> {
     let progress = ProgressUi::new();
-    let scan = progress.phase("Scanning local agent logs");
-    let ingest = ingest::update_local(
+    let mut scan = progress.phase("Scanning local agent logs");
+    let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
         ingest::UpdateOptions { max_files, source },
+        |event| scan.update(update_progress_detail(event)),
     )?;
     scan.finish(format!(
-        "{} files, {} new events",
+        "{} files, {} new events, {} unchanged, {} errors",
         format_count(ingest.files_seen),
-        format_count(ingest.inserted)
+        format_count(ingest.inserted),
+        format_count(ingest.skipped_unchanged),
+        format_count(ingest.errors)
     ));
 
     let index = progress.phase(if repair {
@@ -1597,6 +1601,102 @@ fn embedding_phase_detail(embeddings: &search::EmbeddingRefresh) -> String {
     }
 }
 
+fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
+    match event {
+        ingest::UpdateProgress::Discovered {
+            sources,
+            selected_files,
+        } => {
+            let source_text = sources
+                .iter()
+                .filter(|source| source.found_files > 0)
+                .map(|source| {
+                    if source.selected_files == source.found_files {
+                        format!("{} {}", source.kind, format_count(source.found_files))
+                    } else {
+                        format!(
+                            "{} {}/{}",
+                            source.kind,
+                            format_count(source.selected_files),
+                            format_count(source.found_files)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if source_text.is_empty() {
+                "no local agent logs found".to_string()
+            } else {
+                format!(
+                    "found {} files across {}",
+                    format_count(*selected_files),
+                    source_text
+                )
+            }
+        }
+        ingest::UpdateProgress::Processing {
+            kind,
+            path,
+            file_index,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats,
+        } => format!(
+            "{} {}/{} file {}/{} {}; {} new, {} unchanged, {} errors",
+            kind,
+            format_count(*source_file_index),
+            format_count(*source_file_count),
+            format_count(*file_index),
+            format_count(*total_files),
+            compact_path(path),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
+        ingest::UpdateProgress::CompletedFile {
+            kind,
+            path,
+            file_index,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats,
+        } => format!(
+            "{} {}/{} file {}/{} done {}; {} new, {} unchanged, {} errors",
+            kind,
+            format_count(*source_file_index),
+            format_count(*source_file_count),
+            format_count(*file_index),
+            format_count(*total_files),
+            compact_path(path),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
+    }
+}
+
+fn compact_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let home = std::env::var("HOME").ok();
+    let text = home
+        .as_deref()
+        .and_then(|home| text.strip_prefix(home).map(|rest| format!("~{rest}")))
+        .unwrap_or_else(|| text.to_string());
+    const MAX_CHARS: usize = 72;
+    let char_count = text.chars().count();
+    if char_count <= MAX_CHARS {
+        text
+    } else {
+        let tail = text
+            .chars()
+            .skip(char_count.saturating_sub(MAX_CHARS - 3))
+            .collect::<String>();
+        format!("...{tail}")
+    }
+}
+
 fn format_count(value: usize) -> String {
     let text = value.to_string();
     let mut out = String::with_capacity(text.len() + text.len() / 3);
@@ -1652,6 +1752,8 @@ struct ProgressPhase {
     label: String,
     interactive: bool,
     started: Instant,
+    detail: Option<Arc<Mutex<String>>>,
+    last_update_emit: Instant,
     stop: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
     finished: bool,
@@ -1662,15 +1764,28 @@ impl ProgressPhase {
         let started = Instant::now();
         if interactive {
             let label_for_thread = label.to_string();
+            let detail = Arc::new(Mutex::new(String::new()));
+            let detail_for_thread = Arc::clone(&detail);
             let (tx, rx) = mpsc::channel();
             let handle = thread::spawn(move || {
                 let frames = ["-", "\\", "|", "/"];
                 let mut idx = 0usize;
                 loop {
+                    let detail = detail_for_thread
+                        .lock()
+                        .ok()
+                        .map(|detail| detail.clone())
+                        .unwrap_or_default();
+                    let suffix = if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {detail}")
+                    };
                     eprint!(
-                        "\r\x1b[36m{}\x1b[0m {}... ",
+                        "\r\x1b[2K\x1b[36m{}\x1b[0m {}...{} ",
                         frames[idx % frames.len()],
-                        label_for_thread
+                        label_for_thread,
+                        suffix
                     );
                     let _ = std::io::stderr().flush();
                     idx = idx.wrapping_add(1);
@@ -1683,6 +1798,8 @@ impl ProgressPhase {
                 label: label.to_string(),
                 interactive,
                 started,
+                detail: Some(detail),
+                last_update_emit: started,
                 stop: Some(tx),
                 handle: Some(handle),
                 finished: false,
@@ -1693,10 +1810,24 @@ impl ProgressPhase {
                 label: label.to_string(),
                 interactive,
                 started,
+                detail: None,
+                last_update_emit: started,
                 stop: None,
                 handle: None,
                 finished: false,
             }
+        }
+    }
+
+    fn update(&mut self, detail: String) {
+        if let Some(shared) = &self.detail {
+            if let Ok(mut current) = shared.lock() {
+                *current = detail.clone();
+            }
+        }
+        if !self.interactive && self.last_update_emit.elapsed() >= Duration::from_secs(2) {
+            eprintln!("{}: {}", self.label, detail);
+            self.last_update_emit = Instant::now();
         }
     }
 
@@ -2969,19 +3100,22 @@ async fn run_daemon(
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     let progress = ProgressUi::new();
     loop {
-        let scan = progress.phase("Scanning local agent logs");
-        let stats = ingest::update_local(
+        let mut scan = progress.phase("Scanning local agent logs");
+        let stats = ingest::update_local_with_progress(
             store,
             machine_id,
             ingest::UpdateOptions {
                 max_files,
                 source: source.clone(),
             },
+            |event| scan.update(update_progress_detail(event)),
         )?;
         scan.finish(format!(
-            "{} files, {} new events",
+            "{} files, {} new events, {} unchanged, {} errors",
             format_count(stats.files_seen),
-            format_count(stats.inserted)
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
         ));
 
         let index = progress.phase("Updating search index");
