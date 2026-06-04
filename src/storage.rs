@@ -1322,6 +1322,10 @@ impl Store {
         self.with_conn(|conn| search_units_need_embedding(conn, model_id))
     }
 
+    pub fn search_units_missing_embedding_count(&self, model_id: &str) -> Result<usize> {
+        self.with_conn(|conn| search_units_missing_embedding_count(conn, model_id))
+    }
+
     pub fn refresh_vector_projection(&self) -> Result<usize> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM vec_embeddings_384", [])?;
@@ -2373,6 +2377,21 @@ fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM search_units su
+         LEFT JOIN embeddings e
+           ON e.unit_id = su.id
+          AND e.text_hash = su.text_hash
+          AND e.model_id = ?1
+         WHERE e.id IS NULL",
+        params![model_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 fn vector_projection_needs_repair(conn: &Connection) -> Result<bool> {

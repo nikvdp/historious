@@ -1379,12 +1379,20 @@ fn run_update_once_human(
     let projected = refresh_search_after_update(store, &ingest.delta, repair)?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
-    let embed = progress.phase(if repair {
+    let mut embed = progress.phase(if repair {
         "Repairing embeddings"
     } else {
         "Updating embeddings"
     });
-    let embeddings = refresh_embeddings_after_update(store, config, &ingest.delta, repair)?;
+    let embeddings = refresh_embeddings_after_update_with_progress(
+        store,
+        config,
+        &ingest.delta,
+        repair,
+        |event| {
+            embed.update(embedding_progress_detail(event));
+        },
+    )?;
     embed.finish(embedding_phase_detail(&embeddings));
 
     Ok(UpdateOutput {
@@ -1414,16 +1422,31 @@ fn refresh_embeddings_after_update(
     delta: &crate::storage::ImportDelta,
     repair: bool,
 ) -> Result<search::EmbeddingRefresh> {
+    refresh_embeddings_after_update_with_progress(store, config, delta, repair, |_| {})
+}
+
+fn refresh_embeddings_after_update_with_progress(
+    store: &Store,
+    config: &AppConfig,
+    delta: &crate::storage::ImportDelta,
+    repair: bool,
+    progress: impl FnMut(&search::EmbeddingProgress),
+) -> Result<search::EmbeddingRefresh> {
     if repair {
-        let (embedder, degraded_reason) = load_embedder(config);
-        search::refresh_embeddings(
+        search::refresh_embeddings_repair_with_progress(
             store,
             &config.machine_id,
-            embedder.as_deref(),
-            degraded_reason,
+            &config.embedder,
+            progress,
         )
     } else {
-        search::refresh_embeddings_incremental(store, &config.machine_id, &config.embedder, delta)
+        search::refresh_embeddings_incremental_with_progress(
+            store,
+            &config.machine_id,
+            &config.embedder,
+            delta,
+            progress,
+        )
     }
 }
 
@@ -1564,16 +1587,27 @@ fn print_search_summary(indexed_events: usize, color: bool) {
 }
 
 fn print_embedding_summary(embeddings: &search::EmbeddingRefresh, color: bool) {
-    let mode = embeddings
-        .degraded_reason
-        .as_deref()
-        .map(|reason| format!("degraded ({reason})"))
-        .unwrap_or_else(|| "ready".to_string());
+    let mode = if let Some(reason) = embeddings.deferred_reason.as_deref() {
+        format!("deferred ({reason})")
+    } else {
+        embeddings
+            .degraded_reason
+            .as_deref()
+            .map(|reason| format!("degraded ({reason})"))
+            .unwrap_or_else(|| "ready".to_string())
+    };
+    let reductions = if embeddings.batch_size_reductions == 0 {
+        "none".to_string()
+    } else {
+        format_count(embeddings.batch_size_reductions)
+    };
     print_section(
         "Embeddings",
         &[
             ("New embeddings", format_count(embeddings.embedded)),
             ("Indexed vectors", format_count(embeddings.vectors_indexed)),
+            ("Pending", format_count(embeddings.pending)),
+            ("Batch reductions", reductions),
             ("Mode", mode),
         ],
         color,
@@ -1590,14 +1624,66 @@ fn print_section(title: &str, rows: &[(&str, String)], color: bool) {
 }
 
 fn embedding_phase_detail(embeddings: &search::EmbeddingRefresh) -> String {
-    if let Some(reason) = &embeddings.degraded_reason {
-        format!("degraded: {reason}")
-    } else {
+    if let Some(reason) = &embeddings.deferred_reason {
         format!(
+            "deferred: {reason}; {} pending, {} new embeddings",
+            format_count(embeddings.pending),
+            format_count(embeddings.embedded)
+        )
+    } else if let Some(reason) = &embeddings.degraded_reason {
+        if embeddings.pending > 0 {
+            format!(
+                "degraded: {reason}; {} pending",
+                format_count(embeddings.pending)
+            )
+        } else {
+            format!("degraded: {reason}")
+        }
+    } else {
+        let detail = format!(
             "{} new embeddings, {} vectors indexed",
             format_count(embeddings.embedded),
             format_count(embeddings.vectors_indexed)
-        )
+        );
+        if embeddings.batch_size_reductions > 0 {
+            format!(
+                "{detail}, batch reduced {} times",
+                format_count(embeddings.batch_size_reductions)
+            )
+        } else {
+            detail
+        }
+    }
+}
+
+fn embedding_progress_detail(event: &search::EmbeddingProgress) -> String {
+    match event {
+        search::EmbeddingProgress::LoadingModel { model_id } => {
+            format!("loading model {model_id}")
+        }
+        search::EmbeddingProgress::Batch {
+            embedded,
+            pending,
+            batch_size,
+            reductions,
+            available_gib,
+        } => {
+            let memory = available_gib
+                .map(|value| format!(", {value:.1} GiB available"))
+                .unwrap_or_default();
+            format!(
+                "{} embedded, {} pending, batch {}{}{}",
+                format_count(*embedded),
+                format_count(*pending),
+                format_count(*batch_size),
+                if *reductions > 0 { ", reduced" } else { "" },
+                memory
+            )
+        }
+        search::EmbeddingProgress::Deferred { pending, reason } => format!(
+            "deferred {pending} pending embeddings: {reason}",
+            pending = format_count(*pending)
+        ),
     }
 }
 
@@ -3122,12 +3208,13 @@ async fn run_daemon(
         let projected = search::refresh_incremental(store, &stats.delta)?;
         index.finish(format!("{} events indexed", format_count(projected)));
 
-        let embed = progress.phase("Updating embeddings");
-        let embeddings = search::refresh_embeddings_incremental(
+        let mut embed = progress.phase("Updating embeddings");
+        let embeddings = search::refresh_embeddings_incremental_with_progress(
             store,
             machine_id,
             &embedder_config,
             &stats.delta,
+            |event| embed.update(embedding_progress_detail(event)),
         )?;
         embed.finish(embedding_phase_detail(&embeddings));
 
