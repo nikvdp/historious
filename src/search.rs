@@ -134,12 +134,17 @@ pub fn refresh(store: &Store) -> Result<usize> {
 }
 
 pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
-    store.refresh_search_index_for_events(
+    let indexed = store.refresh_search_index_for_events(
         crate::embed::HashEmbedder::MODEL_ID,
         crate::embed::HashEmbedder::DIMS,
         &delta.inserted_events,
         crate::embed::hash_embed,
-    )
+    )?;
+    if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
+        refresh(store)
+    } else {
+        Ok(indexed)
+    }
 }
 
 pub fn refresh_embeddings(
@@ -213,8 +218,7 @@ pub fn refresh_embeddings_incremental(
     let mut vector_embedding_ids = delta.inserted_embeddings.clone();
     let Some(model_id) = status.model_id.as_deref() else {
         return Ok(EmbeddingRefresh {
-            vectors_indexed: store
-                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
             degraded_reason: status.degraded_reason,
             ..EmbeddingRefresh::default()
         });
@@ -222,8 +226,7 @@ pub fn refresh_embeddings_incremental(
 
     if !status.semantic {
         return Ok(EmbeddingRefresh {
-            vectors_indexed: store
-                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
             degraded_reason: status.degraded_reason.or_else(|| {
                 Some("embedder is not semantic; skipping durable embeddings".to_string())
             }),
@@ -238,9 +241,16 @@ pub fn refresh_embeddings_incremental(
         EMBEDDING_BATCH_SIZE,
     )?;
     if first_units.is_empty() {
+        if store.search_units_need_embedding(model_id)? {
+            return refresh_embeddings_incremental_repair(
+                store,
+                machine_id,
+                embedder_config,
+                status.degraded_reason,
+            );
+        }
         return Ok(EmbeddingRefresh {
-            vectors_indexed: store
-                .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+            vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
             degraded_reason: status.degraded_reason,
             ..EmbeddingRefresh::default()
         });
@@ -301,11 +311,48 @@ pub fn refresh_embeddings_incremental(
         }
     }
 
+    if store.search_units_need_embedding(model_id)? {
+        return refresh_embeddings(
+            store,
+            machine_id,
+            Some(embedder.as_ref()),
+            status.degraded_reason,
+        );
+    }
+
     Ok(EmbeddingRefresh {
         embedded,
-        vectors_indexed: store.refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
+        vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
         degraded_reason: status.degraded_reason,
     })
+}
+
+fn refresh_vector_projection_incremental(store: &Store, embedding_ids: &[String]) -> Result<usize> {
+    let indexed = store.refresh_vector_projection_for_embeddings(embedding_ids)?;
+    if store.vector_projection_needs_repair()? {
+        store.refresh_vector_projection()
+    } else {
+        Ok(indexed)
+    }
+}
+
+fn refresh_embeddings_incremental_repair(
+    store: &Store,
+    machine_id: &str,
+    embedder_config: &EmbedderConfig,
+    degraded_reason: Option<String>,
+) -> Result<EmbeddingRefresh> {
+    let embedder = embedder_config.load()?;
+    if !embedder.is_semantic() {
+        return Ok(EmbeddingRefresh {
+            vectors_indexed: store.refresh_vector_projection()?,
+            degraded_reason: Some(
+                "embedder is not semantic; skipping durable embeddings".to_string(),
+            ),
+            ..EmbeddingRefresh::default()
+        });
+    }
+    refresh_embeddings(store, machine_id, Some(embedder.as_ref()), degraded_reason)
 }
 
 fn embedding_input(text: &str) -> String {
