@@ -2729,7 +2729,15 @@ mod tests {
         store.refresh_vector_projection().expect("refresh vectors");
 
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(0), 5, None, None)
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(0),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("vector search");
 
         assert_eq!(hits.len(), 1);
@@ -2760,7 +2768,15 @@ mod tests {
             1
         );
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(2), 5, None, None)
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(2),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);

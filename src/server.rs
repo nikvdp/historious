@@ -347,6 +347,7 @@ mod tests {
             match_type: search::MatchType::Hybrid,
             event_id: "sc_1234567890abcdef".to_string(),
             session_id: "session_1".to_string(),
+            machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
             score: 0.25,
             lexical_rank: Some(1),
@@ -360,7 +361,7 @@ mod tests {
         let row = server_fzf_row(&result, Some("ab3f"));
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 9);
+        assert_eq!(fields.len(), 10);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
@@ -369,5 +370,6 @@ mod tests {
         assert_eq!(fields[6], "sc_1234567890abcdef");
         assert_eq!(fields[7], "Planning Session");
         assert_eq!(fields[8], "/tmp/workspace");
+        assert_eq!(fields[9], "machine_devbox_123");
     }
 }

@@ -1196,7 +1196,15 @@ mod tests {
         assert_eq!(refresh.degraded_reason, None);
         assert_eq!(store.stats().expect("stats").embeddings, 1);
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(13), 5, None, None)
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(13),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("vector search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].unit_id, unit.id);
@@ -1264,7 +1272,15 @@ mod tests {
             refresh_embeddings_incremental(&store, "machine_fixture", &config, &stats.delta)
                 .expect("refresh embeddings");
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(17), 5, None, None)
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(17),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("vector search");
 
         assert_eq!(refresh.embedded, 0);
@@ -1302,7 +1318,15 @@ mod tests {
         )
         .expect("refresh embeddings");
         let hits = store
-            .vector_search("fixture-semantic-384", &unit_vector(23), 5, None, None)
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(23),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("vector search");
 
         assert_eq!(refresh.embedded, 0);
@@ -1524,6 +1548,89 @@ mod tests {
     }
 
     #[test]
+    fn lexical_search_filters_by_machine_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let target_id = import_event_at_machine(
+            &store,
+            "shared machine filter target",
+            None,
+            "machine_devbox_111",
+        )
+        .0;
+        import_event_at_machine(
+            &store,
+            "shared machine filter other",
+            None,
+            "machine_laptop_222",
+        );
+        refresh(&store).expect("refresh search");
+
+        let response = search(
+            &store,
+            "shared machine filter",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Lexical)
+                .with_machine_filter(Some("machine_devbox_111".to_string()), None),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, target_id);
+        assert_eq!(response.results[0].machine_id, "machine_devbox_111");
+    }
+
+    #[test]
+    fn semantic_search_filters_by_hostname_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let target = import_event_and_project_at_machine(
+            &store,
+            "shared semantic machine target",
+            None,
+            "machine_dev_box_111",
+        );
+        let other = import_event_and_project_at_machine(
+            &store,
+            "shared semantic machine other",
+            None,
+            "machine_other_222",
+        );
+        for unit in [&target, &other] {
+            store
+                .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                    unit,
+                    unit_vector(31),
+                )))
+                .expect("embedding");
+        }
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(31),
+        };
+
+        let response = search(
+            &store,
+            "conceptual neighbor",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Semantic)
+                .with_machine_filter(None, Some("Dev-Box".to_string())),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, target.event_id);
+        assert_eq!(response.results[0].machine_id, "machine_dev_box_111");
+    }
+
+    #[test]
     fn semantic_search_honors_time_window() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -1586,7 +1693,17 @@ mod tests {
         search_text: &str,
         occurred_at: Option<DateTime<Utc>>,
     ) -> SearchUnitRecord {
-        let (event_id, delta) = import_event_at(store, search_text, occurred_at);
+        import_event_and_project_at_machine(store, search_text, occurred_at, "machine_fixture")
+    }
+
+    fn import_event_and_project_at_machine(
+        store: &Store,
+        search_text: &str,
+        occurred_at: Option<DateTime<Utc>>,
+        machine_id: &str,
+    ) -> SearchUnitRecord {
+        let (event_id, delta) =
+            import_event_at_machine(store, search_text, occurred_at, machine_id);
         refresh_incremental(store, &delta).expect("refresh projection");
 
         let text_hash = crate::archive::blake3_hex(search_text.as_bytes());
@@ -1596,7 +1713,7 @@ mod tests {
             event_id,
             session_id: stable_id(&["session", search_text]),
             source_id: stable_id(&["source", search_text]),
-            machine_id: "machine_fixture".to_string(),
+            machine_id: machine_id.to_string(),
             source_kind: "fixture".to_string(),
             role: Some("assistant".to_string()),
             search_kind: "assistant".to_string(),
@@ -1676,6 +1793,15 @@ mod tests {
         search_text: &str,
         occurred_at: Option<DateTime<Utc>>,
     ) -> (String, ImportDelta) {
+        import_event_at_machine(store, search_text, occurred_at, "machine_fixture")
+    }
+
+    fn import_event_at_machine(
+        store: &Store,
+        search_text: &str,
+        occurred_at: Option<DateTime<Utc>>,
+        machine_id: &str,
+    ) -> (String, ImportDelta) {
         let source = SourceRecord {
             id: stable_id(&["source", search_text]),
             kind: "fixture".to_string(),
@@ -1688,7 +1814,7 @@ mod tests {
         let session = SessionRecord {
             id: stable_id(&["session", search_text]),
             source_id: source.id.clone(),
-            machine_id: "machine_fixture".to_string(),
+            machine_id: machine_id.to_string(),
             source_kind: "fixture".to_string(),
             external_id: search_text.to_string(),
             title: None,
@@ -1704,7 +1830,7 @@ mod tests {
             id: event_id.clone(),
             session_id: session.id.clone(),
             source_id: source.id.clone(),
-            machine_id: "machine_fixture".to_string(),
+            machine_id: machine_id.to_string(),
             source_kind: "fixture".to_string(),
             ordinal: 0,
             event_type: "assistant".to_string(),
@@ -1799,6 +1925,7 @@ mod tests {
         SearchRow {
             event_id: event_id.to_string(),
             session_id: "session".to_string(),
+            machine_id: "machine_fixture".to_string(),
             source_kind: "fixture".to_string(),
             content: event_id.to_string(),
             occurred_at: Some(occurred_at),
