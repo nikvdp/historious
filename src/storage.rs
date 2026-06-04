@@ -102,6 +102,7 @@ pub struct EventForProjection {
 pub struct SearchRow {
     pub event_id: String,
     pub session_id: String,
+    pub machine_id: String,
     pub source_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -122,6 +123,7 @@ pub struct VectorSearchRow {
     pub event_id: String,
     pub unit_id: String,
     pub session_id: String,
+    pub machine_id: String,
     pub source_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -972,6 +974,8 @@ impl Store {
         limit: usize,
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
+        machine_id: Option<&str>,
+        machine_id_prefix: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query(query);
         if fts_query.is_empty() {
@@ -983,6 +987,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT events_fts.event_id,
                         events_fts.session_id,
+                        e.machine_id,
                         events_fts.source_kind,
                         snippet(events_fts, 3, '', '', '...', 24),
                         e.occurred_at,
@@ -994,23 +999,36 @@ impl Store {
                  WHERE events_fts MATCH ?1
                    AND (?2 IS NULL OR e.occurred_at >= ?2)
                    AND (?3 IS NULL OR e.occurred_at < ?3)
+                   AND (?4 IS NULL OR e.machine_id = ?4)
+                   AND (?5 IS NULL OR substr(e.machine_id, 1, length(?5)) = ?5)
                  ORDER BY bm25(events_fts)
-                 LIMIT ?4",
+                 LIMIT ?6",
             )?;
-            let rows = stmt.query_map(params![fts_query, after, before, limit as i64], |row| {
-                Ok(SearchRow {
-                    event_id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    source_kind: row.get(2)?,
-                    content: row.get(3)?,
-                    occurred_at: parse_opt_dt(row.get(4)?),
-                    session_title: row.get(5)?,
-                    workspace_values: session_workspace_values(&parse_metadata_json(
-                        row.get::<_, Option<String>>(6)?,
-                    )),
-                    rank: 0,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    fts_query,
+                    after,
+                    before,
+                    machine_id,
+                    machine_id_prefix,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(SearchRow {
+                        event_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        machine_id: row.get(2)?,
+                        source_kind: row.get(3)?,
+                        content: row.get(4)?,
+                        occurred_at: parse_opt_dt(row.get(5)?),
+                        session_title: row.get(6)?,
+                        workspace_values: session_workspace_values(&parse_metadata_json(
+                            row.get::<_, Option<String>>(7)?,
+                        )),
+                        rank: 0,
+                    })
+                },
+            )?;
             let mut out = Vec::new();
             for (idx, row) in rows.enumerate() {
                 let mut row = row?;
@@ -1388,6 +1406,8 @@ impl Store {
         limit: usize,
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
+        machine_id: Option<&str>,
+        machine_id_prefix: Option<&str>,
     ) -> Result<Vec<VectorSearchRow>> {
         if query_vector.len() != 384 {
             return Ok(Vec::new());
@@ -1399,6 +1419,7 @@ impl Store {
                 "SELECT su.event_id,
                         e.unit_id,
                         su.session_id,
+                        su.machine_id,
                         su.source_kind,
                         su.text,
                         su.occurred_at,
@@ -1414,6 +1435,8 @@ impl Store {
                    AND e.model_id = ?3
                    AND (?4 IS NULL OR su.occurred_at >= ?4)
                    AND (?5 IS NULL OR su.occurred_at < ?5)
+                   AND (?6 IS NULL OR su.machine_id = ?6)
+                   AND (?7 IS NULL OR substr(su.machine_id, 1, length(?7)) = ?7)
                  ORDER BY vec_embeddings_384.distance",
             )?;
             let rows = stmt.query_map(
@@ -1422,21 +1445,24 @@ impl Store {
                     limit as i64,
                     model_id,
                     after,
-                    before
+                    before,
+                    machine_id,
+                    machine_id_prefix
                 ],
                 |row| {
                     Ok(VectorSearchRow {
                         event_id: row.get(0)?,
                         unit_id: row.get(1)?,
                         session_id: row.get(2)?,
-                        source_kind: row.get(3)?,
-                        content: row.get(4)?,
-                        occurred_at: parse_opt_dt(row.get(5)?),
-                        session_title: row.get(6)?,
+                        machine_id: row.get(3)?,
+                        source_kind: row.get(4)?,
+                        content: row.get(5)?,
+                        occurred_at: parse_opt_dt(row.get(6)?),
+                        session_title: row.get(7)?,
                         workspace_values: session_workspace_values(&parse_metadata_json(
-                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
                         )),
-                        distance: row.get(8)?,
+                        distance: row.get(9)?,
                         rank: 0,
                     })
                 },

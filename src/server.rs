@@ -87,6 +87,8 @@ struct SearchParams {
     recency_bias: Option<f64>,
     after: Option<String>,
     before: Option<String>,
+    machine: Option<String>,
+    hostname: Option<String>,
     format: Option<String>,
 }
 
@@ -106,6 +108,8 @@ struct ServerSearchOptions {
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    machine: Option<String>,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +117,7 @@ struct ServerSearchResult {
     match_type: search::MatchType,
     event_id: String,
     session_id: String,
+    machine_id: String,
     source_kind: String,
     score: f64,
     lexical_rank: Option<usize>,
@@ -140,7 +145,8 @@ async fn search_endpoint(
     let before = parse_rfc3339_opt(params.before.as_deref(), "before")?;
     let options = search::SearchOptions::new(limit, sort, recency_bias)
         .with_mode(mode)
-        .with_time_window(after, before);
+        .with_time_window(after, before)
+        .with_machine_filter(params.machine.clone(), params.hostname.clone());
     let response = search::search(
         &state.store,
         &query,
@@ -167,6 +173,8 @@ async fn search_endpoint(
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after,
             before,
+            machine: params.machine,
+            hostname: params.hostname,
         },
         degraded_reason: response.degraded_reason,
         results: response
@@ -207,6 +215,7 @@ impl From<search::SearchResult> for ServerSearchResult {
             match_type: result.match_type,
             event_id: result.event_id,
             session_id: result.session_id,
+            machine_id: result.machine_id,
             source_kind: result.source_kind,
             score: result.score,
             lexical_rank: result.lexical_rank,
@@ -298,6 +307,7 @@ fn server_fzf_row(result: &search::SearchResult, ref_id: Option<&str>) -> String
         clean_fzf_field(&result.event_id),
         clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
         clean_fzf_field(&result.workspace_values.join(" ")),
+        clean_fzf_field(&result.machine_id),
     ]
     .join("\t")
 }
