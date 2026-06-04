@@ -3412,6 +3412,7 @@ mod tests {
             match_type: search::MatchType::Hybrid,
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
+            machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
             score: 0.5,
             lexical_rank: Some(1),
@@ -3425,7 +3426,7 @@ mod tests {
         let row = fzf_row(&result, Some("ab3f"), false);
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 9);
+        assert_eq!(fields.len(), 10);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
@@ -3434,6 +3435,7 @@ mod tests {
         assert_eq!(fields[6], "event_1");
         assert_eq!(fields[7], "Planning Session");
         assert_eq!(fields[8], "/home/example/projects/super-cass");
+        assert_eq!(fields[9], "machine_devbox_123");
     }
 
     #[test]
@@ -3446,7 +3448,7 @@ mod tests {
 
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--nth", "1,2,3,4,5,8,9"]));
+            .any(|pair| pair == ["--nth", "1,2,3,4,5,8,9,10"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--with-nth", "1,2,3,4,5"]));
@@ -3458,6 +3460,7 @@ mod tests {
             match_type: search::MatchType::Hybrid,
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
+            machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
             score: 0.5,
             lexical_rank: Some(1),
@@ -3480,6 +3483,8 @@ mod tests {
             0.25,
             None,
             None,
+            Some("machine_devbox_123".to_string()),
+            Some("devbox".to_string()),
             &response,
             &["ab3f".to_string()],
         );
@@ -3491,8 +3496,11 @@ mod tests {
         assert_eq!(value["options"]["mode"], "semantic");
         assert_eq!(value["options"]["after"], serde_json::Value::Null);
         assert_eq!(value["options"]["before"], serde_json::Value::Null);
+        assert_eq!(value["options"]["machine"], "machine_devbox_123");
+        assert_eq!(value["options"]["hostname"], "devbox");
         assert_eq!(value["results"][0]["ref"], "ab3f");
         assert_eq!(value["results"][0]["event_id"], "event_1");
+        assert_eq!(value["results"][0]["machine_id"], "machine_devbox_123");
         assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
         assert_eq!(
             value["next_commands"][1],
@@ -3608,6 +3616,8 @@ mod tests {
             0.25,
             Some(after),
             None,
+            Some("machine_devbox_123"),
+            Some("devbox"),
         )
         .expect("reload command");
 
@@ -3616,6 +3626,8 @@ mod tests {
         assert!(command.contains("mode=lexical"));
         assert!(command.contains("recency_bias=0.25"));
         assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
+        assert!(command.contains("machine=machine_devbox_123"));
+        assert!(command.contains("hostname=devbox"));
     }
 
     #[test]
