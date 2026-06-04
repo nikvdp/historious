@@ -119,6 +119,7 @@ struct ServerSearchResult {
     semantic_rank: Option<usize>,
     occurred_at: Option<DateTime<Utc>>,
     session_title: Option<String>,
+    workspace_values: Vec<String>,
     snippet: String,
 }
 
@@ -212,6 +213,7 @@ impl From<search::SearchResult> for ServerSearchResult {
             semantic_rank: result.semantic_rank,
             occurred_at: result.occurred_at,
             session_title: result.session_title,
+            workspace_values: result.workspace_values,
             snippet: result.snippet,
         }
     }
@@ -294,6 +296,8 @@ fn server_fzf_row(result: &search::SearchResult, ref_id: Option<&str>) -> String
         clean_fzf_field(&result.snippet),
         clean_fzf_field(&result.session_id),
         clean_fzf_field(&result.event_id),
+        clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
+        clean_fzf_field(&result.workspace_values.join(" ")),
     ]
     .join("\t")
 }
@@ -338,19 +342,22 @@ mod tests {
             lexical_rank: Some(1),
             semantic_rank: Some(2),
             occurred_at: None,
-            session_title: None,
+            session_title: Some("Planning Session".to_string()),
+            workspace_values: vec!["/tmp/workspace".to_string()],
             snippet: "line one\nline two".to_string(),
         };
 
         let row = server_fzf_row(&result, Some("ab3f"));
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 7);
+        assert_eq!(fields.len(), 9);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
         assert_eq!(fields[4], "line one line two");
         assert_eq!(fields[5], "session_1");
         assert_eq!(fields[6], "sc_1234567890abcdef");
+        assert_eq!(fields[7], "Planning Session");
+        assert_eq!(fields[8], "/tmp/workspace");
     }
 }

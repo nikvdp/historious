@@ -1200,6 +1200,7 @@ struct SearchResultOutput {
     semantic_rank: Option<usize>,
     occurred_at: Option<chrono::DateTime<chrono::Utc>>,
     session_title: Option<String>,
+    workspace_values: Vec<String>,
     snippet: String,
 }
 
@@ -1952,6 +1953,7 @@ fn search_output(
                 semantic_rank: result.semantic_rank,
                 occurred_at: result.occurred_at,
                 session_title: result.session_title.clone(),
+                workspace_values: result.workspace_values.clone(),
                 snippet: result.snippet.clone(),
             })
             .collect(),
@@ -2435,7 +2437,7 @@ fn base_fzf_command() -> ProcessCommand {
         .arg("--delimiter")
         .arg("\t")
         .arg("--nth")
-        .arg("1,2,3,4,5")
+        .arg("1,2,3,4,5,8,9")
         .arg("--with-nth")
         .arg("1,2,3,4,5");
     command
@@ -2651,6 +2653,8 @@ fn fzf_row(result: &search::SearchResult, ref_id: Option<&str>, color: bool) -> 
         clean_fzf_field(&result.snippet),
         clean_fzf_field(&result.session_id),
         clean_fzf_field(&result.event_id),
+        clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
+        clean_fzf_field(&result.workspace_values.join(" ")),
     ]
     .join("\t")
 }
@@ -3063,20 +3067,39 @@ mod tests {
             lexical_rank: Some(1),
             semantic_rank: Some(2),
             occurred_at: None,
-            session_title: None,
+            session_title: Some("Planning Session".to_string()),
+            workspace_values: vec!["/home/example/projects/super-cass".to_string()],
             snippet: "preview with\nnew line".to_string(),
         };
 
         let row = fzf_row(&result, Some("ab3f"), false);
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 7);
+        assert_eq!(fields.len(), 9);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
         assert_eq!(fields[4], "preview with new line");
         assert_eq!(fields[5], "session_1");
         assert_eq!(fields[6], "event_1");
+        assert_eq!(fields[7], "Planning Session");
+        assert_eq!(fields[8], "/home/example/projects/super-cass");
+    }
+
+    #[test]
+    fn fzf_filters_visible_and_hidden_metadata_fields() {
+        let command = base_fzf_command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--nth", "1,2,3,4,5,8,9"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--with-nth", "1,2,3,4,5"]));
     }
 
     #[test]
@@ -3091,6 +3114,7 @@ mod tests {
             semantic_rank: Some(2),
             occurred_at: None,
             session_title: Some("Session title".to_string()),
+            workspace_values: vec!["/tmp/workspace".to_string()],
             snippet: "useful snippet".to_string(),
         };
         let response = search::SearchResponse {
