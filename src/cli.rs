@@ -223,6 +223,8 @@ pub enum Command {
         before: usize,
         #[arg(long, default_value_t = 5, help = "Number of later events to show")]
         after: usize,
+        #[arg(long, value_enum, help = "When to use colored output")]
+        color: Option<ColorArg>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
@@ -254,6 +256,8 @@ pub enum Command {
         before: usize,
         #[arg(long, default_value_t = 5, help = "Number of later events to show")]
         after: usize,
+        #[arg(long, value_enum, help = "When to use colored output")]
+        color: Option<ColorArg>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
@@ -282,6 +286,8 @@ pub enum Command {
         search_unit: Option<String>,
         #[arg(long, help = "Print directly instead of opening a pager")]
         no_pager: bool,
+        #[arg(long, value_enum, help = "When to use colored output")]
+        color: Option<ColorArg>,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
@@ -457,6 +463,13 @@ pub enum SearchModeArg {
     Hybrid,
     Lexical,
     Semantic,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ColorArg {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -729,6 +742,7 @@ impl Cli {
                 search_unit,
                 before,
                 after,
+                color,
                 no_color,
                 verbose,
                 json,
@@ -739,6 +753,7 @@ impl Cli {
                 search_unit,
                 before,
                 after,
+                color,
                 no_color,
                 verbose,
                 json,
@@ -761,7 +776,7 @@ impl Cli {
                     )?;
                 } else {
                     let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
-                    let color = !no_color && !robot && std::io::stdout().is_terminal();
+                    let color = should_color(no_color, color, robot);
                     write_stdout(&crate::transcript::render_context(
                         &context, &metadata, color,
                     ))?;
@@ -772,6 +787,7 @@ impl Cli {
                 at,
                 search_unit,
                 no_pager,
+                color,
                 no_color,
                 verbose,
                 json,
@@ -808,7 +824,7 @@ impl Cli {
                         target_event.as_ref(),
                         verbose,
                     )?;
-                    let color = !no_color && !robot && std::io::stdout().is_terminal();
+                    let color = should_color(no_color, color, robot);
                     let rendered = crate::transcript::render_session(
                         &session_record,
                         &events,
@@ -1580,6 +1596,17 @@ fn styled(text: &str, code: &str, color: bool) -> String {
         format!("\x1b[{code}m{text}\x1b[0m")
     } else {
         text.to_string()
+    }
+}
+
+fn should_color(no_color: bool, color: Option<ColorArg>, robot: bool) -> bool {
+    if no_color || robot {
+        return false;
+    }
+    match color.unwrap_or(ColorArg::Auto) {
+        ColorArg::Auto => std::io::stdout().is_terminal(),
+        ColorArg::Always => true,
+        ColorArg::Never => false,
     }
 }
 
@@ -2421,7 +2448,11 @@ fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
         .map(|path| shell_quote(&path.to_string_lossy()))
         .unwrap_or_else(|| "super-cass".to_string());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let color_flag = if color { "" } else { " --no-color" };
+    let color_flag = if color {
+        " --color always"
+    } else {
+        " --no-color"
+    };
     format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}")
 }
 
@@ -2432,7 +2463,11 @@ fn fzf_open_command(config: &AppConfig, color: bool) -> String {
         .map(|path| shell_quote(&path.to_string_lossy()))
         .unwrap_or_else(|| "super-cass".to_string());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let color_flag = if color { "" } else { " --no-color" };
+    let color_flag = if color {
+        " --color auto"
+    } else {
+        " --no-color"
+    };
     format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}")
 }
 
@@ -3132,6 +3167,27 @@ mod tests {
             preview_scroll_bind("shift-down", "preview-down", 3),
             "shift-down:preview-down+preview-down+preview-down"
         );
+    }
+
+    #[test]
+    fn color_always_overrides_non_tty_output() {
+        assert!(should_color(false, Some(ColorArg::Always), false));
+        assert!(!should_color(false, Some(ColorArg::Never), false));
+        assert!(!should_color(true, Some(ColorArg::Always), false));
+        assert!(!should_color(false, Some(ColorArg::Always), true));
+    }
+
+    #[test]
+    fn fzf_preview_forces_color_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        let with_color = fzf_preview_command(&config, true);
+        let without_color = fzf_preview_command(&config, false);
+
+        assert!(with_color.contains("--color always"));
+        assert!(!with_color.contains("--no-color"));
+        assert!(without_color.contains("--no-color"));
     }
 
     #[test]
