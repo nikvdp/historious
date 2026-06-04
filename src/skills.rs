@@ -144,10 +144,10 @@ ssh gpu-box 'super-cass export --jsonl [filters]' \
   | super-cass import --jsonl --json -
 ```
 
-Use `--no-embeddings` only when bandwidth or storage matters:
+Use `--embeddings omit` only when bandwidth or storage matters:
 
 ```bash
-super-cass export --jsonl --no-embeddings [filters] \
+super-cass export --jsonl --embeddings omit [filters] \
   | ssh remote 'super-cass import --jsonl --json -'
 ```
 
@@ -210,7 +210,7 @@ super-cass export --jsonl [filters] \
   | ssh remote 'super-cass import --jsonl --json -'
 
 # Omit embeddings only when bandwidth or storage is constrained.
-super-cass export --jsonl --no-embeddings [filters] \
+super-cass export --jsonl --embeddings omit [filters] \
   | ssh remote 'super-cass import --jsonl --json -'
 
 # Round-trip through an embedding-capable box.
@@ -225,6 +225,7 @@ Exchange rules:
 
 - Export includes existing embeddings by default.
 - Import stores transferred embeddings and refreshes the local vector index.
+- Use `--embeddings omit` only for bandwidth or storage constrained exchanges.
 - Use an embedding-capable machine by piping history to it, then exporting back from it.
 - Do not include `super-cass update` in exchange flows; local log scanning is separate.
 

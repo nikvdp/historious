@@ -299,7 +299,14 @@ pub enum Command {
     Export {
         #[arg(long, help = "Write newline-delimited JSON records")]
         jsonl: bool,
-        #[arg(long, help = "Omit embedding records from the JSONL history stream")]
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = EmbeddingExportMode::Include,
+            help = "Whether to include embedding records in JSONL exports"
+        )]
+        embeddings: EmbeddingExportMode,
+        #[arg(long, help = "Alias for --embeddings omit")]
         no_embeddings: bool,
         #[arg(
             long,
@@ -476,6 +483,12 @@ pub enum ColorArg {
 pub enum RawArtifactExportMode {
     Inline,
     Metadata,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum EmbeddingExportMode {
+    Include,
+    Omit,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -837,6 +850,7 @@ impl Cli {
             }
             Command::Export {
                 jsonl,
+                embeddings,
                 no_embeddings,
                 raw_artifacts,
                 source,
@@ -859,7 +873,10 @@ impl Cli {
                         &store,
                         &filter,
                         transport::ExportOptions {
-                            include_embeddings: !no_embeddings,
+                            include_embeddings: include_embedding_records(
+                                embeddings,
+                                no_embeddings,
+                            ),
                             include_raw_artifact_content: matches!(
                                 raw_artifacts,
                                 RawArtifactExportMode::Inline
@@ -1609,6 +1626,10 @@ fn should_color(no_color: bool, color: Option<ColorArg>, robot: bool) -> bool {
         ColorArg::Always => true,
         ColorArg::Never => false,
     }
+}
+
+fn include_embedding_records(mode: EmbeddingExportMode, no_embeddings: bool) -> bool {
+    !no_embeddings && matches!(mode, EmbeddingExportMode::Include)
 }
 
 struct ProgressUi {
@@ -3199,6 +3220,19 @@ mod tests {
         assert!(!should_color(false, Some(ColorArg::Never), false));
         assert!(!should_color(true, Some(ColorArg::Always), false));
         assert!(!should_color(false, Some(ColorArg::Always), true));
+    }
+
+    #[test]
+    fn embedding_export_mode_defaults_include_and_can_omit() {
+        assert!(include_embedding_records(
+            EmbeddingExportMode::Include,
+            false
+        ));
+        assert!(!include_embedding_records(EmbeddingExportMode::Omit, false));
+        assert!(!include_embedding_records(
+            EmbeddingExportMode::Include,
+            true
+        ));
     }
 
     #[test]
