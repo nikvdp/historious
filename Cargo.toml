@@ -14,6 +14,7 @@ base64 = "0.22"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
 directories = "5.0"
 fastembed = { version = "5.15.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 hex = "0.4"
