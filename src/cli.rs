@@ -1400,12 +1400,15 @@ fn run_update_once_human(
         format_count(ingest.errors)
     ));
 
-    let index = progress.phase(if repair {
+    let mut index = progress.phase(if repair {
         "Repairing search index"
     } else {
         "Updating search index"
     });
-    let projected = refresh_search_after_update(store, &ingest.delta, repair)?;
+    let projected =
+        refresh_search_after_update_with_progress(store, &ingest.delta, repair, |detail| {
+            index.update(detail);
+        })?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let mut embed = progress.phase(if repair {
@@ -1438,10 +1441,55 @@ fn refresh_search_after_update(
     delta: &crate::storage::ImportDelta,
     repair: bool,
 ) -> Result<usize> {
+    refresh_search_after_update_with_progress(store, delta, repair, |_| {})
+}
+
+fn refresh_search_after_update_with_progress(
+    store: &Store,
+    delta: &crate::storage::ImportDelta,
+    repair: bool,
+    mut progress: impl FnMut(String),
+) -> Result<usize> {
     if repair {
+        progress("repairing all indexable events".to_string());
         search::refresh(store)
     } else {
-        search::refresh_incremental(store, delta)
+        progress(format!(
+            "indexing {} new events",
+            format_count(delta.inserted_events.len())
+        ));
+        let mut last_index_progress = Instant::now();
+        let mut last_index_report: Option<(usize, usize)> = None;
+        let indexed = store.refresh_search_index_for_events_with_progress(
+            crate::embed::HashEmbedder::MODEL_ID,
+            crate::embed::HashEmbedder::DIMS,
+            &delta.inserted_events,
+            crate::embed::hash_embed,
+            |processed, total| {
+                if processed == 1
+                    || processed == total
+                    || last_index_progress.elapsed() >= Duration::from_secs(1)
+                {
+                    let report = (processed, total);
+                    if last_index_report != Some(report) {
+                        progress(format!(
+                            "indexed {}/{} new events",
+                            format_count(processed),
+                            format_count(total)
+                        ));
+                        last_index_progress = Instant::now();
+                        last_index_report = Some(report);
+                    }
+                }
+            },
+        )?;
+        progress("checking index health".to_string());
+        if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
+            progress("repairing missing search index rows".to_string());
+            search::refresh(store)
+        } else {
+            Ok(indexed)
+        }
     }
 }
 

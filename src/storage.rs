@@ -920,11 +920,32 @@ impl Store {
         event_ids: &[String],
         embed: impl Fn(&str) -> Vec<f32>,
     ) -> Result<usize> {
+        self.refresh_search_index_for_events_with_progress(model, dims, event_ids, embed, |_, _| {})
+    }
+
+    pub fn refresh_search_index_for_events_with_progress(
+        &self,
+        model: &str,
+        dims: usize,
+        event_ids: &[String],
+        embed: impl Fn(&str) -> Vec<f32>,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
         let event_ids = normalized_ids(event_ids);
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 if !event_ids.is_empty() {
                     prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
+                    let total_events: usize = tx.query_row(
+                        "SELECT COUNT(*)
+                         FROM events e
+                         JOIN temp_search_index_event_ids scope
+                           ON scope.id = e.id
+                         WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                           AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )? as usize;
                     let mut stmt = tx.prepare(
                         "SELECT e.id,
                             e.session_id,
@@ -957,8 +978,14 @@ impl Store {
                             occurred_at: parse_opt_dt(row.get(8)?),
                         })
                     })?;
+                    let mut projected_events = 0;
                     for row in rows {
                         insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                        projected_events += 1;
+                        progress(projected_events, total_events);
+                    }
+                    if total_events > 0 {
+                        progress(projected_events, total_events);
                     }
                     drop(stmt);
                 }
@@ -2298,14 +2325,8 @@ fn insert_search_index_rows(
         }),
         hash: unit_hash,
     };
-    insert_search_unit(conn, &unit)?;
-
-    let fts_exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events_fts WHERE event_id = ?1)",
-        params![event.id],
-        |row| row.get(0),
-    )?;
-    if fts_exists == 0 {
+    let inserted_unit = insert_search_unit(conn, &unit)?;
+    if inserted_unit {
         conn.execute(
             "INSERT INTO events_fts (event_id, session_id, source_kind, content)
              VALUES (?1, ?2, ?3, ?4)",
@@ -2384,29 +2405,37 @@ fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
 }
 
 fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1
-           FROM events e
-           LEFT JOIN search_units su
-             ON su.event_id = e.id
-           LEFT JOIN events_fts fts
-             ON fts.event_id = e.id
-           LEFT JOIN event_embeddings emb
-             ON emb.event_id = e.id AND emb.model = ?1
-           WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
-             AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-             AND (
-               su.event_id IS NULL
-               OR fts.event_id IS NULL
-               OR emb.event_id IS NULL
-             )
-           LIMIT 1
-         )",
+    let search_units: i64 =
+        conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
+    let fts_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
+    let embeddings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM event_embeddings WHERE model = ?1",
         params![model],
         |row| row.get(0),
     )?;
-    Ok(exists != 0)
+
+    if search_units > 0 && search_units == fts_events && search_units == embeddings {
+        return Ok(false);
+    }
+    if fts_events < search_units || embeddings < search_units {
+        return Ok(true);
+    }
+
+    let indexable = indexable_event_count(conn)?;
+    Ok(search_units < indexable || fts_events < indexable || embeddings < indexable)
+}
+
+fn indexable_event_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM events
+         WHERE json_extract(metadata_json, '$.search_indexable') = 1
+           AND length(trim(json_extract(metadata_json, '$.search_text'))) > 0",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool> {
