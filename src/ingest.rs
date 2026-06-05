@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
@@ -100,6 +101,11 @@ struct SearchProjection {
     skip_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct NativeTitleIndex {
+    titles: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceIdentity {
     workspace_path: String,
@@ -190,6 +196,7 @@ pub fn update_local_with_progress(
         selected_files: candidates.len(),
     });
 
+    let native_titles = NativeTitleIndex::load();
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
     for (idx, candidate) in candidates.into_iter().enumerate() {
@@ -245,7 +252,7 @@ pub fn update_local_with_progress(
             });
             continue;
         }
-        match ingest_file(store, machine_id, kind, &path) {
+        match ingest_file(store, machine_id, kind, &path, &native_titles) {
             Ok(delta) => {
                 stats.inserted += delta.inserted;
                 stats.duplicates += delta.duplicates;
@@ -356,7 +363,13 @@ fn discover_roots() -> Vec<SourceRoot> {
     roots
 }
 
-fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Result<ImportStats> {
+fn ingest_file(
+    store: &Store,
+    machine_id: &str,
+    kind: &str,
+    path: &Path,
+    native_titles: &NativeTitleIndex,
+) -> Result<ImportStats> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let raw_hash = blake3_hex(&bytes);
     let path_text = path.to_string_lossy().to_string();
@@ -390,11 +403,7 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
         .find_map(|line| line.external_session_id.clone())
         .unwrap_or_else(|| file_stem(path));
     let session_id = stable_id(&["session", kind, &path_text, &external_session_id]);
-    let title = lines
-        .iter()
-        .find(|line| line.role.as_deref() == Some("user") && !line.content.trim().is_empty())
-        .or_else(|| lines.iter().find(|line| !line.content.trim().is_empty()))
-        .map(|line| snippet(&line.content, 100));
+    let title = session_title(kind, &external_session_id, &lines, native_titles);
     let workspace = session_workspace(kind, path, &lines);
     let session_hash = stable_hash(&(kind, &source_id, &external_session_id, &path_text))?;
     records.push(ArchiveRecord::Session(SessionRecord {
@@ -451,6 +460,126 @@ fn ingest_file(store: &Store, machine_id: &str, kind: &str, path: &Path) -> Resu
         }));
     }
     store.import_records(&records)
+}
+
+impl NativeTitleIndex {
+    fn load() -> Self {
+        let mut index = Self::default();
+        let Some(home) = home_dir() else {
+            return index;
+        };
+        index.load_jsonl_titles(
+            &home.join(".codex/session_index.jsonl"),
+            "codex",
+            &["id"],
+            &["thread_name"],
+        );
+        index.load_jsonl_titles(
+            &home.join(".claude/history.jsonl"),
+            "claude_code",
+            &["sessionId"],
+            &["display"],
+        );
+        index
+    }
+
+    fn insert(&mut self, kind: &str, external_session_id: &str, title: &str) {
+        let title = normalize_title(title);
+        if title.is_empty() {
+            return;
+        }
+        self.titles
+            .insert(native_title_key(kind, external_session_id), title);
+    }
+
+    fn get(&self, kind: &str, external_session_id: &str) -> Option<String> {
+        self.titles
+            .get(&native_title_key(kind, external_session_id))
+            .cloned()
+    }
+
+    fn load_jsonl_titles(
+        &mut self,
+        path: &Path,
+        kind: &str,
+        id_path: &[&str],
+        title_path: &[&str],
+    ) {
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
+        };
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(id) = string_at(&value, id_path) else {
+                continue;
+            };
+            let Some(title) = string_at(&value, title_path) else {
+                continue;
+            };
+            self.insert(kind, &id, &title);
+        }
+    }
+}
+
+fn native_title_key(kind: &str, external_session_id: &str) -> String {
+    format!("{kind}\0{external_session_id}")
+}
+
+fn session_title(
+    kind: &str,
+    external_session_id: &str,
+    lines: &[ParsedLine],
+    native_titles: &NativeTitleIndex,
+) -> Option<String> {
+    native_titles
+        .get(kind, external_session_id)
+        .or_else(|| fallback_session_title(lines))
+}
+
+fn fallback_session_title(lines: &[ParsedLine]) -> Option<String> {
+    lines
+        .iter()
+        .find(|line| is_human_line(line) && title_candidate(&line.content).is_some())
+        .or_else(|| {
+            lines.iter().find(|line| {
+                !is_bootstrap_content(&line.content) && title_candidate(&line.content).is_some()
+            })
+        })
+        .and_then(|line| title_candidate(&line.content))
+}
+
+fn is_human_line(line: &ParsedLine) -> bool {
+    line.role.as_deref() == Some("user") || line.event_type == "user"
+}
+
+fn title_candidate(content: &str) -> Option<String> {
+    if is_bootstrap_content(content) {
+        return None;
+    }
+    let title = normalize_title(content);
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.chars().take(100).collect())
+    }
+}
+
+fn normalize_title(content: &str) -> String {
+    let first_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    first_line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_bootstrap_content(content: &str) -> bool {
+    let content = content.trim_start();
+    content.starts_with("# AGENTS.md instructions for ")
+        || content.starts_with("<INSTRUCTIONS>")
+        || content.starts_with("<environment_context>")
 }
 
 fn session_metadata(path_text: &str, workspace: Option<&WorkspaceIdentity>) -> Value {
@@ -997,11 +1126,6 @@ fn is_hidden_noise(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn snippet(input: &str, max_chars: usize) -> String {
-    let input = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    input.chars().take(max_chars).collect()
-}
-
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -1138,6 +1262,60 @@ mod tests {
     }
 
     #[test]
+    fn session_title_prefers_native_title() {
+        let mut native_titles = NativeTitleIndex::default();
+        native_titles.insert("codex", "session-1", "Native Codex Title");
+        let lines = vec![parsed_line(
+            0,
+            json!({
+                "session_id": "session-1",
+                "type": "message",
+                "role": "user",
+                "content": "fallback user request"
+            }),
+            0,
+            1,
+        )];
+
+        assert_eq!(
+            session_title("codex", "session-1", &lines, &native_titles).as_deref(),
+            Some("Native Codex Title")
+        );
+    }
+
+    #[test]
+    fn fallback_session_title_skips_bootstrap_content() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "session_id": "session-1",
+                    "type": "user",
+                    "content": "# AGENTS.md instructions for /tmp/repo\n<INSTRUCTIONS>..."
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "session_id": "session-1",
+                    "type": "user",
+                    "content": "Make thread titles recognizable\nwith more detail"
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("codex", "session-1", &lines, &native_titles).as_deref(),
+            Some("Make thread titles recognizable")
+        );
+    }
+
+    #[test]
     fn falls_back_to_claude_project_directory() {
         let source_path =
             Path::new("/home/example/.claude/projects/-home-example-workspace-project-alpha/session.jsonl");
@@ -1179,8 +1357,15 @@ mod tests {
         let log_path = temp.path().join("session.jsonl");
         fs::write(&log_path, fixture_line("session-1", "first question")).expect("write first log");
 
-        let first =
-            ingest_file(&store, "machine_fixture", "codex", &log_path).expect("first ingest");
+        let native_titles = NativeTitleIndex::default();
+        let first = ingest_file(
+            &store,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .expect("first ingest");
         let metadata = fs::metadata(&log_path).expect("first metadata");
         let current = store
             .raw_artifact_is_current(
@@ -1205,8 +1390,14 @@ mod tests {
             ),
         )
         .expect("append second log line");
-        let second =
-            ingest_file(&store, "machine_fixture", "codex", &log_path).expect("second ingest");
+        let second = ingest_file(
+            &store,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .expect("second ingest");
         let stats = store.stats().expect("stats");
 
         assert_eq!(second.inserted, 2);

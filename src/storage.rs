@@ -2214,9 +2214,28 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
         ],
     )?;
     if changed == 0 {
+        update_session_title(conn, session)?;
         enrich_session_metadata(conn, session)?;
     }
     Ok(changed > 0)
+}
+
+fn update_session_title(conn: &Connection, session: &SessionRecord) -> Result<()> {
+    let Some(title) = session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE sessions
+         SET title = ?2
+         WHERE id = ?1
+           AND coalesce(title, '') != ?2",
+        params![session.id, title],
+    )?;
+    Ok(())
 }
 
 fn enrich_session_metadata(conn: &Connection, session: &SessionRecord) -> Result<()> {
@@ -3039,6 +3058,31 @@ mod tests {
             })
             .expect("session metadata");
         assert_eq!(metadata["workspace_path"], "/tmp/repo");
+    }
+
+    #[test]
+    fn duplicate_session_import_updates_stale_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut stale = fixture_session("session_title", "source_title");
+        stale.title = Some("# AGENTS.md instructions for /tmp/repo <INSTRUCTIONS>".to_string());
+        let mut improved = stale.clone();
+        improved.title = Some("Fix thread listing titles".to_string());
+
+        store
+            .import_record(&ArchiveRecord::Session(stale))
+            .expect("stale import");
+        let stats = store
+            .import_record(&ArchiveRecord::Session(improved))
+            .expect("improved duplicate import");
+        let session = store
+            .session_by_id("session_title")
+            .expect("session lookup")
+            .expect("session exists");
+
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.duplicates, 1);
+        assert_eq!(session.title.as_deref(), Some("Fix thread listing titles"));
     }
 
     #[test]
