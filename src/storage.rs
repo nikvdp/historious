@@ -4,14 +4,18 @@ use crate::archive::{
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
 const SQLITE_BIND_CHUNK_SIZE: usize = 500;
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -233,6 +237,7 @@ impl Store {
         load_sqlite_vec();
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("opening database {}", self.db_path.display()))?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
         f(&conn)
     }
 
@@ -345,28 +350,28 @@ impl Store {
         delta_mode: ImportDeltaMode,
     ) -> Result<ImportStats> {
         self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let mut stats = ImportStats::default();
-            for record in records {
-                let inserted = match record {
-                    ArchiveRecord::Source(source) => insert_source(&tx, source)?,
-                    ArchiveRecord::RawArtifact(raw) => {
-                        insert_raw_artifact(&tx, raw, &self.blob_dir)?
+            with_immediate_write_tx(conn, |tx| {
+                let mut stats = ImportStats::default();
+                for record in records {
+                    let inserted = match record {
+                        ArchiveRecord::Source(source) => insert_source(&tx, source)?,
+                        ArchiveRecord::RawArtifact(raw) => {
+                            insert_raw_artifact(&tx, raw, &self.blob_dir)?
+                        }
+                        ArchiveRecord::Session(session) => insert_session(&tx, session)?,
+                        ArchiveRecord::Event(event) => insert_event(&tx, event)?,
+                        ArchiveRecord::SearchUnit(unit) => insert_search_unit(&tx, unit)?,
+                        ArchiveRecord::Embedding(embedding) => insert_embedding(&tx, embedding)?,
+                    };
+                    if inserted {
+                        stats.inserted += 1;
+                    } else {
+                        stats.duplicates += 1;
                     }
-                    ArchiveRecord::Session(session) => insert_session(&tx, session)?,
-                    ArchiveRecord::Event(event) => insert_event(&tx, event)?,
-                    ArchiveRecord::SearchUnit(unit) => insert_search_unit(&tx, unit)?,
-                    ArchiveRecord::Embedding(embedding) => insert_embedding(&tx, embedding)?,
-                };
-                if inserted {
-                    stats.inserted += 1;
-                } else {
-                    stats.duplicates += 1;
+                    record_delta(record, inserted, delta_mode, &mut stats.delta);
                 }
-                record_delta(record, inserted, delta_mode, &mut stats.delta);
-            }
-            tx.commit()?;
-            Ok(stats)
+                Ok(stats)
+            })
         })
     }
 
@@ -753,9 +758,9 @@ impl Store {
         embed: impl Fn(&str) -> Vec<f32>,
     ) -> Result<usize> {
         self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let mut stmt = tx.prepare(
-                "SELECT e.id,
+            with_immediate_write_tx(conn, |tx| {
+                let mut stmt = tx.prepare(
+                    "SELECT e.id,
                         e.session_id,
                         e.source_id,
                         e.machine_id,
@@ -771,173 +776,8 @@ impl Store {
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
                    AND emb.event_id IS NULL
                  ORDER BY e.session_id, e.ordinal, e.id",
-            )?;
-            let rows = stmt.query_map(params![model], |row| {
-                let content: String = row.get(7)?;
-                Ok(EventForProjection {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    machine_id: row.get(3)?,
-                    source_kind: row.get(4)?,
-                    role: row.get(5)?,
-                    search_kind: row.get(6)?,
-                    text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                    content,
-                    occurred_at: parse_opt_dt(row.get(8)?),
-                })
-            })?;
-            for row in rows {
-                let event = row?;
-                let unit_id =
-                    crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
-                let unit_hash = crate::archive::stable_hash(&(
-                    &unit_id,
-                    &event.id,
-                    &event.text_hash,
-                    &event.content,
-                    &event.search_kind,
-                ))?;
-                let unit = SearchUnitRecord {
-                    id: unit_id,
-                    event_id: event.id.clone(),
-                    session_id: event.session_id.clone(),
-                    source_id: event.source_id.clone(),
-                    machine_id: event.machine_id.clone(),
-                    source_kind: event.source_kind.clone(),
-                    role: event.role.clone(),
-                    search_kind: event.search_kind.clone(),
-                    text: event.content.clone(),
-                    text_hash: event.text_hash.clone(),
-                    occurred_at: event.occurred_at,
-                    metadata: serde_json::json!({
-                        "derived_from": "event.search_text",
-                        "indexer": "search_unit_v1"
-                    }),
-                    hash: unit_hash,
-                };
-                insert_search_unit(&tx, &unit)?;
-                tx.execute(
-                    "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![event.id, event.session_id, event.source_kind, event.content],
                 )?;
-                let vector = embed(&event.content);
-                tx.execute(
-                    "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        event.id,
-                        model,
-                        dims as i64,
-                        serde_json::to_string(&vector)?
-                    ],
-                )?;
-            }
-            drop(stmt);
-
-            let mut missing_unit_stmt = tx.prepare(
-                "SELECT e.id,
-                        e.session_id,
-                        e.source_id,
-                        e.machine_id,
-                        e.source_kind,
-                        e.role,
-                        json_extract(e.metadata_json, '$.search_kind'),
-                        json_extract(e.metadata_json, '$.search_text'),
-                        e.occurred_at
-                 FROM events e
-                 LEFT JOIN search_units su
-                   ON su.event_id = e.id
-                 WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
-                   AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND su.event_id IS NULL
-                 ORDER BY e.session_id, e.ordinal, e.id",
-            )?;
-            let missing_unit_rows = missing_unit_stmt.query_map([], |row| {
-                let content: String = row.get(7)?;
-                Ok(EventForProjection {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    machine_id: row.get(3)?,
-                    source_kind: row.get(4)?,
-                    role: row.get(5)?,
-                    search_kind: row.get(6)?,
-                    text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                    content,
-                    occurred_at: parse_opt_dt(row.get(8)?),
-                })
-            })?;
-            for row in missing_unit_rows {
-                let event = row?;
-                let unit_id =
-                    crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
-                let unit_hash = crate::archive::stable_hash(&(
-                    &unit_id,
-                    &event.id,
-                    &event.text_hash,
-                    &event.content,
-                    &event.search_kind,
-                ))?;
-                let unit = SearchUnitRecord {
-                    id: unit_id,
-                    event_id: event.id.clone(),
-                    session_id: event.session_id.clone(),
-                    source_id: event.source_id.clone(),
-                    machine_id: event.machine_id.clone(),
-                    source_kind: event.source_kind.clone(),
-                    role: event.role.clone(),
-                    search_kind: event.search_kind.clone(),
-                    text: event.content.clone(),
-                    text_hash: event.text_hash.clone(),
-                    occurred_at: event.occurred_at,
-                    metadata: serde_json::json!({
-                        "derived_from": "event.search_text",
-                        "indexer": "search_unit_v1"
-                    }),
-                    hash: unit_hash,
-                };
-                insert_search_unit(&tx, &unit)?;
-            }
-            let indexed_events = count_indexed_events(&tx, model)?;
-            update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
-            drop(missing_unit_stmt);
-            tx.commit()?;
-            Ok(indexed_events)
-        })
-    }
-
-    pub fn refresh_search_index_for_events(
-        &self,
-        model: &str,
-        dims: usize,
-        event_ids: &[String],
-        embed: impl Fn(&str) -> Vec<f32>,
-    ) -> Result<usize> {
-        let event_ids = normalized_ids(event_ids);
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            if !event_ids.is_empty() {
-                prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
-                let mut stmt = tx.prepare(
-                    "SELECT e.id,
-                            e.session_id,
-                            e.source_id,
-                            e.machine_id,
-                            e.source_kind,
-                            e.role,
-                            json_extract(e.metadata_json, '$.search_kind'),
-                            json_extract(e.metadata_json, '$.search_text'),
-                            e.occurred_at
-                     FROM events e
-                     JOIN temp_search_index_event_ids scope
-                       ON scope.id = e.id
-                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
-                       AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                     ORDER BY e.session_id, e.ordinal, e.id",
-                )?;
-                let rows = stmt.query_map([], |row| {
+                let rows = stmt.query_map(params![model], |row| {
                     let content: String = row.get(7)?;
                     Ok(EventForProjection {
                         id: row.get(0)?,
@@ -953,14 +793,179 @@ impl Store {
                     })
                 })?;
                 for row in rows {
-                    insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                    let event = row?;
+                    let unit_id =
+                        crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
+                    let unit_hash = crate::archive::stable_hash(&(
+                        &unit_id,
+                        &event.id,
+                        &event.text_hash,
+                        &event.content,
+                        &event.search_kind,
+                    ))?;
+                    let unit = SearchUnitRecord {
+                        id: unit_id,
+                        event_id: event.id.clone(),
+                        session_id: event.session_id.clone(),
+                        source_id: event.source_id.clone(),
+                        machine_id: event.machine_id.clone(),
+                        source_kind: event.source_kind.clone(),
+                        role: event.role.clone(),
+                        search_kind: event.search_kind.clone(),
+                        text: event.content.clone(),
+                        text_hash: event.text_hash.clone(),
+                        occurred_at: event.occurred_at,
+                        metadata: serde_json::json!({
+                            "derived_from": "event.search_text",
+                            "indexer": "search_unit_v1"
+                        }),
+                        hash: unit_hash,
+                    };
+                    insert_search_unit(&tx, &unit)?;
+                    tx.execute(
+                        "INSERT INTO events_fts (event_id, session_id, source_kind, content)
+                     VALUES (?1, ?2, ?3, ?4)",
+                        params![event.id, event.session_id, event.source_kind, event.content],
+                    )?;
+                    let vector = embed(&event.content);
+                    tx.execute(
+                    "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        event.id,
+                        model,
+                        dims as i64,
+                        serde_json::to_string(&vector)?
+                    ],
+                )?;
                 }
                 drop(stmt);
-            }
-            let indexed_events = count_indexed_events(&tx, model)?;
-            update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
-            tx.commit()?;
-            Ok(indexed_events)
+
+                let mut missing_unit_stmt = tx.prepare(
+                    "SELECT e.id,
+                        e.session_id,
+                        e.source_id,
+                        e.machine_id,
+                        e.source_kind,
+                        e.role,
+                        json_extract(e.metadata_json, '$.search_kind'),
+                        json_extract(e.metadata_json, '$.search_text'),
+                        e.occurred_at
+                 FROM events e
+                 LEFT JOIN search_units su
+                   ON su.event_id = e.id
+                 WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                   AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                   AND su.event_id IS NULL
+                 ORDER BY e.session_id, e.ordinal, e.id",
+                )?;
+                let missing_unit_rows = missing_unit_stmt.query_map([], |row| {
+                    let content: String = row.get(7)?;
+                    Ok(EventForProjection {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        machine_id: row.get(3)?,
+                        source_kind: row.get(4)?,
+                        role: row.get(5)?,
+                        search_kind: row.get(6)?,
+                        text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                        content,
+                        occurred_at: parse_opt_dt(row.get(8)?),
+                    })
+                })?;
+                for row in missing_unit_rows {
+                    let event = row?;
+                    let unit_id =
+                        crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
+                    let unit_hash = crate::archive::stable_hash(&(
+                        &unit_id,
+                        &event.id,
+                        &event.text_hash,
+                        &event.content,
+                        &event.search_kind,
+                    ))?;
+                    let unit = SearchUnitRecord {
+                        id: unit_id,
+                        event_id: event.id.clone(),
+                        session_id: event.session_id.clone(),
+                        source_id: event.source_id.clone(),
+                        machine_id: event.machine_id.clone(),
+                        source_kind: event.source_kind.clone(),
+                        role: event.role.clone(),
+                        search_kind: event.search_kind.clone(),
+                        text: event.content.clone(),
+                        text_hash: event.text_hash.clone(),
+                        occurred_at: event.occurred_at,
+                        metadata: serde_json::json!({
+                            "derived_from": "event.search_text",
+                            "indexer": "search_unit_v1"
+                        }),
+                        hash: unit_hash,
+                    };
+                    insert_search_unit(&tx, &unit)?;
+                }
+                let indexed_events = count_indexed_events(&tx, model)?;
+                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                drop(missing_unit_stmt);
+                Ok(indexed_events)
+            })
+        })
+    }
+
+    pub fn refresh_search_index_for_events(
+        &self,
+        model: &str,
+        dims: usize,
+        event_ids: &[String],
+        embed: impl Fn(&str) -> Vec<f32>,
+    ) -> Result<usize> {
+        let event_ids = normalized_ids(event_ids);
+        self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                if !event_ids.is_empty() {
+                    prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
+                    let mut stmt = tx.prepare(
+                        "SELECT e.id,
+                            e.session_id,
+                            e.source_id,
+                            e.machine_id,
+                            e.source_kind,
+                            e.role,
+                            json_extract(e.metadata_json, '$.search_kind'),
+                            json_extract(e.metadata_json, '$.search_text'),
+                            e.occurred_at
+                     FROM events e
+                     JOIN temp_search_index_event_ids scope
+                       ON scope.id = e.id
+                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                       AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                     ORDER BY e.session_id, e.ordinal, e.id",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        let content: String = row.get(7)?;
+                        Ok(EventForProjection {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            source_id: row.get(2)?,
+                            machine_id: row.get(3)?,
+                            source_kind: row.get(4)?,
+                            role: row.get(5)?,
+                            search_kind: row.get(6)?,
+                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                            content,
+                            occurred_at: parse_opt_dt(row.get(8)?),
+                        })
+                    })?;
+                    for row in rows {
+                        insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                    }
+                    drop(stmt);
+                }
+                let indexed_events = count_indexed_events(&tx, model)?;
+                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                Ok(indexed_events)
+            })
         })
     }
 
@@ -1219,14 +1224,14 @@ impl Store {
         results: &[RecentResultRefInput],
     ) -> Result<Vec<String>> {
         self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let mut refs = Vec::with_capacity(results.len());
-            for result in results {
-                refs.push(upsert_recent_result_ref(&tx, result)?);
-            }
-            prune_recent_result_refs(&tx, RECENT_RESULT_REF_LIMIT)?;
-            tx.commit()?;
-            Ok(refs)
+            with_immediate_write_tx(conn, |tx| {
+                let mut refs = Vec::with_capacity(results.len());
+                for result in results {
+                    refs.push(upsert_recent_result_ref(&tx, result)?);
+                }
+                prune_recent_result_refs(&tx, RECENT_RESULT_REF_LIMIT)?;
+                Ok(refs)
+            })
         })
     }
 
@@ -1346,15 +1351,17 @@ impl Store {
 
     pub fn refresh_vector_projection(&self) -> Result<usize> {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM vec_embeddings_384", [])?;
-            let inserted = conn.execute(
-                "INSERT INTO vec_embeddings_384(rowid, embedding)
-                 SELECT rowid, vector
-                 FROM embeddings
-                 WHERE dims = 384",
-                [],
-            )?;
-            Ok(inserted)
+            with_immediate_write_tx(conn, |tx| {
+                tx.execute("DELETE FROM vec_embeddings_384", [])?;
+                let inserted = tx.execute(
+                    "INSERT INTO vec_embeddings_384(rowid, embedding)
+                     SELECT rowid, vector
+                     FROM embeddings
+                     WHERE dims = 384",
+                    [],
+                )?;
+                Ok(inserted)
+            })
         })
     }
 
@@ -1364,34 +1371,34 @@ impl Store {
     ) -> Result<usize> {
         let embedding_ids = normalized_ids(embedding_ids);
         self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            for chunk in embedding_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
-                let placeholders = placeholders(chunk.len());
-                let delete_sql = format!(
-                    "DELETE FROM vec_embeddings_384
+            with_immediate_write_tx(conn, |tx| {
+                for chunk in embedding_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
+                    let placeholders = placeholders(chunk.len());
+                    let delete_sql = format!(
+                        "DELETE FROM vec_embeddings_384
                      WHERE rowid IN (
                        SELECT rowid FROM embeddings WHERE id IN ({placeholders})
                      )"
-                );
-                tx.execute(
-                    &delete_sql,
-                    params_from_iter(chunk.iter().map(String::as_str)),
-                )?;
-                let insert_sql = format!(
-                    "INSERT INTO vec_embeddings_384(rowid, embedding)
+                    );
+                    tx.execute(
+                        &delete_sql,
+                        params_from_iter(chunk.iter().map(String::as_str)),
+                    )?;
+                    let insert_sql = format!(
+                        "INSERT INTO vec_embeddings_384(rowid, embedding)
                      SELECT rowid, vector
                      FROM embeddings
                      WHERE dims = 384
                        AND id IN ({placeholders})"
-                );
-                tx.execute(
-                    &insert_sql,
-                    params_from_iter(chunk.iter().map(String::as_str)),
-                )?;
-            }
-            let count = count_vec_embeddings(&tx)?;
-            tx.commit()?;
-            Ok(count)
+                    );
+                    tx.execute(
+                        &insert_sql,
+                        params_from_iter(chunk.iter().map(String::as_str)),
+                    )?;
+                }
+                let count = count_vec_embeddings(&tx)?;
+                Ok(count)
+            })
         })
     }
 
@@ -1486,6 +1493,21 @@ fn load_sqlite_vec() {
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
+}
+
+fn with_immediate_write_tx<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    let tx =
+        Transaction::new_unchecked(conn, TransactionBehavior::Immediate).with_context(|| {
+            format!(
+                "starting SQLite write transaction after waiting up to {SQLITE_BUSY_TIMEOUT_MS}ms"
+            )
+        })?;
+    let value = f(&tx)?;
+    tx.commit().context("committing SQLite write transaction")?;
+    Ok(value)
 }
 
 fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
