@@ -851,7 +851,7 @@ mod tests {
 
     fn fixture_search_unit_384() -> SearchUnitRecord {
         let id = stable_id(&["search_unit", "event_sync", "hash_sync"]);
-        let text = "offline machines should converge after vector sync".to_string();
+        let text = "offline machines should converge after vector sync with enough user context for semantic retrieval".to_string();
         let text_hash = crate::archive::blake3_hex(text.as_bytes());
         let hash = stable_hash(&(&id, "event_sync", &text_hash, &text)).expect("unit hash");
         SearchUnitRecord {

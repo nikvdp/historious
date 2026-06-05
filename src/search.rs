@@ -1006,7 +1006,7 @@ mod tests {
     fn vector_only_result_can_win_without_fts_overlap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(
+        let unit = import_user_event_and_project(
             &store,
             "exact lexical marker with enough surrounding human context to stay eligible for semantic retrieval",
         );
@@ -1044,7 +1044,7 @@ mod tests {
     fn high_user_limit_does_not_exceed_sqlite_vec_knn_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(
+        let unit = import_user_event_and_project(
             &store,
             "high limit semantic target with enough surrounding context to pass semantic candidate filtering",
         );
@@ -1081,7 +1081,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
         let lexical_only = import_event_and_project(&store, "alpha token only");
-        let hybrid = import_event_and_project(
+        let hybrid = import_user_event_and_project(
             &store,
             "alpha token also semantic with enough surrounding words to remain a useful vector candidate",
         );
@@ -1121,8 +1121,8 @@ mod tests {
     fn semantic_search_filters_short_low_information_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let short = import_event_and_project(&store, "fix");
-        let rich = import_event_and_project(
+        let short = import_event_and_project_with_kind_at(&store, "fix", "user", None);
+        let rich = import_user_event_and_project(
             &store,
             "payment workflow failed after the funding step and the logs explain the retry behavior clearly",
         );
@@ -1328,7 +1328,10 @@ mod tests {
     fn refresh_embeddings_creates_durable_vectors_for_missing_search_units() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(&store, "semantic refresh target");
+        let unit = import_user_event_and_project(
+            &store,
+            "semantic refresh target with enough user context to become a durable embedding in the local vector index",
+        );
         let embedder = FixtureEmbedder {
             model_id: "fixture-semantic-384",
             vector: unit_vector(13),
@@ -1402,7 +1405,10 @@ mod tests {
     fn refresh_embeddings_incremental_indexes_transferred_embedding_when_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(&store, "transferred vector target");
+        let unit = import_user_event_and_project(
+            &store,
+            "transferred vector target with enough user context to stay eligible for semantic retrieval",
+        );
         let stats = store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &unit,
@@ -1445,7 +1451,10 @@ mod tests {
     fn refresh_embeddings_incremental_repairs_vector_projection_after_empty_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(&store, "empty delta vector target");
+        let unit = import_user_event_and_project(
+            &store,
+            "empty delta vector target with enough user context to stay eligible for semantic retrieval",
+        );
         store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &unit,
@@ -1735,15 +1744,17 @@ mod tests {
     fn semantic_search_filters_by_hostname_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let target = import_event_and_project_at_machine(
+        let target = import_event_and_project_with_kind_at_machine(
             &store,
             "shared semantic machine target with enough surrounding context for useful vector retrieval",
+            "user",
             None,
             "machine_dev_box_111",
         );
-        let other = import_event_and_project_at_machine(
+        let other = import_event_and_project_with_kind_at_machine(
             &store,
             "shared semantic machine other with enough surrounding context for useful vector retrieval",
+            "user",
             None,
             "machine_other_222",
         );
@@ -1789,14 +1800,16 @@ mod tests {
         let new_time = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
             .expect("new time")
             .with_timezone(&Utc);
-        let old_unit = import_event_and_project_at(
+        let old_unit = import_event_and_project_with_kind_at(
             &store,
             "old semantic target with enough surrounding context for useful vector retrieval during regression testing",
+            "user",
             Some(old_time),
         );
-        let new_unit = import_event_and_project_at(
+        let new_unit = import_event_and_project_with_kind_at(
             &store,
             "new semantic target with enough surrounding context for useful vector retrieval during regression testing",
+            "user",
             Some(new_time),
         );
         for unit in [&old_unit, &new_unit] {
@@ -1845,22 +1858,47 @@ mod tests {
         import_event_and_project_at(store, search_text, None)
     }
 
+    fn import_user_event_and_project(store: &Store, search_text: &str) -> SearchUnitRecord {
+        import_event_and_project_with_kind_at(store, search_text, "user", None)
+    }
+
     fn import_event_and_project_at(
         store: &Store,
         search_text: &str,
         occurred_at: Option<DateTime<Utc>>,
     ) -> SearchUnitRecord {
-        import_event_and_project_at_machine(store, search_text, occurred_at, "machine_fixture")
+        import_event_and_project_with_kind_at(store, search_text, "assistant", occurred_at)
     }
 
-    fn import_event_and_project_at_machine(
+    fn import_event_and_project_with_kind_at(
         store: &Store,
         search_text: &str,
+        search_kind: &str,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> SearchUnitRecord {
+        import_event_and_project_with_kind_at_machine(
+            store,
+            search_text,
+            search_kind,
+            occurred_at,
+            "machine_fixture",
+        )
+    }
+
+    fn import_event_and_project_with_kind_at_machine(
+        store: &Store,
+        search_text: &str,
+        search_kind: &str,
         occurred_at: Option<DateTime<Utc>>,
         machine_id: &str,
     ) -> SearchUnitRecord {
-        let (event_id, delta) =
-            import_event_at_machine(store, search_text, occurred_at, machine_id);
+        let (event_id, delta) = import_event_with_kind_at_machine(
+            store,
+            search_text,
+            search_kind,
+            occurred_at,
+            machine_id,
+        );
         refresh_incremental(store, &delta).expect("refresh projection");
 
         let text_hash = crate::archive::blake3_hex(search_text.as_bytes());
@@ -1872,8 +1910,8 @@ mod tests {
             source_id: stable_id(&["source", search_text]),
             machine_id: machine_id.to_string(),
             source_kind: "fixture".to_string(),
-            role: Some("assistant".to_string()),
-            search_kind: "assistant".to_string(),
+            role: Some(search_kind.to_string()),
+            search_kind: search_kind.to_string(),
             text: search_text.to_string(),
             text_hash,
             occurred_at,
@@ -1959,6 +1997,16 @@ mod tests {
         occurred_at: Option<DateTime<Utc>>,
         machine_id: &str,
     ) -> (String, ImportDelta) {
+        import_event_with_kind_at_machine(store, search_text, "assistant", occurred_at, machine_id)
+    }
+
+    fn import_event_with_kind_at_machine(
+        store: &Store,
+        search_text: &str,
+        search_kind: &str,
+        occurred_at: Option<DateTime<Utc>>,
+        machine_id: &str,
+    ) -> (String, ImportDelta) {
         let source = SourceRecord {
             id: stable_id(&["source", search_text]),
             kind: "fixture".to_string(),
@@ -1990,14 +2038,14 @@ mod tests {
             machine_id: machine_id.to_string(),
             source_kind: "fixture".to_string(),
             ordinal: 0,
-            event_type: "assistant".to_string(),
-            role: Some("assistant".to_string()),
+            event_type: search_kind.to_string(),
+            role: Some(search_kind.to_string()),
             content: search_text.to_string(),
             raw_artifact_hash: None,
             occurred_at,
             metadata: json!({
                 "search_indexable": true,
-                "search_kind": "assistant",
+                "search_kind": search_kind,
                 "search_text": search_text
             }),
             hash: event_hash,
