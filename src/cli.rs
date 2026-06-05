@@ -2792,6 +2792,7 @@ fn base_fzf_command() -> ProcessCommand {
     let mut command = ProcessCommand::new("fzf");
     command
         .arg("--ansi")
+        .arg("--no-hscroll")
         .arg("--delimiter")
         .arg("\t")
         .arg("--nth")
@@ -3519,6 +3520,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--with-nth", "1,2,3,4,5"]));
+        assert!(args.iter().any(|arg| arg == "--no-hscroll"));
     }
 
     #[test]
