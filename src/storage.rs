@@ -938,10 +938,10 @@ impl Store {
                     prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
                     let total_events: usize = tx.query_row(
                         "SELECT COUNT(*)
-                         FROM events e
-                         JOIN temp_search_index_event_ids scope
-                           ON scope.id = e.id
-                         WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                         FROM temp_search_index_event_ids scope
+                         CROSS JOIN events e
+                         WHERE e.id = scope.id
+                           AND json_extract(e.metadata_json, '$.search_indexable') = 1
                            AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0",
                         [],
                         |row| row.get::<_, i64>(0),
@@ -956,12 +956,12 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at
-                     FROM events e
-                     JOIN temp_search_index_event_ids scope
-                       ON scope.id = e.id
-                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                     FROM temp_search_index_event_ids scope
+                     CROSS JOIN events e
+                     WHERE e.id = scope.id
+                       AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                     ORDER BY e.session_id, e.ordinal, e.id",
+                     ORDER BY scope.id",
                     )?;
                     let rows = stmt.query_map([], |row| {
                         let content: String = row.get(7)?;
