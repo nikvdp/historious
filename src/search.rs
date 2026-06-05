@@ -1344,7 +1344,7 @@ mod tests {
 
         batch.observe(memory_sample(16, 8, 512), memory_sample(16, 1, 1024));
 
-        assert_eq!(batch.batch_size, 8);
+        assert_eq!(batch.batch_size, 32);
         assert_eq!(batch.reductions, 1);
     }
 
@@ -1359,7 +1359,7 @@ mod tests {
         let reason = batch.defer_reason(critical).expect("defer reason");
 
         assert_eq!(batch.batch_size, 1);
-        assert_eq!(batch.reductions, 4);
+        assert_eq!(batch.reductions, 6);
         assert!(reason.contains("memory pressure"));
     }
 
@@ -1371,7 +1371,7 @@ mod tests {
             batch.observe(memory_sample(16, 12, 512), memory_sample(16, 12, 512));
         }
 
-        assert_eq!(batch.batch_size, 32);
+        assert_eq!(batch.batch_size, 64);
         assert_eq!(batch.reductions, 0);
     }
 
@@ -1382,14 +1382,14 @@ mod tests {
     }
 
     #[test]
-    fn rss_spike_counts_as_batch_pressure() {
-        assert!(rss_spiked(
+    fn rss_spike_counts_as_batch_pressure_only_when_memory_is_low() {
+        assert!(rss_spiked_under_pressure(
+            memory_sample(16, 8, 512),
+            memory_sample(16, 1, 1200)
+        ));
+        assert!(!rss_spiked_under_pressure(
             memory_sample(16, 8, 512),
             memory_sample(16, 8, 1200)
-        ));
-        assert!(!rss_spiked(
-            memory_sample(16, 8, 512),
-            memory_sample(16, 8, 700)
         ));
     }
 
