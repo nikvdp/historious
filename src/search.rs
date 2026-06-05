@@ -10,7 +10,7 @@ const RRF_K: f64 = 60.0;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
 const SQLITE_VEC_MAX_K: usize = 4096;
-const EMBEDDING_BATCH_START: usize = 16;
+const EMBEDDING_BATCH_START: usize = 64;
 const EMBEDDING_BATCH_MAX: usize = 64;
 const EMBEDDING_BATCH_MIN: usize = 1;
 const EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
@@ -572,7 +572,7 @@ impl AdaptiveEmbeddingBatch {
     }
 
     fn observe(&mut self, before: Option<MemorySample>, after: Option<MemorySample>) {
-        if memory_sample_is_low(after) || rss_spiked(before, after) {
+        if memory_sample_is_low(after) || rss_spiked_under_pressure(before, after) {
             self.reduce();
             return;
         }
@@ -623,7 +623,10 @@ fn memory_sample_is_low(sample: Option<MemorySample>) -> bool {
         .unwrap_or(false)
 }
 
-fn rss_spiked(before: Option<MemorySample>, after: Option<MemorySample>) -> bool {
+fn rss_spiked_under_pressure(before: Option<MemorySample>, after: Option<MemorySample>) -> bool {
+    if !memory_sample_is_low(after) {
+        return false;
+    }
     let Some(before) = before.and_then(|sample| sample.process_rss_bytes) else {
         return false;
     };

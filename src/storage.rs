@@ -2457,6 +2457,17 @@ fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool
 }
 
 fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Result<usize> {
+    let search_units: i64 =
+        conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
+    let embeddings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM embeddings WHERE model_id = ?1",
+        params![model_id],
+        |row| row.get(0),
+    )?;
+    if embeddings <= search_units {
+        return Ok(search_units.saturating_sub(embeddings) as usize);
+    }
+
     let count: i64 = conn.query_row(
         "SELECT COUNT(*)
          FROM search_units su
