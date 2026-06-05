@@ -16,6 +16,7 @@ use std::time::Duration;
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
 const SQLITE_BIND_CHUNK_SIZE: usize = 500;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
+const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -1304,16 +1305,25 @@ impl Store {
                   AND e.text_hash = su.text_hash
                   AND e.model_id = ?1
                  WHERE e.id IS NULL
+                   AND su.search_kind = 'user'
+                   AND length(trim(su.text)) >= ?2
                  ORDER BY su.occurred_at, su.session_id, su.id
-                 LIMIT ?2",
+                 LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![model_id, limit as i64], |row| {
-                Ok(SearchUnitForEmbedding {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    text_hash: row.get(2)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    model_id,
+                    SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(SearchUnitForEmbedding {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        text_hash: row.get(2)?,
+                    })
+                },
+            )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -1350,16 +1360,25 @@ impl Store {
                   AND e.model_id = ?
                  WHERE e.id IS NULL
                    AND (event_scope.id IS NOT NULL OR unit_scope.id IS NOT NULL)
+                   AND su.search_kind = 'user'
+                   AND length(trim(su.text)) >= ?
                  ORDER BY su.occurred_at, su.session_id, su.id
                  LIMIT ?",
             )?;
-            let rows = stmt.query_map(params![model_id, limit as i64], |row| {
-                Ok(SearchUnitForEmbedding {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    text_hash: row.get(2)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    model_id,
+                    SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(SearchUnitForEmbedding {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        text_hash: row.get(2)?,
+                    })
+                },
+            )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -1471,6 +1490,8 @@ impl Store {
                    AND (?5 IS NULL OR su.occurred_at < ?5)
                    AND (?6 IS NULL OR su.machine_id = ?6)
                    AND (?7 IS NULL OR substr(su.machine_id, 1, length(?7)) = ?7)
+                   AND su.search_kind = 'user'
+                   AND length(trim(su.text)) >= ?8
                  ORDER BY vec_embeddings_384.distance",
             )?;
             let rows = stmt.query_map(
@@ -1481,7 +1502,8 @@ impl Store {
                     after,
                     before,
                     machine_id,
-                    machine_id_prefix
+                    machine_id_prefix,
+                    SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64
                 ],
                 |row| {
                     Ok(VectorSearchRow {
@@ -2467,26 +2489,17 @@ fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool
             AND e.text_hash = su.text_hash
             AND e.model_id = ?1
            WHERE e.id IS NULL
+             AND su.search_kind = 'user'
+             AND length(trim(su.text)) >= ?2
            LIMIT 1
          )",
-        params![model_id],
+        params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
 }
 
 fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Result<usize> {
-    let search_units: i64 =
-        conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
-    let embeddings: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM embeddings WHERE model_id = ?1",
-        params![model_id],
-        |row| row.get(0),
-    )?;
-    if embeddings <= search_units {
-        return Ok(search_units.saturating_sub(embeddings) as usize);
-    }
-
     let count: i64 = conn.query_row(
         "SELECT COUNT(*)
          FROM search_units su
@@ -2494,8 +2507,10 @@ fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Re
            ON e.unit_id = su.id
           AND e.text_hash = su.text_hash
           AND e.model_id = ?1
-         WHERE e.id IS NULL",
-        params![model_id],
+         WHERE e.id IS NULL
+           AND su.search_kind = 'user'
+           AND length(trim(su.text)) >= ?2",
+        params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
         |row| row.get(0),
     )?;
     Ok(count as usize)
@@ -2799,7 +2814,10 @@ mod tests {
     fn sqlite_vec_search_returns_synced_embedding_without_fts_match() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
-        let unit = fixture_search_unit("conversation about distributed memories");
+        let unit = fixture_search_unit_with_kind(
+            "user conversation about distributed memories with enough context for semantic retrieval",
+            "user",
+        );
         let embedding = fixture_embedding(&unit, unit_vector(0));
         store
             .import_records(&[
@@ -2826,7 +2844,10 @@ mod tests {
         assert_eq!(hits[0].unit_id, unit.id);
         assert_eq!(hits[0].session_id, "session_vector");
         assert_eq!(hits[0].source_kind, "codex");
-        assert_eq!(hits[0].content, "conversation about distributed memories");
+        assert_eq!(
+            hits[0].content,
+            "user conversation about distributed memories with enough context for semantic retrieval"
+        );
         assert!(hits[0].distance <= 0.001);
     }
 
@@ -2834,7 +2855,10 @@ mod tests {
     fn vector_projection_refresh_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
-        let unit = fixture_search_unit("idempotent vector projection");
+        let unit = fixture_search_unit_with_kind(
+            "idempotent vector projection with enough user context for semantic retrieval in local history",
+            "user",
+        );
         let embedding = fixture_embedding(&unit, unit_vector(2));
         store
             .import_records(&[
@@ -2884,6 +2908,60 @@ mod tests {
             .expect("refresh projection");
 
         assert_eq!(indexed, records.len());
+    }
+
+    #[test]
+    fn semantic_embedding_queue_only_includes_long_user_units() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let assistant = fixture_search_unit(
+            "assistant progress update with plenty of words that should remain lexical only",
+        );
+        let short_user = fixture_search_unit_with_kind("short user request", "user");
+        let long_user = fixture_search_unit_with_kind(
+            "user wants to find payment failures in agent history with enough surrounding context",
+            "user",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::SearchUnit(assistant),
+                ArchiveRecord::SearchUnit(short_user),
+                ArchiveRecord::SearchUnit(long_user.clone()),
+            ])
+            .expect("import search units");
+
+        let missing = store
+            .search_units_missing_embedding("fixture-semantic-384", 10)
+            .expect("missing embeddings");
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, long_user.id);
+        assert_eq!(
+            store
+                .search_units_missing_embedding_count("fixture-semantic-384")
+                .expect("missing count"),
+            1
+        );
+        assert!(store
+            .search_units_need_embedding("fixture-semantic-384")
+            .expect("needs embedding"));
+
+        store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &long_user,
+                unit_vector(4),
+            )))
+            .expect("import embedding");
+
+        assert_eq!(
+            store
+                .search_units_missing_embedding_count("fixture-semantic-384")
+                .expect("missing count"),
+            0
+        );
+        assert!(!store
+            .search_units_need_embedding("fixture-semantic-384")
+            .expect("needs embedding"));
     }
 
     #[test]
@@ -3353,6 +3431,10 @@ mod tests {
     }
 
     fn fixture_search_unit(text: &str) -> SearchUnitRecord {
+        fixture_search_unit_with_kind(text, "assistant")
+    }
+
+    fn fixture_search_unit_with_kind(text: &str, search_kind: &str) -> SearchUnitRecord {
         let text_hash = crate::archive::blake3_hex(text.as_bytes());
         let id = stable_id(&["search_unit", "event_vector", &text_hash]);
         let hash = stable_hash(&(&id, "event_vector", &text_hash, text)).expect("unit hash");
@@ -3363,8 +3445,8 @@ mod tests {
             source_id: "source_vector".to_string(),
             machine_id: "machine_a".to_string(),
             source_kind: "codex".to_string(),
-            role: Some("assistant".to_string()),
-            search_kind: "assistant".to_string(),
+            role: Some(search_kind.to_string()),
+            search_kind: search_kind.to_string(),
             text: text.to_string(),
             text_hash,
             occurred_at: None,
