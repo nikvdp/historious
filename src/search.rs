@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 const RRF_K: f64 = 60.0;
 const LEXICAL_RRF_WEIGHT: f64 = 1.0;
+const NON_USER_LEXICAL_RRF_WEIGHT: f64 = 0.88;
 const SEMANTIC_RRF_WEIGHT: f64 = 0.98;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
@@ -802,7 +803,9 @@ fn semantic_search(
             )),
         ));
     }
-    let query_vector = embedder.embed_one(query)?;
+    let query_concepts = semantic_query_concepts(query);
+    let query_text = semantic_embedding_query_text(query, &query_concepts);
+    let query_vector = embedder.embed_one(&query_text)?;
     let rows = store
         .vector_search(
             embedder.model_id(),
@@ -815,6 +818,7 @@ fn semantic_search(
         )?
         .into_iter()
         .filter(|row| semantic_candidate_has_context(&row.content))
+        .filter(|row| semantic_candidate_matches_query(&row.content, &query_concepts))
         .enumerate()
         .map(|(idx, mut row)| {
             row.rank = idx + 1;
@@ -837,6 +841,103 @@ fn semantic_candidate_has_context(text: &str) -> bool {
     informative_terms >= SEMANTIC_CANDIDATE_MIN_TERMS
 }
 
+fn semantic_query_concepts(query: &str) -> Vec<Vec<&'static str>> {
+    let mut concepts = Vec::new();
+    let lower = query.to_ascii_lowercase();
+    for token in lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        let concept = match token {
+            "billing" | "bill" | "charge" | "charged" | "fee" | "fees" | "money" | "payment"
+            | "payments" | "stripe" => Some(vec![
+                "billing", "charge", "fee", "money", "payment", "stripe",
+            ]),
+            "crash" | "crashed" | "died" => Some(vec!["crash", "died"]),
+            "database" | "databases" | "db" => Some(vec!["database", "db"]),
+            "bug" | "bugs" | "fail" | "failed" | "failing" | "failure" | "failures" | "fix"
+            | "fixes" | "fixed" | "issue" | "issues" | "error" | "errors" => {
+                Some(vec!["bug", "error", "fail", "fix", "issue"])
+            }
+            "label" | "labels" | "name" | "names" | "summary" | "summaries" | "title"
+            | "titles" => Some(vec!["label", "name", "summar", "title"]),
+            "process" | "processed" | "processing" => Some(vec!["process"]),
+            "remote" | "remotes" => Some(vec!["remote"]),
+            "replicate" | "replicated" | "replication" | "sync" | "synced" | "syncing" => {
+                Some(vec!["replic", "sync"])
+            }
+            "tap" | "tapped" | "tapping" => Some(vec!["tap"]),
+            "thread" | "threads" | "conversation" | "conversations" => {
+                Some(vec!["conversation", "thread"])
+            }
+            _ => None,
+        };
+        if let Some(concept) = concept {
+            if !concepts.contains(&concept) {
+                concepts.push(concept);
+            }
+        }
+    }
+    if lower.contains("did not go through")
+        || lower.contains("didn't go through")
+        || lower.contains("does not go through")
+        || lower.contains("did not process")
+        || lower.contains("didn't process")
+        || lower.contains("does not process")
+        || lower.contains("failed to process")
+    {
+        let concept = vec!["bug", "error", "fail", "fix", "issue", "process"];
+        if !concepts.contains(&concept) {
+            concepts.push(concept);
+        }
+    }
+    concepts
+}
+
+fn semantic_embedding_query_text(query: &str, query_concepts: &[Vec<&'static str>]) -> String {
+    if query_concepts.is_empty() {
+        return query.to_string();
+    }
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for concept in query_concepts {
+        for term in concept {
+            if seen.insert(*term) {
+                terms.push(*term);
+            }
+        }
+    }
+    format!("{query} {}", terms.join(" "))
+}
+
+fn semantic_candidate_matches_query(text: &str, query_concepts: &[Vec<&'static str>]) -> bool {
+    if query_concepts.len() < 2 {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    let matched = query_concepts
+        .iter()
+        .filter(|concept| concept.iter().any(|variant| lower.contains(variant)))
+        .count();
+    let required = if query_concepts
+        .iter()
+        .any(|concept| semantic_concept_is_metadata_label(concept))
+    {
+        1
+    } else if query_concepts.len() <= 2 {
+        query_concepts.len()
+    } else {
+        2
+    };
+    matched >= required
+}
+
+fn semantic_concept_is_metadata_label(concept: &[&'static str]) -> bool {
+    concept
+        .iter()
+        .any(|variant| matches!(*variant, "label" | "name" | "summar" | "title"))
+}
+
 fn fuse(
     lexical: Vec<SearchRow>,
     semantic: Vec<SearchRow>,
@@ -857,7 +958,7 @@ fn fuse(
             continue;
         }
         let entry = acc.entry(row.event_id.clone()).or_default();
-        entry.score += LEXICAL_RRF_WEIGHT / (RRF_K + row.rank as f64);
+        entry.score += lexical_rrf_weight(&row) / (RRF_K + row.rank as f64);
         entry.lexical_rank = Some(row.rank);
         entry.row = Some(row);
     }
@@ -897,6 +998,14 @@ fn fuse(
     results
 }
 
+fn lexical_rrf_weight(row: &SearchRow) -> f64 {
+    if row.search_kind == "user" {
+        LEXICAL_RRF_WEIGHT
+    } else {
+        NON_USER_LEXICAL_RRF_WEIGHT
+    }
+}
+
 fn dedupe_results_by_snippet(results: &mut Vec<SearchResult>) {
     let mut seen = HashSet::new();
     results.retain(|result| seen.insert(normalized_result_key(&result.snippet)));
@@ -917,6 +1026,7 @@ fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
         session_id: row.session_id,
         machine_id: row.machine_id,
         source_kind: row.source_kind,
+        search_kind: row.search_kind,
         content: row.content,
         occurred_at: row.occurred_at,
         session_title: row.session_title,
@@ -1157,6 +1267,92 @@ mod tests {
     }
 
     #[test]
+    fn semantic_search_filters_candidates_missing_multi_concept_intent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let unrelated_failure = import_user_event_and_project(
+            &store,
+            "please check actual logs and figure out why the deploy keeps failing during startup retries",
+        );
+        let payment_failure = import_user_event_and_project(
+            &store,
+            "payment failed after the stripe charge step and the customer money did not process correctly",
+        );
+        for unit in [&unrelated_failure, &payment_failure] {
+            store
+                .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                    unit,
+                    unit_vector(23),
+                )))
+                .expect("embedding");
+        }
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(23),
+        };
+
+        let response = search(
+            &store,
+            "payment failed",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, payment_failure.event_id);
+    }
+
+    #[test]
+    fn semantic_query_gate_requires_multiple_intent_concepts_when_present() {
+        let payment_failed = semantic_query_concepts("payment failed");
+        assert!(semantic_candidate_matches_query(
+            "the payment failed after the stripe charge step",
+            &payment_failed
+        ));
+        assert!(!semantic_candidate_matches_query(
+            "please check actual logs and figure out why startup keeps failing",
+            &payment_failed
+        ));
+
+        let vague_payment = semantic_query_concepts("money did not go through");
+        assert!(semantic_candidate_matches_query(
+            "the customer payment failed to process after the charge step",
+            &vague_payment
+        ));
+        assert!(!semantic_candidate_matches_query(
+            "the background worker did not process the queue cleanly",
+            &vague_payment
+        ));
+
+        let payment_process = semantic_query_concepts("payment did not process");
+        assert!(semantic_candidate_matches_query(
+            "the stripe billing integration had several critical issues",
+            &payment_process
+        ));
+
+        let thread_title = semantic_query_concepts("thread summary title");
+        assert!(semantic_candidate_matches_query(
+            "give me the overall summary of what the feature is doing",
+            &thread_title
+        ));
+        assert!(semantic_candidate_matches_query(
+            "explain how the thread system stores conversation history",
+            &thread_title
+        ));
+
+        let crash = semantic_query_concepts("app crash tap");
+        assert!(semantic_candidate_matches_query(
+            "the app crashed when the user tapped the billing button",
+            &crash
+        ));
+    }
+
+    #[test]
     fn disabled_semantic_search_reports_degraded_fts_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -1264,6 +1460,28 @@ mod tests {
                 "semantic_one",
                 "lexical_three"
             ]
+        );
+    }
+
+    #[test]
+    fn rrf_penalizes_non_user_lexical_rows_below_semantic_neighbors() {
+        let now = Utc::now();
+        let results = fuse(
+            vec![
+                ranked_row_with_kind("assistant_note", "assistant", 1, now),
+                ranked_row_with_kind("user_phrase", "user", 2, now),
+            ],
+            vec![ranked_row("semantic_user", 1, now)],
+            SearchOptions::new(10, SortMode::Relevance, 0.0),
+        );
+
+        let ordered = results
+            .iter()
+            .map(|result| result.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec!["user_phrase", "semantic_user", "assistant_note"]
         );
     }
 
@@ -2130,9 +2348,28 @@ mod tests {
         ranked_row_with_content(event_id, event_id, rank, occurred_at)
     }
 
+    fn ranked_row_with_kind(
+        event_id: &str,
+        search_kind: &str,
+        rank: usize,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> SearchRow {
+        ranked_row_with_content_and_kind(event_id, event_id, search_kind, rank, occurred_at)
+    }
+
     fn ranked_row_with_content(
         event_id: &str,
         content: &str,
+        rank: usize,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> SearchRow {
+        ranked_row_with_content_and_kind(event_id, content, "user", rank, occurred_at)
+    }
+
+    fn ranked_row_with_content_and_kind(
+        event_id: &str,
+        content: &str,
+        search_kind: &str,
         rank: usize,
         occurred_at: chrono::DateTime<Utc>,
     ) -> SearchRow {
@@ -2141,6 +2378,7 @@ mod tests {
             session_id: "session".to_string(),
             machine_id: "machine_fixture".to_string(),
             source_kind: "fixture".to_string(),
+            search_kind: search_kind.to_string(),
             content: content.to_string(),
             occurred_at: Some(occurred_at),
             session_title: Some("fixture session".to_string()),
