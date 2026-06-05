@@ -4,6 +4,7 @@ use crate::archive::{
 use crate::storage::{ImportDelta, ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
@@ -239,7 +240,7 @@ pub fn update_local_with_progress(
         let mtime_ms = file_mtime_ms(&metadata);
         let path_text = path.to_string_lossy().to_string();
         let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
-        if file_status.raw_current && !file_status.needs_workspace_refresh {
+        if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
                 kind: kind.to_string(),
@@ -359,6 +360,11 @@ fn discover_roots() -> Vec<SourceRoot> {
             path: home.join(".hermes/sessions"),
             extensions: &["json", "jsonl"],
         });
+        roots.push(SourceRoot {
+            kind: "opencode",
+            path: home.join(".local/share/opencode/opencode.db"),
+            extensions: &["db"],
+        });
     }
     roots
 }
@@ -380,7 +386,7 @@ fn ingest_file(
         fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
     let mtime_ms = file_mtime_ms(&metadata);
     let mut records = Vec::new();
-    records.push(ArchiveRecord::RawArtifact(RawArtifact {
+    let raw_artifact = RawArtifact {
         hash: raw_hash.clone(),
         source_id: source_id.clone(),
         path: path_text.clone(),
@@ -389,7 +395,19 @@ fn ingest_file(
         media_type: media_type(path),
         content: bytes.clone(),
         first_seen_at: Utc::now(),
-    }));
+    };
+    records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
+
+    if kind == "opencode" {
+        return ingest_opencode_db(
+            store,
+            machine_id,
+            path,
+            &path_text,
+            &source_id,
+            raw_artifact,
+        );
+    }
 
     let text = String::from_utf8_lossy(&bytes);
     let lines = if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
@@ -460,6 +478,222 @@ fn ingest_file(
         }));
     }
     store.import_records(&records)
+}
+
+fn ingest_opencode_db(
+    store: &Store,
+    machine_id: &str,
+    path: &Path,
+    path_text: &str,
+    source_id: &str,
+    raw_artifact: RawArtifact,
+) -> Result<ImportStats> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening OpenCode database {}", path.display()))?;
+    let mut records = vec![ArchiveRecord::RawArtifact(raw_artifact.clone())];
+
+    let mut sessions = conn.prepare(
+        "SELECT id, project_id, parent_id, slug, directory, title, version,
+                time_created, time_updated, time_archived
+         FROM session
+         ORDER BY time_created, id",
+    )?;
+    let session_rows = sessions.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+        ))
+    })?;
+
+    for session in session_rows {
+        let (
+            external_session_id,
+            project_id,
+            parent_id,
+            slug,
+            directory,
+            title,
+            version,
+            time_created,
+            time_updated,
+            time_archived,
+        ) = session?;
+        let session_id = stable_id(&["session", "opencode", path_text, &external_session_id]);
+        let workspace = workspace_from_opencode_directory(&directory);
+        let session_hash = stable_hash(&(
+            "opencode",
+            source_id,
+            &external_session_id,
+            path_text,
+            &title,
+            time_updated,
+        ))?;
+        records.push(ArchiveRecord::Session(SessionRecord {
+            id: session_id.clone(),
+            source_id: source_id.to_string(),
+            machine_id: machine_id.to_string(),
+            source_kind: "opencode".to_string(),
+            external_id: external_session_id.clone(),
+            title: clean_optional_title(&title),
+            status: if time_archived.is_some() {
+                "archived".to_string()
+            } else {
+                "open".to_string()
+            },
+            started_at: unix_millis_to_utc(time_created),
+            updated_at: unix_millis_to_utc(time_updated),
+            metadata: opencode_session_metadata(
+                path_text,
+                workspace.as_ref(),
+                &project_id,
+                parent_id.as_deref(),
+                &slug,
+                &version,
+            ),
+            hash: session_hash,
+        }));
+
+        let mut parts = conn.prepare(
+            "SELECT m.id, m.time_created, m.data, p.id, p.time_created, p.data
+             FROM message m
+             JOIN part p ON p.message_id = m.id
+             WHERE m.session_id = ?1
+             ORDER BY m.time_created, m.id, p.time_created, p.id",
+        )?;
+        let part_rows = parts.query_map([&external_session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut ordinal = 0i64;
+        for part in part_rows {
+            let (message_id, message_time, message_data, part_id, part_time, part_data) = part?;
+            let message_value: Value = serde_json::from_str(&message_data)
+                .with_context(|| format!("parsing OpenCode message {message_id}"))?;
+            let part_value: Value = serde_json::from_str(&part_data)
+                .with_context(|| format!("parsing OpenCode part {part_id}"))?;
+            let role = string_at(&message_value, &["role"])
+                .map(|role| role.to_ascii_lowercase())
+                .unwrap_or_else(|| "event".to_string());
+            let part_type = string_at(&part_value, &["type"]).unwrap_or_else(|| "part".to_string());
+            if part_type != "text" || (role != "user" && role != "assistant") {
+                continue;
+            }
+            let Some(content) = string_at(&part_value, &["text"])
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let event_id = stable_id(&["event", "opencode", &session_id, &message_id, &part_id]);
+            let event_hash = stable_hash(&(
+                "opencode_part",
+                &message_id,
+                &part_id,
+                &role,
+                &part_type,
+                &content,
+            ))?;
+            records.push(ArchiveRecord::Event(EventRecord {
+                id: event_id,
+                session_id: session_id.clone(),
+                source_id: source_id.to_string(),
+                machine_id: machine_id.to_string(),
+                source_kind: "opencode".to_string(),
+                ordinal,
+                event_type: part_type.clone(),
+                role: Some(role.clone()),
+                content: content.clone(),
+                raw_artifact_hash: Some(raw_artifact.hash.clone()),
+                occurred_at: unix_millis_to_utc(part_time)
+                    .or_else(|| unix_millis_to_utc(message_time)),
+                metadata: json!({
+                    "raw_artifact_hash": raw_artifact.hash.clone(),
+                    "capture_fidelity": "native_opencode_sqlite",
+                    "parser": "opencode_sqlite_v1",
+                    "opencode_session_id": external_session_id.clone(),
+                    "opencode_message_id": message_id.clone(),
+                    "opencode_part_id": part_id.clone(),
+                    "opencode_part_type": part_type.clone(),
+                    "search_indexable": true,
+                    "search_kind": role.clone(),
+                    "search_text": content.clone(),
+                    "search_skip_reason": null
+                }),
+                hash: event_hash,
+            }));
+            ordinal += 1;
+        }
+    }
+
+    store.import_records(&records)
+}
+
+fn clean_optional_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+fn unix_millis_to_utc(millis: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(millis)
+}
+
+fn workspace_from_opencode_directory(directory: &str) -> Option<WorkspaceIdentity> {
+    let cwd = normalize_path_text(directory)?;
+    let workspace_root = git_root_for(&cwd).unwrap_or_else(|| cwd.clone());
+    Some(WorkspaceIdentity {
+        workspace_path: workspace_root.clone(),
+        workspace_root,
+        cwd: Some(cwd),
+        git_repo: None,
+        git_branch: None,
+        source: "opencode.session.directory".to_string(),
+        confidence: "direct".to_string(),
+    })
+}
+
+fn opencode_session_metadata(
+    path_text: &str,
+    workspace: Option<&WorkspaceIdentity>,
+    project_id: &str,
+    parent_id: Option<&str>,
+    slug: &str,
+    version: &str,
+) -> Value {
+    let mut metadata = session_metadata(path_text, workspace);
+    if let Value::Object(map) = &mut metadata {
+        map.insert("parser".to_string(), json!("opencode_sqlite_v1"));
+        map.insert(
+            "capture_fidelity".to_string(),
+            json!("native_opencode_sqlite"),
+        );
+        map.insert("opencode_project_id".to_string(), json!(project_id));
+        map.insert("opencode_parent_id".to_string(), json!(parent_id));
+        map.insert("opencode_slug".to_string(), json!(slug));
+        map.insert("opencode_version".to_string(), json!(version));
+    }
+    metadata
 }
 
 impl NativeTitleIndex {
@@ -1326,6 +1560,132 @@ mod tests {
         assert_eq!(workspace.cwd, None);
         assert_eq!(workspace.source, "source_path.claude_project_dir");
         assert_eq!(workspace.confidence, "inferred");
+    }
+
+    #[test]
+    fn ingests_opencode_sqlite_sessions_with_native_titles_and_text_parts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let db_path = temp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (
+              id text PRIMARY KEY,
+              project_id text NOT NULL,
+              parent_id text,
+              slug text NOT NULL,
+              directory text NOT NULL,
+              title text NOT NULL,
+              version text NOT NULL,
+              time_created integer NOT NULL,
+              time_updated integer NOT NULL,
+              time_archived integer
+            );
+            CREATE TABLE message (
+              id text PRIMARY KEY,
+              session_id text NOT NULL,
+              time_created integer NOT NULL,
+              time_updated integer NOT NULL,
+              data text NOT NULL
+            );
+            CREATE TABLE part (
+              id text PRIMARY KEY,
+              message_id text NOT NULL,
+              session_id text NOT NULL,
+              time_created integer NOT NULL,
+              time_updated integer NOT NULL,
+              data text NOT NULL
+            );
+            "#,
+        )
+        .expect("create schema");
+        conn.execute(
+            "INSERT INTO session
+             (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            (
+                "ses_fixture",
+                "project_fixture",
+                "native-title-slug",
+                temp.path().to_string_lossy().as_ref(),
+                "Native OpenCode Title",
+                "1.2.3",
+                1_775_640_000_000i64,
+                1_775_640_002_000i64,
+            ),
+        )
+        .expect("insert session");
+        for (message_id, role, time) in [
+            ("msg_user", "user", 1_775_640_000_100i64),
+            ("msg_assistant", "assistant", 1_775_640_001_000i64),
+        ] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?1, 'ses_fixture', ?2, ?2, ?3)",
+                (
+                    message_id,
+                    time,
+                    json!({"role": role, "time": {"created": time}}).to_string(),
+                ),
+            )
+            .expect("insert message");
+        }
+        for (part_id, message_id, time, data) in [
+            (
+                "part_user",
+                "msg_user",
+                1_775_640_000_200i64,
+                json!({"type": "text", "text": "user asks for OpenCode ingestion"}),
+            ),
+            (
+                "part_assistant",
+                "msg_assistant",
+                1_775_640_001_200i64,
+                json!({"type": "text", "text": "assistant explains the OpenCode parser"}),
+            ),
+            (
+                "part_tool",
+                "msg_assistant",
+                1_775_640_001_300i64,
+                json!({"type": "tool", "tool": "bash", "state": {"output": "do not index"}}),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?1, ?2, 'ses_fixture', ?3, ?3, ?4)",
+                (part_id, message_id, time, data.to_string()),
+            )
+            .expect("insert part");
+        }
+        drop(conn);
+
+        let native_titles = NativeTitleIndex::default();
+        let imported = ingest_file(
+            &store,
+            "machine_fixture",
+            "opencode",
+            &db_path,
+            &native_titles,
+        )
+        .expect("ingest opencode");
+        let path_text = db_path.to_string_lossy().to_string();
+        let session_id = stable_id(&["session", "opencode", &path_text, "ses_fixture"]);
+        let session = store
+            .session_by_id(&session_id)
+            .expect("load session")
+            .expect("session");
+        let events = store.events_for_session(&session_id).expect("load events");
+
+        assert_eq!(imported.inserted, 4);
+        assert_eq!(session.title.as_deref(), Some("Native OpenCode Title"));
+        assert_eq!(session.source_kind, "opencode");
+        assert_eq!(session.metadata["parser"], "opencode_sqlite_v1");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].content, "user asks for OpenCode ingestion");
+        assert_eq!(events[1].role.as_deref(), Some("assistant"));
+        assert_eq!(events[1].content, "assistant explains the OpenCode parser");
     }
 
     #[test]
