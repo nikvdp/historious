@@ -6,7 +6,8 @@ use crate::storage::{RecentResultRefInput, Store, ThreadListOptions, ThreadSortM
 use crate::transport;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -414,6 +415,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Generate a shell completion script.
+    Completion {
+        #[arg(value_enum, help = "Shell to generate completions for")]
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -570,9 +576,15 @@ impl Cli {
 
     pub async fn run(self) -> Result<()> {
         let robot = self.robot;
+        let command = self.command;
+        if let Command::Completion { shell } = command {
+            print_completion(shell);
+            return Ok(());
+        }
+
         let config = AppConfig::load(self.data_dir)?;
         let store = Store::open(&config.data_dir)?;
-        match self.command {
+        match command {
             Command::Update {
                 max_files,
                 source,
@@ -1062,6 +1074,7 @@ impl Cli {
                 }
             }
             Command::Skill { command } => run_skill_command(command)?,
+            Command::Completion { .. } => unreachable!("completion returns before storage setup"),
         }
         Ok(())
     }
@@ -1085,6 +1098,7 @@ impl Command {
             Command::Status { .. } => "status",
             Command::Onboard { .. } => "onboard",
             Command::Skill { .. } => "skill",
+            Command::Completion { .. } => "completion",
         }
     }
 
@@ -1105,6 +1119,11 @@ impl Command {
                 | Command::Status { json: true, .. }
         )
     }
+}
+
+fn print_completion(shell: Shell) {
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "super-cass", &mut io::stdout());
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {
