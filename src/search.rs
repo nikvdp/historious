@@ -984,7 +984,7 @@ mod tests {
         stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, SearchUnitRecord,
         SessionRecord, SourceRecord,
     };
-    use crate::embed::{EmbedderConfig, EmbedderProvider};
+    use crate::embed::{EmbedderConfig, EmbedderProvider, FastEmbedModel};
     use crate::storage::{f32_vector_to_blob, ImportDelta, Store};
     use chrono::Utc;
     use serde_json::json;
@@ -1336,6 +1336,7 @@ mod tests {
         let store = Store::open(dir.path()).expect("store");
         let config = EmbedderConfig {
             provider: EmbedderProvider::FastEmbed,
+            semantic_model: FastEmbedModel::BgeSmallEnV15Q,
             model_cache: dir.path().join("models"),
             intra_threads: 1,
         };
@@ -1365,6 +1366,7 @@ mod tests {
             .expect("embedding import");
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
+            semantic_model: FastEmbedModel::BgeSmallEnV15Q,
             model_cache: dir.path().join("models"),
             intra_threads: 1,
         };
@@ -1407,6 +1409,7 @@ mod tests {
             .expect("embedding import");
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
+            semantic_model: FastEmbedModel::BgeSmallEnV15Q,
             model_cache: dir.path().join("models"),
             intra_threads: 1,
         };

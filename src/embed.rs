@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "semantic-fastembed")]
 use std::sync::Mutex;
 
-pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:snowflake/snowflake-arctic-embed-xs-q";
+pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:bge-small-en-v1.5-q";
 pub const DEFAULT_SEMANTIC_DIMS: usize = 384;
+const DEFAULT_FASTEMBED_MODEL: FastEmbedModel = FastEmbedModel::BgeSmallEnV15Q;
 
 pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;
@@ -27,6 +28,7 @@ pub trait Embedder: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
     pub provider: EmbedderProvider,
+    pub semantic_model: FastEmbedModel,
     pub model_cache: PathBuf,
     pub intra_threads: usize,
 }
@@ -36,6 +38,41 @@ pub enum EmbedderProvider {
     FastEmbed,
     HashFallback,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastEmbedModel {
+    BgeSmallEnV15Q,
+    SnowflakeArcticEmbedXSQ,
+}
+
+impl FastEmbedModel {
+    fn from_name(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "bge-small-en-v1.5-q" | "bge-small-en-v15-q" | "bge-small-q" | "bge" => {
+                Some(Self::BgeSmallEnV15Q)
+            }
+            "snowflake-xs-q" | "snowflake-arctic-embed-xs-q" | "snowflake" => {
+                Some(Self::SnowflakeArcticEmbedXSQ)
+            }
+            _ => None,
+        }
+    }
+
+    fn model_id(self) -> &'static str {
+        match self {
+            Self::BgeSmallEnV15Q => DEFAULT_SEMANTIC_MODEL_ID,
+            Self::SnowflakeArcticEmbedXSQ => "fastembed:snowflake/snowflake-arctic-embed-xs-q",
+        }
+    }
+
+    #[cfg(feature = "semantic-fastembed")]
+    fn embedding_model(self) -> EmbeddingModel {
+        match self {
+            Self::BgeSmallEnV15Q => EmbeddingModel::BGESmallENV15Q,
+            Self::SnowflakeArcticEmbedXSQ => EmbeddingModel::SnowflakeArcticEmbedXSQ,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +99,10 @@ impl EmbedderConfig {
         let model_cache = std::env::var_os("SUPER_CASS_MODEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("models").join("fastembed"));
+        let semantic_model = std::env::var("SUPER_CASS_FASTEMBED_MODEL")
+            .ok()
+            .and_then(|value| FastEmbedModel::from_name(&value))
+            .unwrap_or(DEFAULT_FASTEMBED_MODEL);
         let intra_threads = std::env::var("SUPER_CASS_EMBEDDER_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -69,6 +110,7 @@ impl EmbedderConfig {
             .unwrap_or_else(default_intra_threads);
         Self {
             provider,
+            semantic_model,
             model_cache,
             intra_threads,
         }
@@ -78,7 +120,7 @@ impl EmbedderConfig {
         match self.provider {
             EmbedderProvider::FastEmbed => EmbedderStatus {
                 provider: "fastembed".to_string(),
-                model_id: Some(DEFAULT_SEMANTIC_MODEL_ID.to_string()),
+                model_id: Some(self.semantic_model.model_id().to_string()),
                 dims: Some(DEFAULT_SEMANTIC_DIMS),
                 semantic: cfg!(feature = "semantic-fastembed"),
                 available: cfg!(feature = "semantic-fastembed"),
@@ -105,7 +147,9 @@ impl EmbedderConfig {
 
     pub fn load(&self) -> Result<Box<dyn Embedder>> {
         match self.provider {
-            EmbedderProvider::FastEmbed => load_fastembed(&self.model_cache, self.intra_threads),
+            EmbedderProvider::FastEmbed => {
+                load_fastembed(&self.model_cache, self.intra_threads, self.semantic_model)
+            }
             EmbedderProvider::HashFallback => Ok(Box::new(HashEmbedder)),
             EmbedderProvider::Disabled => anyhow::bail!("query embedder disabled"),
         }
@@ -133,32 +177,50 @@ fn fastembed_unavailable_reason() -> Option<String> {
 }
 
 #[cfg(feature = "semantic-fastembed")]
-fn load_fastembed(model_cache: &Path, intra_threads: usize) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(FastEmbedder::new(model_cache, intra_threads)?))
+fn load_fastembed(
+    model_cache: &Path,
+    intra_threads: usize,
+    semantic_model: FastEmbedModel,
+) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(FastEmbedder::new(
+        model_cache,
+        intra_threads,
+        semantic_model,
+    )?))
 }
 
 #[cfg(not(feature = "semantic-fastembed"))]
-fn load_fastembed(_model_cache: &Path, _intra_threads: usize) -> Result<Box<dyn Embedder>> {
+fn load_fastembed(
+    _model_cache: &Path,
+    _intra_threads: usize,
+    _semantic_model: FastEmbedModel,
+) -> Result<Box<dyn Embedder>> {
     anyhow::bail!("fastembed support was not compiled; rebuild with the semantic-fastembed feature")
 }
 
 #[cfg(feature = "semantic-fastembed")]
 pub struct FastEmbedder {
     model: Mutex<TextEmbedding>,
+    model_id: &'static str,
 }
 
 #[cfg(feature = "semantic-fastembed")]
 impl FastEmbedder {
-    pub fn new(model_cache: &Path, intra_threads: usize) -> Result<Self> {
+    pub fn new(
+        model_cache: &Path,
+        intra_threads: usize,
+        semantic_model: FastEmbedModel,
+    ) -> Result<Self> {
         std::fs::create_dir_all(model_cache)
             .with_context(|| format!("creating model cache {}", model_cache.display()))?;
-        let options = InitOptions::new(EmbeddingModel::SnowflakeArcticEmbedXSQ)
+        let options = InitOptions::new(semantic_model.embedding_model())
             .with_cache_dir(model_cache.to_path_buf())
             .with_intra_threads(intra_threads.max(1))
             .with_show_download_progress(false);
         let model = TextEmbedding::try_new(options).context("loading fastembed model")?;
         Ok(Self {
             model: Mutex::new(model),
+            model_id: semantic_model.model_id(),
         })
     }
 }
@@ -166,7 +228,7 @@ impl FastEmbedder {
 #[cfg(feature = "semantic-fastembed")]
 impl Embedder for FastEmbedder {
     fn model_id(&self) -> &str {
-        DEFAULT_SEMANTIC_MODEL_ID
+        self.model_id
     }
 
     fn dims(&self) -> usize {
@@ -258,6 +320,7 @@ mod tests {
     fn disabled_provider_reports_degraded_status() {
         let config = EmbedderConfig {
             provider: EmbedderProvider::Disabled,
+            semantic_model: DEFAULT_FASTEMBED_MODEL,
             model_cache: PathBuf::from("unused"),
             intra_threads: 1,
         };
@@ -268,6 +331,33 @@ mod tests {
             status.degraded_reason.as_deref(),
             Some("query embedder disabled")
         );
+    }
+
+    #[test]
+    fn default_fastembed_model_is_bge_small_quantized() {
+        let config = EmbedderConfig {
+            provider: EmbedderProvider::FastEmbed,
+            semantic_model: DEFAULT_FASTEMBED_MODEL,
+            model_cache: PathBuf::from("unused"),
+            intra_threads: 1,
+        };
+        let status = config.status_without_loading();
+
+        assert_eq!(status.model_id.as_deref(), Some(DEFAULT_SEMANTIC_MODEL_ID));
+        assert_eq!(status.dims, Some(DEFAULT_SEMANTIC_DIMS));
+    }
+
+    #[test]
+    fn fastembed_model_names_parse_supported_384_dim_choices() {
+        assert_eq!(
+            FastEmbedModel::from_name("bge-small-en-v1.5-q"),
+            Some(FastEmbedModel::BgeSmallEnV15Q)
+        );
+        assert_eq!(
+            FastEmbedModel::from_name("snowflake-xs-q"),
+            Some(FastEmbedModel::SnowflakeArcticEmbedXSQ)
+        );
+        assert_eq!(FastEmbedModel::from_name("large-model"), None);
     }
 
     #[test]
