@@ -7,9 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const RRF_K: f64 = 60.0;
+const LEXICAL_RRF_WEIGHT: f64 = 1.0;
+const SEMANTIC_RRF_WEIGHT: f64 = 0.98;
 const BACKEND_LIMIT_MULTIPLIER: usize = 50;
 const BACKEND_MIN_LIMIT: usize = 200;
 const SQLITE_VEC_MAX_K: usize = 4096;
+const SEMANTIC_CANDIDATE_MIN_CHARS: usize = 80;
+const SEMANTIC_CANDIDATE_MIN_TERMS: usize = 8;
 const EMBEDDING_BATCH_START: usize = 64;
 const EMBEDDING_BATCH_MAX: usize = 64;
 const EMBEDDING_BATCH_MIN: usize = 1;
@@ -810,9 +814,27 @@ fn semantic_search(
             machine_id_prefix,
         )?
         .into_iter()
+        .filter(|row| semantic_candidate_has_context(&row.content))
+        .enumerate()
+        .map(|(idx, mut row)| {
+            row.rank = idx + 1;
+            row
+        })
         .map(search_row_from_vector)
         .collect();
     Ok((rows, degraded_reason))
+}
+
+fn semantic_candidate_has_context(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < SEMANTIC_CANDIDATE_MIN_CHARS {
+        return false;
+    }
+    let informative_terms = trimmed
+        .split_whitespace()
+        .filter(|term| term.chars().any(char::is_alphanumeric))
+        .count();
+    informative_terms >= SEMANTIC_CANDIDATE_MIN_TERMS
 }
 
 fn fuse(
@@ -835,13 +857,13 @@ fn fuse(
             continue;
         }
         let entry = acc.entry(row.event_id.clone()).or_default();
-        entry.score += 1.0 / (RRF_K + row.rank as f64);
+        entry.score += LEXICAL_RRF_WEIGHT / (RRF_K + row.rank as f64);
         entry.lexical_rank = Some(row.rank);
         entry.row = Some(row);
     }
     for row in semantic {
         let entry = acc.entry(row.event_id.clone()).or_default();
-        entry.score += 1.0 / (RRF_K + row.rank as f64);
+        entry.score += SEMANTIC_RRF_WEIGHT / (RRF_K + row.rank as f64);
         entry.semantic_rank = Some(row.rank);
         if entry.row.is_none() {
             entry.row = Some(row);
@@ -971,7 +993,10 @@ mod tests {
     fn vector_only_result_can_win_without_fts_overlap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(&store, "exact lexical marker");
+        let unit = import_event_and_project(
+            &store,
+            "exact lexical marker with enough surrounding human context to stay eligible for semantic retrieval",
+        );
         store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &unit,
@@ -1006,7 +1031,10 @@ mod tests {
     fn high_user_limit_does_not_exceed_sqlite_vec_knn_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let unit = import_event_and_project(&store, "high limit semantic target");
+        let unit = import_event_and_project(
+            &store,
+            "high limit semantic target with enough surrounding context to pass semantic candidate filtering",
+        );
         store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &unit,
@@ -1040,7 +1068,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
         let lexical_only = import_event_and_project(&store, "alpha token only");
-        let hybrid = import_event_and_project(&store, "alpha token also semantic");
+        let hybrid = import_event_and_project(
+            &store,
+            "alpha token also semantic with enough surrounding words to remain a useful vector candidate",
+        );
         store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &hybrid,
@@ -1071,6 +1102,45 @@ mod tests {
         assert!(response.results.iter().any(
             |result| result.event_id == lexical_only.event_id && result.semantic_rank.is_none()
         ));
+    }
+
+    #[test]
+    fn semantic_search_filters_short_low_information_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let short = import_event_and_project(&store, "fix");
+        let rich = import_event_and_project(
+            &store,
+            "payment workflow failed after the funding step and the logs explain the retry behavior clearly",
+        );
+        for unit in [&short, &rich] {
+            store
+                .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                    unit,
+                    unit_vector(11),
+                )))
+                .expect("embedding");
+        }
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(11),
+        };
+
+        let response = search(
+            &store,
+            "payment failure",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, rich.event_id);
+        assert_eq!(response.results[0].semantic_rank, Some(1));
     }
 
     #[test]
@@ -1154,6 +1224,34 @@ mod tests {
 
         assert_eq!(results[0].event_id, "new_event");
         assert_eq!(results[1].event_id, "old_event");
+    }
+
+    #[test]
+    fn rrf_keeps_exact_lexical_anchors_before_semantic_complements() {
+        let now = Utc::now();
+        let results = fuse(
+            vec![
+                ranked_row("lexical_one", 1, now),
+                ranked_row("lexical_two", 2, now),
+                ranked_row("lexical_three", 3, now),
+            ],
+            vec![ranked_row("semantic_one", 1, now)],
+            SearchOptions::new(10, SortMode::Relevance, 0.0),
+        );
+
+        let ordered = results
+            .iter()
+            .map(|result| result.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                "lexical_one",
+                "lexical_two",
+                "semantic_one",
+                "lexical_three"
+            ]
+        );
     }
 
     #[test]
@@ -1591,13 +1689,13 @@ mod tests {
         let store = Store::open(dir.path()).expect("store");
         let target = import_event_and_project_at_machine(
             &store,
-            "shared semantic machine target",
+            "shared semantic machine target with enough surrounding context for useful vector retrieval",
             None,
             "machine_dev_box_111",
         );
         let other = import_event_and_project_at_machine(
             &store,
-            "shared semantic machine other",
+            "shared semantic machine other with enough surrounding context for useful vector retrieval",
             None,
             "machine_other_222",
         );
@@ -1643,8 +1741,16 @@ mod tests {
         let new_time = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
             .expect("new time")
             .with_timezone(&Utc);
-        let old_unit = import_event_and_project_at(&store, "old semantic target", Some(old_time));
-        let new_unit = import_event_and_project_at(&store, "new semantic target", Some(new_time));
+        let old_unit = import_event_and_project_at(
+            &store,
+            "old semantic target with enough surrounding context for useful vector retrieval during regression testing",
+            Some(old_time),
+        );
+        let new_unit = import_event_and_project_at(
+            &store,
+            "new semantic target with enough surrounding context for useful vector retrieval during regression testing",
+            Some(new_time),
+        );
         for unit in [&old_unit, &new_unit] {
             store
                 .import_record(&ArchiveRecord::Embedding(fixture_embedding(
