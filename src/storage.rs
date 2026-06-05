@@ -109,6 +109,7 @@ pub struct SearchRow {
     pub session_id: String,
     pub machine_id: String,
     pub source_kind: String,
+    pub search_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub session_title: Option<String>,
@@ -130,6 +131,7 @@ pub struct VectorSearchRow {
     pub session_id: String,
     pub machine_id: String,
     pub source_kind: String,
+    pub search_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub session_title: Option<String>,
@@ -1022,6 +1024,7 @@ impl Store {
                         events_fts.session_id,
                         e.machine_id,
                         events_fts.source_kind,
+                        COALESCE(json_extract(e.metadata_json, '$.search_kind'), e.role, e.event_type),
                         snippet(events_fts, 3, '', '', '...', 24),
                         e.occurred_at,
                         s.title,
@@ -1052,11 +1055,12 @@ impl Store {
                         session_id: row.get(1)?,
                         machine_id: row.get(2)?,
                         source_kind: row.get(3)?,
-                        content: row.get(4)?,
-                        occurred_at: parse_opt_dt(row.get(5)?),
-                        session_title: row.get(6)?,
+                        search_kind: row.get(4)?,
+                        content: row.get(5)?,
+                        occurred_at: parse_opt_dt(row.get(6)?),
+                        session_title: row.get(7)?,
                         workspace_values: session_workspace_values(&parse_metadata_json(
-                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
                         )),
                         rank: 0,
                     })
@@ -1303,10 +1307,11 @@ impl Store {
                  LEFT JOIN embeddings e
                    ON e.unit_id = su.id
                   AND e.text_hash = su.text_hash
-                  AND e.model_id = ?1
+                   AND e.model_id = ?1
                  WHERE e.id IS NULL
                    AND su.search_kind = 'user'
                    AND length(trim(su.text)) >= ?2
+                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
                  ORDER BY su.occurred_at, su.session_id, su.id
                  LIMIT ?3",
             )?;
@@ -1362,6 +1367,7 @@ impl Store {
                    AND (event_scope.id IS NOT NULL OR unit_scope.id IS NOT NULL)
                    AND su.search_kind = 'user'
                    AND length(trim(su.text)) >= ?
+                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
                  ORDER BY su.occurred_at, su.session_id, su.id
                  LIMIT ?",
             )?;
@@ -1474,6 +1480,7 @@ impl Store {
                         su.session_id,
                         su.machine_id,
                         su.source_kind,
+                        su.search_kind,
                         su.text,
                         su.occurred_at,
                         s.title,
@@ -1492,6 +1499,7 @@ impl Store {
                    AND (?7 IS NULL OR substr(su.machine_id, 1, length(?7)) = ?7)
                    AND su.search_kind = 'user'
                    AND length(trim(su.text)) >= ?8
+                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
                  ORDER BY vec_embeddings_384.distance",
             )?;
             let rows = stmt.query_map(
@@ -1512,13 +1520,14 @@ impl Store {
                         session_id: row.get(2)?,
                         machine_id: row.get(3)?,
                         source_kind: row.get(4)?,
-                        content: row.get(5)?,
-                        occurred_at: parse_opt_dt(row.get(6)?),
-                        session_title: row.get(7)?,
+                        search_kind: row.get(5)?,
+                        content: row.get(6)?,
+                        occurred_at: parse_opt_dt(row.get(7)?),
+                        session_title: row.get(8)?,
                         workspace_values: session_workspace_values(&parse_metadata_json(
-                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(9)?,
                         )),
-                        distance: row.get(9)?,
+                        distance: row.get(10)?,
                         rank: 0,
                     })
                 },
@@ -2491,6 +2500,7 @@ fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool
            WHERE e.id IS NULL
              AND su.search_kind = 'user'
              AND length(trim(su.text)) >= ?2
+             AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
            LIMIT 1
          )",
         params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
@@ -2509,7 +2519,8 @@ fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Re
           AND e.model_id = ?1
          WHERE e.id IS NULL
            AND su.search_kind = 'user'
-           AND length(trim(su.text)) >= ?2",
+           AND length(trim(su.text)) >= ?2
+           AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'",
         params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
         |row| row.get(0),
     )?;
@@ -2922,10 +2933,15 @@ mod tests {
             "user wants to find payment failures in agent history with enough surrounding context",
             "user",
         );
+        let agents_instructions = fixture_search_unit_with_kind(
+            "# AGENTS.md instructions for /tmp/repo <INSTRUCTIONS> Guidelines for interaction with enough surrounding context to otherwise qualify",
+            "user",
+        );
         store
             .import_records(&[
                 ArchiveRecord::SearchUnit(assistant),
                 ArchiveRecord::SearchUnit(short_user),
+                ArchiveRecord::SearchUnit(agents_instructions.clone()),
                 ArchiveRecord::SearchUnit(long_user.clone()),
             ])
             .expect("import search units");
@@ -2952,6 +2968,30 @@ mod tests {
                 unit_vector(4),
             )))
             .expect("import embedding");
+        store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &agents_instructions,
+                unit_vector(4),
+            )))
+            .expect("import instruction embedding");
+        store
+            .refresh_vector_projection()
+            .expect("refresh vector projection");
+
+        let hits = store
+            .vector_search(
+                "fixture-semantic-384",
+                &unit_vector(4),
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("vector search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].unit_id, long_user.id);
 
         assert_eq!(
             store
