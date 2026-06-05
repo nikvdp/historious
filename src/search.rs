@@ -892,8 +892,21 @@ fn fuse(
         .collect::<Vec<_>>();
     apply_recency_bias(&mut results, options.recency_bias);
     sort_results(&mut results, options.sort);
+    dedupe_results_by_snippet(&mut results);
     results.truncate(options.limit);
     results
+}
+
+fn dedupe_results_by_snippet(results: &mut Vec<SearchResult>) {
+    let mut seen = HashSet::new();
+    results.retain(|result| seen.insert(normalized_result_key(&result.snippet)));
+}
+
+fn normalized_result_key(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
@@ -1252,6 +1265,38 @@ mod tests {
                 "lexical_three"
             ]
         );
+    }
+
+    #[test]
+    fn fuse_collapses_duplicate_snippets_and_refills_with_distinct_results() {
+        let now = Utc::now();
+        let duplicate_text = "same forked transcript result repeated across agent branches";
+        let results = fuse(
+            vec![
+                ranked_row_with_content("lexical_one", "first exact lexical result", 1, now),
+                ranked_row_with_content("lexical_dup", duplicate_text, 2, now),
+            ],
+            vec![
+                ranked_row_with_content("semantic_dup", duplicate_text, 1, now),
+                ranked_row_with_content("semantic_two", "second distinct semantic result", 2, now),
+                ranked_row_with_content("semantic_three", "third distinct semantic result", 3, now),
+            ],
+            SearchOptions::new(4, SortMode::Relevance, 0.0),
+        );
+
+        let snippets = results
+            .iter()
+            .map(|result| result.snippet.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(snippets.len(), 4);
+        assert_eq!(
+            snippets
+                .iter()
+                .filter(|snippet| **snippet == duplicate_text)
+                .count(),
+            1
+        );
+        assert!(snippets.contains(&"third distinct semantic result"));
     }
 
     #[test]
@@ -2034,12 +2079,21 @@ mod tests {
     }
 
     fn ranked_row(event_id: &str, rank: usize, occurred_at: chrono::DateTime<Utc>) -> SearchRow {
+        ranked_row_with_content(event_id, event_id, rank, occurred_at)
+    }
+
+    fn ranked_row_with_content(
+        event_id: &str,
+        content: &str,
+        rank: usize,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> SearchRow {
         SearchRow {
             event_id: event_id.to_string(),
             session_id: "session".to_string(),
             machine_id: "machine_fixture".to_string(),
             source_kind: "fixture".to_string(),
-            content: event_id.to_string(),
+            content: content.to_string(),
             occurred_at: Some(occurred_at),
             session_title: Some("fixture session".to_string()),
             workspace_values: vec!["/tmp/fixture".to_string()],
