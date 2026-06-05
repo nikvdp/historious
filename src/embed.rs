@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "semantic-fastembed")]
 use std::sync::Mutex;
 
-pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:bge-small-en-v1.5-q";
+pub const DEFAULT_SEMANTIC_MODEL_ID: &str = "fastembed:snowflake/snowflake-arctic-embed-xs-q";
 pub const DEFAULT_SEMANTIC_DIMS: usize = 384;
-const DEFAULT_FASTEMBED_MODEL: FastEmbedModel = FastEmbedModel::BgeSmallEnV15Q;
+const DEFAULT_FASTEMBED_MODEL: FastEmbedModel = FastEmbedModel::SnowflakeArcticEmbedXSQ;
 
 pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;
@@ -42,7 +42,9 @@ pub enum EmbedderProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastEmbedModel {
+    AllMiniLML12V2Q,
     BgeSmallEnV15Q,
+    SnowflakeArcticEmbedSQ,
     SnowflakeArcticEmbedXSQ,
 }
 
@@ -51,6 +53,12 @@ impl FastEmbedModel {
         match input.trim().to_ascii_lowercase().as_str() {
             "bge-small-en-v1.5-q" | "bge-small-en-v15-q" | "bge-small-q" | "bge" => {
                 Some(Self::BgeSmallEnV15Q)
+            }
+            "minilm-l12-q" | "all-minilm-l12-v2-q" | "all-minilm-l12-q" | "minilm" => {
+                Some(Self::AllMiniLML12V2Q)
+            }
+            "snowflake-s-q" | "snowflake-arctic-embed-s-q" | "snowflake-small-q" => {
+                Some(Self::SnowflakeArcticEmbedSQ)
             }
             "snowflake-xs-q" | "snowflake-arctic-embed-xs-q" | "snowflake" => {
                 Some(Self::SnowflakeArcticEmbedXSQ)
@@ -61,15 +69,19 @@ impl FastEmbedModel {
 
     fn model_id(self) -> &'static str {
         match self {
-            Self::BgeSmallEnV15Q => DEFAULT_SEMANTIC_MODEL_ID,
-            Self::SnowflakeArcticEmbedXSQ => "fastembed:snowflake/snowflake-arctic-embed-xs-q",
+            Self::AllMiniLML12V2Q => "fastembed:all-minilm-l12-v2-q",
+            Self::BgeSmallEnV15Q => "fastembed:bge-small-en-v1.5-q",
+            Self::SnowflakeArcticEmbedSQ => "fastembed:snowflake/snowflake-arctic-embed-s-q",
+            Self::SnowflakeArcticEmbedXSQ => DEFAULT_SEMANTIC_MODEL_ID,
         }
     }
 
     #[cfg(feature = "semantic-fastembed")]
     fn embedding_model(self) -> EmbeddingModel {
         match self {
+            Self::AllMiniLML12V2Q => EmbeddingModel::AllMiniLML12V2Q,
             Self::BgeSmallEnV15Q => EmbeddingModel::BGESmallENV15Q,
+            Self::SnowflakeArcticEmbedSQ => EmbeddingModel::SnowflakeArcticEmbedSQ,
             Self::SnowflakeArcticEmbedXSQ => EmbeddingModel::SnowflakeArcticEmbedXSQ,
         }
     }
@@ -334,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn default_fastembed_model_is_bge_small_quantized() {
+    fn default_fastembed_model_stays_fast_snowflake_xs_quantized() {
         let config = EmbedderConfig {
             provider: EmbedderProvider::FastEmbed,
             semantic_model: DEFAULT_FASTEMBED_MODEL,
@@ -356,6 +368,14 @@ mod tests {
         assert_eq!(
             FastEmbedModel::from_name("snowflake-xs-q"),
             Some(FastEmbedModel::SnowflakeArcticEmbedXSQ)
+        );
+        assert_eq!(
+            FastEmbedModel::from_name("snowflake-s-q"),
+            Some(FastEmbedModel::SnowflakeArcticEmbedSQ)
+        );
+        assert_eq!(
+            FastEmbedModel::from_name("minilm-l12-q"),
+            Some(FastEmbedModel::AllMiniLML12V2Q)
         );
         assert_eq!(FastEmbedModel::from_name("large-model"), None);
     }
