@@ -1471,7 +1471,10 @@ fn refresh_search_after_update_with_progress(
 ) -> Result<usize> {
     if repair {
         progress("repairing all indexable events".to_string());
-        search::refresh(store)
+        let indexed = search::refresh(store)?;
+        progress("repairing history items".to_string());
+        store.refresh_history_items()?;
+        Ok(indexed)
     } else {
         progress(format!(
             "indexing {} new events",
@@ -1503,12 +1506,20 @@ fn refresh_search_after_update_with_progress(
             },
         )?;
         progress("checking index health".to_string());
-        if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
+        let indexed = if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
             progress("repairing missing search index rows".to_string());
             search::refresh(store)
         } else {
             Ok(indexed)
+        }?;
+        if store.history_items_projection_ready()? {
+            progress("projecting changed history items".to_string());
+            store.refresh_history_items_for_events(&delta.touched_events)?;
+        } else {
+            progress("projecting history items".to_string());
+            store.refresh_history_items()?;
         }
+        Ok(indexed)
     }
 }
 
@@ -2147,6 +2158,7 @@ fn print_status_output(output: &StatusOutput) {
     println!("raw_artifacts={}", output.stats.raw_artifacts);
     println!("sessions={}", output.stats.sessions);
     println!("events={}", output.stats.events);
+    println!("history_items={}", output.stats.history_items);
     println!("search_units={}", output.stats.search_units);
     println!("embeddings={}", output.stats.embeddings);
     println!(
