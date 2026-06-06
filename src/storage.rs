@@ -201,6 +201,15 @@ pub struct TranscriptContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct HistoryTranscriptContext {
+    pub session: SessionRecord,
+    pub target_event: Option<EventRecord>,
+    pub items: Vec<HistoryItemRecord>,
+    pub target_index: Option<usize>,
+    pub omitted_target: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RawArtifactSummary {
     pub hash: String,
     pub path: String,
@@ -1412,6 +1421,73 @@ impl Store {
                 target_event,
                 events: session_events[start..end].to_vec(),
                 target_index: target_index - start,
+            }))
+        })
+    }
+
+    pub fn history_items_for_transcript_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<HistoryTranscriptContext>> {
+        self.with_conn(|conn| {
+            let Some(session) = session_by_id(conn, session_id)? else {
+                return Ok(None);
+            };
+            let items = conversation_history_items_for_session(conn, session_id)?;
+            Ok(Some(HistoryTranscriptContext {
+                session,
+                target_event: None,
+                items,
+                target_index: None,
+                omitted_target: false,
+            }))
+        })
+    }
+
+    pub fn history_items_around_event(
+        &self,
+        event_id: &str,
+        before: usize,
+        after: usize,
+    ) -> Result<Option<HistoryTranscriptContext>> {
+        self.with_conn(|conn| {
+            let Some(target_event) = event_by_id(conn, event_id)? else {
+                return Ok(None);
+            };
+            let Some(session) = session_by_id(conn, &target_event.session_id)? else {
+                return Ok(None);
+            };
+            let all_items = conversation_history_items_for_session(conn, &target_event.session_id)?;
+            let target_index = all_items
+                .iter()
+                .position(|candidate| candidate.event_id == target_event.id);
+            let anchor_index = target_index.or_else(|| {
+                all_items
+                    .iter()
+                    .position(|candidate| candidate.ordinal >= target_event.ordinal)
+                    .or_else(|| all_items.len().checked_sub(1))
+            });
+            let items = if let Some(anchor_index) = anchor_index {
+                let start = anchor_index.saturating_sub(before);
+                let end = (anchor_index + after + 1).min(all_items.len());
+                all_items[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            let target_index = target_index.and_then(|target_index| {
+                anchor_index.and_then(|anchor_index| {
+                    let start = anchor_index.saturating_sub(before);
+                    target_index
+                        .checked_sub(start)
+                        .filter(|idx| *idx < items.len())
+                })
+            });
+            Ok(Some(HistoryTranscriptContext {
+                session,
+                target_event: Some(target_event),
+                items,
+                target_index,
+                omitted_target: target_index.is_none(),
             }))
         })
     }
@@ -3385,7 +3461,6 @@ fn row_search_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchUnitRecord
     })
 }
 
-#[cfg(test)]
 fn row_history_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItemRecord> {
     let metadata: String = row.get(15)?;
     Ok(HistoryItemRecord {
@@ -3407,6 +3482,27 @@ fn row_history_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItemReco
         metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
         hash: row.get(16)?,
     })
+}
+
+fn conversation_history_items_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<HistoryItemRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, event_id, session_id, source_id, machine_id, source_kind, ordinal, subordinal,
+                tier, kind, text, text_hash, occurred_at, lexical_indexable, semantic_policy,
+                metadata_json, hash
+         FROM history_items
+         WHERE session_id = ?1
+           AND tier = 'conversation'
+         ORDER BY ordinal, subordinal, id",
+    )?;
+    let rows = stmt.query_map(params![session_id], row_history_item)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn row_embedding(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingRecord> {
@@ -4107,6 +4203,87 @@ mod tests {
         assert_eq!(
             tier_kinds(&history_items_from_event(&encrypted).expect("encrypted")),
             vec![("raw", "response_item")]
+        );
+    }
+
+    #[test]
+    fn clean_transcript_context_marks_hidden_raw_target_as_omitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_clean_transcript");
+        let session = fixture_session("session_clean_transcript", &source.id);
+        let mut user = fixture_event(
+            "event_clean_user",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_clean_user",
+        );
+        user.role = Some("user".to_string());
+        user.content = "please make transcript output readable".to_string();
+        user.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_text": user.content
+        });
+        let mut hidden = fixture_event(
+            "event_clean_hidden",
+            &session.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_clean_hidden",
+        );
+        hidden.role = Some("user".to_string());
+        hidden.content = "# AGENTS.md instructions for /tmp/repo <INSTRUCTIONS>".to_string();
+        hidden.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_text": hidden.content
+        });
+        let mut assistant = fixture_event(
+            "event_clean_assistant",
+            &session.id,
+            &source.id,
+            3,
+            None,
+            "event_hash_clean_assistant",
+        );
+        assistant.role = Some("assistant".to_string());
+        assistant.content = "I will keep the readable turns visible.".to_string();
+        assistant.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "assistant",
+            "search_text": assistant.content
+        });
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(user),
+                ArchiveRecord::Event(hidden),
+                ArchiveRecord::Event(assistant),
+            ])
+            .expect("import clean transcript records");
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
+
+        let context = store
+            .history_items_around_event("event_clean_hidden", 1, 1)
+            .expect("clean context")
+            .expect("context");
+
+        assert!(context.omitted_target);
+        assert_eq!(context.target_index, None);
+        assert_eq!(
+            context
+                .items
+                .iter()
+                .map(|item| item.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event_clean_user", "event_clean_assistant"]
         );
     }
 

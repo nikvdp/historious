@@ -1,5 +1,7 @@
 use crate::archive::{EventRecord, SessionRecord, SourceRecord};
-use crate::storage::{RawArtifactSummary, TranscriptContext};
+use crate::storage::{
+    HistoryItemRecord, HistoryTranscriptContext, RawArtifactSummary, TranscriptContext,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct ViewMetadata {
@@ -32,6 +34,35 @@ pub fn render_context(context: &TranscriptContext, metadata: &ViewMetadata, colo
     out
 }
 
+pub fn render_history_context(
+    context: &HistoryTranscriptContext,
+    metadata: &ViewMetadata,
+    color: bool,
+) -> String {
+    let mut out = String::new();
+    push_view_header(
+        &mut out,
+        "Transcript",
+        &context.session,
+        context.target_event.as_ref(),
+        metadata,
+    );
+    out.push('\n');
+    if context.omitted_target {
+        push_omitted_target(&mut out, color);
+    }
+    for (idx, item) in context.items.iter().enumerate() {
+        push_history_item(
+            &mut out,
+            item,
+            context.target_index == Some(idx),
+            color,
+            metadata.verbose,
+        );
+    }
+    out
+}
+
 pub fn render_session(
     session: &SessionRecord,
     events: &[EventRecord],
@@ -55,6 +86,14 @@ pub fn render_session(
         );
     }
     out
+}
+
+pub fn render_history_session(
+    context: &HistoryTranscriptContext,
+    metadata: &ViewMetadata,
+    color: bool,
+) -> String {
+    render_history_context(context, metadata, color)
 }
 
 fn push_view_header(
@@ -209,6 +248,68 @@ fn push_event(
     out.push_str("\n\n");
 }
 
+fn push_history_item(
+    out: &mut String,
+    item: &HistoryItemRecord,
+    target: bool,
+    color: bool,
+    verbose: bool,
+) {
+    let marker = if target { "=> " } else { "   " };
+    if target && color {
+        out.push_str("\x1b[1;36m");
+    }
+    out.push_str(marker);
+    if verbose {
+        out.push_str("history_item:");
+        out.push_str(&item.id);
+        out.push_str(" event:");
+        out.push_str(&item.event_id);
+        out.push_str(" session:");
+        out.push_str(&item.session_id);
+        out.push_str(" ordinal:");
+        out.push_str(&item.ordinal.to_string());
+        out.push_str(" tier:");
+        out.push_str(&item.tier);
+        out.push_str(" kind:");
+        out.push_str(&item.kind);
+        if let Some(occurred_at) = item.occurred_at {
+            out.push_str(" when:");
+            out.push_str(&occurred_at.to_rfc3339());
+        }
+    } else {
+        out.push('#');
+        out.push_str(&item.ordinal.to_string());
+        out.push(' ');
+        out.push_str(&item.source_kind);
+        out.push(' ');
+        out.push_str(&item.kind);
+        if let Some(occurred_at) = item.occurred_at {
+            out.push(' ');
+            out.push_str(&occurred_at.format("%Y-%m-%d %H:%M").to_string());
+        }
+    }
+    if target && color {
+        out.push_str("\x1b[0m");
+    }
+    out.push('\n');
+    out.push_str(&item.text);
+    out.push_str("\n\n");
+}
+
+fn push_omitted_target(out: &mut String, color: bool) {
+    if color {
+        out.push_str("\x1b[1;36m");
+    }
+    out.push_str(
+        "=> [target event omitted from clean transcript; use --full to inspect raw event]",
+    );
+    if color {
+        out.push_str("\x1b[0m");
+    }
+    out.push_str("\n\n");
+}
+
 fn should_compact_preview_event(event: &EventRecord, target: bool, mode: RenderMode) -> bool {
     matches!(mode, RenderMode::Preview)
         && !target
@@ -266,6 +367,38 @@ mod tests {
         assert!(rendered.contains("non-message event omitted"));
         assert!(!rendered.contains("\"arguments\""));
         assert!(rendered.contains("target"));
+    }
+
+    #[test]
+    fn history_context_renders_clean_items_and_omitted_target_marker() {
+        let session = fixture_session();
+        let target = fixture_event("event_raw", 2, "{\"payload\":\"hidden\"}");
+        let context = HistoryTranscriptContext {
+            session,
+            target_event: Some(target),
+            items: vec![
+                fixture_history_item("item_user", "event_user", 1, "user", "please fix this"),
+                fixture_history_item(
+                    "item_assistant",
+                    "event_assistant",
+                    3,
+                    "assistant",
+                    "I fixed it",
+                ),
+            ],
+            target_index: None,
+            omitted_target: true,
+        };
+
+        let rendered = render_history_context(&context, &ViewMetadata::default(), false);
+
+        assert!(rendered.contains("Transcript"));
+        assert!(rendered.contains("target event omitted from clean transcript"));
+        assert!(rendered.contains("#1 codex user"));
+        assert!(rendered.contains("please fix this"));
+        assert!(rendered.contains("#3 codex assistant"));
+        assert!(rendered.contains("I fixed it"));
+        assert!(!rendered.contains("{\"payload\":\"hidden\"}"));
     }
 
     #[test]
@@ -352,5 +485,33 @@ mod tests {
         let mut event = fixture_event(id, ordinal, content);
         event.role = None;
         event
+    }
+
+    fn fixture_history_item(
+        id: &str,
+        event_id: &str,
+        ordinal: i64,
+        kind: &str,
+        text: &str,
+    ) -> HistoryItemRecord {
+        HistoryItemRecord {
+            id: id.to_string(),
+            event_id: event_id.to_string(),
+            session_id: "session_test".to_string(),
+            source_id: "source_test".to_string(),
+            machine_id: "machine_test".to_string(),
+            source_kind: "codex".to_string(),
+            ordinal,
+            subordinal: 0,
+            tier: "conversation".to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            text_hash: stable_hash(&(id, text)).expect("text hash"),
+            occurred_at: None,
+            lexical_indexable: true,
+            semantic_policy: "required".to_string(),
+            metadata: json!({}),
+            hash: stable_hash(&(id, event_id, text)).expect("history item hash"),
+        }
     }
 }
