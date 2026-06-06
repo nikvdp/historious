@@ -435,6 +435,60 @@ pub enum Command {
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
     },
+    /// Preview or remove indexed history sessions.
+    Prune {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(long, conflicts_with = "dry_run", help = "Remove matching sessions")]
+        confirm: bool,
+        #[arg(long, help = "Preview matching sessions without deleting")]
+        dry_run: bool,
+        #[arg(
+            long,
+            requires = "confirm",
+            help = "Compact the SQLite database after deleting rows"
+        )]
+        vacuum: bool,
+        #[arg(
+            long,
+            help = "Match only one source kind, such as codex or claude_code"
+        )]
+        source: Vec<String>,
+        #[arg(long, help = "Match this session id")]
+        session: Vec<String>,
+        #[arg(
+            long,
+            help = "Match sessions active at or after a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            help = "Match sessions active before a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        before: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before"],
+            help = "Match sessions active today"
+        )]
+        today: bool,
+        #[arg(
+            long,
+            conflicts_with = "all",
+            help = "Match sessions from this folder scope"
+        )]
+        project: Option<PathBuf>,
+        #[arg(long, conflicts_with = "project", help = "Match every project scope")]
+        all: bool,
+        #[arg(long, help = "Match this exact machine id")]
+        machine: Option<String>,
+        #[arg(
+            long,
+            alias = "host",
+            help = "Match machine ids generated for this hostname"
+        )]
+        hostname: Option<String>,
+    },
     /// List, export, and import raw artifact blobs by content hash.
     RawBlobs {
         #[command(subcommand)]
@@ -1154,6 +1208,67 @@ impl Cli {
                     anyhow::bail!("only --jsonl import is supported in v0");
                 }
             }
+            Command::Prune {
+                json,
+                confirm,
+                dry_run,
+                vacuum,
+                source,
+                session,
+                after,
+                before,
+                today,
+                project,
+                all,
+                machine,
+                hostname,
+            } => {
+                let (after_bound, before_bound) =
+                    search_time_bounds(today, after.as_deref(), before.as_deref())?;
+                let filter = prune_filter(
+                    source,
+                    session,
+                    after_bound,
+                    before_bound,
+                    search_workspace_scope(project.as_deref(), all),
+                    machine,
+                    hostname,
+                )?;
+                let dry_run = dry_run || !confirm;
+                let output = if dry_run {
+                    let plan = store.prune_plan(&filter)?;
+                    PruneOutput {
+                        dry_run: true,
+                        confirmed: false,
+                        vacuumed: false,
+                        plan,
+                        deleted: None,
+                    }
+                } else {
+                    let outcome = store.prune(&filter)?;
+                    let vacuumed = if vacuum && outcome.plan.sessions > 0 {
+                        store.vacuum()?;
+                        true
+                    } else {
+                        false
+                    };
+                    PruneOutput {
+                        dry_run: false,
+                        confirmed: true,
+                        vacuumed,
+                        plan: outcome.plan.clone(),
+                        deleted: Some(PruneDeletedOutput {
+                            raw_blobs_deleted: outcome.raw_blobs_deleted,
+                            raw_blob_bytes_deleted: outcome.raw_blob_bytes_deleted,
+                        }),
+                    }
+                };
+                if json || robot {
+                    crate::output::write_success("prune", output, Default::default())?;
+                } else {
+                    print_prune_output(&output);
+                }
+            }
             Command::RawBlobs { command } => match command {
                 RawBlobCommand::Missing {
                     json,
@@ -1306,6 +1421,7 @@ impl Command {
             Command::Transcript { .. } => "transcript",
             Command::Export { .. } => "export",
             Command::Import { .. } => "import",
+            Command::Prune { .. } => "prune",
             Command::RawBlobs { .. } => "raw-blobs",
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
@@ -1326,6 +1442,7 @@ impl Command {
                 | Command::Expand { json: true, .. }
                 | Command::Transcript { json: true, .. }
                 | Command::Import { json: true, .. }
+                | Command::Prune { json: true, .. }
                 | Command::RawBlobs {
                     command: RawBlobCommand::Missing { json: true, .. }
                         | RawBlobCommand::Import { json: true, .. },
@@ -1432,6 +1549,21 @@ struct ImportOutput {
     import: crate::storage::ImportStats,
     search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
+}
+
+#[derive(Debug, Serialize)]
+struct PruneOutput {
+    dry_run: bool,
+    confirmed: bool,
+    vacuumed: bool,
+    plan: crate::storage::PrunePlan,
+    deleted: Option<PruneDeletedOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct PruneDeletedOutput {
+    raw_blobs_deleted: usize,
+    raw_blob_bytes_deleted: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2004,6 +2136,57 @@ fn print_import_output(output: &ImportOutput, color: bool) {
     );
     print_search_summary(output.search_index.indexed_events, color);
     print_embedding_summary(&output.embeddings, color);
+}
+
+fn print_prune_output(output: &PruneOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Prune preview"
+    } else {
+        "Prune complete"
+    };
+    println!("{title}");
+    print_section(
+        "Matched",
+        &[
+            ("Sessions", format_count(output.plan.sessions as usize)),
+            ("Events", format_count(output.plan.events as usize)),
+            (
+                "History items",
+                format_count(output.plan.history_items as usize),
+            ),
+            (
+                "Search units",
+                format_count(output.plan.search_units as usize),
+            ),
+            ("Embeddings", format_count(output.plan.embeddings as usize)),
+            (
+                "Raw artifacts",
+                format_count(output.plan.raw_artifacts as usize),
+            ),
+            ("Sources", format_count(output.plan.sources as usize)),
+            ("Raw blob bytes", format_bytes(output.plan.raw_blob_bytes)),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if let Some(deleted) = &output.deleted {
+        print_section(
+            "Removed",
+            &[
+                ("Raw blobs", format_count(deleted.raw_blobs_deleted)),
+                (
+                    "Raw blob bytes",
+                    format_bytes(deleted.raw_blob_bytes_deleted),
+                ),
+                ("Vacuumed", output.vacuumed.to_string()),
+            ],
+            std::io::stdout().is_terminal(),
+        );
+    } else if output.plan.sessions > 0 {
+        println!("Run again with --confirm to remove these sessions.");
+    } else {
+        println!("No matching sessions.");
+    }
 }
 
 fn print_search_summary(indexed_events: usize, color: bool) {
@@ -3305,6 +3488,34 @@ fn search_workspace_scope(project: Option<&std::path::Path>, all: bool) -> Optio
         return None;
     }
     project.map(transport::normalize_workspace_arg)
+}
+
+fn prune_filter(
+    sources: Vec<String>,
+    sessions: Vec<String>,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+    workspace_scope: Option<String>,
+    machine_id: Option<String>,
+    hostname: Option<String>,
+) -> Result<crate::storage::PruneFilter> {
+    let filter = crate::storage::PruneFilter {
+        sources,
+        sessions,
+        after,
+        before,
+        workspace_scope,
+        machine_id,
+        machine_id_prefix: hostname
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| search::machine_id_prefix_for_hostname(&value)),
+    };
+    if !filter.has_selector() {
+        bail!(
+            "prune requires at least one filter, such as --before, --today, --project, --machine, --hostname, --source, or --session"
+        );
+    }
+    Ok(filter)
 }
 
 #[derive(Debug, Clone, Copy)]
