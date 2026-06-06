@@ -194,6 +194,7 @@ pub struct SearchOptions {
     pub machine_id: Option<String>,
     pub machine_id_prefix: Option<String>,
     pub corpus: SearchCorpus,
+    pub show_duplicates: bool,
 }
 
 impl SearchOptions {
@@ -208,6 +209,7 @@ impl SearchOptions {
             machine_id: None,
             machine_id_prefix: None,
             corpus: SearchCorpus::default(),
+            show_duplicates: false,
         }
     }
 
@@ -242,10 +244,35 @@ impl SearchOptions {
         self.corpus = corpus;
         self
     }
+
+    pub fn with_show_duplicates(mut self, show_duplicates: bool) -> Self {
+        self.show_duplicates = show_duplicates;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
+    pub history_item_id: Option<String>,
+    pub match_type: MatchType,
+    pub event_id: String,
+    pub session_id: String,
+    pub machine_id: String,
+    pub source_kind: String,
+    pub tier: Option<String>,
+    pub kind: String,
+    pub score: f64,
+    pub lexical_rank: Option<usize>,
+    pub semantic_rank: Option<usize>,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub session_title: Option<String>,
+    pub workspace_values: Vec<String>,
+    pub snippet: String,
+    pub duplicate_group: Vec<DuplicateSearchMember>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DuplicateSearchMember {
     pub history_item_id: Option<String>,
     pub match_type: MatchType,
     pub event_id: String,
@@ -1117,12 +1144,15 @@ fn fuse(
                 session_title: row.session_title,
                 workspace_values: row.workspace_values,
                 snippet: snippet(&row.content, 240),
+                duplicate_group: Vec::new(),
             })
         })
         .collect::<Vec<_>>();
     apply_recency_bias(&mut results, options.recency_bias);
     sort_results(&mut results, options.sort);
-    dedupe_results_by_snippet(&mut results);
+    if !options.show_duplicates {
+        collapse_results_by_snippet(&mut results);
+    }
     results.truncate(options.limit);
     results
 }
@@ -1141,9 +1171,42 @@ fn lexical_rrf_weight(row: &SearchRow) -> f64 {
     }
 }
 
-fn dedupe_results_by_snippet(results: &mut Vec<SearchResult>) {
-    let mut seen = HashSet::new();
-    results.retain(|result| seen.insert(normalized_result_key(&result.snippet)));
+fn collapse_results_by_snippet(results: &mut Vec<SearchResult>) {
+    let mut representatives = HashMap::new();
+    let mut collapsed = Vec::with_capacity(results.len());
+    for result in results.drain(..) {
+        let key = normalized_result_key(&result.snippet);
+        if let Some(idx) = representatives.get(&key).copied() {
+            let representative: &mut SearchResult = &mut collapsed[idx];
+            representative
+                .duplicate_group
+                .push(duplicate_member_from_result(result));
+        } else {
+            representatives.insert(key, collapsed.len());
+            collapsed.push(result);
+        }
+    }
+    *results = collapsed;
+}
+
+fn duplicate_member_from_result(result: SearchResult) -> DuplicateSearchMember {
+    DuplicateSearchMember {
+        history_item_id: result.history_item_id,
+        match_type: result.match_type,
+        event_id: result.event_id,
+        session_id: result.session_id,
+        machine_id: result.machine_id,
+        source_kind: result.source_kind,
+        tier: result.tier,
+        kind: result.kind,
+        score: result.score,
+        lexical_rank: result.lexical_rank,
+        semantic_rank: result.semantic_rank,
+        occurred_at: result.occurred_at,
+        session_title: result.session_title,
+        workspace_values: result.workspace_values,
+        snippet: result.snippet,
+    }
 }
 
 fn normalized_result_key(text: &str) -> String {
@@ -1650,7 +1713,45 @@ mod tests {
                 .count(),
             1
         );
+        let duplicate = results
+            .iter()
+            .find(|result| result.snippet == duplicate_text)
+            .expect("duplicate representative");
+        assert_eq!(duplicate.duplicate_group.len(), 1);
+        assert_eq!(duplicate.duplicate_group[0].event_id, "semantic_dup");
         assert!(snippets.contains(&"third distinct semantic result"));
+    }
+
+    #[test]
+    fn fuse_can_show_duplicate_snippets_without_collapsing() {
+        let now = Utc::now();
+        let duplicate_text = "same visible result from two forked histories";
+        let results = fuse(
+            vec![ranked_row_with_content(
+                "lexical_dup",
+                duplicate_text,
+                1,
+                now,
+            )],
+            vec![ranked_row_with_content(
+                "semantic_dup",
+                duplicate_text,
+                1,
+                now,
+            )],
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_show_duplicates(true),
+        );
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.snippet == duplicate_text)
+                .count(),
+            2
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.duplicate_group.is_empty()));
     }
 
     #[test]
