@@ -64,6 +64,7 @@ pub fn export_jsonl_filtered_with_options(
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOptions {
     pub include_embeddings: bool,
+    pub include_raw_artifact_records: bool,
     pub include_raw_artifact_content: bool,
 }
 
@@ -71,6 +72,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             include_embeddings: true,
+            include_raw_artifact_records: true,
             include_raw_artifact_content: true,
         }
     }
@@ -80,12 +82,14 @@ fn filter_export_records(
     records: Vec<ArchiveRecord>,
     options: ExportOptions,
 ) -> Vec<ArchiveRecord> {
-    if options.include_embeddings {
-        return records;
-    }
     records
         .into_iter()
-        .filter(|record| !matches!(record, ArchiveRecord::Embedding(_)))
+        .filter(|record| {
+            options.include_embeddings || !matches!(record, ArchiveRecord::Embedding(_))
+        })
+        .filter(|record| {
+            options.include_raw_artifact_records || !matches!(record, ArchiveRecord::RawArtifact(_))
+        })
         .collect()
 }
 
@@ -380,6 +384,7 @@ mod tests {
             &store,
             ExportOptions {
                 include_embeddings: false,
+                include_raw_artifact_records: true,
                 include_raw_artifact_content: true,
             },
             &mut lean_body,
@@ -646,6 +651,7 @@ mod tests {
             &store,
             ExportOptions {
                 include_embeddings: true,
+                include_raw_artifact_records: true,
                 include_raw_artifact_content: false,
             },
             &mut body,
@@ -668,6 +674,81 @@ mod tests {
     }
 
     #[test]
+    fn raw_artifact_omit_export_leaves_search_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::Session(fixture_session(
+                    "session_raw",
+                    "source_raw",
+                    "/tmp/super-cass/repo",
+                )),
+                ArchiveRecord::Event(fixture_event(
+                    "event_raw",
+                    "session_raw",
+                    "source_raw",
+                    Some("raw_omit"),
+                )),
+                ArchiveRecord::SearchUnit(fixture_search_unit()),
+                ArchiveRecord::RawArtifact(fixture_raw("source_raw", "raw_omit")),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: true,
+                include_raw_artifact_records: false,
+                include_raw_artifact_content: false,
+            },
+            &mut body,
+        )
+        .expect("export search-only jsonl");
+
+        assert_jsonl_contains_kind(&body, "source");
+        assert_jsonl_contains_kind(&body, "session");
+        assert_jsonl_contains_kind(&body, "event");
+        assert_jsonl_contains_kind(&body, "search_unit");
+        assert!(!jsonl_contains_kind(&body, "raw_artifact"));
+    }
+
+    #[test]
+    fn raw_artifact_omit_composes_with_embedding_omit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let unit = fixture_search_unit();
+        let embedding = fixture_embedding(&unit);
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::RawArtifact(fixture_raw("source_raw", "raw_omit")),
+                ArchiveRecord::SearchUnit(unit),
+                ArchiveRecord::Embedding(embedding),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: false,
+                include_raw_artifact_records: false,
+                include_raw_artifact_content: false,
+            },
+            &mut body,
+        )
+        .expect("export lean search-only jsonl");
+
+        assert_jsonl_contains_kind(&body, "source");
+        assert_jsonl_contains_kind(&body, "search_unit");
+        assert!(!jsonl_contains_kind(&body, "embedding"));
+        assert!(!jsonl_contains_kind(&body, "raw_artifact"));
+    }
+
+    #[test]
     fn raw_blob_export_import_fills_missing_metadata_blob() {
         let content = b"blob fixture bytes";
         let raw = fixture_raw_with_content_hash("source_raw", content);
@@ -686,6 +767,7 @@ mod tests {
             &source,
             ExportOptions {
                 include_embeddings: true,
+                include_raw_artifact_records: true,
                 include_raw_artifact_content: false,
             },
             &mut metadata_body,
@@ -776,6 +858,7 @@ mod tests {
             &filter,
             ExportOptions {
                 include_embeddings: false,
+                include_raw_artifact_records: true,
                 include_raw_artifact_content: true,
             },
             &mut body,

@@ -363,9 +363,14 @@ pub enum Command {
             long,
             value_enum,
             default_value_t = RawArtifactExportMode::Inline,
-            help = "How to include raw artifact content in JSONL exports"
+            help = "How to include raw artifacts in JSONL exports: inline content, metadata only, or omit for search-only/incomplete sync"
         )]
         raw_artifacts: RawArtifactExportMode,
+        #[arg(
+            long,
+            help = "Alias for --raw-artifacts omit; export is search-only/incomplete"
+        )]
+        no_raw_artifacts: bool,
         #[arg(
             long,
             help = "Export only one source kind, such as codex or claude_code"
@@ -539,6 +544,7 @@ pub enum ColorArg {
 pub enum RawArtifactExportMode {
     Inline,
     Metadata,
+    Omit,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -979,6 +985,7 @@ impl Cli {
                 embeddings,
                 no_embeddings,
                 raw_artifacts,
+                no_raw_artifacts,
                 source,
                 workspace,
                 session,
@@ -1003,10 +1010,14 @@ impl Cli {
                                 embeddings,
                                 no_embeddings,
                             ),
+                            include_raw_artifact_records: include_raw_artifact_records(
+                                raw_artifacts,
+                                no_raw_artifacts,
+                            ),
                             include_raw_artifact_content: matches!(
                                 raw_artifacts,
                                 RawArtifactExportMode::Inline
-                            ),
+                            ) && !no_raw_artifacts,
                         },
                         stdout.lock(),
                     )?;
@@ -2012,6 +2023,10 @@ fn should_color(no_color: bool, color: Option<ColorArg>, robot: bool) -> bool {
 
 fn include_embedding_records(mode: EmbeddingExportMode, no_embeddings: bool) -> bool {
     !no_embeddings && matches!(mode, EmbeddingExportMode::Include)
+}
+
+fn include_raw_artifact_records(mode: RawArtifactExportMode, no_raw_artifacts: bool) -> bool {
+    !no_raw_artifacts && !matches!(mode, RawArtifactExportMode::Omit)
 }
 
 struct ProgressUi {
@@ -3926,6 +3941,26 @@ mod tests {
         assert!(!include_embedding_records(EmbeddingExportMode::Omit, false));
         assert!(!include_embedding_records(
             EmbeddingExportMode::Include,
+            true
+        ));
+    }
+
+    #[test]
+    fn raw_artifact_export_mode_defaults_include_and_can_omit() {
+        assert!(include_raw_artifact_records(
+            RawArtifactExportMode::Inline,
+            false
+        ));
+        assert!(include_raw_artifact_records(
+            RawArtifactExportMode::Metadata,
+            false
+        ));
+        assert!(!include_raw_artifact_records(
+            RawArtifactExportMode::Omit,
+            false
+        ));
+        assert!(!include_raw_artifact_records(
+            RawArtifactExportMode::Inline,
             true
         ));
     }
