@@ -845,6 +845,7 @@ impl Store {
                 drop(stmt);
                 let count = count(tx, "history_items")? as usize;
                 update_projection_status(tx, "history_items_v1", count)?;
+                update_projection_status(tx, "history_items_conversation_fts_v1", count)?;
                 Ok(count)
             })
         })
@@ -853,11 +854,24 @@ impl Store {
     pub fn refresh_history_items_for_events(&self, event_ids: &[String]) -> Result<usize> {
         let event_ids = normalized_ids(event_ids);
         if event_ids.is_empty() {
-            return self.with_conn(|conn| Ok(count(conn, "history_items")? as usize));
+            return self.with_conn(|conn| {
+                if let Some(count) = projection_status_count(conn, "history_items_v1")? {
+                    Ok(count)
+                } else {
+                    Ok(count(conn, "history_items")? as usize)
+                }
+            });
         }
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
+                let replaced_count: usize = tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM history_items
+                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
                 tx.execute(
                     "DELETE FROM history_items_fts
                      WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
@@ -882,14 +896,25 @@ impl Store {
                      ORDER BY e.session_id, e.ordinal, e.id",
                 )?;
                 let rows = stmt.query_map([], row_event)?;
+                let mut inserted_count = 0usize;
                 for row in rows {
                     for item in history_items_from_event(&row?)? {
-                        insert_history_item(&tx, &item)?;
+                        if insert_history_item(&tx, &item)? {
+                            inserted_count += 1;
+                        }
                     }
                 }
                 drop(stmt);
-                let count = count(tx, "history_items")? as usize;
+                let count =
+                    if let Some(current_count) = projection_status_count(tx, "history_items_v1")? {
+                        current_count
+                            .saturating_sub(replaced_count)
+                            .saturating_add(inserted_count)
+                    } else {
+                        count(tx, "history_items")? as usize
+                    };
                 update_projection_status(tx, "history_items_v1", count)?;
+                update_projection_status(tx, "history_items_conversation_fts_v1", count)?;
                 Ok(count)
             })
         })
@@ -897,32 +922,8 @@ impl Store {
 
     pub fn history_items_projection_ready(&self) -> Result<bool> {
         self.with_conn(|conn| {
-            let ready: i64 = conn.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM projection_status
-                   WHERE projection_name = 'history_items_v1'
-                     AND status = 'ready'
-                 )",
-                [],
-                |row| row.get(0),
-            )?;
-            if ready == 0 {
-                return Ok(false);
-            }
-            let conversation_fts: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM history_items_conversation_fts",
-                [],
-                |row| row.get(0),
-            )?;
-            let conversation_indexable: i64 = conn.query_row(
-                "SELECT COUNT(*)
-                 FROM history_items
-                 WHERE tier = 'conversation'
-                   AND lexical_indexable = 1",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(conversation_fts == conversation_indexable)
+            Ok(projection_status_ready(conn, "history_items_v1")?
+                && projection_status_ready(conn, "history_items_conversation_fts_v1")?)
         })
     }
 
@@ -2310,11 +2311,9 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
            AND NOT EXISTS (SELECT 1 FROM raw_artifacts WHERE source_id = sources.id)",
         [],
     )?;
-    update_projection_status(
-        conn,
-        "history_items_v1",
-        count(conn, "history_items")? as usize,
-    )?;
+    let history_count = count(conn, "history_items")? as usize;
+    update_projection_status(conn, "history_items_v1", history_count)?;
+    update_projection_status(conn, "history_items_conversation_fts_v1", history_count)?;
     update_projection_status(conn, "search_rrf_v1", count(conn, "search_units")? as usize)?;
     Ok(())
 }
@@ -3868,6 +3867,33 @@ fn count_indexed_events(conn: &Connection, model: &str) -> Result<usize> {
         |row| row.get(0),
     )?;
     Ok(fts_count.min(embedding_count) as usize)
+}
+
+fn projection_status_ready(conn: &Connection, name: &str) -> Result<bool> {
+    let ready: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM projection_status
+           WHERE projection_name = ?1
+             AND status = 'ready'
+         )",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(ready != 0)
+}
+
+fn projection_status_count(conn: &Connection, name: &str) -> Result<Option<usize>> {
+    let count = conn
+        .query_row(
+            "SELECT input_high_watermark
+             FROM projection_status
+             WHERE projection_name = ?1
+               AND status = 'ready'",
+            params![name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(count.and_then(|value| value.parse::<usize>().ok()))
 }
 
 fn update_projection_status(conn: &Connection, name: &str, indexed_events: usize) -> Result<()> {
