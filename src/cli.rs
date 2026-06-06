@@ -282,7 +282,7 @@ pub enum Command {
             help = "Show raw event payloads instead of clean conversation history"
         )]
         full: bool,
-        #[arg(long, help = "Print structured JSON with exact event content")]
+        #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
     },
     /// Deprecated alias for `show`.
@@ -320,7 +320,7 @@ pub enum Command {
             help = "Show raw event payloads instead of clean conversation history"
         )]
         full: bool,
-        #[arg(long, help = "Print structured JSON with exact event content")]
+        #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
     },
     /// Show a full conversation transcript.
@@ -355,7 +355,7 @@ pub enum Command {
             help = "Show raw event payloads instead of clean conversation history"
         )]
         full: bool,
-        #[arg(long, help = "Print structured JSON with exact event content")]
+        #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
     },
     /// Write history records to JSONL for backup or transfer.
@@ -886,20 +886,42 @@ impl Cli {
             } => {
                 let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
                 if json || robot {
-                    let context = store
-                        .events_around_event(&event_id, before, after)?
-                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                    crate::output::write_success(
-                        "show",
-                        show_output(&store, &context)?,
-                        crate::output::EnvelopeOptions {
-                            hints: vec![format!(
-                                "super-cass transcript {} --at {} --json",
-                                context.session.id, context.target_event.id
-                            )],
-                            ..Default::default()
-                        },
-                    )?;
+                    if full {
+                        let context = store
+                            .events_around_event(&event_id, before, after)?
+                            .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                        crate::output::write_success(
+                            "show",
+                            show_output(&store, &context)?,
+                            crate::output::EnvelopeOptions {
+                                hints: vec![format!(
+                                    "super-cass transcript {} --at {} --full --json",
+                                    context.session.id, context.target_event.id
+                                )],
+                                ..Default::default()
+                            },
+                        )?;
+                    } else {
+                        let context = store
+                            .history_items_around_event(&event_id, before, after)?
+                            .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                        let target_hint = context
+                            .target_event
+                            .as_ref()
+                            .map(|event| event.id.as_str())
+                            .unwrap_or(event_id.as_str());
+                        crate::output::write_success(
+                            "show",
+                            history_show_output(&store, &context)?,
+                            crate::output::EnvelopeOptions {
+                                hints: vec![format!(
+                                    "super-cass transcript {} --at {} --json",
+                                    context.session.id, target_hint
+                                )],
+                                ..Default::default()
+                            },
+                        )?;
+                    }
                 } else if full {
                     let context = store
                         .events_around_event(&event_id, before, after)?
@@ -949,17 +971,38 @@ impl Cli {
                     })
                     .transpose()?;
                 if json || robot {
-                    let events = store.events_for_session(&session)?;
-                    crate::output::write_success(
-                        "transcript",
-                        transcript_output(
-                            &store,
-                            &session_record,
-                            &events,
-                            target_event_id.as_deref(),
-                        )?,
-                        Default::default(),
-                    )?;
+                    if full {
+                        let events = store.events_for_session(&session)?;
+                        crate::output::write_success(
+                            "transcript",
+                            transcript_output(
+                                &store,
+                                &session_record,
+                                &events,
+                                target_event_id.as_deref(),
+                            )?,
+                            Default::default(),
+                        )?;
+                    } else {
+                        let context = if let Some(event_id) = target_event_id.as_deref() {
+                            store
+                                .history_items_around_event(
+                                    event_id,
+                                    usize::MAX / 4,
+                                    usize::MAX / 4,
+                                )?
+                                .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?
+                        } else {
+                            store
+                                .history_items_for_transcript_session(&session)?
+                                .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?
+                        };
+                        crate::output::write_success(
+                            "transcript",
+                            history_transcript_output(&store, &context)?,
+                            Default::default(),
+                        )?;
+                    }
                 } else if full {
                     let events = store.events_for_session(&session)?;
                     let metadata = view_metadata_for_session(
@@ -1461,12 +1504,34 @@ struct ShowOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct HistoryShowOutput {
+    session: crate::archive::SessionRecord,
+    target_event_id: Option<String>,
+    target_ref: Option<String>,
+    target_index: Option<usize>,
+    omitted_target: bool,
+    before: Vec<HistoryItemOutput>,
+    target: Option<HistoryItemOutput>,
+    after: Vec<HistoryItemOutput>,
+}
+
+#[derive(Debug, Serialize)]
 struct TranscriptOutput {
     session: crate::archive::SessionRecord,
     target_event_id: Option<String>,
     target_ref: Option<String>,
     target_index: Option<usize>,
     events: Vec<EventOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryTranscriptOutput {
+    session: crate::archive::SessionRecord,
+    target_event_id: Option<String>,
+    target_ref: Option<String>,
+    target_index: Option<usize>,
+    omitted_target: bool,
+    items: Vec<HistoryItemOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1484,6 +1549,29 @@ struct EventOutput {
     content: String,
     raw_artifact_hash: Option<String>,
     occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: serde_json::Value,
+    hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryItemOutput {
+    history_item_id: String,
+    event_id: String,
+    #[serde(rename = "ref")]
+    ref_id: Option<String>,
+    session_id: String,
+    source_id: String,
+    machine_id: String,
+    source_kind: String,
+    ordinal: i64,
+    subordinal: i64,
+    tier: String,
+    kind: String,
+    text: String,
+    text_hash: String,
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    lexical_indexable: bool,
+    semantic_policy: String,
     metadata: serde_json::Value,
     hash: String,
 }
@@ -2589,6 +2677,50 @@ fn show_output(store: &Store, context: &crate::storage::TranscriptContext) -> Re
     })
 }
 
+fn history_show_output(
+    store: &Store,
+    context: &crate::storage::HistoryTranscriptContext,
+) -> Result<HistoryShowOutput> {
+    let target_event_id = context.target_event.as_ref().map(|event| event.id.clone());
+    let target_ref = target_event_id
+        .as_deref()
+        .map(|event_id| store.recent_ref_for_event_id(event_id))
+        .transpose()?
+        .flatten();
+    let target_index = context.target_index;
+    let before = context
+        .items
+        .iter()
+        .take(target_index.unwrap_or(context.items.len()))
+        .map(|item| history_item_output(store, item))
+        .collect::<Result<Vec<_>>>()?;
+    let target = target_index
+        .and_then(|idx| context.items.get(idx))
+        .map(|item| history_item_output(store, item))
+        .transpose()?;
+    let after = target_index
+        .map(|idx| {
+            context
+                .items
+                .iter()
+                .skip(idx + 1)
+                .map(|item| history_item_output(store, item))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(HistoryShowOutput {
+        session: context.session.clone(),
+        target_event_id,
+        target_ref,
+        target_index,
+        omitted_target: context.omitted_target,
+        before,
+        target,
+        after,
+    })
+}
+
 fn threads_output(
     limit: usize,
     sort: ThreadSort,
@@ -2664,6 +2796,31 @@ fn transcript_output(
     })
 }
 
+fn history_transcript_output(
+    store: &Store,
+    context: &crate::storage::HistoryTranscriptContext,
+) -> Result<HistoryTranscriptOutput> {
+    let target_event_id = context.target_event.as_ref().map(|event| event.id.clone());
+    let target_ref = target_event_id
+        .as_deref()
+        .map(|event_id| store.recent_ref_for_event_id(event_id))
+        .transpose()?
+        .flatten();
+    let items = context
+        .items
+        .iter()
+        .map(|item| history_item_output(store, item))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(HistoryTranscriptOutput {
+        session: context.session.clone(),
+        target_event_id,
+        target_ref,
+        target_index: context.target_index,
+        omitted_target: context.omitted_target,
+        items,
+    })
+}
+
 fn event_output(store: &Store, event: &crate::archive::EventRecord) -> Result<EventOutput> {
     Ok(EventOutput {
         event_id: event.id.clone(),
@@ -2680,6 +2837,32 @@ fn event_output(store: &Store, event: &crate::archive::EventRecord) -> Result<Ev
         occurred_at: event.occurred_at,
         metadata: event.metadata.clone(),
         hash: event.hash.clone(),
+    })
+}
+
+fn history_item_output(
+    store: &Store,
+    item: &crate::storage::HistoryItemRecord,
+) -> Result<HistoryItemOutput> {
+    Ok(HistoryItemOutput {
+        history_item_id: item.id.clone(),
+        event_id: item.event_id.clone(),
+        ref_id: store.recent_ref_for_event_id(&item.event_id)?,
+        session_id: item.session_id.clone(),
+        source_id: item.source_id.clone(),
+        machine_id: item.machine_id.clone(),
+        source_kind: item.source_kind.clone(),
+        ordinal: item.ordinal,
+        subordinal: item.subordinal,
+        tier: item.tier.clone(),
+        kind: item.kind.clone(),
+        text: item.text.clone(),
+        text_hash: item.text_hash.clone(),
+        occurred_at: item.occurred_at,
+        lexical_indexable: item.lexical_indexable,
+        semantic_policy: item.semantic_policy.clone(),
+        metadata: item.metadata.clone(),
+        hash: item.hash.clone(),
     })
 }
 
@@ -4409,6 +4592,107 @@ mod tests {
         assert_eq!(event_id.as_deref(), Some("event_view"));
     }
 
+    #[test]
+    fn clean_transcript_json_uses_history_items() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let event = store
+            .event_by_id("event_view")
+            .expect("event lookup")
+            .expect("event exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: Some(event),
+            items: vec![fixture_history_item(
+                "history_view",
+                "event_view",
+                7,
+                "assistant",
+                "clean assistant text",
+            )],
+            target_index: Some(0),
+            omitted_target: false,
+        };
+
+        let output = history_transcript_output(&store, &context).expect("history output");
+        let value = serde_json::to_value(output).expect("serialize");
+        let ref_id = store
+            .recent_ref_for_event_id("event_view")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        assert_eq!(value["target_ref"], ref_id);
+        assert_eq!(value["target_index"], 0);
+        assert!(value.get("events").is_none());
+        assert_eq!(value["items"][0]["history_item_id"], "history_view");
+        assert_eq!(value["items"][0]["kind"], "assistant");
+        assert_eq!(value["items"][0]["text"], "clean assistant text");
+    }
+
+    #[test]
+    fn clean_show_json_keeps_before_target_after_history_shape() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let event = store
+            .event_by_id("event_view")
+            .expect("event lookup")
+            .expect("event exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: Some(event),
+            items: vec![
+                fixture_history_item("history_before", "event_before", 6, "user", "before text"),
+                fixture_history_item("history_view", "event_view", 7, "assistant", "target text"),
+                fixture_history_item("history_after", "event_after", 8, "assistant", "after text"),
+            ],
+            target_index: Some(1),
+            omitted_target: false,
+        };
+
+        let output = history_show_output(&store, &context).expect("history show output");
+        let value = serde_json::to_value(output).expect("serialize");
+        let ref_id = store
+            .recent_ref_for_event_id("event_view")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        assert_eq!(value["target_ref"], ref_id);
+        assert_eq!(value["before"][0]["text"], "before text");
+        assert_eq!(value["target"]["text"], "target text");
+        assert_eq!(value["after"][0]["text"], "after text");
+        assert!(value.get("events").is_none());
+    }
+
+    #[test]
+    fn full_transcript_json_preserves_raw_events() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let events = store
+            .events_for_session("session_view")
+            .expect("events lookup");
+
+        let output =
+            transcript_output(&store, &session, &events, Some("event_view")).expect("raw output");
+        let value = serde_json::to_value(output).expect("serialize");
+        let ref_id = store
+            .recent_ref_for_event_id("event_view")
+            .expect("ref lookup")
+            .expect("ref exists");
+
+        assert_eq!(value["target_ref"], ref_id);
+        assert_eq!(value["events"][0]["content"], "viewer test content");
+        assert!(value.get("items").is_none());
+    }
+
     fn fixture_store_with_viewer_ref() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -4466,5 +4750,33 @@ mod tests {
             }])
             .expect("record recent ref");
         (dir, store)
+    }
+
+    fn fixture_history_item(
+        id: &str,
+        event_id: &str,
+        ordinal: i64,
+        kind: &str,
+        text: &str,
+    ) -> crate::storage::HistoryItemRecord {
+        crate::storage::HistoryItemRecord {
+            id: id.to_string(),
+            event_id: event_id.to_string(),
+            session_id: "session_view".to_string(),
+            source_id: "source_view".to_string(),
+            machine_id: "machine_view".to_string(),
+            source_kind: "codex".to_string(),
+            ordinal,
+            subordinal: 0,
+            tier: "conversation".to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            text_hash: stable_hash(&(id, text)).expect("text hash"),
+            occurred_at: None,
+            lexical_indexable: true,
+            semantic_policy: "required".to_string(),
+            metadata: json!({}),
+            hash: stable_hash(&(id, event_id, text)).expect("history item hash"),
+        }
     }
 }
