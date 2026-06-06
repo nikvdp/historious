@@ -2336,10 +2336,15 @@ fn print_status_output(output: &StatusOutput) {
     println!("search_units={}", output.stats.search_units);
     println!("embeddings={}", output.stats.embeddings);
     println!(
-        "query_embedder={} semantic={} available={} degraded_reason={}",
+        "query_embedder={} semantic={} available={} intra_threads={} degraded_reason={}",
         output.query_embedder.provider,
         output.query_embedder.semantic,
         output.query_embedder.available,
+        output
+            .query_embedder
+            .intra_threads
+            .map(|threads| threads.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
         output
             .query_embedder
             .degraded_reason
