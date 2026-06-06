@@ -88,6 +88,7 @@ struct SearchParams {
     recency_bias: Option<f64>,
     after: Option<String>,
     before: Option<String>,
+    project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
     show_duplicates: Option<bool>,
@@ -111,6 +112,7 @@ struct ServerSearchOptions {
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
     show_duplicates: bool,
@@ -158,7 +160,8 @@ async fn search_endpoint(
         .with_corpus(corpus.clone())
         .with_show_duplicates(show_duplicates)
         .with_time_window(after, before)
-        .with_machine_filter(params.machine.clone(), params.hostname.clone());
+        .with_machine_filter(params.machine.clone(), params.hostname.clone())
+        .with_workspace_scope(params.project.clone());
     let response = search::search(
         &state.store,
         &query,
@@ -186,6 +189,7 @@ async fn search_endpoint(
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after,
             before,
+            project: params.project,
             machine: params.machine,
             hostname: params.hostname,
             show_duplicates,

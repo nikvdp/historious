@@ -118,6 +118,20 @@ pub enum Command {
             help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
         )]
         before: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before"],
+            help = "Only show results from today"
+        )]
+        today: bool,
+        #[arg(
+            long,
+            conflicts_with = "all",
+            help = "Only show results from this folder scope"
+        )]
+        project: Option<PathBuf>,
+        #[arg(long, conflicts_with = "project", help = "Search across every project")]
+        all: bool,
         #[arg(long, help = "Only show results from this exact machine id")]
         machine: Option<String>,
         #[arg(
@@ -188,6 +202,20 @@ pub enum Command {
             help = "Only show results before a date or time, like 2026-04-20 or \"3 days ago\""
         )]
         before: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before"],
+            help = "Only show results from today"
+        )]
+        today: bool,
+        #[arg(
+            long,
+            conflicts_with = "all",
+            help = "Only show results from this folder scope"
+        )]
+        project: Option<PathBuf>,
+        #[arg(long, conflicts_with = "project", help = "Search across every project")]
+        all: bool,
         #[arg(long, help = "Only show results from this exact machine id")]
         machine: Option<String>,
         #[arg(
@@ -672,6 +700,9 @@ impl Cli {
                 recency_bias,
                 after,
                 before,
+                today,
+                project,
+                all,
                 machine,
                 hostname,
                 no_color,
@@ -692,10 +723,9 @@ impl Cli {
                 if fzf_rows && query.trim().is_empty() {
                     return Ok(());
                 }
-                let after_bound =
-                    parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
-                let before_bound =
-                    parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
+                let (after_bound, before_bound) =
+                    search_time_bounds(today, after.as_deref(), before.as_deref())?;
+                let workspace_scope = search_workspace_scope(project.as_deref(), all);
                 let mode = mode
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
@@ -706,7 +736,8 @@ impl Cli {
                     .with_corpus(corpus.clone())
                     .with_show_duplicates(show_duplicates)
                     .with_time_window(after_bound, before_bound)
-                    .with_machine_filter(machine.clone(), hostname.clone());
+                    .with_machine_filter(machine.clone(), hostname.clone())
+                    .with_workspace_scope(workspace_scope.clone());
                 let response = search::search(
                     &store,
                     &query,
@@ -736,6 +767,7 @@ impl Cli {
                         show_duplicates,
                         after_bound,
                         before_bound,
+                        workspace_scope.clone(),
                         machine.clone(),
                         hostname.clone(),
                         &response,
@@ -779,6 +811,9 @@ impl Cli {
                 recency_bias,
                 after,
                 before,
+                today,
+                project,
+                all,
                 machine,
                 hostname,
                 no_color,
@@ -786,10 +821,9 @@ impl Cli {
                 if robot {
                     bail!("--robot cannot be combined with tui");
                 }
-                let after_bound =
-                    parse_optional_search_time(after.as_deref(), TimeFilterBound::After)?;
-                let before_bound =
-                    parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?;
+                let (after_bound, before_bound) =
+                    search_time_bounds(today, after.as_deref(), before.as_deref())?;
+                let workspace_scope = search_workspace_scope(project.as_deref(), all);
                 let mode = mode
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
@@ -806,6 +840,7 @@ impl Cli {
                     recency_bias,
                     after_bound,
                     before_bound,
+                    workspace_scope,
                     machine,
                     hostname,
                     !no_color,
@@ -1428,6 +1463,7 @@ struct SearchOptionsOutput {
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
     show_duplicates: bool,
@@ -2876,6 +2912,7 @@ fn search_output(
     show_duplicates: bool,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
     response: &search::SearchResponse,
@@ -2891,6 +2928,7 @@ fn search_output(
             recency_bias,
             after,
             before,
+            project,
             machine,
             hostname,
             show_duplicates,
@@ -3245,6 +3283,30 @@ fn search_limit(limit: Option<usize>, fzf: bool) -> usize {
     })
 }
 
+fn search_time_bounds(
+    today: bool,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    if today {
+        return Ok((
+            Some(parse_search_time("today", TimeFilterBound::After)?),
+            Some(parse_search_time("today", TimeFilterBound::Before)?),
+        ));
+    }
+    Ok((
+        parse_optional_search_time(after, TimeFilterBound::After)?,
+        parse_optional_search_time(before, TimeFilterBound::Before)?,
+    ))
+}
+
+fn search_workspace_scope(project: Option<&std::path::Path>, all: bool) -> Option<String> {
+    if all {
+        return None;
+    }
+    project.map(transport::normalize_workspace_arg)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TimeFilterBound {
     After,
@@ -3383,6 +3445,7 @@ fn run_tui_search(
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
     color: bool,
@@ -3400,6 +3463,7 @@ fn run_tui_search(
         recency_bias,
         after,
         before,
+        project.as_deref(),
         machine.as_deref(),
         hostname.as_deref(),
     )?;
@@ -3496,6 +3560,7 @@ fn tui_reload_command(
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
+    project: Option<&str>,
     machine: Option<&str>,
     hostname: Option<&str>,
 ) -> Result<String> {
@@ -3534,13 +3599,22 @@ fn tui_reload_command(
             )
         })
         .unwrap_or_default();
+    let project_arg = project
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            format!(
+                " --data-urlencode {}",
+                shell_quote(&format!("project={value}"))
+            )
+        })
+        .unwrap_or_default();
     let duplicate_arg = if show_duplicates {
         " --data-urlencode show_duplicates=true"
     } else {
         ""
     };
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG --connect-timeout 2 --max-time 10 {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}{duplicate_arg} 2>/dev/null || :; fi",
+        "if [ -z {{q}} ]; then :; else curl -fsSG --connect-timeout 2 --max-time 10 {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{project_arg}{machine_arg}{hostname_arg}{duplicate_arg} 2>/dev/null || :; fi",
         sort.as_str(),
         mode.as_str(),
         shell_quote(&corpus.as_csv())
@@ -4348,6 +4422,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             Some("machine_devbox_123".to_string()),
             Some("devbox".to_string()),
             &response,
@@ -4535,6 +4610,7 @@ mod tests {
             true,
             0.25,
             Some(after),
+            None,
             None,
             Some("machine_devbox_123"),
             Some("devbox"),
