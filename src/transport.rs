@@ -15,16 +15,26 @@ pub fn export_jsonl(store: &Store, mut writer: impl Write) -> Result<usize> {
     write_jsonl_records(records, &mut writer)
 }
 
+#[allow(dead_code)]
 pub fn export_jsonl_with_options(
     store: &Store,
     options: ExportOptions,
     mut writer: impl Write,
 ) -> Result<usize> {
+    export_jsonl_with_options_and_progress(store, options, &mut writer, |_| {})
+}
+
+pub fn export_jsonl_with_options_and_progress(
+    store: &Store,
+    options: ExportOptions,
+    mut writer: impl Write,
+    progress: impl FnMut(JsonlProgress),
+) -> Result<usize> {
     let records = filter_export_records(
         store.export_records_with_raw_content(options.include_raw_artifact_content)?,
         options,
     );
-    write_jsonl_records(records, &mut writer)
+    write_jsonl_records_with_progress(records, &mut writer, progress)
 }
 
 #[allow(dead_code)]
@@ -47,8 +57,18 @@ pub fn export_jsonl_filtered_with_options(
     options: ExportOptions,
     mut writer: impl Write,
 ) -> Result<usize> {
+    export_jsonl_filtered_with_options_and_progress(store, filter, options, &mut writer, |_| {})
+}
+
+pub fn export_jsonl_filtered_with_options_and_progress(
+    store: &Store,
+    filter: &ArchiveExportFilter,
+    options: ExportOptions,
+    mut writer: impl Write,
+    progress: impl FnMut(JsonlProgress),
+) -> Result<usize> {
     if filter.is_empty() {
-        return export_jsonl_with_options(store, options, writer);
+        return export_jsonl_with_options_and_progress(store, options, writer, progress);
     }
     let session_ids = store.session_ids_for_export_filter(filter)?;
     let records = filter_export_records(
@@ -58,7 +78,7 @@ pub fn export_jsonl_filtered_with_options(
         )?,
         options,
     );
-    write_jsonl_records(records, &mut writer)
+    write_jsonl_records_with_progress(records, &mut writer, progress)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,14 +113,32 @@ fn filter_export_records(
         .collect()
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JsonlProgress {
+    pub records: usize,
+    pub bytes: u64,
+}
+
 fn write_jsonl_records(records: Vec<ArchiveRecord>, writer: &mut impl Write) -> Result<usize> {
-    let count = records.len();
+    write_jsonl_records_with_progress(records, writer, |_| {})
+}
+
+fn write_jsonl_records_with_progress(
+    records: Vec<ArchiveRecord>,
+    writer: &mut impl Write,
+    mut progress: impl FnMut(JsonlProgress),
+) -> Result<usize> {
+    let mut state = JsonlProgress::default();
     for record in records {
         let envelope = ArchiveEnvelope::new(record);
-        serde_json::to_writer(&mut *writer, &envelope)?;
+        let line = serde_json::to_vec(&envelope)?;
+        writer.write_all(&line)?;
         writer.write_all(b"\n")?;
+        state.records += 1;
+        state.bytes += line.len() as u64 + 1;
+        progress(state);
     }
-    Ok(count)
+    Ok(state.records)
 }
 
 pub fn normalize_workspace_arg(path: &Path) -> String {
@@ -140,35 +178,61 @@ fn clean_path(path: &Path) -> PathBuf {
 }
 
 pub fn import_jsonl_path(store: &Store, path: &str) -> Result<ImportStats> {
+    import_jsonl_path_with_progress(store, path, |_| {})
+}
+
+pub fn import_jsonl_path_with_progress(
+    store: &Store,
+    path: &str,
+    progress: impl FnMut(JsonlProgress),
+) -> Result<ImportStats> {
     if path == "-" {
         let stdin = io::stdin();
-        import_jsonl_reader(store, stdin.lock())
+        import_jsonl_reader_with_progress(store, stdin.lock(), progress)
     } else {
         let file = File::open(Path::new(path)).with_context(|| format!("opening {path}"))?;
-        import_jsonl_reader(store, file)
+        import_jsonl_reader_with_progress(store, file, progress)
     }
 }
 
 pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<ImportStats> {
+    import_jsonl_reader_with_progress(store, reader, |_| {})
+}
+
+pub fn import_jsonl_reader_with_progress(
+    store: &Store,
+    reader: impl io::Read,
+    mut progress: impl FnMut(JsonlProgress),
+) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
-    let reader = BufReader::new(reader);
+    let mut reader = BufReader::new(reader);
     let mut batch = Vec::with_capacity(IMPORT_JSONL_BATCH_RECORDS);
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading JSONL line {}", idx + 1))?;
+    let mut line_no = 0usize;
+    let mut state = JsonlProgress::default();
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading JSONL line {}", line_no + 1))?;
+        if bytes == 0 {
+            break;
+        }
+        line_no += 1;
+        state.bytes += bytes as u64;
         if line.trim().is_empty() {
             continue;
         }
         let envelope: ArchiveEnvelope = serde_json::from_str(&line)
-            .with_context(|| format!("parsing archive JSONL line {}", idx + 1))?;
+            .with_context(|| format!("parsing archive JSONL line {line_no}"))?;
         if envelope.schema != ARCHIVE_SCHEMA {
             bail!(
                 "unsupported archive schema on line {}: {}",
-                idx + 1,
+                line_no,
                 envelope.schema
             );
         }
         if envelope.id != envelope.record.id() || envelope.hash != envelope.record.hash() {
-            bail!("envelope identity mismatch on line {}", idx + 1);
+            bail!("envelope identity mismatch on line {line_no}");
         }
         let is_inline_raw_artifact =
             matches!(&envelope.record, ArchiveRecord::RawArtifact(raw) if !raw.content.is_empty());
@@ -179,6 +243,8 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         if batch.len() >= IMPORT_JSONL_BATCH_RECORDS || is_inline_raw_artifact {
             flush_import_batch(store, &mut stats, &mut batch)?;
         }
+        state.records += 1;
+        progress(state);
     }
     flush_import_batch(store, &mut stats, &mut batch)?;
     if store.history_items_projection_ready()? {
@@ -395,6 +461,71 @@ mod tests {
         assert_jsonl_contains_kind(&default_body, "search_unit");
         assert!(!jsonl_contains_kind(&lean_body, "embedding"));
         assert_jsonl_contains_kind(&lean_body, "search_unit");
+    }
+
+    #[test]
+    fn jsonl_export_progress_counts_records_and_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_progress_a")),
+                ArchiveRecord::Source(fixture_source("source_progress_b")),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        let mut progress = Vec::new();
+        let count = export_jsonl_with_options_and_progress(
+            &store,
+            ExportOptions::default(),
+            &mut body,
+            |event| progress.push(event),
+        )
+        .expect("export jsonl");
+
+        assert_eq!(count, 2);
+        assert_eq!(progress.len(), 2);
+        assert_eq!(
+            progress.last().copied(),
+            Some(JsonlProgress {
+                records: 2,
+                bytes: body.len() as u64,
+            })
+        );
+        assert_jsonl_contains_kind(&body, "source");
+    }
+
+    #[test]
+    fn jsonl_import_progress_counts_records_and_bytes() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source = Store::open(source_dir.path()).expect("open source");
+        source
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_progress_a")),
+                ArchiveRecord::Source(fixture_source("source_progress_b")),
+            ])
+            .expect("import source records");
+        let mut body = Vec::new();
+        export_jsonl(&source, &mut body).expect("export jsonl");
+
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target = Store::open(target_dir.path()).expect("open target");
+        let mut progress = Vec::new();
+        let stats = import_jsonl_reader_with_progress(&target, body.as_slice(), |event| {
+            progress.push(event);
+        })
+        .expect("import jsonl");
+
+        assert_eq!(stats.inserted, 2);
+        assert_eq!(progress.len(), 2);
+        assert_eq!(
+            progress.last().copied(),
+            Some(JsonlProgress {
+                records: 2,
+                bytes: body.len() as u64,
+            })
+        );
     }
 
     #[test]

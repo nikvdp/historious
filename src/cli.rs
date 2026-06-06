@@ -1002,25 +1002,44 @@ impl Cli {
                         sessions: session,
                         since: transport::parse_since_arg(since.as_deref())?,
                     };
-                    transport::export_jsonl_filtered_with_options(
-                        &store,
-                        &filter,
-                        transport::ExportOptions {
-                            include_embeddings: include_embedding_records(
-                                embeddings,
-                                no_embeddings,
-                            ),
-                            include_raw_artifact_records: include_raw_artifact_records(
-                                raw_artifacts,
-                                no_raw_artifacts,
-                            ),
-                            include_raw_artifact_content: matches!(
-                                raw_artifacts,
-                                RawArtifactExportMode::Inline
-                            ) && !no_raw_artifacts,
-                        },
-                        stdout.lock(),
-                    )?;
+                    let options = transport::ExportOptions {
+                        include_embeddings: include_embedding_records(embeddings, no_embeddings),
+                        include_raw_artifact_records: include_raw_artifact_records(
+                            raw_artifacts,
+                            no_raw_artifacts,
+                        ),
+                        include_raw_artifact_content: matches!(
+                            raw_artifacts,
+                            RawArtifactExportMode::Inline
+                        ) && !no_raw_artifacts,
+                    };
+                    if robot {
+                        transport::export_jsonl_filtered_with_options(
+                            &store,
+                            &filter,
+                            options,
+                            stdout.lock(),
+                        )?;
+                    } else {
+                        let progress = ProgressUi::new();
+                        let mut export = progress.phase("Exporting history stream");
+                        let mut last = transport::JsonlProgress::default();
+                        let count = transport::export_jsonl_filtered_with_options_and_progress(
+                            &store,
+                            &filter,
+                            options,
+                            stdout.lock(),
+                            |event| {
+                                last = event;
+                                export.update(jsonl_progress_detail(event));
+                            },
+                        )?;
+                        export.finish(format!(
+                            "{} records exported, {}",
+                            format_count(count),
+                            format_bytes(last.bytes)
+                        ));
+                    }
                 } else {
                     anyhow::bail!("only --jsonl export is supported in v0");
                 }
@@ -1677,12 +1696,18 @@ fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<Imp
 
 fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let progress = ProgressUi::new();
-    let import = progress.phase("Importing history stream");
-    let stats = transport::import_jsonl_path(store, input)?;
+    let mut import = progress.phase("Importing history stream");
+    let mut last = transport::JsonlProgress::default();
+    let stats = transport::import_jsonl_path_with_progress(store, input, |event| {
+        last = event;
+        import.update(jsonl_progress_detail(event));
+    })?;
     import.finish(format!(
-        "{} new records, {} duplicates",
+        "{} new records, {} duplicates, read {} records, {}",
         format_count(stats.inserted),
-        format_count(stats.duplicates)
+        format_count(stats.duplicates),
+        format_count(last.records),
+        format_bytes(last.bytes)
     ));
 
     let index = progress.phase("Updating search index");
@@ -2000,6 +2025,31 @@ fn format_count(value: usize) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn jsonl_progress_detail(progress: transport::JsonlProgress) -> String {
+    format!(
+        "streamed {} records, {}",
+        format_count(progress.records),
+        format_bytes(progress.bytes)
+    )
 }
 
 fn styled(text: &str, code: &str, color: bool) -> String {
@@ -3963,6 +4013,19 @@ mod tests {
             RawArtifactExportMode::Inline,
             true
         ));
+    }
+
+    #[test]
+    fn jsonl_progress_detail_formats_records_and_bytes() {
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(
+            jsonl_progress_detail(transport::JsonlProgress {
+                records: 1234,
+                bytes: 5 * 1024 * 1024,
+            }),
+            "streamed 1,234 records, 5.0 MiB"
+        );
     }
 
     #[test]
