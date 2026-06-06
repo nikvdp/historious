@@ -3464,7 +3464,9 @@ fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
     } else {
         " --no-color"
     };
-    format!("{exe} --data-dir {data_dir} show {{7}} {{12}} --before 3 --after 5{color_flag}")
+    format!(
+        "mode={{12}}; if [ -n \"$mode\" ]; then {exe} --data-dir {data_dir} show {{7}} \"$mode\" --before 3 --after 5{color_flag}; else {exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}; fi"
+    )
 }
 
 fn fzf_open_command(config: &AppConfig, color: bool) -> String {
@@ -3479,7 +3481,9 @@ fn fzf_open_command(config: &AppConfig, color: bool) -> String {
     } else {
         " --no-color"
     };
-    format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}} {{12}}{color_flag}")
+    format!(
+        "mode={{12}}; if [ -n \"$mode\" ]; then {exe} --data-dir {data_dir} transcript {{6}} --at {{7}} \"$mode\"{color_flag}; else {exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}; fi"
+    )
 }
 
 fn tui_reload_command(
@@ -4488,8 +4492,12 @@ mod tests {
         let without_color = fzf_preview_command(&config, false);
         let open = fzf_open_command(&config, true);
 
-        assert!(with_color.contains("show {7} {12}"));
-        assert!(open.contains("transcript {6} --at {7} {12}"));
+        assert!(with_color.contains("mode={12}; if [ -n \"$mode\" ]"));
+        assert!(with_color.contains("show {7} \"$mode\""));
+        assert!(with_color.contains("show {7} --before 3 --after 5"));
+        assert!(open.contains("mode={12}; if [ -n \"$mode\" ]"));
+        assert!(open.contains("transcript {6} --at {7} \"$mode\""));
+        assert!(open.contains("transcript {6} --at {7} --color auto"));
         assert!(with_color.contains("--color always"));
         assert!(!with_color.contains("--no-color"));
         assert!(without_color.contains("--no-color"));
