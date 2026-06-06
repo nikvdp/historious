@@ -3540,7 +3540,7 @@ fn tui_reload_command(
         ""
     };
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}{duplicate_arg}; fi",
+        "if [ -z {{q}} ]; then :; else curl -fsSG --connect-timeout 2 --max-time 10 {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}{duplicate_arg} 2>/dev/null || :; fi",
         sort.as_str(),
         mode.as_str(),
         shell_quote(&corpus.as_csv())
@@ -4541,7 +4541,7 @@ mod tests {
         )
         .expect("reload command");
 
-        assert!(command.contains("curl -fsSG"));
+        assert!(command.contains("curl -fsSG --connect-timeout 2 --max-time 10"));
         assert!(command.contains("sort=newest"));
         assert!(command.contains("mode=lexical"));
         assert!(command.contains("corpus='conversation,tool'"));
@@ -4550,6 +4550,8 @@ mod tests {
         assert!(command.contains("machine=machine_devbox_123"));
         assert!(command.contains("hostname=devbox"));
         assert!(command.contains("show_duplicates=true"));
+        assert!(command.contains(" 2>/dev/null"));
+        assert!(command.contains(" || :; fi"));
     }
 
     #[test]
