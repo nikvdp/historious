@@ -265,6 +265,11 @@ pub enum Command {
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
+        #[arg(
+            long,
+            help = "Show raw event payloads instead of clean conversation history"
+        )]
+        full: bool,
         #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
@@ -298,6 +303,11 @@ pub enum Command {
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
+        #[arg(
+            long,
+            help = "Show raw event payloads instead of clean conversation history"
+        )]
+        full: bool,
         #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
@@ -328,6 +338,11 @@ pub enum Command {
         no_color: bool,
         #[arg(long, help = "Show source file details and internal ids")]
         verbose: bool,
+        #[arg(
+            long,
+            help = "Show raw event payloads instead of clean conversation history"
+        )]
+        full: bool,
         #[arg(long, help = "Print structured JSON with exact event content")]
         json: bool,
     },
@@ -829,6 +844,7 @@ impl Cli {
                 color,
                 no_color,
                 verbose,
+                full,
                 json,
             }
             | Command::Expand {
@@ -840,13 +856,14 @@ impl Cli {
                 color,
                 no_color,
                 verbose,
+                full,
                 json,
             } => {
                 let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
-                let context = store
-                    .events_around_event(&event_id, before, after)?
-                    .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
                 if json || robot {
+                    let context = store
+                        .events_around_event(&event_id, before, after)?
+                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
                     crate::output::write_success(
                         "show",
                         show_output(&store, &context)?,
@@ -858,10 +875,26 @@ impl Cli {
                             ..Default::default()
                         },
                     )?;
-                } else {
+                } else if full {
+                    let context = store
+                        .events_around_event(&event_id, before, after)?
+                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
                     let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
                     let color = should_color(no_color, color, robot);
                     write_stdout(&crate::transcript::render_context(
+                        &context, &metadata, color,
+                    ))?;
+                } else {
+                    let context = store
+                        .history_items_around_event(&event_id, before, after)?
+                        .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+                    let metadata = if let Some(event) = &context.target_event {
+                        view_metadata_for_event(&store, event, verbose)?
+                    } else {
+                        view_metadata_for_session(&store, &context.session, None, verbose)?
+                    };
+                    let color = should_color(no_color, color, robot);
+                    write_stdout(&crate::transcript::render_history_context(
                         &context, &metadata, color,
                     ))?;
                 }
@@ -874,6 +907,7 @@ impl Cli {
                 color,
                 no_color,
                 verbose,
+                full,
                 json,
             } => {
                 let (session, target_event_id) =
@@ -881,7 +915,6 @@ impl Cli {
                 let session_record = store
                     .session_by_id(&session)?
                     .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-                let events = store.events_for_session(&session)?;
                 let target_event = target_event_id
                     .as_deref()
                     .map(|event_id| {
@@ -891,6 +924,7 @@ impl Cli {
                     })
                     .transpose()?;
                 if json || robot {
+                    let events = store.events_for_session(&session)?;
                     crate::output::write_success(
                         "transcript",
                         transcript_output(
@@ -901,7 +935,8 @@ impl Cli {
                         )?,
                         Default::default(),
                     )?;
-                } else {
+                } else if full {
+                    let events = store.events_for_session(&session)?;
                     let metadata = view_metadata_for_session(
                         &store,
                         &session_record,
@@ -916,6 +951,26 @@ impl Cli {
                         &metadata,
                         color,
                     );
+                    page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
+                } else {
+                    let metadata = view_metadata_for_session(
+                        &store,
+                        &session_record,
+                        target_event.as_ref(),
+                        verbose,
+                    )?;
+                    let color = should_color(no_color, color, robot);
+                    let context = if let Some(event_id) = target_event_id.as_deref() {
+                        store
+                            .history_items_around_event(event_id, usize::MAX / 4, usize::MAX / 4)?
+                            .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?
+                    } else {
+                        store
+                            .history_items_for_transcript_session(&session)?
+                            .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?
+                    };
+                    let rendered =
+                        crate::transcript::render_history_session(&context, &metadata, color);
                     page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
                 }
             }
