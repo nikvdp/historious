@@ -1,6 +1,9 @@
 use crate::embed::{Embedder, EmbedderConfig};
 use crate::memory::MemorySample;
-use crate::storage::{HistoryItemForEmbedding, ImportDelta, SearchRow, Store, VectorSearchRow};
+use crate::storage::{
+    HistoryItemEmbeddingCursor, HistoryItemForEmbedding, ImportDelta, SearchRow, Store,
+    VectorSearchRow,
+};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -579,10 +582,16 @@ fn refresh_embeddings_loaded(
 ) -> Result<EmbeddingRefresh> {
     let mut embedded = 0;
     let mut controller = AdaptiveEmbeddingBatch::new();
+    let mut full_cursor: Option<HistoryItemEmbeddingCursor> = None;
+    let mut pending_hint: Option<usize> = None;
     loop {
         if let Some(reason) = controller.defer_reason(crate::memory::sample_memory()) {
-            let pending =
-                store.history_items_missing_required_embedding_count(embedder.model_id())?;
+            let pending = match pending_hint {
+                Some(pending) => pending,
+                None => {
+                    store.history_items_missing_required_embedding_count(embedder.model_id())?
+                }
+            };
             progress(&EmbeddingProgress::Deferred {
                 pending,
                 reason: reason.clone(),
@@ -602,10 +611,17 @@ fn refresh_embeddings_loaded(
         }
 
         let units = match &mut scope {
-            EmbeddingScope::All => store.history_items_missing_required_embedding(
-                embedder.model_id(),
-                controller.batch_size,
-            )?,
+            EmbeddingScope::All => match &full_cursor {
+                Some(cursor) => store.history_items_missing_required_embedding_after(
+                    embedder.model_id(),
+                    cursor,
+                    controller.batch_size,
+                )?,
+                None => store.history_items_missing_required_embedding(
+                    embedder.model_id(),
+                    controller.batch_size,
+                )?,
+            },
             EmbeddingScope::Delta {
                 event_ids,
                 first_units,
@@ -620,7 +636,20 @@ fn refresh_embeddings_loaded(
         if units.is_empty() {
             break;
         }
-        let pending = store.history_items_missing_required_embedding_count(embedder.model_id())?;
+        let pending = match &scope {
+            EmbeddingScope::All => match pending_hint {
+                Some(pending) => pending,
+                None => {
+                    let pending = store
+                        .history_items_missing_required_embedding_count(embedder.model_id())?;
+                    pending_hint = Some(pending);
+                    pending
+                }
+            },
+            EmbeddingScope::Delta { .. } => {
+                store.history_items_missing_required_embedding_count(embedder.model_id())?
+            }
+        };
         progress(&EmbeddingProgress::Batch {
             embedded,
             pending,
@@ -660,6 +689,12 @@ fn refresh_embeddings_loaded(
         let stats = store.import_records(&records)?;
         embedded += stats.inserted;
         vector_embedding_ids.extend(stats.delta.inserted_embeddings);
+        if let Some(pending) = pending_hint.as_mut() {
+            *pending = pending.saturating_sub(stats.inserted);
+        }
+        if matches!(&scope, EmbeddingScope::All) {
+            full_cursor = units.last().map(|unit| unit.cursor.clone());
+        }
         controller.observe(before, crate::memory::sample_memory());
     }
 

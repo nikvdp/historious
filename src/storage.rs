@@ -147,6 +147,16 @@ pub struct HistoryItemForEmbedding {
     pub id: String,
     pub text: String,
     pub text_hash: String,
+    pub cursor: HistoryItemEmbeddingCursor,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryItemEmbeddingCursor {
+    pub occurred_at_key: String,
+    pub session_id: String,
+    pub ordinal: i64,
+    pub subordinal: i64,
+    pub id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1543,7 +1553,13 @@ impl Store {
     ) -> Result<Vec<HistoryItemForEmbedding>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT hi.id, hi.text, hi.text_hash
+                "SELECT hi.id,
+                        hi.text,
+                        hi.text_hash,
+                        COALESCE(hi.occurred_at, ''),
+                        hi.session_id,
+                        hi.ordinal,
+                        hi.subordinal
                  FROM history_items hi
                  LEFT JOIN embeddings e
                    ON e.unit_id = hi.id
@@ -1553,7 +1569,11 @@ impl Store {
                    AND hi.tier = 'conversation'
                    AND hi.semantic_policy = 'required'
                    AND length(trim(hi.text)) >= ?2
-                 ORDER BY hi.occurred_at, hi.session_id, hi.ordinal, hi.subordinal, hi.id
+                 ORDER BY COALESCE(hi.occurred_at, ''),
+                          hi.session_id,
+                          hi.ordinal,
+                          hi.subordinal,
+                          hi.id
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(
@@ -1567,6 +1587,85 @@ impl Store {
                         id: row.get(0)?,
                         text: row.get(1)?,
                         text_hash: row.get(2)?,
+                        cursor: HistoryItemEmbeddingCursor {
+                            occurred_at_key: row.get(3)?,
+                            session_id: row.get(4)?,
+                            ordinal: row.get(5)?,
+                            subordinal: row.get(6)?,
+                            id: row.get(0)?,
+                        },
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn history_items_missing_required_embedding_after(
+        &self,
+        model_id: &str,
+        after: &HistoryItemEmbeddingCursor,
+        limit: usize,
+    ) -> Result<Vec<HistoryItemForEmbedding>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT hi.id,
+                        hi.text,
+                        hi.text_hash,
+                        COALESCE(hi.occurred_at, ''),
+                        hi.session_id,
+                        hi.ordinal,
+                        hi.subordinal
+                 FROM history_items hi
+                 LEFT JOIN embeddings e
+                   ON e.unit_id = hi.id
+                  AND e.text_hash = hi.text_hash
+                   AND e.model_id = ?1
+                 WHERE e.id IS NULL
+                   AND hi.tier = 'conversation'
+                   AND hi.semantic_policy = 'required'
+                   AND length(trim(hi.text)) >= ?2
+                   AND (
+                     COALESCE(hi.occurred_at, ''),
+                     hi.session_id,
+                     hi.ordinal,
+                     hi.subordinal,
+                     hi.id
+                   ) > (?3, ?4, ?5, ?6, ?7)
+                 ORDER BY COALESCE(hi.occurred_at, ''),
+                          hi.session_id,
+                          hi.ordinal,
+                          hi.subordinal,
+                          hi.id
+                 LIMIT ?8",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    model_id,
+                    SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64,
+                    &after.occurred_at_key,
+                    &after.session_id,
+                    after.ordinal,
+                    after.subordinal,
+                    &after.id,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(HistoryItemForEmbedding {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        text_hash: row.get(2)?,
+                        cursor: HistoryItemEmbeddingCursor {
+                            occurred_at_key: row.get(3)?,
+                            session_id: row.get(4)?,
+                            ordinal: row.get(5)?,
+                            subordinal: row.get(6)?,
+                            id: row.get(0)?,
+                        },
                     })
                 },
             )?;
@@ -1591,7 +1690,13 @@ impl Store {
         self.with_conn(|conn| {
             prepare_temp_id_scope(conn, "temp_delta_event_ids", &event_ids)?;
             let mut stmt = conn.prepare(
-                "SELECT hi.id, hi.text, hi.text_hash
+                "SELECT hi.id,
+                        hi.text,
+                        hi.text_hash,
+                        COALESCE(hi.occurred_at, ''),
+                        hi.session_id,
+                        hi.ordinal,
+                        hi.subordinal
                  FROM history_items hi
                  LEFT JOIN temp_delta_event_ids event_scope
                    ON event_scope.id = hi.event_id
@@ -1604,7 +1709,11 @@ impl Store {
                    AND hi.tier = 'conversation'
                    AND hi.semantic_policy = 'required'
                    AND length(trim(hi.text)) >= ?
-                 ORDER BY hi.occurred_at, hi.session_id, hi.ordinal, hi.subordinal, hi.id
+                 ORDER BY COALESCE(hi.occurred_at, ''),
+                          hi.session_id,
+                          hi.ordinal,
+                          hi.subordinal,
+                          hi.id
                  LIMIT ?",
             )?;
             let rows = stmt.query_map(
@@ -1618,6 +1727,13 @@ impl Store {
                         id: row.get(0)?,
                         text: row.get(1)?,
                         text_hash: row.get(2)?,
+                        cursor: HistoryItemEmbeddingCursor {
+                            occurred_at_key: row.get(3)?,
+                            session_id: row.get(4)?,
+                            ordinal: row.get(5)?,
+                            subordinal: row.get(6)?,
+                            id: row.get(0)?,
+                        },
                     })
                 },
             )?;
@@ -2333,6 +2449,18 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_history_items_text_hash
           ON history_items(text_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_history_items_required_embedding_order
+          ON history_items(
+            tier,
+            semantic_policy,
+            COALESCE(occurred_at, ''),
+            session_id,
+            ordinal,
+            subordinal,
+            id
+          )
+          WHERE tier = 'conversation' AND semantic_policy = 'required';
 
         CREATE VIRTUAL TABLE IF NOT EXISTS history_items_fts USING fts5(
           item_id UNINDEXED,
@@ -3755,6 +3883,62 @@ mod tests {
         assert_eq!(missing.len(), 2);
         assert!(missing.iter().any(|item| item.id == assistant.id));
         assert!(missing.iter().any(|item| item.id == long_user.id));
+
+        let first_page = store
+            .history_items_missing_required_embedding("fixture-semantic-384", 1)
+            .expect("first missing embedding page");
+        let second_page = store
+            .history_items_missing_required_embedding_after(
+                "fixture-semantic-384",
+                &first_page[0].cursor,
+                10,
+            )
+            .expect("next missing embedding page");
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(second_page[0].id, first_page[0].id);
+
+        let plan = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT hi.id
+                     FROM history_items hi
+                     LEFT JOIN embeddings e
+                       ON e.unit_id = hi.id
+                      AND e.text_hash = hi.text_hash
+                      AND e.model_id = ?1
+                     WHERE e.id IS NULL
+                       AND hi.tier = 'conversation'
+                       AND hi.semantic_policy = 'required'
+                       AND length(trim(hi.text)) >= ?2
+                     ORDER BY COALESCE(hi.occurred_at, ''),
+                              hi.session_id,
+                              hi.ordinal,
+                              hi.subordinal,
+                              hi.id
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        "fixture-semantic-384",
+                        SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64,
+                        10_i64
+                    ],
+                    |row| row.get::<_, String>(3),
+                )?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .expect("query plan");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_history_items_required_embedding_order")),
+            "missing embedding query should use the ordered partial index: {plan:?}"
+        );
+
         assert_eq!(
             store
                 .history_items_missing_required_embedding_count("fixture-semantic-384")
