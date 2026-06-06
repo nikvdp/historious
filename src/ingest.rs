@@ -118,14 +118,6 @@ struct WorkspaceIdentity {
     confidence: String,
 }
 
-pub fn update_local(
-    store: &Store,
-    machine_id: &str,
-    options: UpdateOptions,
-) -> Result<UpdateStats> {
-    update_local_with_progress(store, machine_id, options, |_| {})
-}
-
 pub fn update_local_with_progress(
     store: &Store,
     machine_id: &str,

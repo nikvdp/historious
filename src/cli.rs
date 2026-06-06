@@ -647,7 +647,8 @@ impl Cli {
                 json,
             } => {
                 if json || robot {
-                    let output = run_update_once(&store, &config, max_files, source, repair)?;
+                    let output =
+                        run_update_once_machine(&store, &config, max_files, source, repair)?;
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
                     let output = run_update_once_human(&store, &config, max_files, source, repair)?;
@@ -1514,20 +1515,88 @@ enum EmbedderProbeStatus {
     Degraded,
 }
 
-fn run_update_once(
+fn run_update_once_machine(
     store: &Store,
     config: &AppConfig,
     max_files: Option<usize>,
     source: Option<String>,
     repair: bool,
 ) -> Result<UpdateOutput> {
-    let ingest = ingest::update_local(
+    let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
         ingest::UpdateOptions { max_files, source },
+        |event| {
+            write_update_progress(
+                "scan",
+                update_progress_detail(event),
+                update_progress_payload(event),
+            );
+        },
     )?;
-    let projected = refresh_search_after_update(store, &ingest.delta, repair)?;
-    let embeddings = refresh_embeddings_after_update(store, config, &ingest.delta, repair)?;
+    write_update_progress(
+        "scan",
+        format!(
+            "{} files, {} new events, {} unchanged, {} errors",
+            format_count(ingest.files_seen),
+            format_count(ingest.inserted),
+            format_count(ingest.skipped_unchanged),
+            format_count(ingest.errors)
+        ),
+        serde_json::json!({
+            "status": "finished",
+            "files_seen": ingest.files_seen,
+            "inserted": ingest.inserted,
+            "skipped_unchanged": ingest.skipped_unchanged,
+            "errors": ingest.errors,
+        }),
+    );
+
+    let projected =
+        refresh_search_after_update_with_progress(store, &ingest.delta, repair, |detail| {
+            write_update_progress(
+                "search_index",
+                detail.clone(),
+                serde_json::json!({ "detail": detail }),
+            );
+        })?;
+    write_update_progress(
+        "search_index",
+        format!("{} events indexed", format_count(projected)),
+        serde_json::json!({
+            "status": "finished",
+            "indexed_events": projected,
+        }),
+    );
+
+    let embeddings = refresh_embeddings_after_update_with_progress(
+        store,
+        config,
+        &ingest.delta,
+        repair,
+        |event| {
+            write_update_progress(
+                "embeddings",
+                embedding_progress_detail(event),
+                embedding_progress_payload(event),
+            );
+        },
+    )?;
+    write_update_progress(
+        "embeddings",
+        embedding_phase_detail(&embeddings),
+        serde_json::json!({
+            "status": "finished",
+            "embedded": embeddings.embedded,
+            "pending": embeddings.pending,
+            "vectors_indexed": embeddings.vectors_indexed,
+            "degraded_reason": embeddings.degraded_reason,
+            "deferred_reason": embeddings.deferred_reason,
+            "batch_size_reductions": embeddings.batch_size_reductions,
+            "final_batch_size": embeddings.final_batch_size,
+        }),
+    );
+
     Ok(UpdateOutput {
         ingest,
         search_index: SearchIndexOutput {
@@ -1596,14 +1665,6 @@ fn run_update_once_human(
     })
 }
 
-fn refresh_search_after_update(
-    store: &Store,
-    delta: &crate::storage::ImportDelta,
-    repair: bool,
-) -> Result<usize> {
-    refresh_search_after_update_with_progress(store, delta, repair, |_| {})
-}
-
 fn refresh_search_after_update_with_progress(
     store: &Store,
     delta: &crate::storage::ImportDelta,
@@ -1660,15 +1721,6 @@ fn refresh_search_after_update_with_progress(
         }
         Ok(indexed)
     }
-}
-
-fn refresh_embeddings_after_update(
-    store: &Store,
-    config: &AppConfig,
-    delta: &crate::storage::ImportDelta,
-    repair: bool,
-) -> Result<search::EmbeddingRefresh> {
-    refresh_embeddings_after_update_with_progress(store, config, delta, repair, |_| {})
 }
 
 fn refresh_embeddings_after_update_with_progress(
@@ -1939,6 +1991,59 @@ fn embedding_progress_detail(event: &search::EmbeddingProgress) -> String {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct MachineProgressEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    command: &'static str,
+    phase: &'static str,
+    detail: String,
+    data: serde_json::Value,
+}
+
+fn write_update_progress(phase: &'static str, detail: String, data: serde_json::Value) {
+    let event = MachineProgressEvent {
+        event_type: "progress",
+        command: "update",
+        phase,
+        detail,
+        data,
+    };
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    if serde_json::to_writer(&mut handle, &event).is_ok() {
+        let _ = writeln!(handle);
+    }
+}
+
+fn embedding_progress_payload(event: &search::EmbeddingProgress) -> serde_json::Value {
+    match event {
+        search::EmbeddingProgress::LoadingModel { model_id } => serde_json::json!({
+            "status": "loading_model",
+            "model_id": model_id,
+        }),
+        search::EmbeddingProgress::Batch {
+            embedded,
+            pending,
+            batch_size,
+            reductions,
+            available_gib,
+        } => serde_json::json!({
+            "status": "batch",
+            "embedded": embedded,
+            "pending": pending,
+            "batch_size": batch_size,
+            "reductions": reductions,
+            "available_gib": available_gib,
+        }),
+        search::EmbeddingProgress::Deferred { pending, reason } => serde_json::json!({
+            "status": "deferred",
+            "pending": pending,
+            "reason": reason,
+        }),
+    }
+}
+
 fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
     match event {
         ingest::UpdateProgress::Discovered {
@@ -2012,6 +2117,61 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.skipped_unchanged),
             format_count(stats.errors)
         ),
+    }
+}
+
+fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value {
+    match event {
+        ingest::UpdateProgress::Discovered {
+            sources,
+            selected_files,
+        } => serde_json::json!({
+            "status": "discovered",
+            "selected_files": selected_files,
+            "sources": sources.iter().map(|source| {
+                serde_json::json!({
+                    "kind": source.kind,
+                    "found_files": source.found_files,
+                    "selected_files": source.selected_files,
+                })
+            }).collect::<Vec<_>>(),
+        }),
+        ingest::UpdateProgress::Processing {
+            kind,
+            path,
+            file_index,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "processing",
+            "kind": kind,
+            "path": path.display().to_string(),
+            "file_index": file_index,
+            "total_files": total_files,
+            "source_file_index": source_file_index,
+            "source_file_count": source_file_count,
+            "stats": stats,
+        }),
+        ingest::UpdateProgress::CompletedFile {
+            kind,
+            path,
+            file_index,
+            total_files,
+            source_file_index,
+            source_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "completed_file",
+            "kind": kind,
+            "path": path.display().to_string(),
+            "file_index": file_index,
+            "total_files": total_files,
+            "source_file_index": source_file_index,
+            "source_file_count": source_file_count,
+            "stats": stats,
+        }),
     }
 }
 
@@ -3797,6 +3957,30 @@ mod tests {
     fn similar_cell_marks_collapsed_duplicate_count() {
         assert_eq!(similar_cell(0), "-");
         assert_eq!(similar_cell(3), "+3 similar");
+    }
+
+    #[test]
+    fn machine_progress_event_has_jsonl_safe_shape() {
+        let event = MachineProgressEvent {
+            event_type: "progress",
+            command: "update",
+            phase: "embeddings",
+            detail: "64 embedded, 128 pending, batch 64".to_string(),
+            data: json!({
+                "status": "batch",
+                "embedded": 64,
+                "pending": 128,
+                "batch_size": 64,
+            }),
+        };
+        let value = serde_json::to_value(event).expect("serialize progress event");
+
+        assert_eq!(value["type"], "progress");
+        assert_eq!(value["command"], "update");
+        assert_eq!(value["phase"], "embeddings");
+        assert_eq!(value["detail"], "64 embedded, 128 pending, batch 64");
+        assert_eq!(value["data"]["status"], "batch");
+        assert_eq!(value["data"]["pending"], 128);
     }
 
     #[test]
