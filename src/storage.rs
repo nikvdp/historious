@@ -2977,6 +2977,61 @@ fn update_projection_status(conn: &Connection, name: &str, indexed_events: usize
 }
 
 fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord>> {
+    let mut items = Vec::new();
+
+    if let Some((kind, text)) = conversation_history_text(event) {
+        items.push(build_history_item(
+            event,
+            0,
+            "conversation",
+            &kind,
+            text,
+            true,
+            "required",
+            serde_json::json!({
+                "derived_from": "event.search_text",
+                "projector": "history_items_v2"
+            }),
+        )?);
+    }
+
+    if let Some((kind, text)) = tool_history_text(event) {
+        items.push(build_history_item(
+            event,
+            10,
+            "tool",
+            &kind,
+            &text,
+            true,
+            "opportunistic",
+            serde_json::json!({
+                "derived_from": "event.content",
+                "projector": "history_items_v2"
+            }),
+        )?);
+    }
+
+    let raw_text = event.content.trim();
+    if !raw_text.is_empty() {
+        items.push(build_history_item(
+            event,
+            100,
+            "raw",
+            &raw_history_kind(event),
+            raw_text,
+            true,
+            "never",
+            serde_json::json!({
+                "derived_from": "event.content",
+                "projector": "history_items_v2"
+            }),
+        )?);
+    }
+
+    Ok(items)
+}
+
+fn conversation_history_text(event: &EventRecord) -> Option<(String, &str)> {
     let search_indexable = event
         .metadata
         .get("search_indexable")
@@ -2987,10 +3042,10 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
         .get("search_text")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|text| !text.is_empty());
-    let Some(text) = text.filter(|_| search_indexable) else {
-        return Ok(Vec::new());
-    };
+        .filter(|text| !text.is_empty())?;
+    if !search_indexable || is_instruction_text(event, text) {
+        return None;
+    }
     let kind = event
         .metadata
         .get("search_kind")
@@ -2998,8 +3053,108 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
         .or(event.role.as_deref())
         .unwrap_or("unknown")
         .to_ascii_lowercase();
-    let item = build_history_item(event, 0, "conversation", &kind, text, true, "required")?;
-    Ok(vec![item])
+    match kind.as_str() {
+        "user" | "assistant" => Some((kind, text)),
+        "conversation" => event
+            .role
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .filter(|role| role == "user" || role == "assistant")
+            .map(|role| (role, text)),
+        "thinking" | "reasoning" => Some(("thinking".to_string(), text)),
+        _ => None,
+    }
+}
+
+fn tool_history_text(event: &EventRecord) -> Option<(String, String)> {
+    let text = event.content.trim();
+    if text.is_empty() || is_encrypted_payload_text(text) {
+        return None;
+    }
+    if let Some(value) = parse_json_value(text) {
+        if let Some((kind, text)) = tool_history_text_from_json(&value) {
+            return Some((kind, text));
+        }
+    }
+    if text.starts_with("Chunk ID:") && text.contains("\nOutput:") {
+        return Some(("tool_result".to_string(), text.to_string()));
+    }
+    None
+}
+
+fn tool_history_text_from_json(value: &Value) -> Option<(String, String)> {
+    let payload = value.get("payload").unwrap_or(value);
+    let name = payload
+        .get("name")
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str);
+    let arguments = payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .or_else(|| payload.get("command"));
+    if let Some(arguments) = arguments {
+        let mut text = String::new();
+        if let Some(name) = name {
+            text.push_str(name);
+            text.push('\n');
+        }
+        if let Some(arguments) = arguments.as_str() {
+            text.push_str(arguments.trim());
+        } else {
+            text.push_str(&arguments.to_string());
+        }
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(("tool_call".to_string(), text.to_string()));
+        }
+    }
+
+    for key in ["stdout", "stderr", "output", "result"] {
+        if let Some(value) = payload.get(key) {
+            let text = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(("tool_result".to_string(), text.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn parse_json_value(text: &str) -> Option<Value> {
+    serde_json::from_str(text).ok()
+}
+
+fn raw_history_kind(event: &EventRecord) -> String {
+    event
+        .role
+        .as_deref()
+        .or(Some(event.event_type.as_str()))
+        .unwrap_or("raw")
+        .to_ascii_lowercase()
+}
+
+fn is_encrypted_payload_text(text: &str) -> bool {
+    text.contains("\"encrypted_content\"")
+}
+
+fn is_instruction_text(event: &EventRecord, text: &str) -> bool {
+    let role = event
+        .role
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if role == "system" || role == "developer" {
+        return true;
+    }
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("# agents.md instructions")
+        || lower.starts_with("<instructions>")
+        || lower.starts_with("<permissions instructions>")
+        || lower.contains("<instructions>")
 }
 
 fn build_history_item(
@@ -3010,6 +3165,7 @@ fn build_history_item(
     text: &str,
     lexical_indexable: bool,
     semantic_policy: &str,
+    metadata: Value,
 ) -> Result<HistoryItemRecord> {
     let text_hash = crate::archive::blake3_hex(text.as_bytes());
     let subordinal_text = subordinal.to_string();
@@ -3021,10 +3177,6 @@ fn build_history_item(
         kind,
         &text_hash,
     ]);
-    let metadata = serde_json::json!({
-        "derived_from": "event.search_text",
-        "projector": "history_items_v1"
-    });
     let hash = crate::archive::stable_hash(&(
         &id,
         &event.id,
@@ -3570,7 +3722,7 @@ mod tests {
             ])
             .expect("import records");
 
-        assert_eq!(store.refresh_history_items().expect("full repair"), 2);
+        assert_eq!(store.refresh_history_items().expect("full repair"), 5);
         let user_items = store
             .history_items_for_event(&user.id)
             .expect("user history items");
@@ -3581,31 +3733,202 @@ mod tests {
             .history_items_for_event(&skipped.id)
             .expect("skipped history items");
 
-        assert_eq!(user_items.len(), 1);
-        assert_eq!(assistant_items.len(), 1);
-        assert!(skipped_items.is_empty());
-        assert_eq!(user_items[0].event_id, user.id);
-        assert_eq!(user_items[0].session_id, "session_history_items");
-        assert_eq!(user_items[0].ordinal, 1);
-        assert_eq!(user_items[0].subordinal, 0);
-        assert_eq!(user_items[0].tier, "conversation");
-        assert_eq!(user_items[0].kind, "user");
-        assert_eq!(user_items[0].text, "please fix the transcript viewer");
-        assert!(user_items[0].lexical_indexable);
-        assert_eq!(user_items[0].semantic_policy, "required");
+        assert_eq!(user_items.len(), 2);
+        assert_eq!(assistant_items.len(), 2);
+        assert_eq!(skipped_items.len(), 1);
+        assert_eq!(
+            tier_kinds(&user_items),
+            vec![("conversation", "user"), ("raw", "user")]
+        );
+        assert_eq!(
+            tier_kinds(&assistant_items),
+            vec![("conversation", "assistant"), ("raw", "assistant")]
+        );
+        assert_eq!(tier_kinds(&skipped_items), vec![("raw", "assistant")]);
+        let conversation_user = user_items
+            .iter()
+            .find(|item| item.tier == "conversation")
+            .expect("conversation user item");
+        assert_eq!(conversation_user.event_id, user.id);
+        assert_eq!(conversation_user.session_id, "session_history_items");
+        assert_eq!(conversation_user.ordinal, 1);
+        assert_eq!(conversation_user.subordinal, 0);
+        assert_eq!(conversation_user.kind, "user");
+        assert_eq!(conversation_user.text, "please fix the transcript viewer");
+        assert!(conversation_user.lexical_indexable);
+        assert_eq!(conversation_user.semantic_policy, "required");
 
-        let stable_id = user_items[0].id.clone();
+        let stable_id = conversation_user.id.clone();
         assert_eq!(
             store
                 .refresh_history_items_for_events(std::slice::from_ref(&user.id))
                 .expect("event repair"),
-            2
+            5
         );
         let repaired_user_items = store
             .history_items_for_event(&user.id)
             .expect("repaired user history items");
-        assert_eq!(repaired_user_items.len(), 1);
-        assert_eq!(repaired_user_items[0].id, stable_id);
+        assert_eq!(repaired_user_items.len(), 2);
+        let repaired_conversation_user = repaired_user_items
+            .iter()
+            .find(|item| item.tier == "conversation")
+            .expect("repaired conversation user item");
+        assert_eq!(repaired_conversation_user.id, stable_id);
+    }
+
+    #[test]
+    fn history_item_projector_separates_bad_codex_payload_shapes() {
+        let source = fixture_source("source_bad_codex_shapes");
+        let session = fixture_session("session_bad_codex_shapes", &source.id);
+
+        let mut session_meta = fixture_event(
+            "event_session_meta",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_session_meta",
+        );
+        session_meta.event_type = "session_meta".to_string();
+        session_meta.role = None;
+        session_meta.content =
+            r#"{"payload":{"base_instructions":{"text":"You are Codex"}}}"#.to_string();
+        session_meta.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        let mut agents = fixture_event(
+            "event_agents",
+            &session.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_agents",
+        );
+        agents.role = Some("user".to_string());
+        agents.content = "# AGENTS.md instructions for /tmp/repo\n<INSTRUCTIONS>".to_string();
+        agents.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_text": agents.content
+        });
+
+        let mut user = fixture_event(
+            "event_real_user",
+            &session.id,
+            &source.id,
+            3,
+            None,
+            "event_hash_real_user",
+        );
+        user.role = Some("user".to_string());
+        user.content = "please make transcript output readable".to_string();
+        user.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_text": user.content
+        });
+
+        let mut assistant = fixture_event(
+            "event_real_assistant",
+            &session.id,
+            &source.id,
+            4,
+            None,
+            "event_hash_real_assistant",
+        );
+        assistant.role = Some("assistant".to_string());
+        assistant.content = "I will inspect the renderer and projection.".to_string();
+        assistant.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "assistant",
+            "search_text": assistant.content
+        });
+
+        let mut tool_call = fixture_event(
+            "event_tool_call",
+            &session.id,
+            &source.id,
+            5,
+            None,
+            "event_hash_tool_call",
+        );
+        tool_call.role = None;
+        tool_call.event_type = "response_item".to_string();
+        tool_call.content = r#"{"payload":{"name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","type":"function_call"}}"#.to_string();
+        tool_call.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        let mut tool_result = fixture_event(
+            "event_tool_result",
+            &session.id,
+            &source.id,
+            6,
+            None,
+            "event_hash_tool_result",
+        );
+        tool_result.role = None;
+        tool_result.event_type = "response_item".to_string();
+        tool_result.content =
+            "Chunk ID: abc\nWall time: 0.1 seconds\nOutput:\nerror[E0425]: missing value"
+                .to_string();
+        tool_result.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        let mut encrypted = fixture_event(
+            "event_encrypted",
+            &session.id,
+            &source.id,
+            7,
+            None,
+            "event_hash_encrypted",
+        );
+        encrypted.role = None;
+        encrypted.event_type = "response_item".to_string();
+        encrypted.content =
+            r#"{"payload":{"content":null,"encrypted_content":"gAAAA..."}}"#.to_string();
+        encrypted.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&session_meta).expect("session meta")),
+            vec![("raw", "session_meta")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&agents).expect("agents")),
+            vec![("raw", "user")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&user).expect("user")),
+            vec![("conversation", "user"), ("raw", "user")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&assistant).expect("assistant")),
+            vec![("conversation", "assistant"), ("raw", "assistant")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&tool_call).expect("tool call")),
+            vec![("tool", "tool_call"), ("raw", "response_item")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&tool_result).expect("tool result")),
+            vec![("tool", "tool_result"), ("raw", "response_item")]
+        );
+        assert_eq!(
+            tier_kinds(&history_items_from_event(&encrypted).expect("encrypted")),
+            vec![("raw", "response_item")]
+        );
     }
 
     #[test]
@@ -3952,6 +4275,13 @@ mod tests {
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
         records.iter().any(|record| record.id() == id)
+    }
+
+    fn tier_kinds(items: &[HistoryItemRecord]) -> Vec<(&str, &str)> {
+        items
+            .iter()
+            .map(|item| (item.tier.as_str(), item.kind.as_str()))
+            .collect()
     }
 
     fn dt(value: &str) -> DateTime<Utc> {
