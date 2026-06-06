@@ -80,6 +80,7 @@ pub struct ArchiveStats {
     pub raw_artifacts: u64,
     pub sessions: u64,
     pub events: u64,
+    pub history_items: u64,
     pub search_units: u64,
     pub embeddings: u64,
 }
@@ -102,6 +103,27 @@ pub struct EventForProjection {
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub text_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryItemRecord {
+    pub id: String,
+    pub event_id: String,
+    pub session_id: String,
+    pub source_id: String,
+    pub machine_id: String,
+    pub source_kind: String,
+    pub ordinal: i64,
+    pub subordinal: i64,
+    pub tier: String,
+    pub kind: String,
+    pub text: String,
+    pub text_hash: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub lexical_indexable: bool,
+    pub semantic_policy: String,
+    pub metadata: Value,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -665,9 +687,105 @@ impl Store {
                 raw_artifacts: count(conn, "raw_artifacts")?,
                 sessions: count(conn, "sessions")?,
                 events: count(conn, "events")?,
+                history_items: count(conn, "history_items")?,
                 search_units: count(conn, "search_units")?,
                 embeddings: count(conn, "embeddings")?,
             })
+        })
+    }
+
+    pub fn refresh_history_items(&self) -> Result<usize> {
+        self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                tx.execute("DELETE FROM history_items", [])?;
+                let mut stmt = tx.prepare(
+                    "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
+                            event_type, role, content, raw_artifact_hash, occurred_at,
+                            metadata_json, hash
+                     FROM events
+                     ORDER BY session_id, ordinal, id",
+                )?;
+                let rows = stmt.query_map([], row_event)?;
+                for row in rows {
+                    for item in history_items_from_event(&row?)? {
+                        insert_history_item(&tx, &item)?;
+                    }
+                }
+                drop(stmt);
+                let count = count(tx, "history_items")? as usize;
+                update_projection_status(tx, "history_items_v1", count)?;
+                Ok(count)
+            })
+        })
+    }
+
+    pub fn refresh_history_items_for_events(&self, event_ids: &[String]) -> Result<usize> {
+        let event_ids = normalized_ids(event_ids);
+        if event_ids.is_empty() {
+            return self.with_conn(|conn| Ok(count(conn, "history_items")? as usize));
+        }
+        self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
+                tx.execute(
+                    "DELETE FROM history_items
+                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                    [],
+                )?;
+                let mut stmt = tx.prepare(
+                    "SELECT e.id, e.session_id, e.source_id, e.machine_id, e.source_kind,
+                            e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
+                            e.occurred_at, e.metadata_json, e.hash
+                     FROM temp_history_item_event_ids scope
+                     JOIN events e ON e.id = scope.id
+                     ORDER BY e.session_id, e.ordinal, e.id",
+                )?;
+                let rows = stmt.query_map([], row_event)?;
+                for row in rows {
+                    for item in history_items_from_event(&row?)? {
+                        insert_history_item(&tx, &item)?;
+                    }
+                }
+                drop(stmt);
+                let count = count(tx, "history_items")? as usize;
+                update_projection_status(tx, "history_items_v1", count)?;
+                Ok(count)
+            })
+        })
+    }
+
+    pub fn history_items_projection_ready(&self) -> Result<bool> {
+        self.with_conn(|conn| {
+            let ready: i64 = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM projection_status
+                   WHERE projection_name = 'history_items_v1'
+                     AND status = 'ready'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(ready != 0)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn history_items_for_event(&self, event_id: &str) -> Result<Vec<HistoryItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, session_id, source_id, machine_id, source_kind,
+                        ordinal, subordinal, tier, kind, text, text_hash, occurred_at,
+                        lexical_indexable, semantic_policy, metadata_json, hash
+                 FROM history_items
+                 WHERE event_id = ?1
+                 ORDER BY subordinal, id",
+            )?;
+            let rows = stmt.query_map(params![event_id], row_history_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
         })
     }
 
@@ -1913,7 +2031,10 @@ fn placeholders(count: usize) -> String {
 
 fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Result<()> {
     match table {
-        "temp_search_index_event_ids" | "temp_delta_event_ids" | "temp_delta_search_unit_ids" => {}
+        "temp_search_index_event_ids"
+        | "temp_delta_event_ids"
+        | "temp_delta_search_unit_ids"
+        | "temp_history_item_event_ids" => {}
         _ => bail!("unsupported temporary id scope table: {table}"),
     }
     conn.execute(
@@ -2039,6 +2160,38 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_session_activity_last_event
           ON session_activity(last_event_at);
+
+        CREATE TABLE IF NOT EXISTS history_items (
+          id TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          subordinal INTEGER NOT NULL,
+          tier TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          text TEXT NOT NULL,
+          text_hash TEXT NOT NULL,
+          occurred_at TEXT,
+          lexical_indexable INTEGER NOT NULL,
+          semantic_policy TEXT NOT NULL,
+          metadata_json TEXT NOT NULL,
+          hash TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_history_items_event
+          ON history_items(event_id, subordinal);
+
+        CREATE INDEX IF NOT EXISTS idx_history_items_session_order
+          ON history_items(session_id, ordinal, subordinal);
+
+        CREATE INDEX IF NOT EXISTS idx_history_items_tier_kind
+          ON history_items(tier, kind);
+
+        CREATE INDEX IF NOT EXISTS idx_history_items_text_hash
+          ON history_items(text_hash);
 
         CREATE TABLE IF NOT EXISTS search_units (
           id TEXT PRIMARY KEY,
@@ -2407,6 +2560,37 @@ fn update_session_activity_for_event(conn: &Connection, event: &EventRecord) -> 
         params![event.session_id, occurred_at],
     )?;
     Ok(())
+}
+
+fn insert_history_item(conn: &Connection, item: &HistoryItemRecord) -> Result<bool> {
+    ensure_same_hash(conn, "history_items", "id", &item.id, &item.hash)?;
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO history_items
+         (id, event_id, session_id, source_id, machine_id, source_kind, ordinal, subordinal,
+          tier, kind, text, text_hash, occurred_at, lexical_indexable, semantic_policy,
+          metadata_json, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            item.id,
+            item.event_id,
+            item.session_id,
+            item.source_id,
+            item.machine_id,
+            item.source_kind,
+            item.ordinal,
+            item.subordinal,
+            item.tier,
+            item.kind,
+            item.text,
+            item.text_hash,
+            opt_dt(item.occurred_at),
+            item.lexical_indexable as i64,
+            item.semantic_policy,
+            item.metadata.to_string(),
+            item.hash
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool> {
@@ -2792,6 +2976,89 @@ fn update_projection_status(conn: &Connection, name: &str, indexed_events: usize
     Ok(())
 }
 
+fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord>> {
+    let search_indexable = event
+        .metadata
+        .get("search_indexable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text = event
+        .metadata
+        .get("search_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let Some(text) = text.filter(|_| search_indexable) else {
+        return Ok(Vec::new());
+    };
+    let kind = event
+        .metadata
+        .get("search_kind")
+        .and_then(Value::as_str)
+        .or(event.role.as_deref())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let item = build_history_item(event, 0, "conversation", &kind, text, true, "required")?;
+    Ok(vec![item])
+}
+
+fn build_history_item(
+    event: &EventRecord,
+    subordinal: i64,
+    tier: &str,
+    kind: &str,
+    text: &str,
+    lexical_indexable: bool,
+    semantic_policy: &str,
+) -> Result<HistoryItemRecord> {
+    let text_hash = crate::archive::blake3_hex(text.as_bytes());
+    let subordinal_text = subordinal.to_string();
+    let id = crate::archive::stable_id(&[
+        "history_item",
+        &event.id,
+        &subordinal_text,
+        tier,
+        kind,
+        &text_hash,
+    ]);
+    let metadata = serde_json::json!({
+        "derived_from": "event.search_text",
+        "projector": "history_items_v1"
+    });
+    let hash = crate::archive::stable_hash(&(
+        &id,
+        &event.id,
+        event.ordinal,
+        subordinal,
+        tier,
+        kind,
+        &text_hash,
+        text,
+        lexical_indexable,
+        semantic_policy,
+        &metadata,
+    ))?;
+    Ok(HistoryItemRecord {
+        id,
+        event_id: event.id.clone(),
+        session_id: event.session_id.clone(),
+        source_id: event.source_id.clone(),
+        machine_id: event.machine_id.clone(),
+        source_kind: event.source_kind.clone(),
+        ordinal: event.ordinal,
+        subordinal,
+        tier: tier.to_string(),
+        kind: kind.to_string(),
+        text: text.to_string(),
+        text_hash,
+        occurred_at: event.occurred_at,
+        lexical_indexable,
+        semantic_policy: semantic_policy.to_string(),
+        metadata,
+        hash,
+    })
+}
+
 fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
     Ok(RawArtifact {
         hash: row.get(0)?,
@@ -2869,6 +3136,30 @@ fn row_search_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchUnitRecord
         occurred_at: parse_opt_dt(row.get(10)?),
         metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
         hash: row.get(12)?,
+    })
+}
+
+#[cfg(test)]
+fn row_history_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItemRecord> {
+    let metadata: String = row.get(15)?;
+    Ok(HistoryItemRecord {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        session_id: row.get(2)?,
+        source_id: row.get(3)?,
+        machine_id: row.get(4)?,
+        source_kind: row.get(5)?,
+        ordinal: row.get(6)?,
+        subordinal: row.get(7)?,
+        tier: row.get(8)?,
+        kind: row.get(9)?,
+        text: row.get(10)?,
+        text_hash: row.get(11)?,
+        occurred_at: parse_opt_dt(row.get(12)?),
+        lexical_indexable: row.get::<_, i64>(13)? != 0,
+        semantic_policy: row.get(14)?,
+        metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+        hash: row.get(16)?,
     })
 }
 
@@ -3219,6 +3510,102 @@ mod tests {
         assert_eq!(rows[1].event_count, 2);
         assert_eq!(rows[1].first_event_at, Some(dt("2026-06-06T03:00:00Z")));
         assert_eq!(rows[1].last_event_at, Some(dt("2026-06-06T04:00:00Z")));
+    }
+
+    #[test]
+    fn history_items_repair_projects_search_text_without_crossing_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_history_items");
+        let session = fixture_session("session_history_items", &source.id);
+        let mut user = fixture_event(
+            "event_history_user",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_history_user",
+        );
+        user.role = Some("user".to_string());
+        user.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_text": "please fix the transcript viewer"
+        });
+        let mut assistant = fixture_event(
+            "event_history_assistant",
+            &session.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_history_assistant",
+        );
+        assistant.role = Some("assistant".to_string());
+        assistant.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "assistant",
+            "search_text": "I will inspect the transcript renderer"
+        });
+        let mut skipped = fixture_event(
+            "event_history_skipped",
+            &session.id,
+            &source.id,
+            3,
+            None,
+            "event_hash_history_skipped",
+        );
+        skipped.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(user.clone()),
+                ArchiveRecord::Event(assistant.clone()),
+                ArchiveRecord::Event(skipped.clone()),
+            ])
+            .expect("import records");
+
+        assert_eq!(store.refresh_history_items().expect("full repair"), 2);
+        let user_items = store
+            .history_items_for_event(&user.id)
+            .expect("user history items");
+        let assistant_items = store
+            .history_items_for_event(&assistant.id)
+            .expect("assistant history items");
+        let skipped_items = store
+            .history_items_for_event(&skipped.id)
+            .expect("skipped history items");
+
+        assert_eq!(user_items.len(), 1);
+        assert_eq!(assistant_items.len(), 1);
+        assert!(skipped_items.is_empty());
+        assert_eq!(user_items[0].event_id, user.id);
+        assert_eq!(user_items[0].session_id, "session_history_items");
+        assert_eq!(user_items[0].ordinal, 1);
+        assert_eq!(user_items[0].subordinal, 0);
+        assert_eq!(user_items[0].tier, "conversation");
+        assert_eq!(user_items[0].kind, "user");
+        assert_eq!(user_items[0].text, "please fix the transcript viewer");
+        assert!(user_items[0].lexical_indexable);
+        assert_eq!(user_items[0].semantic_policy, "required");
+
+        let stable_id = user_items[0].id.clone();
+        assert_eq!(
+            store
+                .refresh_history_items_for_events(std::slice::from_ref(&user.id))
+                .expect("event repair"),
+            2
+        );
+        let repaired_user_items = store
+            .history_items_for_event(&user.id)
+            .expect("repaired user history items");
+        assert_eq!(repaired_user_items.len(), 1);
+        assert_eq!(repaired_user_items[0].id, stable_id);
     }
 
     #[test]
