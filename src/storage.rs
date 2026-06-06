@@ -143,7 +143,7 @@ pub struct SearchRow {
 }
 
 #[derive(Debug, Clone)]
-pub struct SearchUnitForEmbedding {
+pub struct HistoryItemForEmbedding {
     pub id: String,
     pub text: String,
     pub text_hash: String,
@@ -152,10 +152,11 @@ pub struct SearchUnitForEmbedding {
 #[derive(Debug, Clone)]
 pub struct VectorSearchRow {
     pub event_id: String,
-    pub unit_id: String,
+    pub history_item_id: String,
     pub session_id: String,
     pub machine_id: String,
     pub source_kind: String,
+    pub tier: String,
     pub search_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -603,8 +604,8 @@ impl Store {
                     "SELECT e.id, e.unit_id, e.text_hash, e.model_id, e.dims, e.vector_hash, e.vector,
                             e.producer_machine_id, e.embedded_at, e.metadata_json, e.hash
                      FROM embeddings e
-                     JOIN search_units su ON su.id = e.unit_id
-                     WHERE su.session_id IN ({placeholders})
+                     JOIN history_items hi ON hi.id = e.unit_id
+                     WHERE hi.session_id IN ({placeholders})
                      ORDER BY e.model_id, e.unit_id"
                 );
                 let mut stmt = conn.prepare(&sql)?;
@@ -1459,24 +1460,24 @@ impl Store {
         })
     }
 
-    pub fn search_units_missing_embedding(
+    pub fn history_items_missing_required_embedding(
         &self,
         model_id: &str,
         limit: usize,
-    ) -> Result<Vec<SearchUnitForEmbedding>> {
+    ) -> Result<Vec<HistoryItemForEmbedding>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT su.id, su.text, su.text_hash
-                 FROM search_units su
+                "SELECT hi.id, hi.text, hi.text_hash
+                 FROM history_items hi
                  LEFT JOIN embeddings e
-                   ON e.unit_id = su.id
-                  AND e.text_hash = su.text_hash
+                   ON e.unit_id = hi.id
+                  AND e.text_hash = hi.text_hash
                    AND e.model_id = ?1
                  WHERE e.id IS NULL
-                   AND su.search_kind = 'user'
-                   AND length(trim(su.text)) >= ?2
-                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
-                 ORDER BY su.occurred_at, su.session_id, su.id
+                   AND hi.tier = 'conversation'
+                   AND hi.semantic_policy = 'required'
+                   AND length(trim(hi.text)) >= ?2
+                 ORDER BY hi.occurred_at, hi.session_id, hi.ordinal, hi.subordinal, hi.id
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(
@@ -1486,7 +1487,7 @@ impl Store {
                     limit as i64
                 ],
                 |row| {
-                    Ok(SearchUnitForEmbedding {
+                    Ok(HistoryItemForEmbedding {
                         id: row.get(0)?,
                         text: row.get(1)?,
                         text_hash: row.get(2)?,
@@ -1501,38 +1502,33 @@ impl Store {
         })
     }
 
-    pub fn search_units_missing_embedding_for_delta(
+    pub fn history_items_missing_required_embedding_for_events(
         &self,
         model_id: &str,
         event_ids: &[String],
-        unit_ids: &[String],
         limit: usize,
-    ) -> Result<Vec<SearchUnitForEmbedding>> {
+    ) -> Result<Vec<HistoryItemForEmbedding>> {
         let event_ids = normalized_ids(event_ids);
-        let unit_ids = normalized_ids(unit_ids);
-        if event_ids.is_empty() && unit_ids.is_empty() {
+        if event_ids.is_empty() {
             return Ok(Vec::new());
         }
         self.with_conn(|conn| {
             prepare_temp_id_scope(conn, "temp_delta_event_ids", &event_ids)?;
-            prepare_temp_id_scope(conn, "temp_delta_search_unit_ids", &unit_ids)?;
             let mut stmt = conn.prepare(
-                "SELECT su.id, su.text, su.text_hash
-                 FROM search_units su
+                "SELECT hi.id, hi.text, hi.text_hash
+                 FROM history_items hi
                  LEFT JOIN temp_delta_event_ids event_scope
-                   ON event_scope.id = su.event_id
-                 LEFT JOIN temp_delta_search_unit_ids unit_scope
-                   ON unit_scope.id = su.id
+                   ON event_scope.id = hi.event_id
                  LEFT JOIN embeddings e
-                   ON e.unit_id = su.id
-                  AND e.text_hash = su.text_hash
+                   ON e.unit_id = hi.id
+                  AND e.text_hash = hi.text_hash
                   AND e.model_id = ?
                  WHERE e.id IS NULL
-                   AND (event_scope.id IS NOT NULL OR unit_scope.id IS NOT NULL)
-                   AND su.search_kind = 'user'
-                   AND length(trim(su.text)) >= ?
-                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
-                 ORDER BY su.occurred_at, su.session_id, su.id
+                   AND event_scope.id IS NOT NULL
+                   AND hi.tier = 'conversation'
+                   AND hi.semantic_policy = 'required'
+                   AND length(trim(hi.text)) >= ?
+                 ORDER BY hi.occurred_at, hi.session_id, hi.ordinal, hi.subordinal, hi.id
                  LIMIT ?",
             )?;
             let rows = stmt.query_map(
@@ -1542,7 +1538,7 @@ impl Store {
                     limit as i64
                 ],
                 |row| {
-                    Ok(SearchUnitForEmbedding {
+                    Ok(HistoryItemForEmbedding {
                         id: row.get(0)?,
                         text: row.get(1)?,
                         text_hash: row.get(2)?,
@@ -1557,12 +1553,44 @@ impl Store {
         })
     }
 
-    pub fn search_units_need_embedding(&self, model_id: &str) -> Result<bool> {
-        self.with_conn(|conn| search_units_need_embedding(conn, model_id))
+    pub fn history_items_need_required_embedding(&self, model_id: &str) -> Result<bool> {
+        self.with_conn(|conn| history_items_need_required_embedding(conn, model_id))
     }
 
-    pub fn search_units_missing_embedding_count(&self, model_id: &str) -> Result<usize> {
-        self.with_conn(|conn| search_units_missing_embedding_count(conn, model_id))
+    pub fn history_items_missing_required_embedding_count(&self, model_id: &str) -> Result<usize> {
+        self.with_conn(|conn| history_items_missing_required_embedding_count(conn, model_id))
+    }
+
+    pub fn history_items_missing_embedding_count_for_tiers(
+        &self,
+        model_id: &str,
+        tiers: &[&str],
+    ) -> Result<usize> {
+        if tiers.is_empty() {
+            return Ok(0);
+        }
+        let tier_placeholders = vec!["?"; tiers.len()].join(", ");
+        self.with_conn(|conn| {
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM history_items hi
+                 LEFT JOIN embeddings e
+                   ON e.unit_id = hi.id
+                  AND e.text_hash = hi.text_hash
+                  AND e.model_id = ?
+                 WHERE e.id IS NULL
+                   AND hi.semantic_policy != 'never'
+                   AND length(trim(hi.text)) >= ?
+                   AND hi.tier IN ({tier_placeholders})"
+            );
+            let mut values = vec![
+                SqlValue::Text(model_id.to_string()),
+                SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64),
+            ];
+            values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
+            let count: i64 = conn.query_row(&sql, params_from_iter(values), |row| row.get(0))?;
+            Ok(count as usize)
+        })
     }
 
     pub fn refresh_vector_projection(&self) -> Result<usize> {
@@ -1571,9 +1599,11 @@ impl Store {
                 tx.execute("DELETE FROM vec_embeddings_384", [])?;
                 let inserted = tx.execute(
                     "INSERT INTO vec_embeddings_384(rowid, embedding)
-                     SELECT rowid, vector
-                     FROM embeddings
-                     WHERE dims = 384",
+                     SELECT e.rowid, e.vector
+                     FROM embeddings e
+                     JOIN history_items hi ON hi.id = e.unit_id
+                     WHERE e.dims = 384
+                       AND hi.semantic_policy != 'never'",
                     [],
                 )?;
                 Ok(inserted)
@@ -1602,10 +1632,12 @@ impl Store {
                     )?;
                     let insert_sql = format!(
                         "INSERT INTO vec_embeddings_384(rowid, embedding)
-                     SELECT rowid, vector
-                     FROM embeddings
-                     WHERE dims = 384
-                       AND id IN ({placeholders})"
+                     SELECT e.rowid, e.vector
+                     FROM embeddings e
+                     JOIN history_items hi ON hi.id = e.unit_id
+                     WHERE e.dims = 384
+                       AND hi.semantic_policy != 'never'
+                       AND e.id IN ({placeholders})"
                     );
                     tx.execute(
                         &insert_sql,
@@ -1626,76 +1658,85 @@ impl Store {
         &self,
         model_id: &str,
         query_vector: &[f32],
+        tiers: &[&str],
         limit: usize,
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
         machine_id_prefix: Option<&str>,
     ) -> Result<Vec<VectorSearchRow>> {
-        if query_vector.len() != 384 {
+        if query_vector.len() != 384 || tiers.is_empty() {
             return Ok(Vec::new());
         }
         let after = opt_dt(after);
         let before = opt_dt(before);
+        let tier_placeholders = vec!["?"; tiers.len()].join(", ");
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT su.event_id,
-                        e.unit_id,
-                        su.session_id,
-                        su.machine_id,
-                        su.source_kind,
-                        su.search_kind,
-                        su.text,
-                        su.occurred_at,
+            let sql = format!(
+                "SELECT hi.event_id,
+                        hi.id,
+                        hi.session_id,
+                        hi.machine_id,
+                        hi.source_kind,
+                        hi.tier,
+                        hi.kind,
+                        hi.text,
+                        hi.occurred_at,
                         s.title,
                         s.metadata_json,
                         vec_embeddings_384.distance
                  FROM vec_embeddings_384
                  JOIN embeddings e ON e.rowid = vec_embeddings_384.rowid
-                 JOIN search_units su ON su.id = e.unit_id
-                 LEFT JOIN sessions s ON s.id = su.session_id
-                 WHERE vec_embeddings_384.embedding MATCH ?1
-                   AND k = ?2
-                   AND e.model_id = ?3
-                   AND (?4 IS NULL OR su.occurred_at >= ?4)
-                   AND (?5 IS NULL OR su.occurred_at < ?5)
-                   AND (?6 IS NULL OR su.machine_id = ?6)
-                   AND (?7 IS NULL OR substr(su.machine_id, 1, length(?7)) = ?7)
-                   AND su.search_kind = 'user'
-                   AND length(trim(su.text)) >= ?8
-                   AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
-                 ORDER BY vec_embeddings_384.distance",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    f32_vector_to_blob(query_vector),
-                    limit as i64,
-                    model_id,
-                    after,
-                    before,
-                    machine_id,
-                    machine_id_prefix,
-                    SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64
-                ],
-                |row| {
-                    Ok(VectorSearchRow {
-                        event_id: row.get(0)?,
-                        unit_id: row.get(1)?,
-                        session_id: row.get(2)?,
-                        machine_id: row.get(3)?,
-                        source_kind: row.get(4)?,
-                        search_kind: row.get(5)?,
-                        content: row.get(6)?,
-                        occurred_at: parse_opt_dt(row.get(7)?),
-                        session_title: row.get(8)?,
-                        workspace_values: session_workspace_values(&parse_metadata_json(
-                            row.get::<_, Option<String>>(9)?,
-                        )),
-                        distance: row.get(10)?,
-                        rank: 0,
-                    })
-                },
-            )?;
+                 JOIN history_items hi ON hi.id = e.unit_id
+                 LEFT JOIN sessions s ON s.id = hi.session_id
+                 WHERE vec_embeddings_384.embedding MATCH ?
+                   AND k = ?
+                   AND e.model_id = ?
+                   AND (? IS NULL OR hi.occurred_at >= ?)
+                   AND (? IS NULL OR hi.occurred_at < ?)
+                   AND (? IS NULL OR hi.machine_id = ?)
+                   AND (? IS NULL OR substr(hi.machine_id, 1, length(?)) = ?)
+                   AND hi.semantic_policy != 'never'
+                   AND length(trim(hi.text)) >= ?
+                   AND hi.tier IN ({tier_placeholders})
+                 ORDER BY vec_embeddings_384.distance"
+            );
+            let mut values = vec![
+                SqlValue::Blob(f32_vector_to_blob(query_vector)),
+                SqlValue::Integer(limit as i64),
+                SqlValue::Text(model_id.to_string()),
+                opt_sql_text(after.clone()),
+                opt_sql_text(after),
+                opt_sql_text(before.clone()),
+                opt_sql_text(before),
+                opt_sql_text(machine_id.map(str::to_string)),
+                opt_sql_text(machine_id.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64),
+            ];
+            values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok(VectorSearchRow {
+                    event_id: row.get(0)?,
+                    history_item_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    source_kind: row.get(4)?,
+                    tier: row.get(5)?,
+                    search_kind: row.get(6)?,
+                    content: row.get(7)?,
+                    occurred_at: parse_opt_dt(row.get(8)?),
+                    session_title: row.get(9)?,
+                    workspace_values: session_workspace_values(&parse_metadata_json(
+                        row.get::<_, Option<String>>(10)?,
+                    )),
+                    distance: row.get(11)?,
+                    rank: 0,
+                })
+            })?;
             let mut out = Vec::new();
             for (idx, row) in rows.enumerate() {
                 let mut row = row?;
@@ -2813,19 +2854,19 @@ fn indexable_event_count(conn: &Connection) -> Result<i64> {
     .map_err(Into::into)
 }
 
-fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool> {
+fn history_items_need_required_embedding(conn: &Connection, model_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(
            SELECT 1
-           FROM search_units su
+           FROM history_items hi
            LEFT JOIN embeddings e
-             ON e.unit_id = su.id
-            AND e.text_hash = su.text_hash
+             ON e.unit_id = hi.id
+            AND e.text_hash = hi.text_hash
             AND e.model_id = ?1
            WHERE e.id IS NULL
-             AND su.search_kind = 'user'
-             AND length(trim(su.text)) >= ?2
-             AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'
+             AND hi.tier = 'conversation'
+             AND hi.semantic_policy = 'required'
+             AND length(trim(hi.text)) >= ?2
            LIMIT 1
          )",
         params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
@@ -2834,18 +2875,21 @@ fn search_units_need_embedding(conn: &Connection, model_id: &str) -> Result<bool
     Ok(exists != 0)
 }
 
-fn search_units_missing_embedding_count(conn: &Connection, model_id: &str) -> Result<usize> {
+fn history_items_missing_required_embedding_count(
+    conn: &Connection,
+    model_id: &str,
+) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*)
-         FROM search_units su
+         FROM history_items hi
          LEFT JOIN embeddings e
-           ON e.unit_id = su.id
-          AND e.text_hash = su.text_hash
+           ON e.unit_id = hi.id
+          AND e.text_hash = hi.text_hash
           AND e.model_id = ?1
          WHERE e.id IS NULL
-           AND su.search_kind = 'user'
-           AND length(trim(su.text)) >= ?2
-           AND trim(su.text) NOT LIKE '# AGENTS.md instructions%'",
+           AND hi.tier = 'conversation'
+           AND hi.semantic_policy = 'required'
+           AND length(trim(hi.text)) >= ?2",
         params![model_id, SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64],
         |row| row.get(0),
     )?;
@@ -2857,9 +2901,11 @@ fn vector_projection_needs_repair(conn: &Connection) -> Result<bool> {
         "SELECT EXISTS(
            SELECT 1
            FROM embeddings e
+           JOIN history_items hi ON hi.id = e.unit_id
            LEFT JOIN vec_embeddings_384 v
              ON v.rowid = e.rowid
            WHERE e.dims = 384
+             AND hi.semantic_policy != 'never'
              AND v.rowid IS NULL
            LIMIT 1
          )",
@@ -3420,16 +3466,31 @@ mod tests {
         let embedding = fixture_embedding(&unit, unit_vector(0));
         store
             .import_records(&[
-                ArchiveRecord::SearchUnit(unit.clone()),
+                ArchiveRecord::Source(fixture_source("source_vector")),
+                ArchiveRecord::Session(fixture_session("session_vector", "source_vector")),
+                ArchiveRecord::Event(fixture_event_with_text_kind(
+                    "event_vector",
+                    "session_vector",
+                    "source_vector",
+                    1,
+                    None,
+                    "event_hash_vector",
+                    &unit.text,
+                    "user",
+                )),
                 ArchiveRecord::Embedding(embedding),
             ])
             .expect("import records");
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
         store.refresh_vector_projection().expect("refresh vectors");
 
         let hits = store
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(0),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -3440,9 +3501,11 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].event_id, "event_vector");
-        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(hits[0].history_item_id, unit.id);
         assert_eq!(hits[0].session_id, "session_vector");
         assert_eq!(hits[0].source_kind, "codex");
+        assert_eq!(hits[0].tier, "conversation");
+        assert_eq!(hits[0].search_kind, "user");
         assert_eq!(
             hits[0].content,
             "user conversation about distributed memories with enough context for semantic retrieval"
@@ -3461,10 +3524,24 @@ mod tests {
         let embedding = fixture_embedding(&unit, unit_vector(2));
         store
             .import_records(&[
-                ArchiveRecord::SearchUnit(unit.clone()),
+                ArchiveRecord::Source(fixture_source("source_vector")),
+                ArchiveRecord::Session(fixture_session("session_vector", "source_vector")),
+                ArchiveRecord::Event(fixture_event_with_text_kind(
+                    "event_vector",
+                    "session_vector",
+                    "source_vector",
+                    1,
+                    None,
+                    "event_hash_vector",
+                    &unit.text,
+                    "user",
+                )),
                 ArchiveRecord::Embedding(embedding),
             ])
             .expect("import records");
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
 
         assert_eq!(store.refresh_vector_projection().expect("first refresh"), 1);
         assert_eq!(
@@ -3475,6 +3552,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(2),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -3483,73 +3561,120 @@ mod tests {
             )
             .expect("vector search");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(hits[0].history_item_id, unit.id);
     }
 
     #[test]
     fn vector_projection_refresh_chunks_large_embedding_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
-        let records = (0..(SQLITE_BIND_CHUNK_SIZE * 3))
-            .map(|idx| {
-                let unit = fixture_search_unit(&format!("chunked vector projection {idx}"));
-                ArchiveRecord::Embedding(fixture_embedding(&unit, unit_vector(idx % 384)))
-            })
-            .collect::<Vec<_>>();
+        let mut records = vec![
+            ArchiveRecord::Source(fixture_source("source_vector")),
+            ArchiveRecord::Session(fixture_session("session_vector", "source_vector")),
+        ];
+        for idx in 0..(SQLITE_BIND_CHUNK_SIZE * 3) {
+            let event_id = format!("event_vector_{idx}");
+            let text = format!("chunked vector projection {idx}");
+            let unit = fixture_search_unit_for_event(&event_id, &text, "user");
+            records.push(ArchiveRecord::Event(fixture_event_with_text_kind(
+                &event_id,
+                "session_vector",
+                "source_vector",
+                idx as i64,
+                None,
+                &format!("event_hash_vector_{idx}"),
+                &text,
+                "user",
+            )));
+            records.push(ArchiveRecord::Embedding(fixture_embedding(
+                &unit,
+                unit_vector(idx % 384),
+            )));
+        }
         let embedding_ids = records
             .iter()
             .map(|record| record.id().to_string())
             .collect::<Vec<_>>();
         store.import_records(&records).expect("import embeddings");
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
 
         let indexed = store
             .refresh_vector_projection_for_embeddings(&embedding_ids)
             .expect("refresh projection");
 
-        assert_eq!(indexed, records.len());
+        assert_eq!(indexed, SQLITE_BIND_CHUNK_SIZE * 3);
     }
 
     #[test]
-    fn semantic_embedding_queue_only_includes_long_user_units() {
+    fn semantic_embedding_queue_includes_required_conversation_items() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
-        let assistant = fixture_search_unit(
-            "assistant progress update with plenty of words that should remain lexical only",
+        let assistant = fixture_search_unit_for_event(
+            "event_vector_assistant",
+            "assistant progress update with plenty of words that should become a required conversation embedding for semantic retrieval in readable history",
+            "assistant",
         );
-        let short_user = fixture_search_unit_with_kind("short user request", "user");
-        let long_user = fixture_search_unit_with_kind(
+        let short_user =
+            fixture_search_unit_for_event("event_vector_short_user", "short user request", "user");
+        let long_user = fixture_search_unit_for_event(
+            "event_vector_long_user",
             "user wants to find payment failures in agent history with enough surrounding context",
             "user",
         );
-        let agents_instructions = fixture_search_unit_with_kind(
+        let agents_instructions = fixture_search_unit_for_event(
+            "event_vector_agents",
             "# AGENTS.md instructions for /tmp/repo <INSTRUCTIONS> Guidelines for interaction with enough surrounding context to otherwise qualify",
             "user",
         );
+        let mut records = vec![
+            ArchiveRecord::Source(fixture_source("source_vector")),
+            ArchiveRecord::Session(fixture_session("session_vector", "source_vector")),
+        ];
+        for (idx, unit) in [&assistant, &short_user, &agents_instructions, &long_user]
+            .iter()
+            .enumerate()
+        {
+            records.push(ArchiveRecord::Event(fixture_event_with_text_kind(
+                &unit.event_id,
+                "session_vector",
+                "source_vector",
+                idx as i64,
+                None,
+                &format!("event_hash_queue_{idx}"),
+                &unit.text,
+                &unit.search_kind,
+            )));
+        }
+        store.import_records(&records).expect("import events");
         store
-            .import_records(&[
-                ArchiveRecord::SearchUnit(assistant),
-                ArchiveRecord::SearchUnit(short_user),
-                ArchiveRecord::SearchUnit(agents_instructions.clone()),
-                ArchiveRecord::SearchUnit(long_user.clone()),
-            ])
-            .expect("import search units");
+            .refresh_history_items()
+            .expect("refresh history items");
 
         let missing = store
-            .search_units_missing_embedding("fixture-semantic-384", 10)
+            .history_items_missing_required_embedding("fixture-semantic-384", 10)
             .expect("missing embeddings");
 
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].id, long_user.id);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.iter().any(|item| item.id == assistant.id));
+        assert!(missing.iter().any(|item| item.id == long_user.id));
         assert_eq!(
             store
-                .search_units_missing_embedding_count("fixture-semantic-384")
+                .history_items_missing_required_embedding_count("fixture-semantic-384")
                 .expect("missing count"),
-            1
+            2
         );
         assert!(store
-            .search_units_need_embedding("fixture-semantic-384")
+            .history_items_need_required_embedding("fixture-semantic-384")
             .expect("needs embedding"));
 
+        store
+            .import_record(&ArchiveRecord::Embedding(fixture_embedding(
+                &assistant,
+                unit_vector(4),
+            )))
+            .expect("import assistant embedding");
         store
             .import_record(&ArchiveRecord::Embedding(fixture_embedding(
                 &long_user,
@@ -3570,6 +3695,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(4),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -3578,17 +3704,18 @@ mod tests {
             )
             .expect("vector search");
 
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].unit_id, long_user.id);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.history_item_id == long_user.id));
+        assert!(hits.iter().any(|hit| hit.history_item_id == assistant.id));
 
         assert_eq!(
             store
-                .search_units_missing_embedding_count("fixture-semantic-384")
+                .history_items_missing_required_embedding_count("fixture-semantic-384")
                 .expect("missing count"),
             0
         );
         assert!(!store
-            .search_units_need_embedding("fixture-semantic-384")
+            .history_items_need_required_embedding("fixture-semantic-384")
             .expect("needs embedding"));
     }
 
@@ -4057,6 +4184,9 @@ mod tests {
             .import_records(&records)
             .expect("import selected records");
         store
+            .refresh_history_items()
+            .expect("refresh history items");
+        store
             .import_records(&[
                 ArchiveRecord::Source(fixture_source("source_other")),
                 ArchiveRecord::Session(other_session),
@@ -4412,6 +4542,28 @@ mod tests {
         raw_artifact_hash: Option<&str>,
         hash: &str,
     ) -> EventRecord {
+        fixture_event_with_text_kind(
+            id,
+            session_id,
+            source_id,
+            ordinal,
+            raw_artifact_hash,
+            hash,
+            "conversation about distributed memories",
+            "assistant",
+        )
+    }
+
+    fn fixture_event_with_text_kind(
+        id: &str,
+        session_id: &str,
+        source_id: &str,
+        ordinal: i64,
+        raw_artifact_hash: Option<&str>,
+        hash: &str,
+        text: &str,
+        search_kind: &str,
+    ) -> EventRecord {
         EventRecord {
             id: id.to_string(),
             session_id: session_id.to_string(),
@@ -4420,11 +4572,16 @@ mod tests {
             source_kind: "codex".to_string(),
             ordinal,
             event_type: "message".to_string(),
-            role: Some("assistant".to_string()),
-            content: "conversation about distributed memories".to_string(),
+            role: Some(search_kind.to_string()),
+            content: text.to_string(),
             raw_artifact_hash: raw_artifact_hash.map(ToOwned::to_owned),
             occurred_at: None,
-            metadata: json!({"fixture": true}),
+            metadata: json!({
+                "fixture": true,
+                "search_indexable": true,
+                "search_kind": search_kind,
+                "search_text": text
+            }),
             hash: hash.to_string(),
         }
     }
@@ -4434,12 +4591,27 @@ mod tests {
     }
 
     fn fixture_search_unit_with_kind(text: &str, search_kind: &str) -> SearchUnitRecord {
+        fixture_search_unit_for_event("event_vector", text, search_kind)
+    }
+
+    fn fixture_search_unit_for_event(
+        event_id: &str,
+        text: &str,
+        search_kind: &str,
+    ) -> SearchUnitRecord {
         let text_hash = crate::archive::blake3_hex(text.as_bytes());
-        let id = stable_id(&["search_unit", "event_vector", &text_hash]);
-        let hash = stable_hash(&(&id, "event_vector", &text_hash, text)).expect("unit hash");
+        let id = stable_id(&[
+            "history_item",
+            event_id,
+            "0",
+            "conversation",
+            search_kind,
+            &text_hash,
+        ]);
+        let hash = stable_hash(&(&id, event_id, &text_hash, text)).expect("unit hash");
         SearchUnitRecord {
             id,
-            event_id: "event_vector".to_string(),
+            event_id: event_id.to_string(),
             session_id: "session_vector".to_string(),
             source_id: "source_vector".to_string(),
             machine_id: "machine_a".to_string(),
