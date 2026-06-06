@@ -1,6 +1,6 @@
 use crate::embed::{Embedder, EmbedderConfig};
 use crate::memory::MemorySample;
-use crate::storage::{ImportDelta, SearchRow, Store, VectorSearchRow};
+use crate::storage::{HistoryItemForEmbedding, ImportDelta, SearchRow, Store, VectorSearchRow};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -316,7 +316,7 @@ pub fn refresh_embeddings(
     if !embedder.is_semantic() {
         return Ok(EmbeddingRefresh {
             vectors_indexed: store.refresh_vector_projection()?,
-            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
+            pending: store.history_items_missing_required_embedding_count(embedder.model_id())?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -352,7 +352,7 @@ pub fn refresh_embeddings_repair_with_progress(
     if !status.semantic {
         return Ok(EmbeddingRefresh {
             vectors_indexed: store.refresh_vector_projection()?,
-            pending: store.search_units_missing_embedding_count(model_id)?,
+            pending: store.history_items_missing_required_embedding_count(model_id)?,
             degraded_reason: status.degraded_reason.or_else(|| {
                 Some("embedder is not semantic; skipping durable embeddings".to_string())
             }),
@@ -360,7 +360,7 @@ pub fn refresh_embeddings_repair_with_progress(
         });
     }
     if let Some(reason) = memory_model_load_defer_reason(crate::memory::sample_memory()) {
-        let pending = store.search_units_missing_embedding_count(model_id)?;
+        let pending = store.history_items_missing_required_embedding_count(model_id)?;
         progress(&EmbeddingProgress::Deferred {
             pending,
             reason: reason.clone(),
@@ -381,7 +381,7 @@ pub fn refresh_embeddings_repair_with_progress(
     if !embedder.is_semantic() {
         return Ok(EmbeddingRefresh {
             vectors_indexed: store.refresh_vector_projection()?,
-            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
+            pending: store.history_items_missing_required_embedding_count(embedder.model_id())?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -435,14 +435,13 @@ pub fn refresh_embeddings_incremental_with_progress(
         });
     }
 
-    let mut first_units = store.search_units_missing_embedding_for_delta(
+    let mut first_units = store.history_items_missing_required_embedding_for_events(
         model_id,
         &delta.inserted_events,
-        &delta.inserted_search_units,
         EMBEDDING_BATCH_START,
     )?;
     if first_units.is_empty() {
-        if store.search_units_need_embedding(model_id)? {
+        if store.history_items_need_required_embedding(model_id)? {
             return refresh_embeddings_repair_with_progress(
                 store,
                 machine_id,
@@ -458,7 +457,7 @@ pub fn refresh_embeddings_incremental_with_progress(
     }
 
     if let Some(reason) = memory_model_load_defer_reason(crate::memory::sample_memory()) {
-        let pending = store.search_units_missing_embedding_count(model_id)?;
+        let pending = store.history_items_missing_required_embedding_count(model_id)?;
         progress(&EmbeddingProgress::Deferred {
             pending,
             reason: reason.clone(),
@@ -480,7 +479,7 @@ pub fn refresh_embeddings_incremental_with_progress(
         return Ok(EmbeddingRefresh {
             vectors_indexed: store
                 .refresh_vector_projection_for_embeddings(&vector_embedding_ids)?,
-            pending: store.search_units_missing_embedding_count(embedder.model_id())?,
+            pending: store.history_items_missing_required_embedding_count(embedder.model_id())?,
             degraded_reason: Some(
                 "embedder is not semantic; skipping durable embeddings".to_string(),
             ),
@@ -495,7 +494,6 @@ pub fn refresh_embeddings_incremental_with_progress(
         status.degraded_reason.clone(),
         EmbeddingScope::Delta {
             event_ids: &delta.inserted_events,
-            unit_ids: &delta.inserted_search_units,
             first_units: Some(std::mem::take(&mut first_units)),
         },
         vector_embedding_ids,
@@ -539,8 +537,7 @@ enum EmbeddingScope<'a> {
     All,
     Delta {
         event_ids: &'a [String],
-        unit_ids: &'a [String],
-        first_units: Option<Vec<crate::storage::SearchUnitForEmbedding>>,
+        first_units: Option<Vec<HistoryItemForEmbedding>>,
     },
 }
 
@@ -557,7 +554,8 @@ fn refresh_embeddings_loaded(
     let mut controller = AdaptiveEmbeddingBatch::new();
     loop {
         if let Some(reason) = controller.defer_reason(crate::memory::sample_memory()) {
-            let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+            let pending =
+                store.history_items_missing_required_embedding_count(embedder.model_id())?;
             progress(&EmbeddingProgress::Deferred {
                 pending,
                 reason: reason.clone(),
@@ -577,18 +575,17 @@ fn refresh_embeddings_loaded(
         }
 
         let units = match &mut scope {
-            EmbeddingScope::All => {
-                store.search_units_missing_embedding(embedder.model_id(), controller.batch_size)?
-            }
+            EmbeddingScope::All => store.history_items_missing_required_embedding(
+                embedder.model_id(),
+                controller.batch_size,
+            )?,
             EmbeddingScope::Delta {
                 event_ids,
-                unit_ids,
                 first_units,
             } => first_units.take().map(Ok).unwrap_or_else(|| {
-                store.search_units_missing_embedding_for_delta(
+                store.history_items_missing_required_embedding_for_events(
                     embedder.model_id(),
                     event_ids,
-                    unit_ids,
                     controller.batch_size,
                 )
             })?,
@@ -596,7 +593,7 @@ fn refresh_embeddings_loaded(
         if units.is_empty() {
             break;
         }
-        let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+        let pending = store.history_items_missing_required_embedding_count(embedder.model_id())?;
         progress(&EmbeddingProgress::Batch {
             embedded,
             pending,
@@ -623,7 +620,7 @@ fn refresh_embeddings_loaded(
         };
         if vectors.len() != units.len() {
             bail!(
-                "embedder returned {} vectors for {} search units",
+                "embedder returned {} vectors for {} history items",
                 vectors.len(),
                 units.len()
             );
@@ -639,7 +636,7 @@ fn refresh_embeddings_loaded(
         controller.observe(before, crate::memory::sample_memory());
     }
 
-    let pending = store.search_units_missing_embedding_count(embedder.model_id())?;
+    let pending = store.history_items_missing_required_embedding_count(embedder.model_id())?;
     Ok(EmbeddingRefresh {
         embedded,
         vectors_indexed: refresh_vector_projection_incremental(store, &vector_embedding_ids)?,
@@ -789,7 +786,7 @@ fn embedding_input(text: &str) -> String {
 fn embedding_record(
     machine_id: &str,
     embedder: &dyn Embedder,
-    unit: &crate::storage::SearchUnitForEmbedding,
+    unit: &HistoryItemForEmbedding,
     vector: Vec<f32>,
 ) -> Result<crate::archive::ArchiveRecord> {
     if vector.len() != embedder.dims() {
@@ -844,8 +841,8 @@ pub fn search(
         .saturating_mul(BACKEND_LIMIT_MULTIPLIER)
         .max(BACKEND_MIN_LIMIT);
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
+    let tier_names = options.corpus.tier_names();
     let lexical = if options.mode.includes_lexical() {
-        let tier_names = options.corpus.tier_names();
         store.search_fts(
             query,
             &tier_names,
@@ -869,6 +866,7 @@ pub fn search(
             options.before,
             options.machine_id.as_deref(),
             options.machine_id_prefix.as_deref(),
+            &tier_names,
         )?
     } else {
         (Vec::new(), None)
@@ -889,6 +887,7 @@ fn semantic_search(
     before: Option<DateTime<Utc>>,
     machine_id: Option<&str>,
     machine_id_prefix: Option<&str>,
+    selected_tiers: &[&str],
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
     let Some(embedder) = query_embedder else {
         return Ok((Vec::new(), degraded_reason));
@@ -915,6 +914,7 @@ fn semantic_search(
         .vector_search(
             embedder.model_id(),
             &query_vector,
+            selected_tiers,
             limit,
             after,
             before,
@@ -931,7 +931,26 @@ fn semantic_search(
         })
         .map(search_row_from_vector)
         .collect();
+    let missing = store
+        .history_items_missing_embedding_count_for_tiers(embedder.model_id(), selected_tiers)?;
+    let degraded_reason = if missing > 0 {
+        Some(append_degraded_reason(
+            degraded_reason,
+            format!(
+                "semantic embeddings are missing for {missing} selected history items; using available vectors"
+            ),
+        ))
+    } else {
+        degraded_reason
+    };
     Ok((rows, degraded_reason))
+}
+
+fn append_degraded_reason(existing: Option<String>, note: String) -> String {
+    existing
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{value}; {note}"))
+        .unwrap_or(note)
 }
 
 fn semantic_candidate_has_context(text: &str) -> bool {
@@ -1059,16 +1078,18 @@ fn fuse(
     let mut acc: HashMap<String, Acc> = HashMap::new();
     let mut seen_lexical = HashSet::new();
     for row in lexical {
-        if !seen_lexical.insert(row.event_id.clone()) {
+        let key = fusion_key(&row);
+        if !seen_lexical.insert(key.clone()) {
             continue;
         }
-        let entry = acc.entry(row.event_id.clone()).or_default();
+        let entry = acc.entry(key).or_default();
         entry.score += lexical_rrf_weight(&row) / (RRF_K + row.rank as f64);
         entry.lexical_rank = Some(row.rank);
         entry.row = Some(row);
     }
     for row in semantic {
-        let entry = acc.entry(row.event_id.clone()).or_default();
+        let key = fusion_key(&row);
+        let entry = acc.entry(key).or_default();
         entry.score += SEMANTIC_RRF_WEIGHT / (RRF_K + row.rank as f64);
         entry.semantic_rank = Some(row.rank);
         if entry.row.is_none() {
@@ -1106,6 +1127,12 @@ fn fuse(
     results
 }
 
+fn fusion_key(row: &SearchRow) -> String {
+    row.history_item_id
+        .clone()
+        .unwrap_or_else(|| format!("event:{}", row.event_id))
+}
+
 fn lexical_rrf_weight(row: &SearchRow) -> f64 {
     if row.search_kind == "user" {
         LEXICAL_RRF_WEIGHT
@@ -1127,15 +1154,14 @@ fn normalized_result_key(text: &str) -> String {
 }
 
 fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
-    let _unit_id = row.unit_id;
     let _distance = row.distance;
     SearchRow {
-        history_item_id: None,
+        history_item_id: Some(row.history_item_id),
         event_id: row.event_id,
         session_id: row.session_id,
         machine_id: row.machine_id,
         source_kind: row.source_kind,
-        tier: None,
+        tier: Some(row.tier),
         search_kind: row.search_kind,
         content: row.content,
         occurred_at: row.occurred_at,
@@ -1218,7 +1244,7 @@ mod tests {
         SessionRecord, SourceRecord,
     };
     use crate::embed::{EmbedderConfig, EmbedderProvider, FastEmbedModel};
-    use crate::storage::{f32_vector_to_blob, ImportDelta, Store};
+    use crate::storage::{f32_vector_to_blob, HistoryItemRecord, ImportDelta, Store};
     use chrono::Utc;
     use serde_json::json;
 
@@ -1628,6 +1654,47 @@ mod tests {
     }
 
     #[test]
+    fn rrf_fuses_by_history_item_id_not_event_id() {
+        let now = Utc::now();
+        let mut lexical = ranked_row_with_content("shared_event", "first item exact", 1, now);
+        lexical.history_item_id = Some("history_item_first".to_string());
+        let mut semantic = ranked_row_with_content("shared_event", "second item semantic", 1, now);
+        semantic.history_item_id = Some("history_item_second".to_string());
+
+        let distinct = fuse(
+            vec![lexical.clone()],
+            vec![semantic],
+            SearchOptions::new(10, SortMode::Relevance, 0.0),
+        );
+
+        assert_eq!(distinct.len(), 2);
+        assert!(distinct.iter().any(|result| {
+            result.history_item_id.as_deref() == Some("history_item_first")
+                && result.match_type == MatchType::Lexical
+        }));
+        assert!(distinct.iter().any(|result| {
+            result.history_item_id.as_deref() == Some("history_item_second")
+                && result.match_type == MatchType::Semantic
+        }));
+
+        let mut semantic_same_item =
+            ranked_row_with_content("shared_event", "first item semantic", 1, now);
+        semantic_same_item.history_item_id = Some("history_item_first".to_string());
+        let hybrid = fuse(
+            vec![lexical],
+            vec![semantic_same_item],
+            SearchOptions::new(10, SortMode::Relevance, 0.0),
+        );
+
+        assert_eq!(hybrid.len(), 1);
+        assert_eq!(hybrid[0].match_type, MatchType::Hybrid);
+        assert_eq!(
+            hybrid[0].history_item_id.as_deref(),
+            Some("history_item_first")
+        );
+    }
+
+    #[test]
     fn recency_bias_can_promote_recent_matches() {
         let old = Utc::now() - chrono::Duration::days(365);
         let new = Utc::now();
@@ -1653,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_embeddings_creates_durable_vectors_for_missing_search_units() {
+    fn refresh_embeddings_creates_durable_vectors_for_missing_history_items() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
         let unit = import_user_event_and_project(
@@ -1676,6 +1743,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(13),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -1684,7 +1752,10 @@ mod tests {
             )
             .expect("vector search");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(
+            hits[0].history_item_id,
+            history_item_id_for_search_unit(&unit)
+        );
     }
 
     #[test]
@@ -1757,6 +1828,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(17),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -1772,7 +1844,10 @@ mod tests {
             Some("query embedder disabled")
         );
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(
+            hits[0].history_item_id,
+            history_item_id_for_search_unit(&unit)
+        );
     }
 
     #[test]
@@ -1807,6 +1882,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector(23),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -1818,7 +1894,10 @@ mod tests {
         assert_eq!(refresh.embedded, 0);
         assert_eq!(refresh.vectors_indexed, 1);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].unit_id, unit.id);
+        assert_eq!(
+            hits[0].history_item_id,
+            history_item_id_for_search_unit(&unit)
+        );
     }
 
     #[test]
@@ -2154,6 +2233,100 @@ mod tests {
     }
 
     #[test]
+    fn semantic_search_respects_selected_history_item_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let tool = import_event_and_project_with_kind_at(
+            &store,
+            r#"{"payload":{"name":"shell","arguments":"payment failed during the stripe charge and customer money did not process correctly with enough diagnostic context for semantic retrieval toolsemanticmarker"}}"#,
+            "tool_call",
+            None,
+        );
+        let tool_item = store
+            .history_items_for_event(&tool.event_id)
+            .expect("history items")
+            .into_iter()
+            .find(|item| item.tier == "tool")
+            .expect("tool item");
+        store
+            .import_record(&ArchiveRecord::Embedding(
+                fixture_embedding_for_history_item(&tool_item, unit_vector(41)),
+            ))
+            .expect("tool embedding");
+        store
+            .refresh_vector_projection()
+            .expect("vector projection");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(41),
+        };
+
+        let default = search(
+            &store,
+            "payment failed",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            Some(&embedder),
+            None,
+        )
+        .expect("default semantic search");
+        assert!(default.results.is_empty());
+
+        let tool_semantic = search(
+            &store,
+            "payment failed",
+            SearchOptions::new(5, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Semantic)
+                .with_corpus(SearchCorpus::parse("tool").expect("tool corpus")),
+            Some(&embedder),
+            None,
+        )
+        .expect("tool semantic search");
+        assert_eq!(tool_semantic.results.len(), 1);
+        assert_eq!(
+            tool_semantic.results[0].history_item_id.as_deref(),
+            Some(tool_item.id.as_str())
+        );
+        assert_eq!(tool_semantic.results[0].tier.as_deref(), Some("tool"));
+    }
+
+    #[test]
+    fn hybrid_tool_corpus_reports_missing_semantic_coverage_without_losing_lexical_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let tool = import_event_and_project_with_kind_at(
+            &store,
+            r#"{"payload":{"name":"shell","arguments":"toolmissingmarker payment failed during stripe processing with enough diagnostic words to qualify for optional semantic embedding coverage"}}"#,
+            "tool_call",
+            None,
+        );
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(43),
+        };
+
+        let response = search(
+            &store,
+            "toolmissingmarker",
+            SearchOptions::new(5, SortMode::Relevance, 0.0)
+                .with_corpus(SearchCorpus::conversation_with_tools()),
+            Some(&embedder),
+            None,
+        )
+        .expect("hybrid search");
+
+        assert!(response
+            .degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("semantic embeddings are missing"));
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, tool.event_id);
+        assert_eq!(response.results[0].tier.as_deref(), Some("tool"));
+        assert_eq!(response.results[0].lexical_rank, Some(1));
+        assert_eq!(response.results[0].semantic_rank, None);
+    }
+
+    #[test]
     fn semantic_search_filters_by_hostname_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -2476,15 +2649,16 @@ mod tests {
     fn fixture_embedding(unit: &SearchUnitRecord, vector: Vec<f32>) -> EmbeddingRecord {
         let vector_blob = f32_vector_to_blob(&vector);
         let vector_hash = crate::archive::blake3_hex(&vector_blob);
+        let history_item_id = history_item_id_for_search_unit(unit);
         let id = stable_id(&[
             "embedding",
-            &unit.id,
+            &history_item_id,
             &unit.text_hash,
             "fixture-semantic-384",
         ]);
         EmbeddingRecord {
             id: id.clone(),
-            unit_id: unit.id.clone(),
+            unit_id: history_item_id.clone(),
             text_hash: unit.text_hash.clone(),
             model_id: "fixture-semantic-384".to_string(),
             dims: 384,
@@ -2496,6 +2670,45 @@ mod tests {
             hash: stable_hash(&(&id, &unit.id, &unit.text_hash, &vector_hash))
                 .expect("embedding hash"),
         }
+    }
+
+    fn fixture_embedding_for_history_item(
+        item: &HistoryItemRecord,
+        vector: Vec<f32>,
+    ) -> EmbeddingRecord {
+        let vector_blob = f32_vector_to_blob(&vector);
+        let vector_hash = crate::archive::blake3_hex(&vector_blob);
+        let id = stable_id(&[
+            "embedding",
+            &item.id,
+            &item.text_hash,
+            "fixture-semantic-384",
+        ]);
+        EmbeddingRecord {
+            id: id.clone(),
+            unit_id: item.id.clone(),
+            text_hash: item.text_hash.clone(),
+            model_id: "fixture-semantic-384".to_string(),
+            dims: 384,
+            vector_hash: vector_hash.clone(),
+            vector: vector_blob,
+            producer_machine_id: "machine_fixture".to_string(),
+            embedded_at: Utc::now(),
+            metadata: json!({}),
+            hash: stable_hash(&(&id, &item.id, &item.text_hash, &vector_hash))
+                .expect("embedding hash"),
+        }
+    }
+
+    fn history_item_id_for_search_unit(unit: &SearchUnitRecord) -> String {
+        stable_id(&[
+            "history_item",
+            &unit.event_id,
+            "0",
+            "conversation",
+            &unit.search_kind,
+            &unit.text_hash,
+        ])
     }
 
     struct FixtureEmbedder {

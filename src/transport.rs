@@ -177,6 +177,11 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
         }
     }
     flush_import_batch(store, &mut stats, &mut batch)?;
+    if store.history_items_projection_ready()? {
+        store.refresh_history_items_for_events(&stats.delta.touched_events)?;
+    } else {
+        store.refresh_history_items()?;
+    }
     stats.vectors_indexed =
         store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
     Ok(stats)
@@ -480,8 +485,23 @@ mod tests {
         let machine_a = Store::open(machine_a_dir.path()).expect("open machine a");
         let unit = fixture_search_unit_384();
         machine_a
-            .import_record(&ArchiveRecord::SearchUnit(unit.clone()))
-            .expect("machine a unit");
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_sync")),
+                ArchiveRecord::Session(fixture_session("session_sync", "source_sync", "/tmp/sync")),
+                ArchiveRecord::Event(fixture_event_with_text_kind(
+                    "event_sync",
+                    "session_sync",
+                    "source_sync",
+                    None,
+                    &unit.text,
+                    "user",
+                )),
+                ArchiveRecord::SearchUnit(unit.clone()),
+            ])
+            .expect("machine a records");
+        machine_a
+            .refresh_history_items()
+            .expect("machine a history items");
 
         let mut a_export = Vec::new();
         export_jsonl(&machine_a, &mut a_export).expect("export a");
@@ -502,6 +522,7 @@ mod tests {
             .vector_search(
                 "fixture-semantic-384",
                 &unit_vector_384(11),
+                &["conversation"],
                 5,
                 None,
                 None,
@@ -510,7 +531,7 @@ mod tests {
             )
             .expect("vector search");
         assert_eq!(vector_hits.len(), 1);
-        assert_eq!(vector_hits[0].unit_id, unit.id);
+        assert_eq!(vector_hits[0].history_item_id, unit.id);
 
         let response = crate::search::search(
             &machine_a,
@@ -850,9 +871,16 @@ mod tests {
     }
 
     fn fixture_search_unit_384() -> SearchUnitRecord {
-        let id = stable_id(&["search_unit", "event_sync", "hash_sync"]);
         let text = "offline machines should converge after vector sync with enough user context for semantic retrieval".to_string();
         let text_hash = crate::archive::blake3_hex(text.as_bytes());
+        let id = stable_id(&[
+            "history_item",
+            "event_sync",
+            "0",
+            "conversation",
+            "user",
+            &text_hash,
+        ]);
         let hash = stable_hash(&(&id, "event_sync", &text_hash, &text)).expect("unit hash");
         SearchUnitRecord {
             id,
@@ -969,6 +997,24 @@ mod tests {
         source_id: &str,
         raw_artifact_hash: Option<&str>,
     ) -> EventRecord {
+        fixture_event_with_text_kind(
+            id,
+            session_id,
+            source_id,
+            raw_artifact_hash,
+            "fixture message",
+            "user",
+        )
+    }
+
+    fn fixture_event_with_text_kind(
+        id: &str,
+        session_id: &str,
+        source_id: &str,
+        raw_artifact_hash: Option<&str>,
+        text: &str,
+        search_kind: &str,
+    ) -> EventRecord {
         EventRecord {
             id: id.to_string(),
             session_id: session_id.to_string(),
@@ -977,11 +1023,16 @@ mod tests {
             source_kind: "codex".to_string(),
             ordinal: 1,
             event_type: "message".to_string(),
-            role: Some("user".to_string()),
-            content: "fixture message".to_string(),
+            role: Some(search_kind.to_string()),
+            content: text.to_string(),
             raw_artifact_hash: raw_artifact_hash.map(ToOwned::to_owned),
             occurred_at: None,
-            metadata: json!({"fixture": true}),
+            metadata: json!({
+                "fixture": true,
+                "search_indexable": true,
+                "search_kind": search_kind,
+                "search_text": text
+            }),
             hash: stable_hash(&(id, session_id, "event")).expect("event hash"),
         }
     }
