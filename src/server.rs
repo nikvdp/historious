@@ -84,6 +84,7 @@ struct SearchParams {
     limit: Option<usize>,
     sort: Option<String>,
     mode: Option<String>,
+    corpus: Option<String>,
     recency_bias: Option<f64>,
     after: Option<String>,
     before: Option<String>,
@@ -105,6 +106,7 @@ struct ServerSearchOptions {
     limit: usize,
     sort: String,
     mode: String,
+    corpus: String,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -114,11 +116,14 @@ struct ServerSearchOptions {
 
 #[derive(Debug, Serialize)]
 struct ServerSearchResult {
+    history_item_id: Option<String>,
     match_type: search::MatchType,
     event_id: String,
     session_id: String,
     machine_id: String,
     source_kind: String,
+    tier: Option<String>,
+    kind: String,
     score: f64,
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
@@ -140,11 +145,13 @@ async fn search_endpoint(
     let sort = parse_sort(params.sort.as_deref())?;
     let sort_name = sort_name(sort).to_string();
     let mode = parse_mode(params.mode.as_deref())?.unwrap_or(state.default_search_mode);
+    let corpus = parse_corpus(params.corpus.as_deref())?;
     let recency_bias = params.recency_bias.unwrap_or(0.0);
     let after = parse_rfc3339_opt(params.after.as_deref(), "after")?;
     let before = parse_rfc3339_opt(params.before.as_deref(), "before")?;
     let options = search::SearchOptions::new(limit, sort, recency_bias)
         .with_mode(mode)
+        .with_corpus(corpus.clone())
         .with_time_window(after, before)
         .with_machine_filter(params.machine.clone(), params.hostname.clone());
     let response = search::search(
@@ -170,6 +177,7 @@ async fn search_endpoint(
             limit,
             sort: sort_name,
             mode: mode.as_str().to_string(),
+            corpus: corpus.as_csv(),
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after,
             before,
@@ -212,11 +220,14 @@ async fn import_jsonl(
 impl From<search::SearchResult> for ServerSearchResult {
     fn from(result: search::SearchResult) -> Self {
         Self {
+            history_item_id: result.history_item_id,
             match_type: result.match_type,
             event_id: result.event_id,
             session_id: result.session_id,
             machine_id: result.machine_id,
             source_kind: result.source_kind,
+            tier: result.tier,
+            kind: result.kind,
             score: result.score,
             lexical_rank: result.lexical_rank,
             semantic_rank: result.semantic_rank,
@@ -226,6 +237,12 @@ impl From<search::SearchResult> for ServerSearchResult {
             snippet: result.snippet,
         }
     }
+}
+
+fn parse_corpus(value: Option<&str>) -> Result<search::SearchCorpus> {
+    value
+        .map(search::SearchCorpus::parse)
+        .unwrap_or_else(|| Ok(search::SearchCorpus::default()))
 }
 
 fn parse_sort(value: Option<&str>) -> Result<search::SortMode> {
@@ -344,11 +361,14 @@ mod tests {
     #[test]
     fn fzf_rows_include_visible_short_ref_and_hidden_ids() {
         let result = search::SearchResult {
+            history_item_id: Some("hi_1".to_string()),
             match_type: search::MatchType::Hybrid,
             event_id: "sc_1234567890abcdef".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
+            tier: Some("conversation".to_string()),
+            kind: "user".to_string(),
             score: 0.25,
             lexical_rank: Some(1),
             semantic_rank: Some(2),

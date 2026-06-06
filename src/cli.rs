@@ -89,6 +89,15 @@ pub enum Command {
         mode: Option<SearchModeArg>,
         #[arg(
             long,
+            help = "Search these history item tiers, comma-separated: conversation,tool,raw"
+        )]
+        corpus: Option<String>,
+        #[arg(long, help = "Search readable conversation plus tool calls and output")]
+        include_tools: bool,
+        #[arg(long, help = "Search raw event payload text only")]
+        raw: bool,
+        #[arg(
+            long,
             default_value_t = 0.0,
             help = "Favor newer results, from 0.0 to 1.0"
         )]
@@ -142,6 +151,15 @@ pub enum Command {
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
         mode: Option<SearchModeArg>,
+        #[arg(
+            long,
+            help = "Search these history item tiers, comma-separated: conversation,tool,raw"
+        )]
+        corpus: Option<String>,
+        #[arg(long, help = "Search readable conversation plus tool calls and output")]
+        include_tools: bool,
+        #[arg(long, help = "Search raw event payload text only")]
+        raw: bool,
         #[arg(
             long,
             default_value_t = 0.0,
@@ -563,6 +581,9 @@ enum Column {
     Machine,
     Event,
     Session,
+    Item,
+    Tier,
+    Kind,
 }
 
 impl Cli {
@@ -609,6 +630,9 @@ impl Cli {
                 exclude,
                 sort,
                 mode,
+                corpus,
+                include_tools,
+                raw,
                 recency_bias,
                 after,
                 before,
@@ -639,9 +663,11 @@ impl Cli {
                 let mode = mode
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
+                let corpus = resolve_search_corpus(corpus, include_tools, raw)?;
                 let (embedder, degraded_reason) = load_embedder(&config);
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
                     .with_mode(mode)
+                    .with_corpus(corpus.clone())
                     .with_time_window(after_bound, before_bound)
                     .with_machine_filter(machine.clone(), hostname.clone());
                 let response = search::search(
@@ -669,6 +695,7 @@ impl Cli {
                         sort,
                         mode,
                         recency_bias,
+                        &corpus,
                         after_bound,
                         before_bound,
                         machine.clone(),
@@ -707,6 +734,9 @@ impl Cli {
                 server,
                 sort,
                 mode,
+                corpus,
+                include_tools,
+                raw,
                 recency_bias,
                 after,
                 before,
@@ -724,6 +754,7 @@ impl Cli {
                 let mode = mode
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
+                let corpus = resolve_search_corpus(corpus, include_tools, raw)?;
                 run_tui_search(
                     &config,
                     query.as_deref().unwrap_or_default(),
@@ -731,6 +762,7 @@ impl Cli {
                     limit,
                     sort,
                     mode,
+                    corpus,
                     recency_bias,
                     after_bound,
                     before_bound,
@@ -1245,6 +1277,7 @@ struct SearchOptionsOutput {
     limit: usize,
     sort: &'static str,
     mode: &'static str,
+    corpus: String,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -1256,11 +1289,14 @@ struct SearchOptionsOutput {
 struct SearchResultOutput {
     #[serde(rename = "ref")]
     ref_id: String,
+    history_item_id: Option<String>,
     match_type: search::MatchType,
     event_id: String,
     session_id: String,
     machine_id: String,
     source_kind: String,
+    tier: Option<String>,
+    kind: String,
     score: f64,
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
@@ -1472,8 +1508,6 @@ fn refresh_search_after_update_with_progress(
     if repair {
         progress("repairing all indexable events".to_string());
         let indexed = search::refresh(store)?;
-        progress("repairing history items".to_string());
-        store.refresh_history_items()?;
         Ok(indexed)
     } else {
         progress(format!(
@@ -2350,6 +2384,7 @@ fn search_output(
     sort: SearchSort,
     mode: search::SearchMode,
     recency_bias: f64,
+    corpus: &search::SearchCorpus,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     machine: Option<String>,
@@ -2363,6 +2398,7 @@ fn search_output(
             limit,
             sort: sort.as_str(),
             mode: mode.as_str(),
+            corpus: corpus.as_csv(),
             recency_bias,
             after,
             before,
@@ -2376,11 +2412,14 @@ fn search_output(
             .enumerate()
             .map(|(idx, result)| SearchResultOutput {
                 ref_id: refs.get(idx).cloned().unwrap_or_else(|| "-".to_string()),
+                history_item_id: result.history_item_id.clone(),
                 match_type: result.match_type,
                 event_id: result.event_id.clone(),
                 session_id: result.session_id.clone(),
                 machine_id: result.machine_id.clone(),
                 source_kind: result.source_kind.clone(),
+                tier: result.tier.clone(),
+                kind: result.kind.clone(),
                 score: result.score,
                 lexical_rank: result.lexical_rank,
                 semantic_rank: result.semantic_rank,
@@ -2491,12 +2530,15 @@ fn resolve_columns(
             Column::Score,
             Column::Lex,
             Column::Sem,
+            Column::Tier,
+            Column::Kind,
             Column::When,
             Column::Title,
             Column::Preview,
             Column::Machine,
             Column::Session,
             Column::Event,
+            Column::Item,
         ]
     } else {
         vec![
@@ -2516,6 +2558,29 @@ fn resolve_columns(
         columns.retain(|candidate| *candidate != column);
     }
     Ok(columns)
+}
+
+fn resolve_search_corpus(
+    corpus: Option<String>,
+    include_tools: bool,
+    raw: bool,
+) -> Result<search::SearchCorpus> {
+    if corpus.is_some() && (include_tools || raw) {
+        bail!("use either --corpus or a corpus shortcut, not both");
+    }
+    if include_tools && raw {
+        bail!("use either --include-tools or --raw, not both");
+    }
+    if let Some(corpus) = corpus {
+        return search::SearchCorpus::parse(&corpus);
+    }
+    if include_tools {
+        return Ok(search::SearchCorpus::conversation_with_tools());
+    }
+    if raw {
+        return Ok(search::SearchCorpus::raw());
+    }
+    Ok(search::SearchCorpus::default())
 }
 
 fn resolve_context_event_id(
@@ -2820,6 +2885,7 @@ fn run_tui_search(
     limit: usize,
     sort: SearchSort,
     mode: search::SearchMode,
+    corpus: search::SearchCorpus,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -2835,6 +2901,7 @@ fn run_tui_search(
         limit,
         sort,
         mode,
+        &corpus,
         recency_bias,
         after,
         before,
@@ -2925,6 +2992,7 @@ fn tui_reload_command(
     limit: usize,
     sort: SearchSort,
     mode: search::SearchMode,
+    corpus: &search::SearchCorpus,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -2967,9 +3035,10 @@ fn tui_reload_command(
         })
         .unwrap_or_default();
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}; fi",
+        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}; fi",
         sort.as_str(),
-        mode.as_str()
+        mode.as_str(),
+        shell_quote(&corpus.as_csv())
     ))
 }
 
@@ -3189,6 +3258,7 @@ fn parse_columns(input: &str) -> Result<Vec<Column>> {
         if name.eq_ignore_ascii_case("ids") {
             columns.push(Column::Session);
             columns.push(Column::Event);
+            columns.push(Column::Item);
             continue;
         }
         columns.push(parse_column(name)?);
@@ -3213,8 +3283,11 @@ fn parse_column(name: &str) -> Result<Column> {
         "machine" | "machine_id" => Ok(Column::Machine),
         "event" | "event_id" => Ok(Column::Event),
         "session" | "session_id" => Ok(Column::Session),
+        "item" | "history_item" | "history_item_id" => Ok(Column::Item),
+        "tier" | "corpus" => Ok(Column::Tier),
+        "kind" | "search_kind" => Ok(Column::Kind),
         _ => bail!(
-            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,machine,event,session,ids"
+            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,machine,event,session,item,tier,kind,ids"
         ),
     }
 }
@@ -3306,6 +3379,12 @@ fn cell_value(column: Column, result: &search::SearchResult, ref_id: Option<&str
         Column::Machine => result.machine_id.clone(),
         Column::Event => result.event_id.clone(),
         Column::Session => result.session_id.clone(),
+        Column::Item => result
+            .history_item_id
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        Column::Tier => result.tier.clone().unwrap_or_else(|| "-".to_string()),
+        Column::Kind => result.kind.clone(),
     }
 }
 
@@ -3340,6 +3419,9 @@ fn column_header(column: Column) -> &'static str {
         Column::Machine => "Machine",
         Column::Event => "Event",
         Column::Session => "Session",
+        Column::Item => "Item",
+        Column::Tier => "Tier",
+        Column::Kind => "Kind",
     }
 }
 
@@ -3526,9 +3608,34 @@ mod tests {
                 Column::Preview,
                 Column::Score,
                 Column::Session,
-                Column::Event
+                Column::Event,
+                Column::Item
             ]
         );
+    }
+
+    #[test]
+    fn corpus_shortcuts_resolve_to_clear_tier_sets() {
+        assert_eq!(
+            resolve_search_corpus(Some("tool,raw".to_string()), false, false)
+                .expect("explicit corpus")
+                .as_csv(),
+            "tool,raw"
+        );
+        assert_eq!(
+            resolve_search_corpus(None, true, false)
+                .expect("tools shortcut")
+                .as_csv(),
+            "conversation,tool"
+        );
+        assert_eq!(
+            resolve_search_corpus(None, false, true)
+                .expect("raw shortcut")
+                .as_csv(),
+            "raw"
+        );
+        assert!(resolve_search_corpus(Some("conversation".to_string()), true, false).is_err());
+        assert!(resolve_search_corpus(None, true, true).is_err());
     }
 
     #[test]
@@ -3576,11 +3683,14 @@ mod tests {
     #[test]
     fn fzf_row_keeps_stable_ids_hidden_after_visible_fields() {
         let result = search::SearchResult {
+            history_item_id: Some("hi_1".to_string()),
             match_type: search::MatchType::Hybrid,
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
+            tier: Some("conversation".to_string()),
+            kind: "user".to_string(),
             score: 0.5,
             lexical_rank: Some(1),
             semantic_rank: Some(2),
@@ -3625,11 +3735,14 @@ mod tests {
     #[test]
     fn search_json_output_includes_refs_and_next_commands() {
         let result = search::SearchResult {
+            history_item_id: Some("hi_1".to_string()),
             match_type: search::MatchType::Hybrid,
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
             source_kind: "codex".to_string(),
+            tier: Some("conversation".to_string()),
+            kind: "user".to_string(),
             score: 0.5,
             lexical_rank: Some(1),
             semantic_rank: Some(2),
@@ -3649,6 +3762,7 @@ mod tests {
             SearchSort::Relevance,
             search::SearchMode::Semantic,
             0.25,
+            &search::SearchCorpus::conversation_with_tools(),
             None,
             None,
             Some("machine_devbox_123".to_string()),
@@ -3662,13 +3776,17 @@ mod tests {
         assert_eq!(value["options"]["limit"], 20);
         assert_eq!(value["options"]["sort"], "relevance");
         assert_eq!(value["options"]["mode"], "semantic");
+        assert_eq!(value["options"]["corpus"], "conversation,tool");
         assert_eq!(value["options"]["after"], serde_json::Value::Null);
         assert_eq!(value["options"]["before"], serde_json::Value::Null);
         assert_eq!(value["options"]["machine"], "machine_devbox_123");
         assert_eq!(value["options"]["hostname"], "devbox");
         assert_eq!(value["results"][0]["ref"], "ab3f");
+        assert_eq!(value["results"][0]["history_item_id"], "hi_1");
         assert_eq!(value["results"][0]["event_id"], "event_1");
         assert_eq!(value["results"][0]["machine_id"], "machine_devbox_123");
+        assert_eq!(value["results"][0]["tier"], "conversation");
+        assert_eq!(value["results"][0]["kind"], "user");
         assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
         assert_eq!(
             value["next_commands"][1],
@@ -3781,6 +3899,7 @@ mod tests {
             25,
             SearchSort::Newest,
             search::SearchMode::Lexical,
+            &search::SearchCorpus::conversation_with_tools(),
             0.25,
             Some(after),
             None,
@@ -3792,6 +3911,7 @@ mod tests {
         assert!(command.contains("curl -fsSG"));
         assert!(command.contains("sort=newest"));
         assert!(command.contains("mode=lexical"));
+        assert!(command.contains("corpus='conversation,tool'"));
         assert!(command.contains("recency_bias=0.25"));
         assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
         assert!(command.contains("machine=machine_devbox_123"));

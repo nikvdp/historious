@@ -5,8 +5,8 @@ use crate::archive::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{
-    named_params, params, params_from_iter, Connection, OptionalExtension, Transaction,
-    TransactionBehavior,
+    named_params, params, params_from_iter, types::Value as SqlValue, Connection,
+    OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -128,10 +128,12 @@ pub struct HistoryItemRecord {
 
 #[derive(Debug, Clone)]
 pub struct SearchRow {
+    pub history_item_id: Option<String>,
     pub event_id: String,
     pub session_id: String,
     pub machine_id: String,
     pub source_kind: String,
+    pub tier: Option<String>,
     pub search_kind: String,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -697,6 +699,7 @@ impl Store {
     pub fn refresh_history_items(&self) -> Result<usize> {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                tx.execute("DELETE FROM history_items_fts", [])?;
                 tx.execute("DELETE FROM history_items", [])?;
                 let mut stmt = tx.prepare(
                     "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
@@ -727,6 +730,11 @@ impl Store {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
+                tx.execute(
+                    "DELETE FROM history_items_fts
+                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                    [],
+                )?;
                 tx.execute(
                     "DELETE FROM history_items
                      WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
@@ -1125,6 +1133,7 @@ impl Store {
     pub fn search_fts(
         &self,
         query: &str,
+        tiers: &[&str],
         limit: usize,
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
@@ -1135,56 +1144,71 @@ impl Store {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
+        if tiers.is_empty() {
+            return Ok(Vec::new());
+        }
         let after = opt_dt(after);
         let before = opt_dt(before);
+        let tier_placeholders = vec!["?"; tiers.len()].join(", ");
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT events_fts.event_id,
-                        events_fts.session_id,
+            let sql = format!(
+                "SELECT history_items_fts.item_id,
+                        history_items_fts.event_id,
+                        history_items_fts.session_id,
                         e.machine_id,
-                        events_fts.source_kind,
-                        COALESCE(json_extract(e.metadata_json, '$.search_kind'), e.role, e.event_type),
-                        snippet(events_fts, 3, '', '', '...', 24),
-                        e.occurred_at,
+                        e.source_kind,
+                        hi.tier,
+                        hi.kind,
+                        snippet(history_items_fts, 5, '', '', '...', 24),
+                        hi.occurred_at,
                         s.title,
                         s.metadata_json
-                 FROM events_fts
-                 JOIN events e ON e.id = events_fts.event_id
-                 LEFT JOIN sessions s ON s.id = events_fts.session_id
-                 WHERE events_fts MATCH ?1
-                   AND (?2 IS NULL OR e.occurred_at >= ?2)
-                   AND (?3 IS NULL OR e.occurred_at < ?3)
-                   AND (?4 IS NULL OR e.machine_id = ?4)
-                   AND (?5 IS NULL OR substr(e.machine_id, 1, length(?5)) = ?5)
-                 ORDER BY bm25(events_fts)
-                 LIMIT ?6",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    fts_query,
-                    after,
-                    before,
-                    machine_id,
-                    machine_id_prefix,
-                    limit as i64
-                ],
-                |row| {
-                    Ok(SearchRow {
-                        event_id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        machine_id: row.get(2)?,
-                        source_kind: row.get(3)?,
-                        search_kind: row.get(4)?,
-                        content: row.get(5)?,
-                        occurred_at: parse_opt_dt(row.get(6)?),
-                        session_title: row.get(7)?,
-                        workspace_values: session_workspace_values(&parse_metadata_json(
-                            row.get::<_, Option<String>>(8)?,
-                        )),
-                        rank: 0,
-                    })
-                },
-            )?;
+                 FROM history_items_fts
+                 JOIN history_items hi ON hi.id = history_items_fts.item_id
+                 JOIN events e ON e.id = history_items_fts.event_id
+                 LEFT JOIN sessions s ON s.id = history_items_fts.session_id
+                 WHERE history_items_fts MATCH ?
+                   AND (? IS NULL OR hi.occurred_at >= ?)
+                   AND (? IS NULL OR hi.occurred_at < ?)
+                   AND (? IS NULL OR e.machine_id = ?)
+                   AND (? IS NULL OR substr(e.machine_id, 1, length(?)) = ?)
+                   AND hi.tier IN ({tier_placeholders})
+                 ORDER BY bm25(history_items_fts)
+                 LIMIT ?"
+            );
+            let mut values = vec![
+                SqlValue::Text(fts_query),
+                opt_sql_text(after.clone()),
+                opt_sql_text(after),
+                opt_sql_text(before.clone()),
+                opt_sql_text(before),
+                opt_sql_text(machine_id.map(str::to_string)),
+                opt_sql_text(machine_id.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_id_prefix.map(str::to_string)),
+            ];
+            values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
+            values.push(SqlValue::Integer(limit as i64));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok(SearchRow {
+                    history_item_id: Some(row.get(0)?),
+                    event_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    source_kind: row.get(4)?,
+                    tier: Some(row.get(5)?),
+                    search_kind: row.get(6)?,
+                    content: row.get(7)?,
+                    occurred_at: parse_opt_dt(row.get(8)?),
+                    session_title: row.get(9)?,
+                    workspace_values: session_workspace_values(&parse_metadata_json(
+                        row.get::<_, Option<String>>(10)?,
+                    )),
+                    rank: 0,
+                })
+            })?;
             let mut out = Vec::new();
             for (idx, row) in rows.enumerate() {
                 let mut row = row?;
@@ -2193,6 +2217,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_history_items_text_hash
           ON history_items(text_hash);
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_items_fts USING fts5(
+          item_id UNINDEXED,
+          event_id UNINDEXED,
+          session_id UNINDEXED,
+          tier UNINDEXED,
+          kind UNINDEXED,
+          text,
+          tokenize = 'porter unicode61'
+        );
+
         CREATE TABLE IF NOT EXISTS search_units (
           id TEXT PRIMARY KEY,
           event_id TEXT NOT NULL,
@@ -2590,6 +2624,20 @@ fn insert_history_item(conn: &Connection, item: &HistoryItemRecord) -> Result<bo
             item.hash
         ],
     )?;
+    if changed > 0 && item.lexical_indexable {
+        conn.execute(
+            "INSERT INTO history_items_fts (item_id, event_id, session_id, tier, kind, text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                item.id,
+                item.event_id,
+                item.session_id,
+                item.tier,
+                item.kind,
+                item.text
+            ],
+        )?;
+    }
     Ok(changed > 0)
 }
 
@@ -3334,6 +3382,10 @@ fn row_embedding(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingRecord> {
 
 fn opt_dt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(|dt| dt.to_rfc3339())
+}
+
+fn opt_sql_text(value: Option<String>) -> SqlValue {
+    value.map(SqlValue::Text).unwrap_or(SqlValue::Null)
 }
 
 fn parse_opt_dt(value: Option<String>) -> Option<DateTime<Utc>> {

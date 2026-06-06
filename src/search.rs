@@ -73,6 +73,92 @@ pub enum SearchMode {
     Semantic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryTier {
+    Conversation,
+    Tool,
+    Raw,
+}
+
+impl HistoryTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HistoryTier::Conversation => "conversation",
+            HistoryTier::Tool => "tool",
+            HistoryTier::Raw => "raw",
+        }
+    }
+
+    fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "conversation" | "conversations" | "default" => Ok(Self::Conversation),
+            "tool" | "tools" => Ok(Self::Tool),
+            "raw" | "full" => Ok(Self::Raw),
+            other => bail!(
+                "unknown search corpus tier '{other}'. Available tiers: conversation,tool,raw"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchCorpus {
+    tiers: Vec<HistoryTier>,
+}
+
+impl Default for SearchCorpus {
+    fn default() -> Self {
+        Self {
+            tiers: vec![HistoryTier::Conversation],
+        }
+    }
+}
+
+impl SearchCorpus {
+    pub fn parse(input: &str) -> Result<Self> {
+        let mut tiers = Vec::new();
+        for raw in input.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let tier = HistoryTier::parse(raw)?;
+            if !tiers.contains(&tier) {
+                tiers.push(tier);
+            }
+        }
+        if tiers.is_empty() {
+            bail!("search corpus cannot be empty");
+        }
+        Ok(Self { tiers })
+    }
+
+    pub fn conversation_with_tools() -> Self {
+        Self {
+            tiers: vec![HistoryTier::Conversation, HistoryTier::Tool],
+        }
+    }
+
+    pub fn raw() -> Self {
+        Self {
+            tiers: vec![HistoryTier::Raw],
+        }
+    }
+
+    pub fn tier_names(&self) -> Vec<&'static str> {
+        self.tiers.iter().map(|tier| tier.as_str()).collect()
+    }
+
+    pub fn as_csv(&self) -> String {
+        self.tiers
+            .iter()
+            .map(|tier| tier.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 impl Default for SearchMode {
     fn default() -> Self {
         Self::Hybrid
@@ -107,6 +193,7 @@ pub struct SearchOptions {
     pub before: Option<DateTime<Utc>>,
     pub machine_id: Option<String>,
     pub machine_id_prefix: Option<String>,
+    pub corpus: SearchCorpus,
 }
 
 impl SearchOptions {
@@ -120,6 +207,7 @@ impl SearchOptions {
             before: None,
             machine_id: None,
             machine_id_prefix: None,
+            corpus: SearchCorpus::default(),
         }
     }
 
@@ -149,15 +237,23 @@ impl SearchOptions {
             .map(|value| format!("machine_{}_", sanitize_machine_hostname(&value)));
         self
     }
+
+    pub fn with_corpus(mut self, corpus: SearchCorpus) -> Self {
+        self.corpus = corpus;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
+    pub history_item_id: Option<String>,
     pub match_type: MatchType,
     pub event_id: String,
     pub session_id: String,
     pub machine_id: String,
     pub source_kind: String,
+    pub tier: Option<String>,
+    pub kind: String,
     pub score: f64,
     pub lexical_rank: Option<usize>,
     pub semantic_rank: Option<usize>,
@@ -176,11 +272,13 @@ pub enum MatchType {
 }
 
 pub fn refresh(store: &Store) -> Result<usize> {
-    store.refresh_search_index(
+    let indexed = store.refresh_search_index(
         crate::embed::HashEmbedder::MODEL_ID,
         crate::embed::HashEmbedder::DIMS,
         crate::embed::hash_embed,
-    )
+    )?;
+    store.refresh_history_items()?;
+    Ok(indexed)
 }
 
 pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
@@ -193,6 +291,11 @@ pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> 
     if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
         refresh(store)
     } else {
+        if store.history_items_projection_ready()? {
+            store.refresh_history_items_for_events(&delta.touched_events)?;
+        } else {
+            store.refresh_history_items()?;
+        }
         Ok(indexed)
     }
 }
@@ -742,8 +845,10 @@ pub fn search(
         .max(BACKEND_MIN_LIMIT);
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
     let lexical = if options.mode.includes_lexical() {
+        let tier_names = options.corpus.tier_names();
         store.search_fts(
             query,
+            &tier_names,
             backend_limit,
             options.after,
             options.before,
@@ -976,11 +1081,14 @@ fn fuse(
         .filter_map(|entry| {
             let row = entry.row?;
             Some(SearchResult {
+                history_item_id: row.history_item_id,
                 match_type: match_type(entry.lexical_rank, entry.semantic_rank),
                 event_id: row.event_id,
                 session_id: row.session_id,
                 machine_id: row.machine_id,
                 source_kind: row.source_kind,
+                tier: row.tier,
+                kind: row.search_kind,
                 score: entry.score,
                 lexical_rank: entry.lexical_rank,
                 semantic_rank: entry.semantic_rank,
@@ -1022,10 +1130,12 @@ fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
     let _unit_id = row.unit_id;
     let _distance = row.distance;
     SearchRow {
+        history_item_id: None,
         event_id: row.event_id,
         session_id: row.session_id,
         machine_id: row.machine_id,
         source_kind: row.source_kind,
+        tier: None,
         search_kind: row.search_kind,
         content: row.content,
         occurred_at: row.occurred_at,
@@ -1959,6 +2069,91 @@ mod tests {
     }
 
     #[test]
+    fn lexical_search_uses_composable_history_item_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let conversation =
+            import_user_event_and_project(&store, "human visible corpus marker request");
+        let tool = import_event_and_project_with_kind_at(
+            &store,
+            r#"{"payload":{"name":"shell","arguments":{"cmd":"printf toolmarker"}}}"#,
+            "tool_call",
+            None,
+        );
+        let raw = import_event_and_project_with_kind_at(
+            &store,
+            "# AGENTS.md instructions rawbootstrap marker",
+            "user",
+            None,
+        );
+
+        let default = search(
+            &store,
+            "toolmarker",
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_mode(SearchMode::Lexical),
+            None,
+            None,
+        )
+        .expect("default search");
+        assert!(default.results.is_empty());
+
+        let tools = search(
+            &store,
+            "toolmarker",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Lexical)
+                .with_corpus(SearchCorpus::conversation_with_tools()),
+            None,
+            None,
+        )
+        .expect("tool search");
+        assert_eq!(tools.results.len(), 1);
+        assert_eq!(tools.results[0].event_id, tool.event_id);
+        assert_eq!(tools.results[0].tier.as_deref(), Some("tool"));
+        assert_eq!(tools.results[0].kind, "tool_call");
+        assert!(tools.results[0].history_item_id.is_some());
+
+        let conversation_hits = search(
+            &store,
+            "human visible corpus",
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_mode(SearchMode::Lexical),
+            None,
+            None,
+        )
+        .expect("conversation search");
+        assert_eq!(conversation_hits.results.len(), 1);
+        assert_eq!(conversation_hits.results[0].event_id, conversation.event_id);
+        assert_eq!(
+            conversation_hits.results[0].tier.as_deref(),
+            Some("conversation")
+        );
+
+        let raw_default = search(
+            &store,
+            "rawbootstrap",
+            SearchOptions::new(10, SortMode::Relevance, 0.0).with_mode(SearchMode::Lexical),
+            None,
+            None,
+        )
+        .expect("default raw search");
+        assert!(raw_default.results.is_empty());
+
+        let raw_hits = search(
+            &store,
+            "rawbootstrap",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Lexical)
+                .with_corpus(SearchCorpus::raw()),
+            None,
+            None,
+        )
+        .expect("raw search");
+        assert_eq!(raw_hits.results.len(), 1);
+        assert_eq!(raw_hits.results[0].event_id, raw.event_id);
+        assert_eq!(raw_hits.results[0].tier.as_deref(), Some("raw"));
+    }
+
+    #[test]
     fn semantic_search_filters_by_hostname_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -2374,10 +2569,12 @@ mod tests {
         occurred_at: chrono::DateTime<Utc>,
     ) -> SearchRow {
         SearchRow {
+            history_item_id: Some(format!("history_item_{event_id}")),
             event_id: event_id.to_string(),
             session_id: "session".to_string(),
             machine_id: "machine_fixture".to_string(),
             source_kind: "fixture".to_string(),
+            tier: Some("conversation".to_string()),
             search_kind: search_kind.to_string(),
             content: content.to_string(),
             occurred_at: Some(occurred_at),
