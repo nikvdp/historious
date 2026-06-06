@@ -1181,6 +1181,7 @@ impl Store {
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
         machine_id_prefix: Option<&str>,
+        workspace_scope: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query(query);
         if fts_query.is_empty() {
@@ -1199,6 +1200,7 @@ impl Store {
             } else {
                 "history_items_fts"
             };
+            let workspace_filter = positional_workspace_scope_sql();
             let snippet_column = if use_conversation_fts { 4 } else { 5 };
             let tier_clause = if use_conversation_fts {
                 String::new()
@@ -1226,6 +1228,7 @@ impl Store {
                    AND (? IS NULL OR hi.occurred_at < ?)
                    AND (? IS NULL OR e.machine_id = ?)
                    AND (? IS NULL OR substr(e.machine_id, 1, length(?)) = ?)
+                   AND (? IS NULL OR {workspace_filter})
                    {tier_clause}
                  ORDER BY bm25({fts_table})
                  LIMIT ?"
@@ -1242,6 +1245,7 @@ impl Store {
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
             ];
+            push_workspace_scope_filter_params(&mut values, workspace_scope);
             if !use_conversation_fts {
                 values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
             }
@@ -1860,6 +1864,7 @@ impl Store {
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
         machine_id_prefix: Option<&str>,
+        workspace_scope: Option<&str>,
     ) -> Result<Vec<VectorSearchRow>> {
         if query_vector.len() != 384 || tiers.is_empty() {
             return Ok(Vec::new());
@@ -1868,6 +1873,7 @@ impl Store {
         let before = opt_dt(before);
         let tier_placeholders = vec!["?"; tiers.len()].join(", ");
         self.with_conn(|conn| {
+            let workspace_filter = positional_workspace_scope_sql();
             let sql = format!(
                 "SELECT hi.event_id,
                         hi.id,
@@ -1892,6 +1898,7 @@ impl Store {
                    AND (? IS NULL OR hi.occurred_at < ?)
                    AND (? IS NULL OR hi.machine_id = ?)
                    AND (? IS NULL OR substr(hi.machine_id, 1, length(?)) = ?)
+                   AND (? IS NULL OR {workspace_filter})
                    AND hi.semantic_policy != 'never'
                    AND length(trim(hi.text)) >= ?
                    AND hi.tier IN ({tier_placeholders})
@@ -1910,8 +1917,9 @@ impl Store {
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
-                SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64),
             ];
+            push_workspace_scope_filter_params(&mut values, workspace_scope);
+            values.push(SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64));
             values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(values), |row| {
@@ -2272,6 +2280,37 @@ fn thread_workspace_value_matches_scope_sql(value_expr: &str) -> String {
         "(rtrim(COALESCE({value_expr}, ''), '/') = :scope
           OR substr(rtrim(COALESCE({value_expr}, ''), '/'), 1, length(:scope) + 1) = :scope || '/')"
     )
+}
+
+fn positional_workspace_scope_sql() -> String {
+    [
+        "json_extract(s.metadata_json, '$.workspace_path')",
+        "json_extract(s.metadata_json, '$.workspace_root')",
+        "json_extract(s.metadata_json, '$.cwd')",
+        "json_extract(s.metadata_json, '$.workspace.path')",
+        "json_extract(s.metadata_json, '$.workspace.root')",
+        "json_extract(s.metadata_json, '$.workspace.cwd')",
+    ]
+    .into_iter()
+    .map(positional_workspace_value_matches_scope_sql)
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
+fn positional_workspace_value_matches_scope_sql(value_expr: &str) -> String {
+    format!(
+        "(rtrim(COALESCE({value_expr}, ''), '/') = ?
+          OR substr(rtrim(COALESCE({value_expr}, ''), '/'), 1, length(?) + 1) = ? || '/')"
+    )
+}
+
+fn push_workspace_scope_filter_params(values: &mut Vec<SqlValue>, scope: Option<&str>) {
+    values.push(opt_sql_text(scope.map(str::to_string)));
+    for _ in 0..6 {
+        values.push(opt_sql_text(scope.map(str::to_string)));
+        values.push(opt_sql_text(scope.map(str::to_string)));
+        values.push(opt_sql_text(scope.map(str::to_string)));
+    }
 }
 
 fn path_matches_scope(value: &str, scope: &str) -> bool {
@@ -3750,6 +3789,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("vector search");
 
@@ -3808,6 +3848,7 @@ mod tests {
                 &unit_vector(2),
                 &["conversation"],
                 5,
+                None,
                 None,
                 None,
                 None,
@@ -4007,6 +4048,7 @@ mod tests {
                 &unit_vector(4),
                 &["conversation"],
                 5,
+                None,
                 None,
                 None,
                 None,

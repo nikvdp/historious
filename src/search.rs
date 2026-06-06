@@ -196,6 +196,7 @@ pub struct SearchOptions {
     pub before: Option<DateTime<Utc>>,
     pub machine_id: Option<String>,
     pub machine_id_prefix: Option<String>,
+    pub workspace_scope: Option<String>,
     pub corpus: SearchCorpus,
     pub show_duplicates: bool,
 }
@@ -211,6 +212,7 @@ impl SearchOptions {
             before: None,
             machine_id: None,
             machine_id_prefix: None,
+            workspace_scope: None,
             corpus: SearchCorpus::default(),
             show_duplicates: false,
         }
@@ -240,6 +242,11 @@ impl SearchOptions {
         self.machine_id_prefix = hostname
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!("machine_{}_", sanitize_machine_hostname(&value)));
+        self
+    }
+
+    pub fn with_workspace_scope(mut self, workspace_scope: Option<String>) -> Self {
+        self.workspace_scope = workspace_scope.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -913,6 +920,7 @@ pub fn search(
             options.before,
             options.machine_id.as_deref(),
             options.machine_id_prefix.as_deref(),
+            options.workspace_scope.as_deref(),
         )?
     } else {
         Vec::new()
@@ -928,6 +936,7 @@ pub fn search(
             options.before,
             options.machine_id.as_deref(),
             options.machine_id_prefix.as_deref(),
+            options.workspace_scope.as_deref(),
             &tier_names,
         )?
     } else {
@@ -949,6 +958,7 @@ fn semantic_search(
     before: Option<DateTime<Utc>>,
     machine_id: Option<&str>,
     machine_id_prefix: Option<&str>,
+    workspace_scope: Option<&str>,
     selected_tiers: &[&str],
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
     let Some(embedder) = query_embedder else {
@@ -981,6 +991,7 @@ fn semantic_search(
         before,
         machine_id,
         machine_id_prefix,
+        workspace_scope,
     )?;
     let rows = vector_rows
         .into_iter()
@@ -1904,6 +1915,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("vector search");
         assert_eq!(hits.len(), 1);
@@ -1989,6 +2001,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("vector search");
 
@@ -2039,6 +2052,7 @@ mod tests {
                 &unit_vector(23),
                 &["conversation"],
                 5,
+                None,
                 None,
                 None,
                 None,

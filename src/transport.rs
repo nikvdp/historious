@@ -664,6 +664,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("vector search");
         assert_eq!(vector_hits.len(), 1);
