@@ -85,6 +85,63 @@ pub struct ArchiveStats {
     pub embeddings: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PruneFilter {
+    pub sources: Vec<String>,
+    pub sessions: Vec<String>,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub workspace_scope: Option<String>,
+    pub machine_id: Option<String>,
+    pub machine_id_prefix: Option<String>,
+}
+
+impl PruneFilter {
+    pub fn has_selector(&self) -> bool {
+        !self.sources.is_empty()
+            || !self.sessions.is_empty()
+            || self.after.is_some()
+            || self.before.is_some()
+            || self
+                .workspace_scope
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .machine_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .machine_id_prefix
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PrunePlan {
+    pub session_ids: Vec<String>,
+    pub sessions: u64,
+    pub events: u64,
+    pub history_items: u64,
+    pub search_units: u64,
+    pub embeddings: u64,
+    pub event_embeddings: u64,
+    pub vector_rows: u64,
+    pub recent_result_refs: u64,
+    pub raw_artifacts: u64,
+    pub raw_blob_bytes: u64,
+    pub sources: u64,
+    #[serde(skip)]
+    pub raw_artifact_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PruneOutcome {
+    pub plan: PrunePlan,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceFileStatus {
     pub raw_current: bool,
@@ -258,6 +315,17 @@ impl ArchiveExportFilter {
 struct SessionFilterRow {
     id: String,
     source_kind: String,
+    started_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    latest_event_at: Option<DateTime<Utc>>,
+    metadata: Value,
+}
+
+#[derive(Debug)]
+struct PruneSessionFilterRow {
+    id: String,
+    source_kind: String,
+    machine_id: String,
     started_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     latest_event_at: Option<DateTime<Utc>>,
@@ -713,6 +781,45 @@ impl Store {
                 search_units: count(conn, "search_units")?,
                 embeddings: count(conn, "embeddings")?,
             })
+        })
+    }
+
+    pub fn prune_plan(&self, filter: &PruneFilter) -> Result<PrunePlan> {
+        self.with_conn(|conn| {
+            let session_ids = prune_session_ids(conn, filter)?;
+            prepare_prune_scope(conn, &session_ids)?;
+            prune_plan_from_scope(conn, session_ids)
+        })
+    }
+
+    pub fn prune(&self, filter: &PruneFilter) -> Result<PruneOutcome> {
+        let (plan, raw_hashes) = self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                let session_ids = prune_session_ids(tx, filter)?;
+                prepare_prune_scope(tx, &session_ids)?;
+                let plan = prune_plan_from_scope(tx, session_ids)?;
+                if plan.sessions == 0 {
+                    return Ok((plan, Vec::new()));
+                }
+                let raw_hashes = plan.raw_artifact_hashes.clone();
+                delete_prune_scope(tx)?;
+                Ok((plan, raw_hashes))
+            })
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &raw_hashes)?;
+        Ok(PruneOutcome {
+            plan,
+            raw_blobs_deleted,
+            raw_blob_bytes_deleted,
+        })
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("VACUUM")
+                .context("compacting super-cass SQLite database")?;
+            Ok(())
         })
     }
 
@@ -1977,6 +2084,399 @@ fn with_immediate_write_tx<T>(
     Ok(value)
 }
 
+fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<String>> {
+    let sources = normalized_string_set(&filter.sources);
+    let sessions = normalized_string_set(&filter.sessions);
+    let workspace_scope = filter
+        .workspace_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let machine_id = filter
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let machine_id_prefix = filter
+        .machine_id_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut stmt = conn.prepare(
+        "SELECT s.id,
+                s.source_kind,
+                s.machine_id,
+                s.started_at,
+                s.updated_at,
+                a.last_event_at,
+                s.metadata_json
+         FROM sessions s
+         LEFT JOIN session_activity a ON a.session_id = s.id
+         ORDER BY s.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let metadata: String = row.get(6)?;
+        Ok(PruneSessionFilterRow {
+            id: row.get(0)?,
+            source_kind: row.get(1)?,
+            machine_id: row.get(2)?,
+            started_at: parse_opt_dt(row.get(3)?),
+            updated_at: parse_opt_dt(row.get(4)?),
+            latest_event_at: parse_opt_dt(row.get(5)?),
+            metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row?;
+        if prune_session_matches(
+            &row,
+            &sources,
+            &sessions,
+            workspace_scope,
+            machine_id,
+            machine_id_prefix,
+            filter.after,
+            filter.before,
+        ) {
+            out.push(row.id);
+        }
+    }
+    Ok(out)
+}
+
+fn prepare_prune_scope(conn: &Connection, session_ids: &[String]) -> Result<()> {
+    prepare_temp_id_scope(conn, "temp_prune_session_ids", session_ids)?;
+    let raw_hashes = collect_text_column(
+        conn,
+        "SELECT DISTINCT e.raw_artifact_hash
+         FROM events e
+         JOIN temp_prune_session_ids scope ON scope.id = e.session_id
+         WHERE e.raw_artifact_hash IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM events keep
+             LEFT JOIN temp_prune_session_ids keep_scope ON keep_scope.id = keep.session_id
+             WHERE keep.raw_artifact_hash = e.raw_artifact_hash
+               AND keep_scope.id IS NULL
+           )
+         ORDER BY e.raw_artifact_hash",
+    )?;
+    prepare_temp_id_scope(conn, "temp_prune_raw_hashes", &raw_hashes)?;
+    let source_ids = collect_text_column(
+        conn,
+        "SELECT DISTINCT source_id
+         FROM (
+           SELECT source_id FROM sessions
+           WHERE id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT source_id FROM events
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT source_id FROM search_units
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT source_id FROM raw_artifacts
+           WHERE hash IN (SELECT id FROM temp_prune_raw_hashes)
+         )
+         ORDER BY source_id",
+    )?;
+    prepare_temp_id_scope(conn, "temp_prune_source_ids", &source_ids)?;
+    Ok(())
+}
+
+fn prune_plan_from_scope(conn: &Connection, session_ids: Vec<String>) -> Result<PrunePlan> {
+    let raw_artifact_hashes =
+        collect_text_column(conn, "SELECT id FROM temp_prune_raw_hashes ORDER BY id")?;
+    let raw_blob_bytes: u64 = conn.query_row(
+        "SELECT COALESCE(SUM(size), 0)
+         FROM raw_artifacts
+         WHERE hash IN (SELECT id FROM temp_prune_raw_hashes)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? as u64;
+    Ok(PrunePlan {
+        sessions: session_ids.len() as u64,
+        events: count_prune_events(conn)?,
+        history_items: count_prune_history_items(conn)?,
+        search_units: count_prune_search_units(conn)?,
+        embeddings: count_prune_embeddings(conn)?,
+        event_embeddings: count_prune_event_embeddings(conn)?,
+        vector_rows: count_prune_vector_rows(conn)?,
+        recent_result_refs: count_prune_recent_refs(conn)?,
+        raw_artifacts: count_prune_raw_artifacts(conn)?,
+        raw_blob_bytes,
+        sources: count_prune_sources(conn)?,
+        session_ids,
+        raw_artifact_hashes,
+    })
+}
+
+fn delete_prune_scope(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM vec_embeddings_384
+         WHERE rowid IN (
+           SELECT e.rowid
+           FROM embeddings e
+           WHERE e.unit_id IN (
+             SELECT id FROM history_items
+             WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+             UNION
+             SELECT id FROM search_units
+             WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           )
+         )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM embeddings
+         WHERE unit_id IN (
+           SELECT id FROM history_items
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT id FROM search_units
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM event_embeddings
+         WHERE event_id IN (
+           SELECT id FROM events
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM events_fts
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_items_fts
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_items_conversation_fts
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM recent_result_refs
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+            OR event_id IN (
+              SELECT id FROM events
+              WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+            )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_items
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM search_units
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM events
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM session_activity
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM sessions
+         WHERE id IN (SELECT id FROM temp_prune_session_ids)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM raw_artifacts
+         WHERE hash IN (SELECT id FROM temp_prune_raw_hashes)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM sources
+         WHERE id IN (SELECT id FROM temp_prune_source_ids)
+           AND NOT EXISTS (SELECT 1 FROM sessions WHERE source_id = sources.id)
+           AND NOT EXISTS (SELECT 1 FROM events WHERE source_id = sources.id)
+           AND NOT EXISTS (SELECT 1 FROM search_units WHERE source_id = sources.id)
+           AND NOT EXISTS (SELECT 1 FROM raw_artifacts WHERE source_id = sources.id)",
+        [],
+    )?;
+    update_projection_status(
+        conn,
+        "history_items_v1",
+        count(conn, "history_items")? as usize,
+    )?;
+    update_projection_status(conn, "search_rrf_v1", count(conn, "search_units")? as usize)?;
+    Ok(())
+}
+
+fn remove_raw_artifact_blobs(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64)> {
+    let mut deleted = 0;
+    let mut bytes = 0;
+    for hash in hashes {
+        let path = blob_path(blob_dir, hash);
+        if !path.exists() {
+            continue;
+        }
+        let size = std::fs::metadata(&path)
+            .with_context(|| format!("reading blob metadata {}", path.display()))?
+            .len();
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing raw artifact blob {}", path.display()))?;
+        deleted += 1;
+        bytes += size;
+    }
+    Ok((deleted, bytes))
+}
+
+fn collect_text_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn count_prune_events(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM events
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+    )
+}
+
+fn count_prune_history_items(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM history_items
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+    )
+}
+
+fn count_prune_search_units(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM search_units
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+    )
+}
+
+fn count_prune_embeddings(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM embeddings
+         WHERE unit_id IN (
+           SELECT id FROM history_items
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT id FROM search_units
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+    )
+}
+
+fn count_prune_event_embeddings(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM event_embeddings
+         WHERE event_id IN (
+           SELECT id FROM events
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+    )
+}
+
+fn count_prune_vector_rows(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM vec_embeddings_384 v
+         JOIN embeddings e ON e.rowid = v.rowid
+         WHERE e.unit_id IN (
+           SELECT id FROM history_items
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+           UNION
+           SELECT id FROM search_units
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+    )
+}
+
+fn count_prune_recent_refs(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM recent_result_refs
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+            OR event_id IN (
+              SELECT id FROM events
+              WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+            )",
+    )
+}
+
+fn count_prune_raw_artifacts(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM raw_artifacts
+         WHERE hash IN (SELECT id FROM temp_prune_raw_hashes)",
+    )
+}
+
+fn count_prune_sources(conn: &Connection) -> Result<u64> {
+    count_prune_sql(
+        conn,
+        "SELECT COUNT(*)
+         FROM temp_prune_source_ids candidate
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM sessions s
+           LEFT JOIN temp_prune_session_ids scope ON scope.id = s.id
+           WHERE s.source_id = candidate.id AND scope.id IS NULL
+         )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM events e
+             LEFT JOIN temp_prune_session_ids scope ON scope.id = e.session_id
+             WHERE e.source_id = candidate.id AND scope.id IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM search_units su
+             LEFT JOIN temp_prune_session_ids scope ON scope.id = su.session_id
+             WHERE su.source_id = candidate.id AND scope.id IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM raw_artifacts raw
+             LEFT JOIN temp_prune_raw_hashes scope ON scope.id = raw.hash
+             WHERE raw.source_id = candidate.id AND scope.id IS NULL
+           )",
+    )
+}
+
+fn count_prune_sql(conn: &Connection, sql: &str) -> Result<u64> {
+    let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+    Ok(count as u64)
+}
+
 fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
     conn.query_row(
         "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
@@ -2218,6 +2718,57 @@ fn session_matches_export_filter(
     true
 }
 
+fn prune_session_matches(
+    row: &PruneSessionFilterRow,
+    sources: &HashSet<String>,
+    sessions: &HashSet<String>,
+    workspace_scope: Option<&str>,
+    machine_id: Option<&str>,
+    machine_id_prefix: Option<&str>,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+) -> bool {
+    if !sessions.is_empty() && !sessions.contains(&row.id) {
+        return false;
+    }
+    if !sources.is_empty() && !sources.contains(&row.source_kind) {
+        return false;
+    }
+    if let Some(machine_id) = machine_id {
+        if row.machine_id != machine_id {
+            return false;
+        }
+    }
+    if let Some(machine_id_prefix) = machine_id_prefix {
+        if !row.machine_id.starts_with(machine_id_prefix) {
+            return false;
+        }
+    }
+    if let Some(workspace_scope) = workspace_scope {
+        if !session_workspace_values(&row.metadata)
+            .iter()
+            .any(|value| path_matches_scope(value, workspace_scope))
+        {
+            return false;
+        }
+    }
+    let latest = [row.updated_at, row.latest_event_at, row.started_at]
+        .into_iter()
+        .flatten()
+        .max();
+    if let Some(after) = after {
+        if latest.is_none_or(|latest| latest < after) {
+            return false;
+        }
+    }
+    if let Some(before) = before {
+        if latest.is_none_or(|latest| latest >= before) {
+            return false;
+        }
+    }
+    true
+}
+
 fn session_workspace_values(metadata: &Value) -> Vec<String> {
     let mut values = Vec::new();
     for key in ["workspace_path", "workspace_root", "cwd"] {
@@ -2334,7 +2885,10 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
         "temp_search_index_event_ids"
         | "temp_delta_event_ids"
         | "temp_delta_search_unit_ids"
-        | "temp_history_item_event_ids" => {}
+        | "temp_history_item_event_ids"
+        | "temp_prune_session_ids"
+        | "temp_prune_raw_hashes"
+        | "temp_prune_source_ids" => {}
         _ => bail!("unsupported temporary id scope table: {table}"),
     }
     conn.execute(

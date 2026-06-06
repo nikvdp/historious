@@ -241,7 +241,7 @@ impl SearchOptions {
         self.machine_id = machine_id.filter(|value| !value.trim().is_empty());
         self.machine_id_prefix = hostname
             .filter(|value| !value.trim().is_empty())
-            .map(|value| format!("machine_{}_", sanitize_machine_hostname(&value)));
+            .map(|value| machine_id_prefix_for_hostname(&value));
         self
     }
 
@@ -830,6 +830,10 @@ fn is_memory_like_error(err: &anyhow::Error) -> bool {
     ["memory", "alloc", "oom", "resource exhausted"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+pub fn machine_id_prefix_for_hostname(hostname: &str) -> String {
+    format!("machine_{}_", sanitize_machine_hostname(hostname))
 }
 
 fn sanitize_machine_hostname(input: &str) -> String {
