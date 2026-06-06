@@ -3024,7 +3024,7 @@ fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
     } else {
         " --no-color"
     };
-    format!("{exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}")
+    format!("{exe} --data-dir {data_dir} show {{7}} {{12}} --before 3 --after 5{color_flag}")
 }
 
 fn fzf_open_command(config: &AppConfig, color: bool) -> String {
@@ -3039,7 +3039,7 @@ fn fzf_open_command(config: &AppConfig, color: bool) -> String {
     } else {
         " --no-color"
     };
-    format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}")
+    format!("{exe} --data-dir {data_dir} transcript {{6}} --at {{7}} {{12}}{color_flag}")
 }
 
 fn tui_reload_command(
@@ -3247,8 +3247,17 @@ fn fzf_row(result: &search::SearchResult, ref_id: Option<&str>, color: bool) -> 
         clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
         clean_fzf_field(&result.workspace_values.join(" ")),
         clean_fzf_field(&result.machine_id),
+        clean_fzf_field(result.history_item_id.as_deref().unwrap_or("")),
+        clean_fzf_field(fzf_open_mode_flag(result)),
     ]
     .join("\t")
+}
+
+fn fzf_open_mode_flag(result: &search::SearchResult) -> &'static str {
+    match result.tier.as_deref() {
+        Some("conversation") => "",
+        _ => "--full",
+    }
 }
 
 fn clean_fzf_field(input: &str) -> String {
@@ -3758,7 +3767,7 @@ mod tests {
         let row = fzf_row(&result, Some("ab3f"), false);
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 10);
+        assert_eq!(fields.len(), 12);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
@@ -3768,6 +3777,14 @@ mod tests {
         assert_eq!(fields[7], "Planning Session");
         assert_eq!(fields[8], "/home/example/projects/super-cass");
         assert_eq!(fields[9], "machine_devbox_123");
+        assert_eq!(fields[10], "hi_1");
+        assert_eq!(fields[11], "");
+
+        let mut raw_result = result;
+        raw_result.tier = Some("raw".to_string());
+        let raw_row = fzf_row(&raw_result, Some("ab3f"), false);
+        let raw_fields = raw_row.split('\t').collect::<Vec<_>>();
+        assert_eq!(raw_fields[11], "--full");
     }
 
     #[test]
@@ -3920,7 +3937,10 @@ mod tests {
 
         let with_color = fzf_preview_command(&config, true);
         let without_color = fzf_preview_command(&config, false);
+        let open = fzf_open_command(&config, true);
 
+        assert!(with_color.contains("show {7} {12}"));
+        assert!(open.contains("transcript {6} --at {7} {12}"));
         assert!(with_color.contains("--color always"));
         assert!(!with_color.contains("--no-color"));
         assert!(without_color.contains("--no-color"));
