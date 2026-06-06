@@ -972,17 +972,17 @@ fn semantic_search(
     let query_concepts = semantic_query_concepts(query);
     let query_text = semantic_embedding_query_text(query, &query_concepts);
     let query_vector = embedder.embed_one(&query_text)?;
-    let rows = store
-        .vector_search(
-            embedder.model_id(),
-            &query_vector,
-            selected_tiers,
-            limit,
-            after,
-            before,
-            machine_id,
-            machine_id_prefix,
-        )?
+    let vector_rows = store.vector_search(
+        embedder.model_id(),
+        &query_vector,
+        selected_tiers,
+        limit,
+        after,
+        before,
+        machine_id,
+        machine_id_prefix,
+    )?;
+    let rows = vector_rows
         .into_iter()
         .filter(|row| semantic_candidate_has_context(&row.content))
         .filter(|row| semantic_candidate_matches_query(&row.content, &query_concepts))
@@ -993,26 +993,7 @@ fn semantic_search(
         })
         .map(search_row_from_vector)
         .collect();
-    let missing = store
-        .history_items_missing_embedding_count_for_tiers(embedder.model_id(), selected_tiers)?;
-    let degraded_reason = if missing > 0 {
-        Some(append_degraded_reason(
-            degraded_reason,
-            format!(
-                "semantic embeddings are missing for {missing} selected history items; using available vectors"
-            ),
-        ))
-    } else {
-        degraded_reason
-    };
     Ok((rows, degraded_reason))
-}
-
-fn append_degraded_reason(existing: Option<String>, note: String) -> String {
-    existing
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("{value}; {note}"))
-        .unwrap_or(note)
 }
 
 fn semantic_candidate_has_context(text: &str) -> bool {
@@ -1296,11 +1277,15 @@ fn apply_recency_bias(results: &mut [SearchResult], recency_bias: f64) {
 fn sort_results(results: &mut [SearchResult], sort: SortMode) {
     match sort {
         SortMode::Relevance => results.sort_by(|left, right| {
-            right.score.total_cmp(&left.score).then_with(|| {
-                best_rank(left)
-                    .cmp(&best_rank(right))
-                    .then_with(|| left.event_id.cmp(&right.event_id))
-            })
+            lexical_lane(left)
+                .cmp(&lexical_lane(right))
+                .then_with(|| lexical_rank_bucket(left).cmp(&lexical_rank_bucket(right)))
+                .then_with(|| right.score.total_cmp(&left.score))
+                .then_with(|| {
+                    best_rank(left)
+                        .cmp(&best_rank(right))
+                        .then_with(|| left.event_id.cmp(&right.event_id))
+                })
         }),
         SortMode::Newest => results.sort_by(|left, right| {
             right
@@ -1314,6 +1299,21 @@ fn sort_results(results: &mut [SearchResult], sort: SortMode) {
                 .then_with(|| right.score.total_cmp(&left.score))
         }),
     }
+}
+
+fn lexical_lane(result: &SearchResult) -> usize {
+    if result.lexical_rank.is_some() {
+        0
+    } else {
+        1
+    }
+}
+
+fn lexical_rank_bucket(result: &SearchResult) -> usize {
+    result
+        .lexical_rank
+        .map(|rank| rank.saturating_sub(1) / 3)
+        .unwrap_or(usize::MAX)
 }
 
 fn best_rank(result: &SearchResult) -> usize {
@@ -1691,14 +1691,33 @@ mod tests {
             vec![
                 "lexical_one",
                 "lexical_two",
-                "semantic_one",
-                "lexical_three"
+                "lexical_three",
+                "semantic_one"
             ]
         );
     }
 
     #[test]
-    fn rrf_penalizes_non_user_lexical_rows_below_semantic_neighbors() {
+    fn rrf_keeps_stronger_lexical_rank_before_semantic_boosted_later_hits() {
+        let now = Utc::now();
+        let results = fuse(
+            vec![
+                ranked_row("lexical_one", 1, now),
+                ranked_row("lexical_two", 4, now),
+            ],
+            vec![ranked_row("lexical_two", 2, now)],
+            SearchOptions::new(10, SortMode::Relevance, 0.0),
+        );
+
+        let ordered = results
+            .iter()
+            .map(|result| result.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered, vec!["lexical_one", "lexical_two"]);
+    }
+
+    #[test]
+    fn rrf_keeps_non_user_lexical_anchors_before_semantic_neighbors() {
         let now = Utc::now();
         let results = fuse(
             vec![
@@ -1715,7 +1734,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ordered,
-            vec!["user_phrase", "semantic_user", "assistant_note"]
+            vec!["user_phrase", "assistant_note", "semantic_user"]
         );
     }
 
@@ -2426,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_tool_corpus_reports_missing_semantic_coverage_without_losing_lexical_hits() {
+    fn hybrid_tool_corpus_keeps_lexical_hits_without_required_semantic_degradation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
         let tool = import_event_and_project_with_kind_at(
@@ -2450,11 +2469,7 @@ mod tests {
         )
         .expect("hybrid search");
 
-        assert!(response
-            .degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("semantic embeddings are missing"));
+        assert_eq!(response.degraded_reason, None);
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].event_id, tool.event_id);
         assert_eq!(response.results[0].tier.as_deref(), Some("tool"));

@@ -720,6 +720,7 @@ impl Store {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 tx.execute("DELETE FROM history_items_fts", [])?;
+                tx.execute("DELETE FROM history_items_conversation_fts", [])?;
                 tx.execute("DELETE FROM history_items", [])?;
                 let mut stmt = tx.prepare(
                     "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
@@ -752,6 +753,11 @@ impl Store {
                 prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
                 tx.execute(
                     "DELETE FROM history_items_fts
+                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                    [],
+                )?;
+                tx.execute(
+                    "DELETE FROM history_items_conversation_fts
                      WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
                     [],
                 )?;
@@ -793,7 +799,23 @@ impl Store {
                 [],
                 |row| row.get(0),
             )?;
-            Ok(ready != 0)
+            if ready == 0 {
+                return Ok(false);
+            }
+            let conversation_fts: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM history_items_conversation_fts",
+                [],
+                |row| row.get(0),
+            )?;
+            let conversation_indexable: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM history_items
+                 WHERE tier = 'conversation'
+                   AND lexical_indexable = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(conversation_fts == conversation_indexable)
         })
     }
 
@@ -1171,29 +1193,41 @@ impl Store {
         let before = opt_dt(before);
         let tier_placeholders = vec!["?"; tiers.len()].join(", ");
         self.with_conn(|conn| {
+            let use_conversation_fts = tiers_are_only_conversation(tiers);
+            let fts_table = if use_conversation_fts {
+                "history_items_conversation_fts"
+            } else {
+                "history_items_fts"
+            };
+            let snippet_column = if use_conversation_fts { 4 } else { 5 };
+            let tier_clause = if use_conversation_fts {
+                String::new()
+            } else {
+                format!("AND hi.tier IN ({tier_placeholders})")
+            };
             let sql = format!(
-                "SELECT history_items_fts.item_id,
-                        history_items_fts.event_id,
-                        history_items_fts.session_id,
+                "SELECT {fts_table}.item_id,
+                        {fts_table}.event_id,
+                        {fts_table}.session_id,
                         e.machine_id,
                         e.source_kind,
                         hi.tier,
                         hi.kind,
-                        snippet(history_items_fts, 5, '', '', '...', 24),
+                        snippet({fts_table}, {snippet_column}, '', '', '...', 24),
                         hi.occurred_at,
                         s.title,
                         s.metadata_json
-                 FROM history_items_fts
-                 JOIN history_items hi ON hi.id = history_items_fts.item_id
-                 JOIN events e ON e.id = history_items_fts.event_id
-                 LEFT JOIN sessions s ON s.id = history_items_fts.session_id
-                 WHERE history_items_fts MATCH ?
+                 FROM {fts_table}
+                 JOIN history_items hi ON hi.id = {fts_table}.item_id
+                 JOIN events e ON e.id = {fts_table}.event_id
+                 LEFT JOIN sessions s ON s.id = {fts_table}.session_id
+                 WHERE {fts_table} MATCH ?
                    AND (? IS NULL OR hi.occurred_at >= ?)
                    AND (? IS NULL OR hi.occurred_at < ?)
                    AND (? IS NULL OR e.machine_id = ?)
                    AND (? IS NULL OR substr(e.machine_id, 1, length(?)) = ?)
-                   AND hi.tier IN ({tier_placeholders})
-                 ORDER BY bm25(history_items_fts)
+                   {tier_clause}
+                 ORDER BY bm25({fts_table})
                  LIMIT ?"
             );
             let mut values = vec![
@@ -1208,7 +1242,9 @@ impl Store {
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
                 opt_sql_text(machine_id_prefix.map(str::to_string)),
             ];
-            values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
+            if !use_conversation_fts {
+                values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
+            }
             values.push(SqlValue::Integer(limit as i64));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(values), |row| {
@@ -1751,38 +1787,6 @@ impl Store {
 
     pub fn history_items_missing_required_embedding_count(&self, model_id: &str) -> Result<usize> {
         self.with_conn(|conn| history_items_missing_required_embedding_count(conn, model_id))
-    }
-
-    pub fn history_items_missing_embedding_count_for_tiers(
-        &self,
-        model_id: &str,
-        tiers: &[&str],
-    ) -> Result<usize> {
-        if tiers.is_empty() {
-            return Ok(0);
-        }
-        let tier_placeholders = vec!["?"; tiers.len()].join(", ");
-        self.with_conn(|conn| {
-            let sql = format!(
-                "SELECT COUNT(*)
-                 FROM history_items hi
-                 LEFT JOIN embeddings e
-                   ON e.unit_id = hi.id
-                  AND e.text_hash = hi.text_hash
-                  AND e.model_id = ?
-                 WHERE e.id IS NULL
-                   AND hi.semantic_policy != 'never'
-                   AND length(trim(hi.text)) >= ?
-                   AND hi.tier IN ({tier_placeholders})"
-            );
-            let mut values = vec![
-                SqlValue::Text(model_id.to_string()),
-                SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64),
-            ];
-            values.extend(tiers.iter().map(|tier| SqlValue::Text((*tier).to_string())));
-            let count: i64 = conn.query_row(&sql, params_from_iter(values), |row| row.get(0))?;
-            Ok(count as usize)
-        })
     }
 
     pub fn refresh_vector_projection(&self) -> Result<usize> {
@@ -2472,6 +2476,15 @@ fn migrate(conn: &Connection) -> Result<()> {
           tokenize = 'porter unicode61'
         );
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_items_conversation_fts USING fts5(
+          item_id UNINDEXED,
+          event_id UNINDEXED,
+          session_id UNINDEXED,
+          kind UNINDEXED,
+          text,
+          tokenize = 'porter unicode61'
+        );
+
         CREATE TABLE IF NOT EXISTS search_units (
           id TEXT PRIMARY KEY,
           event_id TEXT NOT NULL,
@@ -2882,6 +2895,19 @@ fn insert_history_item(conn: &Connection, item: &HistoryItemRecord) -> Result<bo
                 item.text
             ],
         )?;
+        if item.tier == "conversation" {
+            conn.execute(
+                "INSERT INTO history_items_conversation_fts (item_id, event_id, session_id, kind, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    item.id,
+                    item.event_id,
+                    item.session_id,
+                    item.kind,
+                    item.text
+                ],
+            )?;
+        }
     }
     Ok(changed > 0)
 }
@@ -3022,6 +3048,10 @@ fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
         row.get(0)
     })?;
     Ok(count as usize)
+}
+
+fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
+    tiers.len() == 1 && tiers[0] == "conversation"
 }
 
 fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
