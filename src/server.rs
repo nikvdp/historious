@@ -325,8 +325,17 @@ fn server_fzf_row(result: &search::SearchResult, ref_id: Option<&str>) -> String
         clean_fzf_field(result.session_title.as_deref().unwrap_or("")),
         clean_fzf_field(&result.workspace_values.join(" ")),
         clean_fzf_field(&result.machine_id),
+        clean_fzf_field(result.history_item_id.as_deref().unwrap_or("")),
+        clean_fzf_field(server_fzf_open_mode_flag(result)),
     ]
     .join("\t")
+}
+
+fn server_fzf_open_mode_flag(result: &search::SearchResult) -> &'static str {
+    match result.tier.as_deref() {
+        Some("conversation") => "",
+        _ => "--full",
+    }
 }
 
 fn clean_fzf_field(input: &str) -> String {
@@ -381,7 +390,7 @@ mod tests {
         let row = server_fzf_row(&result, Some("ab3f"));
         let fields = row.split('\t').collect::<Vec<_>>();
 
-        assert_eq!(fields.len(), 10);
+        assert_eq!(fields.len(), 12);
         assert_eq!(fields[0], "ab3f");
         assert_eq!(fields[1], "codex");
         assert_eq!(fields[2], "hybrid");
@@ -391,5 +400,7 @@ mod tests {
         assert_eq!(fields[7], "Planning Session");
         assert_eq!(fields[8], "/tmp/workspace");
         assert_eq!(fields[9], "machine_devbox_123");
+        assert_eq!(fields[10], "hi_1");
+        assert_eq!(fields[11], "");
     }
 }
