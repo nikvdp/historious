@@ -5,7 +5,8 @@ use crate::archive::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{
-    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    named_params, params, params_from_iter, Connection, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1152,7 +1153,17 @@ impl Store {
 
     pub fn list_threads(&self, options: &ThreadListOptions) -> Result<Vec<ThreadRow>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let last_activity = thread_last_activity_sql();
+            let workspace_filter = thread_workspace_scope_sql();
+            let order = match options.sort {
+                ThreadSortMode::Newest => {
+                    "last_activity_at IS NULL ASC, last_activity_at DESC, s.id DESC"
+                }
+                ThreadSortMode::Oldest => {
+                    "last_activity_at IS NULL DESC, last_activity_at ASC, s.id ASC"
+                }
+            };
+            let sql = format!(
                 "SELECT s.id,
                         s.source_id,
                         s.machine_id,
@@ -1164,58 +1175,69 @@ impl Store {
                         s.updated_at,
                         s.metadata_json,
                         s.hash,
-                        COUNT(e.id),
-                        MIN(e.occurred_at),
-                        MAX(e.occurred_at)
+                        COALESCE(a.event_count, 0),
+                        a.first_event_at,
+                        a.last_event_at,
+                        {last_activity} AS last_activity_at
                  FROM sessions s
-                 LEFT JOIN events e ON e.session_id = s.id
-                 GROUP BY s.id
-                 ORDER BY s.id",
+                 LEFT JOIN session_activity a ON a.session_id = s.id
+                 WHERE (:after IS NULL OR {last_activity} >= :after)
+                   AND (:before IS NULL OR {last_activity} < :before)
+                   AND (:scope IS NULL OR {workspace_filter})
+                 ORDER BY {order}
+                 LIMIT :limit"
+            );
+            let after = options.after.map(|dt| dt.to_rfc3339());
+            let before = options.before.map(|dt| dt.to_rfc3339());
+            let scope = options
+                .workspace_scope
+                .as_deref()
+                .map(|scope| scope.trim_end_matches('/'))
+                .filter(|scope| !scope.is_empty());
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                named_params! {
+                    ":after": after,
+                    ":before": before,
+                    ":scope": scope,
+                    ":limit": options.limit as i64,
+                },
+                |row| {
+                    let metadata_text: String = row.get(9)?;
+                    let metadata = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
+                    let session = SessionRecord {
+                        id: row.get(0)?,
+                        source_id: row.get(1)?,
+                        machine_id: row.get(2)?,
+                        source_kind: row.get(3)?,
+                        external_id: row.get(4)?,
+                        title: row.get(5)?,
+                        status: row.get(6)?,
+                        started_at: parse_opt_dt(row.get(7)?),
+                        updated_at: parse_opt_dt(row.get(8)?),
+                        metadata: metadata.clone(),
+                        hash: row.get(10)?,
+                    };
+                    let first_event_at = parse_opt_dt(row.get(12)?);
+                    let last_event_at = parse_opt_dt(row.get(13)?);
+                    let last_activity_at = parse_opt_dt(row.get(14)?);
+                    let workspace_values = session_workspace_values(&metadata);
+                    Ok(ThreadRow {
+                        session,
+                        event_count: row.get::<_, i64>(11)?.max(0) as u64,
+                        first_event_at,
+                        last_event_at,
+                        last_activity_at,
+                        workspace_path: primary_workspace_value(&metadata),
+                        workspace_values,
+                    })
+                },
             )?;
-            let rows = stmt.query_map([], |row| {
-                let metadata_text: String = row.get(9)?;
-                let metadata = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
-                let session = SessionRecord {
-                    id: row.get(0)?,
-                    source_id: row.get(1)?,
-                    machine_id: row.get(2)?,
-                    source_kind: row.get(3)?,
-                    external_id: row.get(4)?,
-                    title: row.get(5)?,
-                    status: row.get(6)?,
-                    started_at: parse_opt_dt(row.get(7)?),
-                    updated_at: parse_opt_dt(row.get(8)?),
-                    metadata: metadata.clone(),
-                    hash: row.get(10)?,
-                };
-                let first_event_at = parse_opt_dt(row.get(12)?);
-                let last_event_at = parse_opt_dt(row.get(13)?);
-                let last_activity_at = [last_event_at, session.updated_at, session.started_at]
-                    .into_iter()
-                    .flatten()
-                    .max();
-                let workspace_values = session_workspace_values(&metadata);
-                Ok(ThreadRow {
-                    session,
-                    event_count: row.get::<_, i64>(11)?.max(0) as u64,
-                    first_event_at,
-                    last_event_at,
-                    last_activity_at,
-                    workspace_path: primary_workspace_value(&metadata),
-                    workspace_values,
-                })
-            })?;
 
             let mut out = Vec::new();
             for row in rows {
-                let row = row?;
-                if !thread_matches_options(&row, options) {
-                    continue;
-                }
-                out.push(row);
+                out.push(row?);
             }
-            sort_threads(&mut out, options.sort);
-            out.truncate(options.limit);
             Ok(out)
         })
     }
@@ -1847,43 +1869,30 @@ fn primary_workspace_value(metadata: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn thread_matches_options(row: &ThreadRow, options: &ThreadListOptions) -> bool {
-    if let Some(scope) = &options.workspace_scope {
-        if !row
-            .workspace_values
-            .iter()
-            .any(|value| path_matches_scope(value, scope))
-        {
-            return false;
-        }
-    }
-    if let Some(after) = options.after {
-        if row.last_activity_at.is_none_or(|last| last < after) {
-            return false;
-        }
-    }
-    if let Some(before) = options.before {
-        if row.last_activity_at.is_none_or(|last| last >= before) {
-            return false;
-        }
-    }
-    true
+fn thread_last_activity_sql() -> &'static str {
+    "NULLIF(MAX(COALESCE(a.last_event_at, ''), COALESCE(s.updated_at, ''), COALESCE(s.started_at, '')), '')"
 }
 
-fn sort_threads(rows: &mut [ThreadRow], sort: ThreadSortMode) {
-    match sort {
-        ThreadSortMode::Newest => rows.sort_by(|left, right| {
-            right
-                .last_activity_at
-                .cmp(&left.last_activity_at)
-                .then_with(|| right.session.id.cmp(&left.session.id))
-        }),
-        ThreadSortMode::Oldest => rows.sort_by(|left, right| {
-            left.last_activity_at
-                .cmp(&right.last_activity_at)
-                .then_with(|| left.session.id.cmp(&right.session.id))
-        }),
-    }
+fn thread_workspace_scope_sql() -> String {
+    [
+        "json_extract(s.metadata_json, '$.workspace_path')",
+        "json_extract(s.metadata_json, '$.workspace_root')",
+        "json_extract(s.metadata_json, '$.cwd')",
+        "json_extract(s.metadata_json, '$.workspace.path')",
+        "json_extract(s.metadata_json, '$.workspace.root')",
+        "json_extract(s.metadata_json, '$.workspace.cwd')",
+    ]
+    .into_iter()
+    .map(thread_workspace_value_matches_scope_sql)
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
+fn thread_workspace_value_matches_scope_sql(value_expr: &str) -> String {
+    format!(
+        "(rtrim(COALESCE({value_expr}, ''), '/') = :scope
+          OR substr(rtrim(COALESCE({value_expr}, ''), '/'), 1, length(:scope) + 1) = :scope || '/')"
+    )
 }
 
 fn path_matches_scope(value: &str, scope: &str) -> bool {
@@ -2021,6 +2030,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_raw_artifact_hash
           ON events(raw_artifact_hash);
 
+        CREATE TABLE IF NOT EXISTS session_activity (
+          session_id TEXT PRIMARY KEY,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          first_event_at TEXT,
+          last_event_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_activity_last_event
+          ON session_activity(last_event_at);
+
         CREATE TABLE IF NOT EXISTS search_units (
           id TEXT PRIMARY KEY,
           event_id TEXT NOT NULL,
@@ -2115,6 +2134,40 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings_384
           USING vec0(embedding float[384]);
         ",
+    )?;
+    backfill_missing_session_activity(conn)?;
+    Ok(())
+}
+
+fn backfill_missing_session_activity(conn: &Connection) -> Result<()> {
+    let missing = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM sessions s
+           LEFT JOIN session_activity a ON a.session_id = s.id
+           WHERE a.session_id IS NULL
+           LIMIT 1
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !missing {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO session_activity
+         (session_id, event_count, first_event_at, last_event_at)
+         SELECT s.id,
+                COUNT(e.id),
+                MIN(e.occurred_at),
+                MAX(e.occurred_at)
+         FROM sessions s
+         LEFT JOIN events e ON e.session_id = s.id
+         LEFT JOIN session_activity a ON a.session_id = s.id
+         WHERE a.session_id IS NULL
+         GROUP BY s.id",
+        [],
     )?;
     Ok(())
 }
@@ -2247,6 +2300,8 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
     if changed == 0 {
         update_session_title(conn, session)?;
         enrich_session_metadata(conn, session)?;
+    } else {
+        ensure_session_activity_row(conn, &session.id)?;
     }
     Ok(changed > 0)
 }
@@ -2290,6 +2345,16 @@ fn metadata_has_workspace(metadata: &Value) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn ensure_session_activity_row(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_activity
+         (session_id, event_count, first_event_at, last_event_at)
+         VALUES (?1, 0, NULL, NULL)",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
 fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
     ensure_same_hash(conn, "events", "id", &event.id, &event.hash)?;
     let changed = conn.execute(
@@ -2313,7 +2378,35 @@ fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
             event.hash
         ],
     )?;
+    if changed > 0 {
+        update_session_activity_for_event(conn, event)?;
+    }
     Ok(changed > 0)
+}
+
+fn update_session_activity_for_event(conn: &Connection, event: &EventRecord) -> Result<()> {
+    let occurred_at = opt_dt(event.occurred_at);
+    conn.execute(
+        "INSERT INTO session_activity
+         (session_id, event_count, first_event_at, last_event_at)
+         VALUES (?1, 1, ?2, ?2)
+         ON CONFLICT(session_id) DO UPDATE SET
+           event_count = session_activity.event_count + 1,
+           first_event_at = CASE
+             WHEN excluded.first_event_at IS NULL THEN session_activity.first_event_at
+             WHEN session_activity.first_event_at IS NULL THEN excluded.first_event_at
+             WHEN excluded.first_event_at < session_activity.first_event_at THEN excluded.first_event_at
+             ELSE session_activity.first_event_at
+           END,
+           last_event_at = CASE
+             WHEN excluded.last_event_at IS NULL THEN session_activity.last_event_at
+             WHEN session_activity.last_event_at IS NULL THEN excluded.last_event_at
+             WHEN excluded.last_event_at > session_activity.last_event_at THEN excluded.last_event_at
+             ELSE session_activity.last_event_at
+           END",
+        params![event.session_id, occurred_at],
+    )?;
+    Ok(())
 }
 
 fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool> {
@@ -3038,6 +3131,97 @@ mod tests {
     }
 
     #[test]
+    fn list_threads_uses_activity_projection_for_scope_dates_and_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_threads");
+        let mut today = fixture_session("session_today", &source.id);
+        today.metadata = json!({"workspace_path": "/tmp/repo"});
+        let mut nested = fixture_session("session_nested", &source.id);
+        nested.metadata = json!({"workspace": {"path": "/tmp/repo/nested"}});
+        let mut old = fixture_session("session_old", &source.id);
+        old.metadata = json!({"workspace_path": "/tmp/repo"});
+        let mut outside = fixture_session("session_outside", &source.id);
+        outside.metadata = json!({"workspace_path": "/tmp/other"});
+
+        let mut today_first = fixture_event(
+            "event_today_first",
+            &today.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_today_first",
+        );
+        today_first.occurred_at = Some(dt("2026-06-06T03:00:00Z"));
+        let mut today_last = fixture_event(
+            "event_today_last",
+            &today.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_today_last",
+        );
+        today_last.occurred_at = Some(dt("2026-06-06T04:00:00Z"));
+        let mut nested_event = fixture_event(
+            "event_nested",
+            &nested.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_nested",
+        );
+        nested_event.occurred_at = Some(dt("2026-06-06T05:00:00Z"));
+        let mut old_event =
+            fixture_event("event_old", &old.id, &source.id, 1, None, "event_hash_old");
+        old_event.occurred_at = Some(dt("2026-06-05T05:00:00Z"));
+        let mut outside_event = fixture_event(
+            "event_outside",
+            &outside.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_outside",
+        );
+        outside_event.occurred_at = Some(dt("2026-06-06T06:00:00Z"));
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(today.clone()),
+                ArchiveRecord::Session(nested.clone()),
+                ArchiveRecord::Session(old),
+                ArchiveRecord::Session(outside),
+                ArchiveRecord::Event(today_first),
+                ArchiveRecord::Event(today_last),
+                ArchiveRecord::Event(nested_event),
+                ArchiveRecord::Event(old_event),
+                ArchiveRecord::Event(outside_event),
+            ])
+            .expect("import thread records");
+
+        let rows = store
+            .list_threads(&ThreadListOptions {
+                limit: 10,
+                sort: ThreadSortMode::Newest,
+                after: Some(dt("2026-06-06T00:00:00Z")),
+                before: Some(dt("2026-06-07T00:00:00Z")),
+                workspace_scope: Some("/tmp/repo".to_string()),
+            })
+            .expect("list threads");
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session_nested", "session_today"]
+        );
+        assert_eq!(rows[0].event_count, 1);
+        assert_eq!(rows[1].event_count, 2);
+        assert_eq!(rows[1].first_event_at, Some(dt("2026-06-06T03:00:00Z")));
+        assert_eq!(rows[1].last_event_at, Some(dt("2026-06-06T04:00:00Z")));
+    }
+
+    #[test]
     fn update_hot_path_query_plans_are_visible() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -3381,6 +3565,12 @@ mod tests {
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
         records.iter().any(|record| record.id() == id)
+    }
+
+    fn dt(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("fixture datetime")
+            .with_timezone(&Utc)
     }
 
     fn fixture_archive_records() -> Vec<ArchiveRecord> {
