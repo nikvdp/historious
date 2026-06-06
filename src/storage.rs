@@ -2147,6 +2147,24 @@ fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<Stri
 
 fn prepare_prune_scope(conn: &Connection, session_ids: &[String]) -> Result<()> {
     prepare_temp_id_scope(conn, "temp_prune_session_ids", session_ids)?;
+    let event_ids = collect_text_column(
+        conn,
+        "SELECT id
+         FROM events
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+    )?;
+    prepare_temp_id_scope(conn, "temp_prune_event_ids", &event_ids)?;
+    let unit_ids = collect_text_column(
+        conn,
+        "SELECT id
+         FROM history_items
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         UNION
+         SELECT id
+         FROM search_units
+         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+    )?;
+    prepare_temp_id_scope(conn, "temp_prune_unit_ids", &unit_ids)?;
     let raw_hashes = collect_text_column(
         conn,
         "SELECT DISTINCT e.raw_artifact_hash
@@ -2218,33 +2236,18 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
          WHERE rowid IN (
            SELECT e.rowid
            FROM embeddings e
-           WHERE e.unit_id IN (
-             SELECT id FROM history_items
-             WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-             UNION
-             SELECT id FROM search_units
-             WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-           )
+           JOIN temp_prune_unit_ids scope ON scope.id = e.unit_id
          )",
         [],
     )?;
     conn.execute(
         "DELETE FROM embeddings
-         WHERE unit_id IN (
-           SELECT id FROM history_items
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-           UNION
-           SELECT id FROM search_units
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-         )",
+         WHERE unit_id IN (SELECT id FROM temp_prune_unit_ids)",
         [],
     )?;
     conn.execute(
         "DELETE FROM event_embeddings
-         WHERE event_id IN (
-           SELECT id FROM events
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-         )",
+         WHERE event_id IN (SELECT id FROM temp_prune_event_ids)",
         [],
     )?;
     conn.execute(
@@ -2265,10 +2268,7 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
     conn.execute(
         "DELETE FROM recent_result_refs
          WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-            OR event_id IN (
-              SELECT id FROM events
-              WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-            )",
+            OR event_id IN (SELECT id FROM temp_prune_event_ids)",
         [],
     )?;
     conn.execute(
@@ -2283,7 +2283,7 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "DELETE FROM events
-         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
+         WHERE id IN (SELECT id FROM temp_prune_event_ids)",
         [],
     )?;
     conn.execute(
@@ -2349,12 +2349,7 @@ fn collect_text_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
 }
 
 fn count_prune_events(conn: &Connection) -> Result<u64> {
-    count_prune_sql(
-        conn,
-        "SELECT COUNT(*)
-         FROM events
-         WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
-    )
+    count_prune_sql(conn, "SELECT COUNT(*) FROM temp_prune_event_ids")
 }
 
 fn count_prune_history_items(conn: &Connection) -> Result<u64> {
@@ -2380,13 +2375,7 @@ fn count_prune_embeddings(conn: &Connection) -> Result<u64> {
         conn,
         "SELECT COUNT(*)
          FROM embeddings
-         WHERE unit_id IN (
-           SELECT id FROM history_items
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-           UNION
-           SELECT id FROM search_units
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-         )",
+         WHERE unit_id IN (SELECT id FROM temp_prune_unit_ids)",
     )
 }
 
@@ -2395,10 +2384,7 @@ fn count_prune_event_embeddings(conn: &Connection) -> Result<u64> {
         conn,
         "SELECT COUNT(*)
          FROM event_embeddings
-         WHERE event_id IN (
-           SELECT id FROM events
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-         )",
+         WHERE event_id IN (SELECT id FROM temp_prune_event_ids)",
     )
 }
 
@@ -2408,13 +2394,7 @@ fn count_prune_vector_rows(conn: &Connection) -> Result<u64> {
         "SELECT COUNT(*)
          FROM vec_embeddings_384 v
          JOIN embeddings e ON e.rowid = v.rowid
-         WHERE e.unit_id IN (
-           SELECT id FROM history_items
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-           UNION
-           SELECT id FROM search_units
-           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-         )",
+         JOIN temp_prune_unit_ids scope ON scope.id = e.unit_id",
     )
 }
 
@@ -2424,10 +2404,7 @@ fn count_prune_recent_refs(conn: &Connection) -> Result<u64> {
         "SELECT COUNT(*)
          FROM recent_result_refs
          WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-            OR event_id IN (
-              SELECT id FROM events
-              WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
-            )",
+            OR event_id IN (SELECT id FROM temp_prune_event_ids)",
     )
 }
 
@@ -2887,6 +2864,8 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
         | "temp_delta_search_unit_ids"
         | "temp_history_item_event_ids"
         | "temp_prune_session_ids"
+        | "temp_prune_event_ids"
+        | "temp_prune_unit_ids"
         | "temp_prune_raw_hashes"
         | "temp_prune_source_ids" => {}
         _ => bail!("unsupported temporary id scope table: {table}"),
@@ -2971,6 +2950,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_sessions_hash
           ON sessions(hash);
 
+        CREATE INDEX IF NOT EXISTS idx_sessions_source
+          ON sessions(source_id);
+
         CREATE INDEX IF NOT EXISTS idx_sessions_workspace_path
           ON sessions(json_extract(metadata_json, '$.workspace_path'));
 
@@ -3001,6 +2983,9 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_events_hash
           ON events(hash);
+
+        CREATE INDEX IF NOT EXISTS idx_events_source
+          ON events(source_id);
 
         CREATE INDEX IF NOT EXISTS idx_events_raw_artifact_hash
           ON events(raw_artifact_hash);
@@ -3099,6 +3084,9 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_search_units_session
           ON search_units(session_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_units_source
+          ON search_units(source_id);
 
         CREATE INDEX IF NOT EXISTS idx_search_units_text_hash
           ON search_units(text_hash);
