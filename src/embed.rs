@@ -92,6 +92,7 @@ pub struct EmbedderStatus {
     pub provider: String,
     pub model_id: Option<String>,
     pub dims: Option<usize>,
+    pub intra_threads: Option<usize>,
     pub semantic: bool,
     pub available: bool,
     pub degraded_reason: Option<String>,
@@ -134,6 +135,7 @@ impl EmbedderConfig {
                 provider: "fastembed".to_string(),
                 model_id: Some(self.semantic_model.model_id().to_string()),
                 dims: Some(DEFAULT_SEMANTIC_DIMS),
+                intra_threads: Some(self.intra_threads),
                 semantic: cfg!(feature = "semantic-fastembed"),
                 available: cfg!(feature = "semantic-fastembed"),
                 degraded_reason: fastembed_unavailable_reason(),
@@ -142,6 +144,7 @@ impl EmbedderConfig {
                 provider: "hash".to_string(),
                 model_id: Some(HashEmbedder::MODEL_ID.to_string()),
                 dims: Some(HashEmbedder::DIMS),
+                intra_threads: None,
                 semantic: false,
                 available: true,
                 degraded_reason: Some("hash fallback is lexical overlap, not semantic".to_string()),
@@ -150,6 +153,7 @@ impl EmbedderConfig {
                 provider: "disabled".to_string(),
                 model_id: None,
                 dims: None,
+                intra_threads: None,
                 semantic: false,
                 available: false,
                 degraded_reason: Some("query embedder disabled".to_string()),
@@ -169,10 +173,29 @@ impl EmbedderConfig {
 }
 
 fn default_intra_threads() -> usize {
-    std::thread::available_parallelism()
+    let logical_cpus = std::thread::available_parallelism()
         .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 2)
+        .unwrap_or(1);
+    default_intra_threads_for(logical_cpus, crate::memory::sample_memory())
+}
+
+fn default_intra_threads_for(
+    logical_cpus: usize,
+    memory: Option<crate::memory::MemorySample>,
+) -> usize {
+    let logical_cpus = logical_cpus.max(1);
+    let half_logical = (logical_cpus / 2).max(1);
+    let leave_one_free = logical_cpus.saturating_sub(1).max(1);
+    let cpu_cap = half_logical.min(leave_one_free);
+    cpu_cap.min(memory_thread_cap(memory)).max(1)
+}
+
+fn memory_thread_cap(memory: Option<crate::memory::MemorySample>) -> usize {
+    const BYTES_PER_THREAD: u64 = 2 * 1024 * 1024 * 1024;
+    memory
+        .and_then(|sample| sample.available_bytes.or(sample.total_bytes))
+        .map(|bytes| ((bytes / BYTES_PER_THREAD) as usize).max(1))
+        .unwrap_or(usize::MAX)
 }
 
 #[cfg(feature = "semantic-fastembed")]
@@ -319,6 +342,7 @@ fn normalize(vector: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MemorySample;
 
     #[test]
     fn hash_embedder_is_explicitly_not_semantic() {
@@ -339,6 +363,7 @@ mod tests {
         let status = config.status_without_loading();
         assert!(!status.available);
         assert!(!status.semantic);
+        assert_eq!(status.intra_threads, None);
         assert_eq!(
             status.degraded_reason.as_deref(),
             Some("query embedder disabled")
@@ -357,6 +382,33 @@ mod tests {
 
         assert_eq!(status.model_id.as_deref(), Some(DEFAULT_SEMANTIC_MODEL_ID));
         assert_eq!(status.dims, Some(DEFAULT_SEMANTIC_DIMS));
+        assert_eq!(status.intra_threads, Some(1));
+    }
+
+    #[test]
+    fn default_intra_threads_uses_half_logical_cpus_and_leaves_one_free() {
+        assert_eq!(default_intra_threads_for(1, None), 1);
+        assert_eq!(default_intra_threads_for(2, None), 1);
+        assert_eq!(default_intra_threads_for(4, None), 2);
+        assert_eq!(default_intra_threads_for(8, None), 4);
+        assert_eq!(default_intra_threads_for(12, None), 6);
+        assert_eq!(default_intra_threads_for(16, None), 8);
+    }
+
+    #[test]
+    fn default_intra_threads_reduces_for_low_available_memory() {
+        assert_eq!(
+            default_intra_threads_for(12, Some(memory_with_available_gib(20))),
+            6
+        );
+        assert_eq!(
+            default_intra_threads_for(16, Some(memory_with_available_gib(8))),
+            4
+        );
+        assert_eq!(
+            default_intra_threads_for(8, Some(memory_with_available_gib(3))),
+            1
+        );
     }
 
     #[test]
@@ -386,5 +438,14 @@ mod tests {
         let first = embedder.embed_one("offline convergence").expect("first");
         let second = embedder.embed_one("offline convergence").expect("second");
         assert_eq!(first, second);
+    }
+
+    fn memory_with_available_gib(gib: u64) -> MemorySample {
+        let bytes = gib * 1024 * 1024 * 1024;
+        MemorySample {
+            total_bytes: Some(bytes),
+            available_bytes: Some(bytes),
+            process_rss_bytes: None,
+        }
     }
 }
