@@ -90,6 +90,7 @@ struct SearchParams {
     before: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
+    show_duplicates: Option<bool>,
     format: Option<String>,
 }
 
@@ -112,6 +113,7 @@ struct ServerSearchOptions {
     before: Option<DateTime<Utc>>,
     machine: Option<String>,
     hostname: Option<String>,
+    show_duplicates: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +133,7 @@ struct ServerSearchResult {
     session_title: Option<String>,
     workspace_values: Vec<String>,
     snippet: String,
+    duplicate_group: Vec<search::DuplicateSearchMember>,
 }
 
 async fn search_endpoint(
@@ -147,11 +150,13 @@ async fn search_endpoint(
     let mode = parse_mode(params.mode.as_deref())?.unwrap_or(state.default_search_mode);
     let corpus = parse_corpus(params.corpus.as_deref())?;
     let recency_bias = params.recency_bias.unwrap_or(0.0);
+    let show_duplicates = params.show_duplicates.unwrap_or(false);
     let after = parse_rfc3339_opt(params.after.as_deref(), "after")?;
     let before = parse_rfc3339_opt(params.before.as_deref(), "before")?;
     let options = search::SearchOptions::new(limit, sort, recency_bias)
         .with_mode(mode)
         .with_corpus(corpus.clone())
+        .with_show_duplicates(show_duplicates)
         .with_time_window(after, before)
         .with_machine_filter(params.machine.clone(), params.hostname.clone());
     let response = search::search(
@@ -183,6 +188,7 @@ async fn search_endpoint(
             before,
             machine: params.machine,
             hostname: params.hostname,
+            show_duplicates,
         },
         degraded_reason: response.degraded_reason,
         results: response
@@ -235,6 +241,7 @@ impl From<search::SearchResult> for ServerSearchResult {
             session_title: result.session_title,
             workspace_values: result.workspace_values,
             snippet: result.snippet,
+            duplicate_group: result.duplicate_group,
         }
     }
 }
@@ -385,6 +392,7 @@ mod tests {
             session_title: Some("Planning Session".to_string()),
             workspace_values: vec!["/tmp/workspace".to_string()],
             snippet: "line one\nline two".to_string(),
+            duplicate_group: Vec::new(),
         };
 
         let row = server_fzf_row(&result, Some("ab3f"));

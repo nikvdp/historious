@@ -98,6 +98,12 @@ pub enum Command {
         raw: bool,
         #[arg(
             long,
+            alias = "no-collapse",
+            help = "Show duplicate/forked matches instead of collapsing them"
+        )]
+        show_duplicates: bool,
+        #[arg(
+            long,
             default_value_t = 0.0,
             help = "Favor newer results, from 0.0 to 1.0"
         )]
@@ -160,6 +166,12 @@ pub enum Command {
         include_tools: bool,
         #[arg(long, help = "Search raw event payload text only")]
         raw: bool,
+        #[arg(
+            long,
+            alias = "no-collapse",
+            help = "Show duplicate/forked matches instead of collapsing them"
+        )]
+        show_duplicates: bool,
         #[arg(
             long,
             default_value_t = 0.0,
@@ -605,6 +617,7 @@ enum Column {
     Item,
     Tier,
     Kind,
+    Similar,
 }
 
 impl Cli {
@@ -654,6 +667,7 @@ impl Cli {
                 corpus,
                 include_tools,
                 raw,
+                show_duplicates,
                 recency_bias,
                 after,
                 before,
@@ -689,6 +703,7 @@ impl Cli {
                 let options = search::SearchOptions::new(limit, sort.into(), recency_bias)
                     .with_mode(mode)
                     .with_corpus(corpus.clone())
+                    .with_show_duplicates(show_duplicates)
                     .with_time_window(after_bound, before_bound)
                     .with_machine_filter(machine.clone(), hostname.clone());
                 let response = search::search(
@@ -717,6 +732,7 @@ impl Cli {
                         mode,
                         recency_bias,
                         &corpus,
+                        show_duplicates,
                         after_bound,
                         before_bound,
                         machine.clone(),
@@ -758,6 +774,7 @@ impl Cli {
                 corpus,
                 include_tools,
                 raw,
+                show_duplicates,
                 recency_bias,
                 after,
                 before,
@@ -784,6 +801,7 @@ impl Cli {
                     sort,
                     mode,
                     corpus,
+                    show_duplicates,
                     recency_bias,
                     after_bound,
                     before_bound,
@@ -1368,6 +1386,7 @@ struct SearchOptionsOutput {
     before: Option<DateTime<Utc>>,
     machine: Option<String>,
     hostname: Option<String>,
+    show_duplicates: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1389,6 +1408,7 @@ struct SearchResultOutput {
     session_title: Option<String>,
     workspace_values: Vec<String>,
     snippet: String,
+    duplicate_group: Vec<search::DuplicateSearchMember>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2505,6 +2525,7 @@ fn search_output(
     mode: search::SearchMode,
     recency_bias: f64,
     corpus: &search::SearchCorpus,
+    show_duplicates: bool,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     machine: Option<String>,
@@ -2524,6 +2545,7 @@ fn search_output(
             before,
             machine,
             hostname,
+            show_duplicates,
         },
         degraded_reason: response.degraded_reason.clone(),
         results: response
@@ -2547,6 +2569,7 @@ fn search_output(
                 session_title: result.session_title.clone(),
                 workspace_values: result.workspace_values.clone(),
                 snippet: result.snippet.clone(),
+                duplicate_group: result.duplicate_group.clone(),
             })
             .collect(),
         next_commands: search_hints(&response.results, refs),
@@ -2655,6 +2678,7 @@ fn resolve_columns(
             Column::When,
             Column::Title,
             Column::Preview,
+            Column::Similar,
             Column::Machine,
             Column::Session,
             Column::Event,
@@ -2667,6 +2691,7 @@ fn resolve_columns(
             Column::Match,
             Column::When,
             Column::Preview,
+            Column::Similar,
         ]
     };
     for column in parse_columns_opt(include)? {
@@ -3006,6 +3031,7 @@ fn run_tui_search(
     sort: SearchSort,
     mode: search::SearchMode,
     corpus: search::SearchCorpus,
+    show_duplicates: bool,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -3022,6 +3048,7 @@ fn run_tui_search(
         sort,
         mode,
         &corpus,
+        show_duplicates,
         recency_bias,
         after,
         before,
@@ -3113,6 +3140,7 @@ fn tui_reload_command(
     sort: SearchSort,
     mode: search::SearchMode,
     corpus: &search::SearchCorpus,
+    show_duplicates: bool,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
@@ -3154,8 +3182,13 @@ fn tui_reload_command(
             )
         })
         .unwrap_or_default();
+    let duplicate_arg = if show_duplicates {
+        " --data-urlencode show_duplicates=true"
+    } else {
+        ""
+    };
     Ok(format!(
-        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}; fi",
+        "if [ -z {{q}} ]; then :; else curl -fsSG {search_url} --data-urlencode q={{q}} --data-urlencode limit={limit} --data-urlencode sort={} --data-urlencode mode={} --data-urlencode corpus={} --data-urlencode recency_bias={recency_bias} --data-urlencode format=fzf{after_arg}{before_arg}{machine_arg}{hostname_arg}{duplicate_arg}; fi",
         sort.as_str(),
         mode.as_str(),
         shell_quote(&corpus.as_csv())
@@ -3415,8 +3448,9 @@ fn parse_column(name: &str) -> Result<Column> {
         "item" | "history_item" | "history_item_id" => Ok(Column::Item),
         "tier" | "corpus" => Ok(Column::Tier),
         "kind" | "search_kind" => Ok(Column::Kind),
+        "similar" | "duplicates" | "duplicate_group" => Ok(Column::Similar),
         _ => bail!(
-            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,score,lex,sem,machine,event,session,item,tier,kind,ids"
+            "unknown column '{name}'. Available columns: ref,source,match,when,title,preview,similar,score,lex,sem,machine,event,session,item,tier,kind,ids"
         ),
     }
 }
@@ -3514,6 +3548,15 @@ fn cell_value(column: Column, result: &search::SearchResult, ref_id: Option<&str
             .unwrap_or_else(|| "-".to_string()),
         Column::Tier => result.tier.clone().unwrap_or_else(|| "-".to_string()),
         Column::Kind => result.kind.clone(),
+        Column::Similar => similar_cell(result.duplicate_group.len()),
+    }
+}
+
+fn similar_cell(count: usize) -> String {
+    if count == 0 {
+        "-".to_string()
+    } else {
+        format!("+{count} similar")
     }
 }
 
@@ -3551,6 +3594,7 @@ fn column_header(column: Column) -> &'static str {
         Column::Item => "Item",
         Column::Tier => "Tier",
         Column::Kind => "Kind",
+        Column::Similar => "Similar",
     }
 }
 
@@ -3735,12 +3779,19 @@ mod tests {
                 Column::Source,
                 Column::Match,
                 Column::Preview,
+                Column::Similar,
                 Column::Score,
                 Column::Session,
                 Column::Event,
                 Column::Item
             ]
         );
+    }
+
+    #[test]
+    fn similar_cell_marks_collapsed_duplicate_count() {
+        assert_eq!(similar_cell(0), "-");
+        assert_eq!(similar_cell(3), "+3 similar");
     }
 
     #[test]
@@ -3827,6 +3878,7 @@ mod tests {
             session_title: Some("Planning Session".to_string()),
             workspace_values: vec!["/home/example/projects/super-cass".to_string()],
             snippet: "preview with\nnew line".to_string(),
+            duplicate_group: Vec::new(),
         };
 
         let row = fzf_row(&result, Some("ab3f"), false);
@@ -3887,6 +3939,23 @@ mod tests {
             session_title: Some("Session title".to_string()),
             workspace_values: vec!["/tmp/workspace".to_string()],
             snippet: "useful snippet".to_string(),
+            duplicate_group: vec![search::DuplicateSearchMember {
+                history_item_id: Some("hi_2".to_string()),
+                match_type: search::MatchType::Lexical,
+                event_id: "event_2".to_string(),
+                session_id: "session_2".to_string(),
+                machine_id: "machine_devbox_123".to_string(),
+                source_kind: "codex".to_string(),
+                tier: Some("conversation".to_string()),
+                kind: "user".to_string(),
+                score: 0.25,
+                lexical_rank: Some(3),
+                semantic_rank: None,
+                occurred_at: None,
+                session_title: Some("Forked session".to_string()),
+                workspace_values: vec!["/tmp/workspace".to_string()],
+                snippet: "useful snippet".to_string(),
+            }],
         };
         let response = search::SearchResponse {
             degraded_reason: None,
@@ -3900,6 +3969,7 @@ mod tests {
             search::SearchMode::Semantic,
             0.25,
             &search::SearchCorpus::conversation_with_tools(),
+            false,
             None,
             None,
             Some("machine_devbox_123".to_string()),
@@ -3914,6 +3984,7 @@ mod tests {
         assert_eq!(value["options"]["sort"], "relevance");
         assert_eq!(value["options"]["mode"], "semantic");
         assert_eq!(value["options"]["corpus"], "conversation,tool");
+        assert_eq!(value["options"]["show_duplicates"], false);
         assert_eq!(value["options"]["after"], serde_json::Value::Null);
         assert_eq!(value["options"]["before"], serde_json::Value::Null);
         assert_eq!(value["options"]["machine"], "machine_devbox_123");
@@ -3924,6 +3995,14 @@ mod tests {
         assert_eq!(value["results"][0]["machine_id"], "machine_devbox_123");
         assert_eq!(value["results"][0]["tier"], "conversation");
         assert_eq!(value["results"][0]["kind"], "user");
+        assert_eq!(
+            value["results"][0]["duplicate_group"][0]["event_id"],
+            "event_2"
+        );
+        assert_eq!(
+            value["results"][0]["duplicate_group"][0]["history_item_id"],
+            "hi_2"
+        );
         assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
         assert_eq!(
             value["next_commands"][1],
@@ -4073,6 +4152,7 @@ mod tests {
             SearchSort::Newest,
             search::SearchMode::Lexical,
             &search::SearchCorpus::conversation_with_tools(),
+            true,
             0.25,
             Some(after),
             None,
@@ -4089,6 +4169,7 @@ mod tests {
         assert!(command.contains("after=2026-04-20T00:00:00+00:00"));
         assert!(command.contains("machine=machine_devbox_123"));
         assert!(command.contains("hostname=devbox"));
+        assert!(command.contains("show_duplicates=true"));
     }
 
     #[test]
