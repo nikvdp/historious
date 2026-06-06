@@ -1959,6 +1959,8 @@ impl ProgressPhase {
                         .ok()
                         .map(|detail| detail.clone())
                         .unwrap_or_default();
+                    let detail =
+                        fit_progress_detail(&label_for_thread, &detail, terminal_columns());
                     let suffix = if detail.is_empty() {
                         String::new()
                     } else {
@@ -2053,6 +2055,80 @@ impl Drop for ProgressPhase {
             }
         }
     }
+}
+
+fn fit_progress_detail(label: &str, detail: &str, columns: usize) -> String {
+    if detail.is_empty() {
+        return String::new();
+    }
+
+    let frame_width = 1usize;
+    let separators_width = 1usize + 3usize + 1usize;
+    let trailing_space_width = 1usize;
+    let base_width = frame_width + separators_width + label.chars().count() + trailing_space_width;
+    let budget = columns.saturating_sub(base_width).saturating_sub(1);
+    ellipsize_middle(detail, budget)
+}
+
+fn ellipsize_middle(value: &str, max_chars: usize) -> String {
+    let total = value.chars().count();
+    if total <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let keep = max_chars - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let start = value.chars().take(left).collect::<String>();
+    let end = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
+fn terminal_columns() -> usize {
+    terminal_columns_from_stderr()
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .filter(|columns| *columns > 0)
+        .unwrap_or(80)
+}
+
+#[cfg(unix)]
+fn terminal_columns_from_stderr() -> Option<usize> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(std::io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_col > 0 {
+        Some(size.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_columns_from_stderr() -> Option<usize> {
+    None
 }
 
 fn format_elapsed(duration: Duration) -> String {
@@ -3472,6 +3548,17 @@ mod tests {
             detail,
             "deferred: memory pressure: only 0.6 GiB appears available; 42 pending, 16 new embeddings"
         );
+    }
+
+    #[test]
+    fn progress_detail_is_capped_to_available_terminal_columns() {
+        let detail = "codex 1,677/1,893 file 1,980/2,196 /home/example/.codex/sessions/rollout-2026-01-21T17-51-26-019be02e-4296-7b30-8260-9a97f387618f.jsonl; 44,364 new";
+        let fitted = fit_progress_detail("Scanning local agent logs", detail, 80);
+
+        assert!(fitted.chars().count() <= 47);
+        assert!(fitted.starts_with("codex 1,677"));
+        assert!(fitted.contains("..."));
+        assert!(fitted.ends_with("364 new"));
     }
 
     #[test]
