@@ -720,7 +720,16 @@ impl Cli {
         }
 
         let config = AppConfig::load(self.data_dir)?;
-        let store = Store::open(&config.data_dir)?;
+        let human_update = matches!(&command, Command::Update { json: false, .. }) && !robot;
+        let store = if human_update {
+            let progress = ProgressUi::new();
+            let opening = progress.phase("Opening history database");
+            let store = Store::open(&config.data_dir)?;
+            opening.finish("ready".to_string());
+            store
+        } else {
+            Store::open(&config.data_dir)?
+        };
         match command {
             Command::Update {
                 max_files,
