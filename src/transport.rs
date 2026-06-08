@@ -695,7 +695,7 @@ mod tests {
                 ArchiveRecord::Session(fixture_session(
                     "session_selected",
                     "source_selected",
-                    "/tmp/super-cass/repo",
+                    "/tmp/historious/repo",
                 )),
                 ArchiveRecord::Event(fixture_event(
                     "event_selected",
@@ -713,7 +713,7 @@ mod tests {
             .expect("import records");
 
         let filter = ArchiveExportFilter {
-            workspaces: vec!["/tmp/super-cass".to_string()],
+            workspaces: vec!["/tmp/historious".to_string()],
             ..ArchiveExportFilter::default()
         };
         let mut body = Vec::new();
@@ -815,7 +815,7 @@ mod tests {
                 ArchiveRecord::Session(fixture_session(
                     "session_raw",
                     "source_raw",
-                    "/tmp/super-cass/repo",
+                    "/tmp/historious/repo",
                 )),
                 ArchiveRecord::Event(fixture_event(
                     "event_raw",
@@ -970,7 +970,7 @@ mod tests {
         let store = Store::open(dir.path()).expect("open store");
         let unit = fixture_search_unit_384();
         let embedding = fixture_embedding_384(&unit);
-        let session = fixture_session("session_sync", "source_sync", "/tmp/super-cass/repo");
+        let session = fixture_session("session_sync", "source_sync", "/tmp/historious/repo");
         store
             .import_records(&[
                 ArchiveRecord::Source(fixture_source("source_sync")),
@@ -980,7 +980,7 @@ mod tests {
             ])
             .expect("import records");
         let filter = ArchiveExportFilter {
-            workspaces: vec!["/tmp/super-cass/repo".to_string()],
+            workspaces: vec!["/tmp/historious/repo".to_string()],
             ..ArchiveExportFilter::default()
         };
 

@@ -1,7 +1,11 @@
 [package]
-name = "super-cass"
+name = "historious"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "histo"
+path = "src/main.rs"
 
 [features]
 default = ["semantic-fastembed"]

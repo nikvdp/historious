@@ -66,7 +66,7 @@ fn load_file_config(data_dir: &PathBuf) -> Result<FileConfig> {
 }
 
 fn default_data_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "example", "super-cass")
+    let dirs = ProjectDirs::from("com", "example", "historious")
         .context("could not resolve platform data directory")?;
     Ok(dirs.data_dir().to_path_buf())
 }

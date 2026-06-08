@@ -100,7 +100,7 @@ pub struct EmbedderStatus {
 
 impl EmbedderConfig {
     pub fn from_env(data_dir: &Path) -> Self {
-        let provider = match std::env::var("SUPER_CASS_EMBEDDER")
+        let provider = match std::env::var("HISTO_EMBEDDER")
             .unwrap_or_else(|_| "fastembed".to_string())
             .to_ascii_lowercase()
             .as_str()
@@ -109,14 +109,14 @@ impl EmbedderConfig {
             "hash" | "hash-fallback" => EmbedderProvider::HashFallback,
             _ => EmbedderProvider::FastEmbed,
         };
-        let model_cache = std::env::var_os("SUPER_CASS_MODEL_CACHE")
+        let model_cache = std::env::var_os("HISTO_MODEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("models").join("fastembed"));
-        let semantic_model = std::env::var("SUPER_CASS_FASTEMBED_MODEL")
+        let semantic_model = std::env::var("HISTO_FASTEMBED_MODEL")
             .ok()
             .and_then(|value| FastEmbedModel::from_name(&value))
             .unwrap_or(DEFAULT_FASTEMBED_MODEL);
-        let intra_threads = std::env::var("SUPER_CASS_EMBEDDER_THREADS")
+        let intra_threads = std::env::var("HISTO_EMBEDDER_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
