@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate search speed and ordering against the local real corpus.
 
-This is intentionally local-only. It uses the operator's configured super-cass
+This is intentionally local-only. It uses the operator's configured Historious
 data directory and should be run before closing search/indexing work.
 """
 
@@ -41,8 +41,8 @@ def env_float(name: str, default: float) -> float:
 
 
 def default_bin() -> Path:
-    release = ROOT / "target" / "release" / "super-cass"
-    debug = ROOT / "target" / "debug" / "super-cass"
+    release = ROOT / "target" / "release" / "histo"
+    debug = ROOT / "target" / "debug" / "histo"
     if release.exists() and os.access(release, os.X_OK):
         return release
     if debug.exists() and os.access(debug, os.X_OK):
@@ -176,7 +176,7 @@ def urlopen_text(url: str, timeout_seconds: float) -> str:
 def start_server(binary: Path, port: int, startup_timeout_seconds: float) -> StartedServer:
     bind = f"127.0.0.1:{port}"
     log_file = tempfile.NamedTemporaryFile(
-        prefix="super-cass-live-search-guardrail.",
+        prefix="histo-live-search-guardrail.",
         suffix=".log",
         delete=False,
     )
@@ -240,23 +240,23 @@ def main() -> int:
     )
     parser.add_argument(
         "--bin",
-        default=os.environ.get("SUPER_CASS_BIN", str(default_bin())),
-        help="super-cass binary to test; defaults to target/release then target/debug",
+        default=os.environ.get("HISTO_BIN", str(default_bin())),
+        help="histo binary to test; defaults to target/release then target/debug",
     )
     parser.add_argument(
         "--primary-query",
-        default=os.environ.get("SUPER_CASS_GUARDRAIL_PRIMARY_QUERY", DEFAULT_PRIMARY_QUERY),
+        default=os.environ.get("HISTO_GUARDRAIL_PRIMARY_QUERY", DEFAULT_PRIMARY_QUERY),
         help="exact/anchor query used for lexical and hybrid ordering checks",
     )
     parser.add_argument(
         "--semantic-query",
-        default=os.environ.get("SUPER_CASS_GUARDRAIL_SEMANTIC_QUERY", DEFAULT_SEMANTIC_QUERY),
+        default=os.environ.get("HISTO_GUARDRAIL_SEMANTIC_QUERY", DEFAULT_SEMANTIC_QUERY),
         help="synonym/concept query used to confirm semantic search still adds value",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("SUPER_CASS_GUARDRAIL_PORT", "7396")),
+        default=int(os.environ.get("HISTO_GUARDRAIL_PORT", "7396")),
         help="local server port for warmed HTTP/fzf validation",
     )
     parser.add_argument(
@@ -269,19 +269,19 @@ def main() -> int:
     binary = Path(args.bin)
     if not binary.exists() or not os.access(binary, os.X_OK):
         print(
-            f"super-cass binary not found or not executable: {binary}\n"
-            "Run cargo build --release or set SUPER_CASS_BIN.",
+            f"histo binary not found or not executable: {binary}\n"
+            "Run cargo build --release or set HISTO_BIN.",
             file=sys.stderr,
         )
         return 2
 
     thresholds = {
-        "cli_lexical": env_float("SUPER_CASS_GUARDRAIL_CLI_LEXICAL_MS", 1500.0),
-        "cli_semantic": env_float("SUPER_CASS_GUARDRAIL_CLI_SEMANTIC_MS", 5000.0),
-        "cli_hybrid": env_float("SUPER_CASS_GUARDRAIL_CLI_HYBRID_MS", 5000.0),
-        "semantic_query": env_float("SUPER_CASS_GUARDRAIL_SEMANTIC_QUERY_MS", 5000.0),
-        "server_fzf": env_float("SUPER_CASS_GUARDRAIL_SERVER_FZF_MS", 2000.0),
-        "server_startup": env_float("SUPER_CASS_GUARDRAIL_SERVER_STARTUP_MS", 30000.0),
+        "cli_lexical": env_float("HISTO_GUARDRAIL_CLI_LEXICAL_MS", 1500.0),
+        "cli_semantic": env_float("HISTO_GUARDRAIL_CLI_SEMANTIC_MS", 5000.0),
+        "cli_hybrid": env_float("HISTO_GUARDRAIL_CLI_HYBRID_MS", 5000.0),
+        "semantic_query": env_float("HISTO_GUARDRAIL_SEMANTIC_QUERY_MS", 5000.0),
+        "server_fzf": env_float("HISTO_GUARDRAIL_SERVER_FZF_MS", 2000.0),
+        "server_startup": env_float("HISTO_GUARDRAIL_SERVER_STARTUP_MS", 30000.0),
     }
     command_timeout = max(thresholds["cli_semantic"], thresholds["cli_hybrid"], 5000.0) / 1000.0
     command_timeout += 10.0
