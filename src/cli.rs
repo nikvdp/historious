@@ -816,7 +816,7 @@ impl Cli {
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let color = !no_color;
                     let rows = fzf_rows_output(&response.results, &refs, color);
-                    run_static_fzf_search(&config, &query, &rows, color)?;
+                    run_static_fzf_search(&store, &config, &query, &rows, color)?;
                 } else if json || robot {
                     let refs =
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
@@ -892,6 +892,7 @@ impl Cli {
                     .unwrap_or(config.default_search_mode);
                 let corpus = resolve_search_corpus(corpus, include_tools, raw)?;
                 run_tui_search(
+                    &store,
                     &config,
                     query.as_deref().unwrap_or_default(),
                     &server,
@@ -3619,19 +3620,25 @@ fn local_naive_to_utc(value: NaiveDateTime) -> Result<DateTime<Utc>> {
     }
 }
 
-fn run_static_fzf_search(config: &AppConfig, query: &str, rows: &str, color: bool) -> Result<()> {
+fn run_static_fzf_search(
+    store: &Store,
+    config: &AppConfig,
+    query: &str,
+    rows: &str,
+    color: bool,
+) -> Result<()> {
     ensure_fzf_available()?;
     let preview = fzf_preview_command(config, color);
-    let open = fzf_open_command(config, color);
+    let copy = fzf_copy_session_command();
     let mut child = base_fzf_command()
         .arg("--query")
         .arg(query)
         .arg("--header")
-        .arg("Ref\tSource\tMatch\tWhen\tPreview")
+        .arg(fzf_header())
         .arg("--preview")
         .arg(preview)
         .arg("--bind")
-        .arg(format!("enter:execute({open})+abort"))
+        .arg(format!("ctrl-y:execute-silent[{copy}]"))
         .arg("--bind")
         .arg(preview_scroll_bind("shift-up", "preview-up", 10))
         .arg("--bind")
@@ -3641,19 +3648,20 @@ fn run_static_fzf_search(config: &AppConfig, query: &str, rows: &str, color: boo
         .arg("--bind")
         .arg("ctrl-d:preview-half-page-down")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(rows.as_bytes())?;
     }
-    let status = child.wait()?;
-    if !status.success() {
-        return Ok(());
+    let output = child.wait_with_output()?;
+    if let Some(selection) = fzf_selection_from_output(&output)? {
+        handle_fzf_selection(store, selection, color)?;
     }
     Ok(())
 }
 
 fn run_tui_search(
+    store: &Store,
     config: &AppConfig,
     query: &str,
     server: &str,
@@ -3688,12 +3696,12 @@ fn run_tui_search(
         hostname.as_deref(),
     )?;
     let preview = fzf_preview_command(config, color);
-    let open = fzf_open_command(config, color);
-    let mut child = base_fzf_command()
+    let copy = fzf_copy_session_command();
+    let child = base_fzf_command()
         .arg("--query")
         .arg(query)
         .arg("--header")
-        .arg("Ref\tSource\tMatch\tWhen\tPreview")
+        .arg(fzf_header())
         .arg("--preview")
         .arg(preview)
         .arg("--bind")
@@ -3703,7 +3711,7 @@ fn run_tui_search(
             "change:reload(sleep {LIVE_SEARCH_RELOAD_DELAY_SECS}; {reload})"
         ))
         .arg("--bind")
-        .arg(format!("enter:execute({open})+abort"))
+        .arg(format!("ctrl-y:execute-silent[{copy}]"))
         .arg("--bind")
         .arg(preview_scroll_bind("shift-up", "preview-up", 10))
         .arg("--bind")
@@ -3713,11 +3721,11 @@ fn run_tui_search(
         .arg("--bind")
         .arg("ctrl-d:preview-half-page-down")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Ok(());
+    let output = child.wait_with_output()?;
+    if let Some(selection) = fzf_selection_from_output(&output)? {
+        handle_fzf_selection(store, selection, color)?;
     }
     Ok(())
 }
@@ -3727,6 +3735,8 @@ fn base_fzf_command() -> ProcessCommand {
     command
         .arg("--ansi")
         .arg("--no-hscroll")
+        .arg("--prompt")
+        .arg("Search> ")
         .arg("--delimiter")
         .arg("\t")
         .arg("--nth")
@@ -3734,6 +3744,132 @@ fn base_fzf_command() -> ProcessCommand {
         .arg("--with-nth")
         .arg("1,2,3,4,5");
     command
+}
+
+fn fzf_header() -> &'static str {
+    "Enter: open transcript | Ctrl-Y: copy session id\nRef\tSource\tMatch\tWhen\tPreview"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FzfSelection {
+    row: FzfSelectedRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FzfSelectedRow {
+    session_id: String,
+    event_id: String,
+    full: bool,
+}
+
+fn fzf_selection_from_output(output: &std::process::Output) -> Result<Option<FzfSelection>> {
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_fzf_selection_output(&stdout)
+}
+
+fn parse_fzf_selection_output(output: &str) -> Result<Option<FzfSelection>> {
+    let mut lines = output.lines();
+    let Some(first) = lines.next() else {
+        return Ok(None);
+    };
+    let row = match first {
+        "enter" | "" => lines.next(),
+        row => Some(row),
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(FzfSelection {
+        row: parse_fzf_selected_row(row)?,
+    }))
+}
+
+fn parse_fzf_selected_row(row: &str) -> Result<FzfSelectedRow> {
+    let fields = row.split('\t').collect::<Vec<_>>();
+    let session_id = fields
+        .get(5)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("fzf selection is missing a session id"))?;
+    let event_id = fields
+        .get(6)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("fzf selection is missing an event id"))?;
+    Ok(FzfSelectedRow {
+        session_id: (*session_id).to_string(),
+        event_id: (*event_id).to_string(),
+        full: fields
+            .get(11)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+    })
+}
+
+fn handle_fzf_selection(store: &Store, selection: FzfSelection, color: bool) -> Result<()> {
+    open_fzf_selection_in_pager(store, &selection.row, color)?;
+    print_fzf_selection_details(store, &selection.row)?;
+    Ok(())
+}
+
+fn open_fzf_selection_in_pager(store: &Store, row: &FzfSelectedRow, color: bool) -> Result<()> {
+    let session = store
+        .session_by_id(&row.session_id)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", row.session_id))?;
+    let target_event = store
+        .event_by_id(&row.event_id)?
+        .ok_or_else(|| anyhow::anyhow!("event not found: {}", row.event_id))?;
+    if target_event.session_id != session.id {
+        bail!(
+            "event {} belongs to session {}, not {}",
+            row.event_id,
+            target_event.session_id,
+            session.id
+        );
+    }
+    let metadata = view_metadata_for_session(store, &session, Some(&target_event), false)?;
+    if row.full {
+        let events = store.events_for_session(&session.id)?;
+        let rendered = crate::transcript::render_session(
+            &session,
+            &events,
+            Some(&row.event_id),
+            &metadata,
+            color,
+        );
+        page_or_print(&rendered, Some(&row.event_id), false)?;
+    } else {
+        let context = store
+            .history_items_around_event(&row.event_id, usize::MAX / 4, usize::MAX / 4)?
+            .ok_or_else(|| anyhow::anyhow!("event not found: {}", row.event_id))?;
+        let rendered = crate::transcript::render_history_session(&context, &metadata, color);
+        page_or_print(&rendered, Some(&row.event_id), false)?;
+    }
+    Ok(())
+}
+
+fn print_fzf_selection_details(store: &Store, row: &FzfSelectedRow) -> Result<()> {
+    let source_path =
+        fzf_selection_source_path(store, &row.session_id)?.unwrap_or_else(|| "-".to_string());
+    write_stdout(&format!(
+        "session_id: {}\nsource_path: {}\n",
+        row.session_id, source_path
+    ))
+}
+
+fn fzf_selection_source_path(store: &Store, session_id: &str) -> Result<Option<String>> {
+    let Some(session) = store.session_by_id(session_id)? else {
+        return Ok(None);
+    };
+    Ok(store
+        .source_by_id(&session.source_id)?
+        .and_then(|source| source.path)
+        .filter(|path| !path.trim().is_empty()))
+}
+
+fn fzf_copy_session_command() -> &'static str {
+    "value={6}; (command -v pbcopy >/dev/null 2>&1 && printf %s \"$value\" | pbcopy) || (command -v wl-copy >/dev/null 2>&1 && printf %s \"$value\" | wl-copy) || (command -v xclip >/dev/null 2>&1 && printf %s \"$value\" | xclip -selection clipboard) || (command -v xsel >/dev/null 2>&1 && printf %s \"$value\" | xsel --clipboard --input) || (command -v clip.exe >/dev/null 2>&1 && printf %s \"$value\" | clip.exe) || true"
 }
 
 fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
@@ -3750,23 +3886,6 @@ fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
     };
     format!(
         "mode={{12}}; if [ -n \"$mode\" ]; then {exe} --data-dir {data_dir} show {{7}} \"$mode\" --before 3 --after 5{color_flag}; else {exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}; fi"
-    )
-}
-
-fn fzf_open_command(config: &AppConfig, color: bool) -> String {
-    let current_exe = std::env::current_exe().ok();
-    let exe = current_exe
-        .as_ref()
-        .map(|path| shell_quote(&path.to_string_lossy()))
-        .unwrap_or_else(|| "super-cass".to_string());
-    let data_dir = shell_quote(&config.data_dir.to_string_lossy());
-    let color_flag = if color {
-        " --color auto"
-    } else {
-        " --no-color"
-    };
-    format!(
-        "mode={{12}}; if [ -n \"$mode\" ]; then {exe} --data-dir {data_dir} transcript {{6}} --at {{7}} \"$mode\"{color_flag}; else {exe} --data-dir {data_dir} transcript {{6}} --at {{7}}{color_flag}; fi"
     )
 }
 
@@ -4575,6 +4694,62 @@ mod tests {
     }
 
     #[test]
+    fn fzf_selection_output_parses_enter_selected_rows() {
+        let row = [
+            "ab3f",
+            "codex",
+            "hybrid",
+            "-",
+            "preview",
+            "session_1",
+            "event_1",
+            "",
+            "/tmp/workspace",
+            "machine_1",
+            "hi_1",
+            "--full",
+        ]
+        .join("\t");
+
+        let enter = parse_fzf_selection_output(&format!("{row}\n"))
+            .expect("parse enter")
+            .expect("selection");
+        assert_eq!(enter.row.session_id, "session_1");
+        assert_eq!(enter.row.event_id, "event_1");
+        assert!(enter.row.full);
+
+        let explicit_enter = parse_fzf_selection_output(&format!("\n{row}\n"))
+            .expect("parse explicit enter")
+            .expect("selection");
+        assert_eq!(explicit_enter.row.session_id, "session_1");
+
+        assert!(parse_fzf_selection_output("")
+            .expect("missing row")
+            .is_none());
+    }
+
+    #[test]
+    fn fzf_copy_session_command_checks_common_clipboards() {
+        let command = fzf_copy_session_command();
+
+        assert!(command.contains("value={6}"));
+        assert!(command.contains("pbcopy"));
+        assert!(command.contains("wl-copy"));
+        assert!(command.contains("xclip -selection clipboard"));
+        assert!(command.contains("xsel --clipboard --input"));
+        assert!(command.contains("clip.exe"));
+    }
+
+    #[test]
+    fn fzf_selection_source_path_uses_session_source_record() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+
+        let path = fzf_selection_source_path(&store, "session_view").expect("source path");
+
+        assert_eq!(path.as_deref(), Some("/tmp/source.jsonl"));
+    }
+
+    #[test]
     fn fzf_filters_visible_and_hidden_metadata_fields() {
         let command = base_fzf_command();
         let args = command
@@ -4589,6 +4764,7 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--with-nth", "1,2,3,4,5"]));
         assert!(args.iter().any(|arg| arg == "--no-hscroll"));
+        assert!(args.windows(2).any(|pair| pair == ["--prompt", "Search> "]));
     }
 
     #[test]
@@ -4785,14 +4961,10 @@ mod tests {
 
         let with_color = fzf_preview_command(&config, true);
         let without_color = fzf_preview_command(&config, false);
-        let open = fzf_open_command(&config, true);
 
         assert!(with_color.contains("mode={12}; if [ -n \"$mode\" ]"));
         assert!(with_color.contains("show {7} \"$mode\""));
         assert!(with_color.contains("show {7} --before 3 --after 5"));
-        assert!(open.contains("mode={12}; if [ -n \"$mode\" ]"));
-        assert!(open.contains("transcript {6} --at {7} \"$mode\""));
-        assert!(open.contains("transcript {6} --at {7} --color auto"));
         assert!(with_color.contains("--color always"));
         assert!(!with_color.contains("--no-color"));
         assert!(without_color.contains("--no-color"));
