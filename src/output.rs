@@ -139,7 +139,7 @@ mod tests {
             "search",
             json!({"results": []}),
             EnvelopeOptions {
-                hints: vec!["super-cass show <ref> --json".to_string()],
+                hints: vec!["histo show <ref> --json".to_string()],
                 degraded_reason: Some("none".to_string()),
                 ..EnvelopeOptions::default()
             },
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(value["command"], "search");
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["data"]["results"], json!([]));
-        assert_eq!(value["hints"][0], "super-cass show <ref> --json");
+        assert_eq!(value["hints"][0], "histo show <ref> --json");
         assert_eq!(value["degraded_reason"], "none");
         assert_eq!(value["metadata"]["version"], env!("CARGO_PKG_VERSION"));
     }
@@ -162,7 +162,7 @@ mod tests {
             "show",
             &err,
             Some("not_found".to_string()),
-            Some("Run `super-cass search <query> --json` first.".to_string()),
+            Some("Run `histo search <query> --json` first.".to_string()),
             None,
         );
         let value = serde_json::to_value(envelope).expect("serialize");
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(value["error"]["kind"], "not_found");
         assert_eq!(
             value["error"]["hint"],
-            "Run `super-cass search <query> --json` first."
+            "Run `histo search <query> --json` first."
         );
     }
 }

@@ -336,7 +336,7 @@ impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-        let db_path = data_dir.join("super-cass.db");
+        let db_path = data_dir.join("historious.db");
         let blob_dir = data_dir.join("blobs");
         std::fs::create_dir_all(&blob_dir)
             .with_context(|| format!("creating blob dir {}", blob_dir.display()))?;
@@ -818,7 +818,7 @@ impl Store {
     pub fn vacuum(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch("VACUUM")
-                .context("compacting super-cass SQLite database")?;
+                .context("compacting Historious SQLite database")?;
             Ok(())
         })
     }
