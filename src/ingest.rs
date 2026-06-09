@@ -1,6 +1,7 @@
 use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
+use crate::config::SourceConfigs;
 use crate::source::{SourceAdapter, SourceAdapterRegistry, SourceCandidate, SourceSyncContext};
 use crate::storage::{ImportDelta, ImportStats, Store};
 use anyhow::{Context, Result};
@@ -29,6 +30,7 @@ pub struct UpdateStats {
 pub struct UpdateOptions {
     pub max_files: Option<usize>,
     pub source: Option<String>,
+    pub sources: SourceConfigs,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +133,7 @@ pub fn update_local_with_progress_and_cancel(
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
-    let registry = built_in_source_adapters()?;
+    let registry = built_in_source_adapters(&options)?;
     for adapter in registry.iter() {
         if should_cancel() {
             return Ok(stats);
@@ -394,10 +396,17 @@ fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &str) -> us
     }
 }
 
-fn built_in_source_adapters() -> Result<SourceAdapterRegistry> {
-    SourceAdapterRegistry::new().register(LocalTranscriptAdapter {
+fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegistry> {
+    let registry = SourceAdapterRegistry::new().register(LocalTranscriptAdapter {
         native_titles: NativeTitleIndex::load(),
-    })
+    })?;
+    if let Some(adapter) = crate::treechat::TreechatAdapter::from_config(
+        &options.sources.treechat,
+        options.source.as_deref(),
+    )? {
+        return registry.register(adapter);
+    }
+    Ok(registry)
 }
 
 struct LocalTranscriptAdapter {

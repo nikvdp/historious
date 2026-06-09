@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub machine_id: String,
     pub embedder: EmbedderConfig,
     pub default_search_mode: SearchMode,
+    pub sources: SourceConfigs,
 }
 
 impl AppConfig {
@@ -28,6 +29,7 @@ impl AppConfig {
             machine_id,
             embedder,
             default_search_mode: file_config.search.default_mode,
+            sources: file_config.sources,
         })
     }
 }
@@ -38,6 +40,8 @@ struct FileConfig {
     search: SearchConfig,
     #[serde(default)]
     embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    sources: SourceConfigs,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +72,26 @@ impl Default for EmbeddingsConfig {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourceConfigs {
+    #[serde(default)]
+    pub treechat: TreechatSourceConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TreechatSourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub profile: Option<String>,
+    pub backend_url: Option<String>,
+    pub app_host: Option<String>,
+    pub access_token: Option<String>,
+    pub client: Option<String>,
+    pub uid: Option<String>,
+    pub page_limit: Option<usize>,
+    pub thread_limit: Option<usize>,
 }
 
 pub fn resolve_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -124,6 +148,7 @@ fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
         return Ok(FileConfig {
             search: SearchConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            sources: SourceConfigs::default(),
         });
     }
     let text = std::fs::read_to_string(&path)

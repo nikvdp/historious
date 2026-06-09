@@ -1489,6 +1489,7 @@ impl Cli {
                     &store,
                     &config.machine_id,
                     config.embedder.clone(),
+                    config.sources.clone(),
                     interval_secs,
                     max_files,
                     source,
@@ -1525,6 +1526,7 @@ impl Cli {
                         &store,
                         &config.machine_id,
                         config.embedder.clone(),
+                        config.sources.clone(),
                         interval_secs,
                         max_files,
                         source,
@@ -1998,7 +2000,11 @@ fn run_update_once_machine(
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
-        ingest::UpdateOptions { max_files, source },
+        ingest::UpdateOptions {
+            max_files,
+            source,
+            sources: config.sources.clone(),
+        },
         |event| {
             write_update_progress(
                 "scan",
@@ -2102,7 +2108,11 @@ fn run_update_once_human(
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
-        ingest::UpdateOptions { max_files, source },
+        ingest::UpdateOptions {
+            max_files,
+            source,
+            sources: config.sources.clone(),
+        },
         |event| scan.update(update_progress_detail(event)),
     )?;
     scan.finish(format!(
@@ -5484,6 +5494,7 @@ async fn run_daemon(
     store: &Store,
     machine_id: &str,
     embedder_config: crate::embed::EmbedderConfig,
+    source_configs: crate::config::SourceConfigs,
     interval_secs: u64,
     max_files: Option<usize>,
     source: Option<String>,
@@ -5498,6 +5509,7 @@ async fn run_daemon(
             ingest::UpdateOptions {
                 max_files,
                 source: source.clone(),
+                sources: source_configs.clone(),
             },
             |event| scan.update(update_progress_detail(event)),
         )?;

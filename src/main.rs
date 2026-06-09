@@ -12,6 +12,7 @@ mod source;
 mod storage;
 mod transcript;
 mod transport;
+mod treechat;
 
 use anyhow::Result;
 use clap::Parser;
