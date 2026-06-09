@@ -123,11 +123,13 @@ mod tests {
 
     #[test]
     fn registry_rejects_duplicate_adapter_kinds() {
-        let err = SourceAdapterRegistry::new()
+        let registry = SourceAdapterRegistry::new()
             .register(FakeAdapter { kind: "fake" })
-            .expect("register fake")
-            .register(FakeAdapter { kind: "fake" })
-            .expect_err("duplicate adapter kind should fail");
+            .expect("register fake");
+        let err = match registry.register(FakeAdapter { kind: "fake" }) {
+            Ok(_) => panic!("duplicate adapter kind should fail"),
+            Err(err) => err,
+        };
 
         assert!(err.to_string().contains("already registered"));
     }

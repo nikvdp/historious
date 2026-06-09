@@ -1974,15 +1974,23 @@ mod tests {
         push_found_source_file(&mut summaries, "hermes");
         push_found_source_file(&mut summaries, "codex");
         let candidates = vec![
-            UpdateCandidate {
+            SourceCandidate {
+                adapter_kind: "agent_logs",
                 modified: 3,
-                kind: "codex",
-                path: PathBuf::from("codex-1.jsonl"),
+                kind: "codex".to_string(),
+                identity: "codex-1.jsonl".to_string(),
+                path: Some(PathBuf::from("codex-1.jsonl")),
+                size: None,
+                mtime_ms: None,
             },
-            UpdateCandidate {
+            SourceCandidate {
+                adapter_kind: "agent_logs",
                 modified: 2,
-                kind: "hermes",
-                path: PathBuf::from("hermes-1.json"),
+                kind: "hermes".to_string(),
+                identity: "hermes-1.json".to_string(),
+                path: Some(PathBuf::from("hermes-1.json")),
+                size: None,
+                mtime_ms: None,
             },
         ];
 
