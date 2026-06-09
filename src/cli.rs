@@ -2982,12 +2982,7 @@ fn threads_output(
         },
         next_commands: results
             .first()
-            .map(|thread| {
-                vec![format!(
-                    "histo transcript {} --json",
-                    thread.session_id
-                )]
-            })
+            .map(|thread| vec![format!("histo transcript {} --json", thread.session_id)])
             .unwrap_or_else(|| vec!["histo update --json".to_string()]),
         results,
     }
