@@ -25,6 +25,16 @@ pub struct Store {
     blob_dir: PathBuf,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SourceCheckpoint {
+    pub source_kind: String,
+    pub source_identity: String,
+    pub cursor: Option<String>,
+    pub metadata: Value,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportStats {
     pub inserted: usize,
@@ -450,6 +460,54 @@ impl Store {
                 hash: crate::archive::stable_hash(&(id, kind, identity, path))?,
             };
             insert_source(conn, &source)?;
+            Ok(())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn source_checkpoint(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+    ) -> Result<Option<SourceCheckpoint>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT source_kind, source_identity, cursor, metadata_json, updated_at
+                 FROM source_checkpoints
+                 WHERE source_kind = ?1 AND source_identity = ?2",
+                params![source_kind, source_identity],
+                row_source_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_source_checkpoint(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+        cursor: Option<&str>,
+        metadata: &Value,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO source_checkpoints
+                 (source_kind, source_identity, cursor, metadata_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_kind, source_identity) DO UPDATE SET
+                   cursor = excluded.cursor,
+                   metadata_json = excluded.metadata_json,
+                   updated_at = excluded.updated_at",
+                params![
+                    source_kind,
+                    source_identity,
+                    cursor,
+                    metadata.to_string(),
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
             Ok(())
         })
     }
@@ -3410,6 +3468,18 @@ fn migrate(conn: &Connection) -> Result<()> {
           updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS source_checkpoints (
+          source_kind TEXT NOT NULL,
+          source_identity TEXT NOT NULL,
+          cursor TEXT,
+          metadata_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source_kind, source_identity)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_checkpoints_kind_updated
+          ON source_checkpoints(source_kind, updated_at);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
           event_id UNINDEXED,
           session_id UNINDEXED,
@@ -4487,6 +4557,18 @@ fn row_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRecord> {
         first_seen_at: parse_dt(row.get::<_, String>(4)?),
         updated_at: parse_dt(row.get::<_, String>(5)?),
         hash: row.get(6)?,
+    })
+}
+
+#[allow(dead_code)]
+fn row_source_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceCheckpoint> {
+    let metadata_json: String = row.get(3)?;
+    Ok(SourceCheckpoint {
+        source_kind: row.get(0)?,
+        source_identity: row.get(1)?,
+        cursor: row.get(2)?,
+        metadata: serde_json::from_str(&metadata_json).unwrap_or(Value::Null),
+        updated_at: parse_dt(row.get(4)?),
     })
 }
 

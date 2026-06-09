@@ -1,6 +1,7 @@
 use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
+use crate::source::{SourceAdapter, SourceAdapterRegistry, SourceCandidate, SourceSyncContext};
 use crate::storage::{ImportDelta, ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -71,13 +72,6 @@ struct SourceRoot {
 }
 
 #[derive(Debug, Clone)]
-struct UpdateCandidate {
-    modified: i128,
-    kind: &'static str,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 struct ParsedLine {
     ordinal: i64,
     value: Value,
@@ -137,55 +131,32 @@ pub fn update_local_with_progress_and_cancel(
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
-    for root in discover_roots() {
+    let registry = built_in_source_adapters()?;
+    for adapter in registry.iter() {
         if should_cancel() {
             return Ok(stats);
         }
-        if options
-            .source
-            .as_deref()
-            .is_some_and(|source| source != root.kind)
-        {
-            continue;
-        }
-        if !root.path.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(&root.path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !is_hidden_noise(entry.path()))
-        {
-            if should_cancel() {
-                return Ok(stats);
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    tracing::debug!(
-                        "skipping unreadable entry under {}: {err}",
-                        root.path.display()
-                    );
-                    stats.errors += 1;
-                    continue;
+        match adapter.discover() {
+            Ok(discovered) => {
+                for candidate in discovered {
+                    if should_cancel() {
+                        return Ok(stats);
+                    }
+                    if options
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source != candidate.kind && source != adapter.kind())
+                    {
+                        continue;
+                    }
+                    push_found_source_file(&mut source_summaries, &candidate.kind);
+                    candidates.push(candidate);
                 }
-            };
-            if !entry.file_type().is_file() || !has_extension(entry.path(), root.extensions) {
-                continue;
             }
-            let modified = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as i128)
-                .unwrap_or(0);
-            push_found_source_file(&mut source_summaries, root.kind);
-            candidates.push(UpdateCandidate {
-                modified,
-                kind: root.kind,
-                path: entry.path().to_path_buf(),
-            });
+            Err(err) => {
+                tracing::debug!("failed to discover {} sources: {err:#}", adapter.kind());
+                stats.errors += 1;
+            }
         }
     }
     candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
@@ -209,14 +180,15 @@ pub fn update_local_with_progress_and_cancel(
     refresh_existing_native_titles(store, &native_titles)?;
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
+    let context = SourceSyncContext { store, machine_id };
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
         }
-        let kind = candidate.kind;
-        let path = candidate.path;
+        let kind = candidate.kind.clone();
+        let path = candidate.progress_path();
         stats.files_seen += 1;
-        let source_file_index = increment_source_seen(&mut source_seen, kind);
+        let source_file_index = increment_source_seen(&mut source_seen, &kind);
         let source_file_count = source_summaries
             .iter()
             .find(|source| source.kind == kind)
@@ -234,28 +206,27 @@ pub fn update_local_with_progress_and_cancel(
         if should_cancel() {
             return Ok(stats);
         }
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                tracing::debug!("failed to read metadata for {}: {err}", path.display());
-                stats.errors += 1;
-                progress(&UpdateProgress::CompletedFile {
-                    kind: kind.to_string(),
-                    path,
-                    file_index: idx + 1,
-                    total_files,
-                    source_file_index,
-                    source_file_count,
-                    stats: stats.clone(),
-                });
-                continue;
-            }
+        let Some(adapter) = registry
+            .iter()
+            .find(|adapter| adapter.kind() == candidate.adapter_kind)
+        else {
+            tracing::debug!(
+                "source adapter {} disappeared during update",
+                candidate.adapter_kind
+            );
+            stats.errors += 1;
+            progress(&UpdateProgress::CompletedFile {
+                kind: kind.to_string(),
+                path,
+                file_index: idx + 1,
+                total_files,
+                source_file_index,
+                source_file_count,
+                stats: stats.clone(),
+            });
+            continue;
         };
-        let size = metadata.len();
-        let mtime_ms = file_mtime_ms(&metadata);
-        let path_text = path.to_string_lossy().to_string();
-        let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
-        if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
+        if adapter.is_current(&context, &candidate)? {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
                 kind: kind.to_string(),
@@ -268,7 +239,7 @@ pub fn update_local_with_progress_and_cancel(
             });
             continue;
         }
-        match ingest_file(store, machine_id, kind, &path, &native_titles) {
+        match adapter.import(&context, &candidate) {
             Ok(delta) => {
                 stats.inserted += delta.inserted;
                 stats.duplicates += delta.duplicates;
@@ -375,17 +346,17 @@ pub fn update_source_path_with_progress_and_cancel(
 
 #[derive(Debug, Clone)]
 struct MutableSourceSummary {
-    kind: &'static str,
+    kind: String,
     found_files: usize,
     selected_files: usize,
 }
 
-fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &'static str) {
+fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &str) {
     if let Some(summary) = summaries.iter_mut().find(|summary| summary.kind == kind) {
         summary.found_files += 1;
     } else {
         summaries.push(MutableSourceSummary {
-            kind,
+            kind: kind.to_string(),
             found_files: 1,
             selected_files: 0,
         });
@@ -394,7 +365,7 @@ fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &'sta
 
 fn mark_selected_source_files(
     summaries: &mut [MutableSourceSummary],
-    candidates: &[UpdateCandidate],
+    candidates: &[SourceCandidate],
 ) {
     for summary in summaries.iter_mut() {
         summary.selected_files = 0;
@@ -409,17 +380,119 @@ fn mark_selected_source_files(
     }
 }
 
-fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &'static str) -> usize {
+fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &str) -> usize {
     if let Some(summary) = seen.iter_mut().find(|summary| summary.kind == kind) {
         summary.found_files += 1;
         summary.found_files
     } else {
         seen.push(MutableSourceSummary {
-            kind,
+            kind: kind.to_string(),
             found_files: 1,
             selected_files: 0,
         });
         1
+    }
+}
+
+fn built_in_source_adapters() -> Result<SourceAdapterRegistry> {
+    SourceAdapterRegistry::new().register(LocalTranscriptAdapter {
+        native_titles: NativeTitleIndex::load(),
+    })
+}
+
+struct LocalTranscriptAdapter {
+    native_titles: NativeTitleIndex,
+}
+
+impl SourceAdapter for LocalTranscriptAdapter {
+    fn kind(&self) -> &'static str {
+        "agent_logs"
+    }
+
+    fn discover(&self) -> Result<Vec<SourceCandidate>> {
+        let mut candidates = Vec::new();
+        for root in discover_roots() {
+            if !root.path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root.path)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| !is_hidden_noise(entry.path()))
+            {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::debug!(
+                            "skipping unreadable entry under {}: {err}",
+                            root.path.display()
+                        );
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file() || !has_extension(entry.path(), root.extensions) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to read metadata for {}: {err}",
+                            entry.path().display()
+                        );
+                        continue;
+                    }
+                };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as i128)
+                    .unwrap_or(0);
+                let path = entry.path().to_path_buf();
+                candidates.push(SourceCandidate {
+                    adapter_kind: self.kind(),
+                    kind: root.kind.to_string(),
+                    identity: path.to_string_lossy().to_string(),
+                    path: Some(path),
+                    modified,
+                    size: Some(metadata.len()),
+                    mtime_ms: file_mtime_ms(&metadata),
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn is_current(
+        &self,
+        context: &SourceSyncContext<'_>,
+        candidate: &SourceCandidate,
+    ) -> Result<bool> {
+        let size = candidate.size.unwrap_or(0);
+        let status =
+            context
+                .store
+                .source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
+        Ok(candidate.kind != "opencode" && status.raw_current && !status.needs_workspace_refresh)
+    }
+
+    fn import(
+        &self,
+        context: &SourceSyncContext<'_>,
+        candidate: &SourceCandidate,
+    ) -> Result<ImportStats> {
+        let path = candidate
+            .path
+            .as_deref()
+            .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+        ingest_file(
+            context.store,
+            context.machine_id,
+            &candidate.kind,
+            path,
+            &self.native_titles,
+        )
     }
 }
 
