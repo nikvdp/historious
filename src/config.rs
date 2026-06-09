@@ -92,6 +92,7 @@ pub struct TreechatSourceConfig {
     pub uid: Option<String>,
     pub page_limit: Option<usize>,
     pub thread_limit: Option<usize>,
+    pub content_scope: Option<String>,
 }
 
 pub fn resolve_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {

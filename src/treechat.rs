@@ -15,6 +15,7 @@ use std::time::Duration;
 
 const TREECHAT_SOURCE_KIND: &str = "treechat";
 const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_SEARCH_PART_CHARS: usize = 24_000;
 
 pub struct TreechatAdapter {
     config: ResolvedTreechatConfig,
@@ -214,7 +215,7 @@ impl SourceAdapter for TreechatAdapter {
                     "quest_url": quest.quest_url,
                     "path": quest.path,
                     "is_clip": quest.is_clip,
-                    "search_content_scope": "treechat_text_with_url_metadata"
+                    "search_content_scope": self.config.content_scope.as_str()
                 }),
                 hash: stable_hash(&(
                     TREECHAT_SOURCE_KIND,
@@ -225,64 +226,79 @@ impl SourceAdapter for TreechatAdapter {
             }),
         ];
 
-        for (ordinal, answer) in answers.iter().enumerate() {
-            let Some(search_text) = treechat_answer_search_text(answer) else {
-                continue;
-            };
+        let mut ordinal = 0i64;
+        for answer in &answers {
             let answer_id = answer.id.as_deref().unwrap_or("unknown");
-            let event_id = stable_id(&[
-                "event",
-                TREECHAT_SOURCE_KIND,
-                &session_id,
-                &ordinal.to_string(),
-                answer_id,
-            ]);
             let role = if answer.is_system.unwrap_or(false) {
                 "system"
             } else {
                 "user"
             };
-            records.push(ArchiveRecord::Event(EventRecord {
-                id: event_id,
-                session_id: session_id.clone(),
-                source_id: source_id.clone(),
-                machine_id: context.machine_id.to_string(),
-                source_kind: TREECHAT_SOURCE_KIND.to_string(),
-                ordinal: ordinal as i64,
-                event_type: "treechat_answer".to_string(),
-                role: Some(role.to_string()),
-                content: search_text.clone(),
-                raw_artifact_hash: Some(raw_hash.clone()),
-                occurred_at: answer.created_time(),
-                metadata: json!({
-                    "raw_artifact_hash": raw_hash,
-                    "capture_fidelity": "treechat_api_thread",
-                    "parser": "treechat_api_v1",
-                    "treechat_quest_id": quest.id,
-                    "treechat_answer_id": answer.id,
-                    "treechat_answer_path": answer.path,
-                    "treechat_user_id": answer.user_id,
-                    "treechat_user_name": answer.user.as_ref().and_then(|user| user.name.clone()),
-                    "treechat_message_type": answer.message_type,
-                    "treechat_is_clip": answer.is_clip,
-                    "treechat_url": answer.url.as_ref().map(|url| json!({
-                        "address": url.address,
-                        "title": url.title,
-                    })),
-                    "search_indexable": role == "user",
-                    "search_kind": role,
-                    "search_text": search_text,
-                    "search_content_scope": "treechat_text_with_url_metadata",
-                    "search_skip_reason": null
-                }),
-                hash: stable_hash(&(
-                    TREECHAT_SOURCE_KIND,
-                    &quest.id,
-                    answer_id,
-                    &answer.updated_at,
-                    &search_text,
-                ))?,
-            }));
+            for part in treechat_answer_search_parts(answer, self.config.content_scope) {
+                let chunks = chunk_search_text(&part.text);
+                let chunk_count = chunks.len();
+                for (chunk_index, search_text) in chunks.into_iter().enumerate() {
+                    let event_id = stable_id(&[
+                        "event",
+                        TREECHAT_SOURCE_KIND,
+                        &session_id,
+                        &ordinal.to_string(),
+                        answer_id,
+                        part.provenance,
+                        &chunk_index.to_string(),
+                    ]);
+                    records.push(ArchiveRecord::Event(EventRecord {
+                        id: event_id,
+                        session_id: session_id.clone(),
+                        source_id: source_id.clone(),
+                        machine_id: context.machine_id.to_string(),
+                        source_kind: TREECHAT_SOURCE_KIND.to_string(),
+                        ordinal,
+                        event_type: part.event_type.to_string(),
+                        role: Some(role.to_string()),
+                        content: search_text.clone(),
+                        raw_artifact_hash: Some(raw_hash.clone()),
+                        occurred_at: answer.created_time(),
+                        metadata: json!({
+                            "raw_artifact_hash": raw_hash,
+                            "capture_fidelity": "treechat_api_thread",
+                            "parser": "treechat_api_v1",
+                            "treechat_quest_id": quest.id,
+                            "treechat_answer_id": answer.id,
+                            "treechat_answer_path": answer.path,
+                            "treechat_user_id": answer.user_id,
+                            "treechat_user_name": answer.user.as_ref().and_then(|user| user.name.clone()),
+                            "treechat_message_type": answer.message_type,
+                            "treechat_is_clip": answer.is_clip,
+                            "treechat_url": answer.url.as_ref().map(|url| json!({
+                                "id": url.id,
+                                "address": url.address,
+                                "title": url.title,
+                                "full_text_attachment_id": url.full_text_attachment_id,
+                            })),
+                            "treechat_url_hash": answer.url_address().map(|address| blake3_hex(address.as_bytes())),
+                            "search_indexable": role == "user",
+                            "search_kind": role,
+                            "search_text": search_text,
+                            "search_content_scope": self.config.content_scope.as_str(),
+                            "search_provenance": part.provenance,
+                            "search_chunk_index": chunk_index,
+                            "search_chunk_count": chunk_count,
+                            "search_skip_reason": null
+                        }),
+                        hash: stable_hash(&(
+                            TREECHAT_SOURCE_KIND,
+                            &quest.id,
+                            answer_id,
+                            part.provenance,
+                            chunk_index,
+                            &answer.updated_at,
+                            &search_text,
+                        ))?,
+                    }));
+                    ordinal += 1;
+                }
+            }
         }
 
         let stats = context.store.import_records(&records)?;
@@ -313,6 +329,7 @@ struct ResolvedTreechatConfig {
     uid: String,
     page_limit: Option<usize>,
     thread_limit: Option<usize>,
+    content_scope: TreechatContentScope,
 }
 
 impl ResolvedTreechatConfig {
@@ -345,6 +362,7 @@ impl ResolvedTreechatConfig {
         resolved.app_host = resolved.app_host.as_deref().map(normalize_base_url);
         resolved.page_limit = config.page_limit;
         resolved.thread_limit = config.thread_limit;
+        resolved.content_scope = TreechatContentScope::parse(config.content_scope.as_deref())?;
         Ok(resolved)
     }
 
@@ -499,6 +517,12 @@ struct TreechatAnswer {
     user: Option<TreechatUser>,
     #[serde(default)]
     url: Option<TreechatUrl>,
+    #[serde(default)]
+    url_title: Option<String>,
+    #[serde(default)]
+    url_address: Option<String>,
+    #[serde(default)]
+    url_full_text: Option<String>,
 }
 
 impl TreechatAnswer {
@@ -508,6 +532,24 @@ impl TreechatAnswer {
 
     fn updated_time(&self) -> Option<DateTime<Utc>> {
         parse_treechat_time(self.updated_at.as_deref())
+    }
+
+    fn url_title(&self) -> Option<&str> {
+        self.url_title
+            .as_deref()
+            .or_else(|| self.url.as_ref().and_then(|url| url.title.as_deref()))
+    }
+
+    fn url_address(&self) -> Option<&str> {
+        self.url_address
+            .as_deref()
+            .or_else(|| self.url.as_ref().and_then(|url| url.address.as_deref()))
+    }
+
+    fn url_full_text(&self) -> Option<&str> {
+        self.url_full_text
+            .as_deref()
+            .or_else(|| self.url.as_ref().and_then(|url| url.full_text.as_deref()))
     }
 }
 
@@ -520,9 +562,53 @@ struct TreechatUser {
 #[derive(Debug, Clone, Deserialize)]
 struct TreechatUrl {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     address: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    full_text: Option<String>,
+    #[serde(default)]
+    full_text_attachment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TreechatContentScope {
+    TextOnly,
+    UrlMetadata,
+    FullText,
+}
+
+impl TreechatContentScope {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("full_text")
+        {
+            "text" | "text_only" | "treechat_text" => Ok(Self::TextOnly),
+            "url" | "url_metadata" | "metadata" => Ok(Self::UrlMetadata),
+            "full" | "full_text" | "linked_full_text" => Ok(Self::FullText),
+            other => bail!(
+                "unknown Treechat content_scope '{other}'; use text_only, url_metadata, or full_text"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TextOnly => "text_only",
+            Self::UrlMetadata => "url_metadata",
+            Self::FullText => "full_text",
+        }
+    }
+}
+
+struct SearchPart {
+    provenance: &'static str,
+    event_type: &'static str,
+    text: String,
 }
 
 fn built_in_profile(profile: &str) -> ResolvedTreechatConfig {
@@ -546,6 +632,7 @@ fn built_in_profile(profile: &str) -> ResolvedTreechatConfig {
         uid: String::new(),
         page_limit: None,
         thread_limit: None,
+        content_scope: TreechatContentScope::FullText,
     }
 }
 
@@ -559,29 +646,75 @@ fn treechat_thread_title(quest: &TreechatQuest, answers: &[TreechatAnswer]) -> O
         .map(|text| truncate_title(&text))
 }
 
-fn treechat_answer_search_text(answer: &TreechatAnswer) -> Option<String> {
+fn treechat_answer_search_parts(
+    answer: &TreechatAnswer,
+    scope: TreechatContentScope,
+) -> Vec<SearchPart> {
     let mut parts = Vec::new();
-    if let Some(text) = clean_text(
+    if let Some(text) = treechat_answer_text(answer) {
+        parts.push(SearchPart {
+            provenance: "treechat_text",
+            event_type: "treechat_answer",
+            text,
+        });
+    }
+    if matches!(
+        scope,
+        TreechatContentScope::UrlMetadata | TreechatContentScope::FullText
+    ) {
+        if let Some(text) = treechat_url_metadata_text(answer) {
+            parts.push(SearchPart {
+                provenance: "url_metadata",
+                event_type: "treechat_url_metadata",
+                text,
+            });
+        }
+    }
+    if matches!(scope, TreechatContentScope::FullText) {
+        if let Some(text) = clean_text(answer.url_full_text()) {
+            parts.push(SearchPart {
+                provenance: "url_full_text",
+                event_type: "treechat_url_full_text",
+                text,
+            });
+        }
+    }
+    parts
+}
+
+fn treechat_answer_text(answer: &TreechatAnswer) -> Option<String> {
+    clean_text(
         answer
             .display_content
             .as_deref()
             .or(answer.content.as_deref()),
-    ) {
-        parts.push(text);
+    )
+}
+
+fn treechat_url_metadata_text(answer: &TreechatAnswer) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(title) = clean_text(answer.url_title()) {
+        parts.push(title);
     }
-    if let Some(url) = &answer.url {
-        if let Some(title) = clean_text(url.title.as_deref()) {
-            parts.push(title);
-        }
-        if let Some(address) = clean_text(url.address.as_deref()) {
-            parts.push(address);
-        }
+    if let Some(address) = clean_text(answer.url_address()) {
+        parts.push(address);
     }
     if parts.is_empty() {
         None
     } else {
         Some(parts.join("\n"))
     }
+}
+
+fn chunk_search_text(text: &str) -> Vec<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= MAX_SEARCH_PART_CHARS {
+        return vec![text.to_string()];
+    }
+    chars
+        .chunks(MAX_SEARCH_PART_CHARS)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
 }
 
 fn clean_text(value: Option<&str>) -> Option<String> {
@@ -650,7 +783,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn answer_search_text_includes_message_and_url_metadata() {
+    fn answer_search_parts_follow_configured_content_scope() {
         let answer = TreechatAnswer {
             id: Some("answer".to_string()),
             user_id: None,
@@ -664,15 +797,32 @@ mod tests {
             is_system: None,
             user: None,
             url: Some(TreechatUrl {
+                id: Some("url".to_string()),
                 address: Some("https://example.com/article".to_string()),
                 title: Some("Example Article".to_string()),
+                full_text: Some("Long page text".to_string()),
+                full_text_attachment_id: Some("attachment".to_string()),
             }),
+            url_title: None,
+            url_address: None,
+            url_full_text: None,
         };
 
-        let text = treechat_answer_search_text(&answer).expect("search text");
+        let text_only = treechat_answer_search_parts(&answer, TreechatContentScope::TextOnly);
+        let full_text = treechat_answer_search_parts(&answer, TreechatContentScope::FullText);
+        let joined = full_text
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(text.contains("saved this"));
-        assert!(text.contains("Example Article"));
-        assert!(text.contains("https://example.com/article"));
+        assert_eq!(text_only.len(), 1);
+        assert!(joined.contains("saved this"));
+        assert!(joined.contains("Example Article"));
+        assert!(joined.contains("https://example.com/article"));
+        assert!(joined.contains("Long page text"));
+        assert!(full_text
+            .iter()
+            .any(|part| part.provenance == "url_full_text"));
     }
 }
