@@ -10,6 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
@@ -22,6 +23,7 @@ const DEFAULT_THREAD_LIMIT: usize = 10;
 const DEFAULT_FZF_LIMIT: usize = 25;
 const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
+const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
 
 #[derive(Debug, Parser)]
@@ -162,18 +164,13 @@ pub enum Command {
         )]
         limit: usize,
         #[arg(
-            long,
-            conflicts_with = "remote",
-            help = "Base URL for the local search server; tui starts it when needed"
+            long = "server-url",
+            alias = "server",
+            alias = "remote",
+            value_name = "URL",
+            help = "HTTP server URL for TUI requests, such as http://127.0.0.1:7391"
         )]
-        server: Option<String>,
-        #[arg(
-            long,
-            conflicts_with = "server",
-            value_name = "BASE_URL",
-            help = "Use a remote Historious server for TUI search requests"
-        )]
-        remote: Option<String>,
+        server_url: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
@@ -512,8 +509,17 @@ pub enum Command {
     },
     /// Serve already-indexed local history over HTTP.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7391", help = "Address to listen on")]
+        #[arg(
+            long,
+            default_value = DEFAULT_SERVER_BIND,
+            help = "Address to listen on; non-loopback addresses require --allow-network-bind"
+        )]
         bind: String,
+        #[arg(
+            long,
+            help = "Allow serving unauthenticated HTTP on a non-loopback address"
+        )]
+        allow_network_bind: bool,
         #[arg(
             long,
             help = "Also keep local history up to date by scanning periodically"
@@ -871,8 +877,7 @@ impl Cli {
             Command::Tui {
                 query,
                 limit,
-                server,
-                remote,
+                server_url,
                 sort,
                 mode,
                 corpus,
@@ -899,7 +904,7 @@ impl Cli {
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
                 let corpus = resolve_search_corpus(corpus, include_tools, raw)?;
-                let backend = resolve_tui_backend(server, remote)?;
+                let backend = resolve_tui_backend(server_url)?;
                 run_tui_search(
                     &store,
                     &config,
@@ -1364,12 +1369,13 @@ impl Cli {
             }
             Command::Serve {
                 bind,
+                allow_network_bind,
                 watch,
                 interval_secs,
                 max_files,
                 source,
             } => {
-                let addr = bind.parse()?;
+                let addr = parse_server_bind_addr(&bind, allow_network_bind)?;
                 if watch {
                     let server_store = store.clone();
                     let server_machine_id = config.machine_id.clone();
@@ -3838,7 +3844,7 @@ fn handle_tui_fzf_selection(
 ) -> Result<()> {
     match backend {
         TuiBackend::LocalAuto { .. } => handle_local_fzf_selection(store, selection, color),
-        TuiBackend::Remote { base_url } => {
+        TuiBackend::ServerUrl { base_url } => {
             open_remote_fzf_selection_in_pager(base_url, &selection.row, color)?;
             print_remote_fzf_selection_details(&selection.row)
         }
@@ -3974,7 +3980,7 @@ fn local_fzf_preview_command(config: &AppConfig, color: bool) -> String {
 fn tui_preview_command(config: &AppConfig, backend: &TuiBackend, color: bool) -> Result<String> {
     match backend {
         TuiBackend::LocalAuto { .. } => Ok(local_fzf_preview_command(config, color)),
-        TuiBackend::Remote { base_url } => remote_fzf_preview_command(base_url, color),
+        TuiBackend::ServerUrl { base_url } => remote_fzf_preview_command(base_url, color),
     }
 }
 
@@ -4089,24 +4095,23 @@ impl Drop for StartedServer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TuiBackend {
     LocalAuto { base_url: String },
-    Remote { base_url: String },
+    ServerUrl { base_url: String },
 }
 
 impl TuiBackend {
     fn base_url(&self) -> String {
         match self {
-            Self::LocalAuto { base_url } | Self::Remote { base_url } => base_url.clone(),
+            Self::LocalAuto { base_url } | Self::ServerUrl { base_url } => base_url.clone(),
         }
     }
 }
 
-fn resolve_tui_backend(server: Option<String>, remote: Option<String>) -> Result<TuiBackend> {
-    if let Some(remote) = remote {
-        let base_url = normalize_non_empty_server_url(&remote, "remote")?;
-        return Ok(TuiBackend::Remote { base_url });
+fn resolve_tui_backend(server_url: Option<String>) -> Result<TuiBackend> {
+    if let Some(server_url) = server_url {
+        let base_url = normalize_non_empty_server_url(&server_url, "server URL")?;
+        return Ok(TuiBackend::ServerUrl { base_url });
     }
-    let base_url =
-        normalize_non_empty_server_url(server.as_deref().unwrap_or(DEFAULT_SERVER_URL), "server")?;
+    let base_url = normalize_non_empty_server_url(DEFAULT_SERVER_URL, "server URL")?;
     Ok(TuiBackend::LocalAuto { base_url })
 }
 
@@ -4124,12 +4129,14 @@ fn ensure_tui_backend_available(
 ) -> Result<Option<StartedServer>> {
     match backend {
         TuiBackend::LocalAuto { base_url } => ensure_server_available(config, base_url),
-        TuiBackend::Remote { base_url } => {
+        TuiBackend::ServerUrl { base_url } => {
             if server_health_available(base_url)? {
                 Ok(None)
             } else {
                 let health_url = server_url(base_url, "health")?;
-                bail!("could not reach remote Historious server at {health_url}");
+                bail!(
+                    "could not reach Historious server at {health_url}. Start one with `histo serve` or check the URL."
+                );
             }
         }
     }
@@ -4189,6 +4196,16 @@ fn wait_for_started_server(server: &str, started: &mut StartedServer) -> Result<
     }
     let health_url = server_url(server, "health")?;
     bail!("local Historious server did not become ready at {health_url}")
+}
+
+fn parse_server_bind_addr(bind: &str, allow_network_bind: bool) -> Result<SocketAddr> {
+    let addr: SocketAddr = bind.parse()?;
+    if !allow_network_bind && !addr.ip().is_loopback() {
+        bail!(
+            "refusing to bind unauthenticated Historious HTTP server to {addr}. Use `--allow-network-bind` only on a trusted network."
+        );
+    }
+    Ok(addr)
 }
 
 fn server_url(server: &str, path: &str) -> Result<String> {
@@ -5029,81 +5046,75 @@ mod tests {
             Command::Tui {
                 query,
                 limit,
-                server,
-                remote,
+                server_url,
                 ..
             } => {
                 assert_eq!(query, None);
                 assert_eq!(limit, DEFAULT_LIVE_SEARCH_LIMIT);
-                assert_eq!(server, None);
-                assert_eq!(remote, None);
+                assert_eq!(server_url, None);
             }
             _ => panic!("expected tui command"),
         }
     }
 
     #[test]
-    fn tui_accepts_explicit_remote_backend() {
+    fn tui_accepts_explicit_server_url_backend() {
         let cli = Cli::try_parse_from([
             "histo",
             "tui",
-            "--remote",
+            "--server-url",
             "http://example.com:7391/",
             "query",
         ])
-        .expect("parse remote tui search");
+        .expect("parse server-url tui search");
 
         match cli.command {
             Command::Tui {
-                query,
-                server,
-                remote,
-                ..
+                query, server_url, ..
             } => {
                 assert_eq!(query.as_deref(), Some("query"));
-                assert_eq!(server, None);
-                assert_eq!(remote.as_deref(), Some("http://example.com:7391/"));
+                assert_eq!(server_url.as_deref(), Some("http://example.com:7391/"));
             }
             _ => panic!("expected tui command"),
         }
     }
 
     #[test]
-    fn tui_rejects_remote_and_server_together() {
-        assert!(Cli::try_parse_from([
-            "histo",
-            "tui",
-            "--remote",
-            "http://example.com:7391",
-            "--server",
-            "http://127.0.0.1:7391",
-        ])
-        .is_err());
+    fn tui_keeps_legacy_remote_alias_for_server_url() {
+        let cli = Cli::try_parse_from(["histo", "tui", "--remote", "http://example.com:7391"])
+            .expect("parse legacy remote alias");
+
+        match cli.command {
+            Command::Tui { server_url, .. } => {
+                assert_eq!(server_url.as_deref(), Some("http://example.com:7391"));
+            }
+            _ => panic!("expected tui command"),
+        }
     }
 
     #[test]
-    fn tui_backend_resolution_distinguishes_local_and_remote() {
+    fn tui_backend_resolution_distinguishes_default_and_explicit_url() {
         assert_eq!(
-            resolve_tui_backend(None, None).expect("default backend"),
+            resolve_tui_backend(None).expect("default backend"),
             TuiBackend::LocalAuto {
                 base_url: DEFAULT_SERVER_URL.to_string()
             }
         );
         assert_eq!(
-            resolve_tui_backend(Some(" http://localhost:7000/ ".to_string()), None)
-                .expect("server backend"),
-            TuiBackend::LocalAuto {
+            resolve_tui_backend(Some(" http://localhost:7000/ ".to_string()))
+                .expect("server URL backend"),
+            TuiBackend::ServerUrl {
                 base_url: "http://localhost:7000".to_string()
             }
         );
         assert_eq!(
-            resolve_tui_backend(None, Some(" http://remote:7391/ ".to_string()))
-                .expect("remote backend"),
-            TuiBackend::Remote {
+            resolve_tui_backend(Some(" http://remote:7391/ ".to_string()))
+                .expect("server URL backend"),
+            TuiBackend::ServerUrl {
                 base_url: "http://remote:7391".to_string()
             }
         );
-        assert!(resolve_tui_backend(None, Some("   ".to_string())).is_err());
+        assert!(resolve_tui_backend(Some("   ".to_string())).is_err());
     }
 
     #[test]
@@ -5274,6 +5285,14 @@ mod tests {
         );
         assert_eq!(local_server_bind_addr("https://example.com:7391"), None);
         assert_eq!(local_server_bind_addr("http://127.0.0.1:7391/path"), None);
+    }
+
+    #[test]
+    fn serve_bind_rejects_network_addresses_without_opt_in() {
+        assert!(parse_server_bind_addr("127.0.0.1:7391", false).is_ok());
+        assert!(parse_server_bind_addr("[::1]:7391", false).is_ok());
+        assert!(parse_server_bind_addr("0.0.0.0:7391", false).is_err());
+        assert!(parse_server_bind_addr("0.0.0.0:7391", true).is_ok());
     }
 
     #[test]
