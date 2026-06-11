@@ -132,11 +132,11 @@ histo export --jsonl --since 2026-06-01
 
 ## Remote TUI
 
-Use `--remote <base-url>` when an already-running super-cass server should back
+Use `--remote <base-url>` when an already-running Historious server should back
 the interactive TUI end to end:
 
 ```bash
-super-cass tui --remote http://127.0.0.1:7391
+histo tui --remote http://127.0.0.1:7391
 ```
 
 For another machine, prefer an SSH tunnel instead of exposing the unauthenticated
@@ -144,8 +144,8 @@ HTTP server directly:
 
 ```bash
 ssh -L 7391:127.0.0.1:7391 remote
-ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
-super-cass tui --remote http://127.0.0.1:7391
+ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
+histo tui --remote http://127.0.0.1:7391
 ```
 
 ### Embedding Transfer
@@ -243,11 +243,11 @@ Remote TUI:
 
 ```bash
 # Keep the server bound to loopback on the remote host.
-ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
+ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
 
 # Forward it locally and use the remote backend for search, preview, and Enter.
 ssh -L 7391:127.0.0.1:7391 remote
-super-cass tui --remote http://127.0.0.1:7391
+histo tui --remote http://127.0.0.1:7391
 ```
 
 Exchange rules:
