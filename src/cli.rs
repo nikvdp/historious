@@ -163,10 +163,17 @@ pub enum Command {
         limit: usize,
         #[arg(
             long,
-            default_value = DEFAULT_SERVER_URL,
+            conflicts_with = "remote",
             help = "Base URL for the local search server; tui starts it when needed"
         )]
-        server: String,
+        server: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "server",
+            value_name = "BASE_URL",
+            help = "Use a remote super-cass server for TUI search requests"
+        )]
+        remote: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
@@ -865,6 +872,7 @@ impl Cli {
                 query,
                 limit,
                 server,
+                remote,
                 sort,
                 mode,
                 corpus,
@@ -891,11 +899,12 @@ impl Cli {
                     .map(search::SearchMode::from)
                     .unwrap_or(config.default_search_mode);
                 let corpus = resolve_search_corpus(corpus, include_tools, raw)?;
+                let backend = resolve_tui_backend(server, remote)?;
                 run_tui_search(
                     &store,
                     &config,
                     query.as_deref().unwrap_or_default(),
-                    &server,
+                    &backend,
                     limit,
                     sort,
                     mode,
@@ -3664,7 +3673,7 @@ fn run_tui_search(
     store: &Store,
     config: &AppConfig,
     query: &str,
-    server: &str,
+    backend: &TuiBackend,
     limit: usize,
     sort: SearchSort,
     mode: search::SearchMode,
@@ -3680,9 +3689,10 @@ fn run_tui_search(
 ) -> Result<()> {
     ensure_fzf_available()?;
     ensure_curl_available()?;
-    let _server = ensure_server_available(config, server)?;
+    let _server = ensure_tui_backend_available(config, backend)?;
+    let server = backend.base_url();
     let reload = tui_reload_command(
-        server,
+        &server,
         limit,
         sort,
         mode,
@@ -3985,6 +3995,55 @@ impl Drop for StartedServer {
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiBackend {
+    LocalAuto { base_url: String },
+    Remote { base_url: String },
+}
+
+impl TuiBackend {
+    fn base_url(&self) -> String {
+        match self {
+            Self::LocalAuto { base_url } | Self::Remote { base_url } => base_url.clone(),
+        }
+    }
+}
+
+fn resolve_tui_backend(server: Option<String>, remote: Option<String>) -> Result<TuiBackend> {
+    if let Some(remote) = remote {
+        let base_url = normalize_non_empty_server_url(&remote, "remote")?;
+        return Ok(TuiBackend::Remote { base_url });
+    }
+    let base_url =
+        normalize_non_empty_server_url(server.as_deref().unwrap_or(DEFAULT_SERVER_URL), "server")?;
+    Ok(TuiBackend::LocalAuto { base_url })
+}
+
+fn normalize_non_empty_server_url(value: &str, name: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("{name} URL cannot be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn ensure_tui_backend_available(
+    config: &AppConfig,
+    backend: &TuiBackend,
+) -> Result<Option<StartedServer>> {
+    match backend {
+        TuiBackend::LocalAuto { base_url } => ensure_server_available(config, base_url),
+        TuiBackend::Remote { base_url } => {
+            if server_health_available(base_url)? {
+                Ok(None)
+            } else {
+                let health_url = server_url(base_url, "health")?;
+                bail!("could not reach remote super-cass server at {health_url}");
+            }
         }
     }
 }
@@ -4877,12 +4936,84 @@ mod tests {
         let cli = Cli::try_parse_from(["super-cass", "tui"]).expect("parse tui search");
 
         match cli.command {
-            Command::Tui { query, limit, .. } => {
+            Command::Tui {
+                query,
+                limit,
+                server,
+                remote,
+                ..
+            } => {
                 assert_eq!(query, None);
                 assert_eq!(limit, DEFAULT_LIVE_SEARCH_LIMIT);
+                assert_eq!(server, None);
+                assert_eq!(remote, None);
             }
             _ => panic!("expected tui command"),
         }
+    }
+
+    #[test]
+    fn tui_accepts_explicit_remote_backend() {
+        let cli = Cli::try_parse_from([
+            "super-cass",
+            "tui",
+            "--remote",
+            "http://example.com:7391/",
+            "query",
+        ])
+        .expect("parse remote tui search");
+
+        match cli.command {
+            Command::Tui {
+                query,
+                server,
+                remote,
+                ..
+            } => {
+                assert_eq!(query.as_deref(), Some("query"));
+                assert_eq!(server, None);
+                assert_eq!(remote.as_deref(), Some("http://example.com:7391/"));
+            }
+            _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn tui_rejects_remote_and_server_together() {
+        assert!(Cli::try_parse_from([
+            "super-cass",
+            "tui",
+            "--remote",
+            "http://example.com:7391",
+            "--server",
+            "http://127.0.0.1:7391",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn tui_backend_resolution_distinguishes_local_and_remote() {
+        assert_eq!(
+            resolve_tui_backend(None, None).expect("default backend"),
+            TuiBackend::LocalAuto {
+                base_url: DEFAULT_SERVER_URL.to_string()
+            }
+        );
+        assert_eq!(
+            resolve_tui_backend(Some(" http://localhost:7000/ ".to_string()), None)
+                .expect("server backend"),
+            TuiBackend::LocalAuto {
+                base_url: "http://localhost:7000".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_tui_backend(None, Some(" http://remote:7391/ ".to_string()))
+                .expect("remote backend"),
+            TuiBackend::Remote {
+                base_url: "http://remote:7391".to_string()
+            }
+        );
+        assert!(resolve_tui_backend(None, Some("   ".to_string())).is_err());
     }
 
     #[test]
