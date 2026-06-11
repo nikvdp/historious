@@ -5,10 +5,13 @@ use base64::Engine;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::thread;
 
 const IMPORT_JSONL_BATCH_RECORDS: usize = 500;
+const IMPORT_STREAM_CHANNEL_BATCHES: usize = 8;
 
 pub fn export_jsonl(store: &Store, mut writer: impl Write) -> Result<usize> {
     let records = store.export_records()?;
@@ -187,8 +190,7 @@ pub fn import_jsonl_path_with_progress(
     progress: impl FnMut(JsonlProgress),
 ) -> Result<ImportStats> {
     if path == "-" {
-        let stdin = io::stdin();
-        import_jsonl_reader_with_progress(store, stdin.lock(), progress)
+        import_jsonl_stdin_with_progress(store, progress)
     } else {
         let file = File::open(Path::new(path)).with_context(|| format!("opening {path}"))?;
         import_jsonl_reader_with_progress(store, file, progress)
@@ -200,6 +202,59 @@ pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<Impor
 }
 
 pub fn import_jsonl_reader_with_progress(
+    store: &Store,
+    reader: impl io::Read,
+    progress: impl FnMut(JsonlProgress),
+) -> Result<ImportStats> {
+    let mut stats = import_jsonl_reader_records_with_progress(store, reader, progress)?;
+    finalize_import_stats(store, &mut stats)?;
+    Ok(stats)
+}
+
+fn import_jsonl_stdin_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(JsonlProgress),
+) -> Result<ImportStats> {
+    let (tx, rx) = sync_channel(IMPORT_STREAM_CHANNEL_BATCHES);
+    let reader = thread::spawn(move || {
+        let stdin = io::stdin();
+        stream_jsonl_stdin_to_import_queue(stdin.lock(), tx)
+    });
+
+    let mut stats = ImportStats::default();
+    while let Ok(message) = rx.recv() {
+        match message? {
+            ImportQueueMessage::Batch {
+                mut records,
+                progress: state,
+            } => {
+                flush_import_batch(store, &mut stats, &mut records)?;
+                progress(state);
+            }
+            ImportQueueMessage::Spill {
+                mut file,
+                progress: state,
+            } => {
+                progress(state);
+                file.as_file_mut()
+                    .rewind()
+                    .context("rewinding spilled streamed archive import")?;
+                let spilled =
+                    import_jsonl_reader_records_with_progress(store, file.as_file_mut(), |_| {})?;
+                stats.inserted += spilled.inserted;
+                stats.duplicates += spilled.duplicates;
+                stats.delta.merge(spilled.delta);
+            }
+        }
+    }
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("streamed archive import reader thread panicked"))??;
+    finalize_import_stats(store, &mut stats)?;
+    Ok(stats)
+}
+
+fn import_jsonl_reader_records_with_progress(
     store: &Store,
     reader: impl io::Read,
     mut progress: impl FnMut(JsonlProgress),
@@ -247,6 +302,10 @@ pub fn import_jsonl_reader_with_progress(
         progress(state);
     }
     flush_import_batch(store, &mut stats, &mut batch)?;
+    Ok(stats)
+}
+
+fn finalize_import_stats(store: &Store, stats: &mut ImportStats) -> Result<()> {
     if store.history_items_projection_ready()? {
         store.refresh_history_items_for_events(&stats.delta.touched_events)?;
     } else {
@@ -254,7 +313,118 @@ pub fn import_jsonl_reader_with_progress(
     }
     stats.vectors_indexed =
         store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
-    Ok(stats)
+    Ok(())
+}
+
+enum ImportQueueMessage {
+    Batch {
+        records: Vec<ArchiveRecord>,
+        progress: JsonlProgress,
+    },
+    Spill {
+        file: tempfile::NamedTempFile,
+        progress: JsonlProgress,
+    },
+}
+
+fn stream_jsonl_stdin_to_import_queue(
+    reader: impl BufRead,
+    tx: SyncSender<Result<ImportQueueMessage>>,
+) -> Result<()> {
+    let mut state = JsonlProgress::default();
+    let mut line_no = 0usize;
+    let mut batch = Vec::with_capacity(IMPORT_JSONL_BATCH_RECORDS);
+    let mut spool: Option<tempfile::NamedTempFile> = None;
+    let mut reader = reader;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading JSONL line {}", line_no + 1))?;
+        if bytes == 0 {
+            break;
+        }
+        line_no += 1;
+        state.bytes += bytes as u64;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(file) = spool.as_mut() {
+            file.as_file_mut()
+                .write_all(line.as_bytes())
+                .context("writing streamed archive line to temporary spill")?;
+            state.records += 1;
+            continue;
+        }
+        let envelope: ArchiveEnvelope = serde_json::from_str(&line)
+            .with_context(|| format!("parsing archive JSONL line {line_no}"))?;
+        validate_archive_envelope(&envelope, line_no)?;
+        let is_inline_raw_artifact =
+            matches!(&envelope.record, ArchiveRecord::RawArtifact(raw) if !raw.content.is_empty());
+        if is_inline_raw_artifact && !batch.is_empty() {
+            queue_or_spill_import_batch(&tx, &mut spool, &mut batch, state)?;
+        }
+        batch.push(envelope.record);
+        state.records += 1;
+        if batch.len() >= IMPORT_JSONL_BATCH_RECORDS || is_inline_raw_artifact {
+            queue_or_spill_import_batch(&tx, &mut spool, &mut batch, state)?;
+        }
+    }
+    queue_or_spill_import_batch(&tx, &mut spool, &mut batch, state)?;
+    if let Some(file) = spool {
+        tx.send(Ok(ImportQueueMessage::Spill {
+            file,
+            progress: state,
+        }))
+        .context("sending spilled streamed archive import")?;
+    }
+    Ok(())
+}
+
+fn validate_archive_envelope(envelope: &ArchiveEnvelope, line_no: usize) -> Result<()> {
+    if envelope.schema != ARCHIVE_SCHEMA {
+        bail!(
+            "unsupported archive schema on line {}: {}",
+            line_no,
+            envelope.schema
+        );
+    }
+    if envelope.id != envelope.record.id() || envelope.hash != envelope.record.hash() {
+        bail!("envelope identity mismatch on line {line_no}");
+    }
+    Ok(())
+}
+
+fn queue_or_spill_import_batch(
+    tx: &SyncSender<Result<ImportQueueMessage>>,
+    spool: &mut Option<tempfile::NamedTempFile>,
+    batch: &mut Vec<ArchiveRecord>,
+    progress: JsonlProgress,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    if let Some(file) = spool.as_mut() {
+        write_jsonl_records(batch.drain(..).collect(), file.as_file_mut())?;
+        return Ok(());
+    }
+
+    let records = std::mem::take(batch);
+    match tx.try_send(Ok(ImportQueueMessage::Batch { records, progress })) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(Ok(ImportQueueMessage::Batch { records, .. }))) => {
+            let mut file = tempfile::NamedTempFile::new()
+                .context("creating temporary file for streamed archive spill")?;
+            write_jsonl_records(records, file.as_file_mut())?;
+            *spool = Some(file);
+            Ok(())
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            bail!("streamed archive import consumer stopped before stdin was drained")
+        }
+        Err(TrySendError::Full(_)) => unreachable!("only batch messages use try_send"),
+    }
 }
 
 fn flush_import_batch(

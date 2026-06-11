@@ -1180,6 +1180,7 @@ impl Store {
         let event_ids = normalized_ids(event_ids);
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                let mut projected_events = 0;
                 if !event_ids.is_empty() {
                     prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
                     let total_events: usize = tx.query_row(
@@ -1224,7 +1225,6 @@ impl Store {
                             occurred_at: parse_opt_dt(row.get(8)?),
                         })
                     })?;
-                    let mut projected_events = 0;
                     for row in rows {
                         insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
                         projected_events += 1;
@@ -1237,7 +1237,7 @@ impl Store {
                 }
                 let indexed_events = count_indexed_events(&tx, model)?;
                 update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
-                Ok(indexed_events)
+                Ok(projected_events)
             })
         })
     }
@@ -1892,6 +1892,7 @@ impl Store {
         let embedding_ids = normalized_ids(embedding_ids);
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                let mut inserted = 0;
                 for chunk in embedding_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
                     let placeholders = placeholders(chunk.len());
                     let delete_sql = format!(
@@ -1913,13 +1914,12 @@ impl Store {
                        AND hi.semantic_policy != 'never'
                        AND e.id IN ({placeholders})"
                     );
-                    tx.execute(
+                    inserted += tx.execute(
                         &insert_sql,
                         params_from_iter(chunk.iter().map(String::as_str)),
                     )?;
                 }
-                let count = count_vec_embeddings(&tx)?;
-                Ok(count)
+                Ok(inserted)
             })
         })
     }
@@ -3586,13 +3586,6 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count as u64)
-}
-
-fn count_vec_embeddings(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM vec_embeddings_384", [], |row| {
-        row.get(0)
-    })?;
-    Ok(count as usize)
 }
 
 fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
