@@ -86,13 +86,48 @@ files; export/import exchanges archive records that already exist in Historious.
 
 ## Remote TUI
 
-For another machine, keep the server bound to loopback on the remote host and
-reach it through an SSH tunnel:
+Local TUI starts and uses the default local server automatically:
 
 ```bash
-ssh <remote> 'histo serve --bind 127.0.0.1:7391 --watch'
-ssh -L 7391:127.0.0.1:7391 <remote>
-histo tui --remote http://127.0.0.1:7391
+histo tui
+```
+
+To start the server yourself, keep it running in one terminal:
+
+```bash
+histo serve
+```
+
+Then connect the TUI from another terminal:
+
+```bash
+histo tui --server-url http://127.0.0.1:7391
+```
+
+For another machine, keep the server bound to loopback on the remote host and
+reach it through an SSH tunnel. In one terminal:
+
+```bash
+ssh -L 7391:127.0.0.1:7391 <remote> 'histo serve'
+```
+
+Then connect the local TUI through the tunnel:
+
+```bash
+histo tui --server-url http://127.0.0.1:7391
+```
+
+Direct LAN exposure is explicit because the HTTP server is unauthenticated. In
+one terminal:
+
+```bash
+ssh <remote> 'histo serve --bind 0.0.0.0:7391 --allow-network-bind'
+```
+
+Then connect to the remote address:
+
+```bash
+histo tui --server-url http://<remote-ip>:7391
 ```
 
 Do not expose the unauthenticated HTTP server directly on a public interface.
