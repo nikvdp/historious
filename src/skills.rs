@@ -130,6 +130,24 @@ super-cass export --jsonl --session <session_id>
 super-cass export --jsonl --since 2026-06-01
 ```
 
+## Remote TUI
+
+Use `--remote <base-url>` when an already-running super-cass server should back
+the interactive TUI end to end:
+
+```bash
+super-cass tui --remote http://127.0.0.1:7391
+```
+
+For another machine, prefer an SSH tunnel instead of exposing the unauthenticated
+HTTP server directly:
+
+```bash
+ssh -L 7391:127.0.0.1:7391 remote
+ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
+super-cass tui --remote http://127.0.0.1:7391
+```
+
 ### Embedding Transfer
 
 Exports include existing embedding records by default. Imports store those embeddings and refresh the local vector index, so the receiving machine can use compatible transferred embeddings without recreating them.
@@ -219,6 +237,17 @@ super-cass export --jsonl [filters] \
 
 ssh gpu-box 'super-cass export --jsonl [filters]' \
   | super-cass import --jsonl --json -
+```
+
+Remote TUI:
+
+```bash
+# Keep the server bound to loopback on the remote host.
+ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
+
+# Forward it locally and use the remote backend for search, preview, and Enter.
+ssh -L 7391:127.0.0.1:7391 remote
+super-cass tui --remote http://127.0.0.1:7391
 ```
 
 Exchange rules:
