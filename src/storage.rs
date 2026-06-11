@@ -3517,22 +3517,9 @@ fn insert_search_index_rows(
         }),
         hash: unit_hash,
     };
-    insert_search_unit(conn, &unit)?;
-    let has_fts_row: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events_fts WHERE event_id = ?1)",
-        params![event.id],
-        |row| row.get(0),
-    )?;
-    if has_fts_row == 0 {
-        conn.execute(
-            "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![event.id, event.session_id, event.source_kind, event.content],
-        )?;
-    }
-
+    let inserted_unit = insert_search_unit(conn, &unit)?;
     let vector = embed(&event.content);
-    conn.execute(
+    let inserted_embedding = conn.execute(
         "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
          VALUES (?1, ?2, ?3, ?4)",
         params![
@@ -3541,7 +3528,14 @@ fn insert_search_index_rows(
             dims as i64,
             serde_json::to_string(&vector)?
         ],
-    )?;
+    )? > 0;
+    if inserted_unit || inserted_embedding {
+        conn.execute(
+            "INSERT INTO events_fts (event_id, session_id, source_kind, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event.id, event.session_id, event.source_kind, event.content],
+        )?;
+    }
     Ok(())
 }
 

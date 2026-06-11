@@ -333,6 +333,21 @@ pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> 
 }
 
 pub fn refresh_search_index_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
+    refresh_search_index_delta(store, delta, true)
+}
+
+pub fn refresh_import_search_index_incremental(
+    store: &Store,
+    delta: &ImportDelta,
+) -> Result<usize> {
+    refresh_search_index_delta(store, delta, false)
+}
+
+fn refresh_search_index_delta(
+    store: &Store,
+    delta: &ImportDelta,
+    repair_if_needed: bool,
+) -> Result<usize> {
     let search_event_ids = delta.search_index_event_ids();
     let mut indexed = store.refresh_search_index_for_events(
         crate::embed::HashEmbedder::MODEL_ID,
@@ -340,7 +355,7 @@ pub fn refresh_search_index_incremental(store: &Store, delta: &ImportDelta) -> R
         &search_event_ids,
         crate::embed::hash_embed,
     )?;
-    if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
+    if repair_if_needed && store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
         indexed = refresh_search_index(store)?;
     }
     Ok(indexed)
