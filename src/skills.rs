@@ -100,7 +100,7 @@ Use JSONL export/import over stdin/stdout to exchange history with another machi
 Pull remote history into the local machine:
 
 ```bash
-ssh remote 'histo export --jsonl [filters]' \
+ssh <remote> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 ```
 
@@ -108,17 +108,17 @@ Push local history to a remote machine:
 
 ```bash
 histo export --jsonl [filters] \
-  | ssh remote 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl --json -'
 ```
 
 Reciprocal exchange is just both directions:
 
 ```bash
-ssh remote 'histo export --jsonl [filters]' \
+ssh <remote> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 
 histo export --jsonl [filters] \
-  | ssh remote 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl --json -'
 ```
 
 Useful filters:
@@ -143,8 +143,8 @@ For another machine, prefer an SSH tunnel instead of exposing the unauthenticate
 HTTP server directly:
 
 ```bash
-ssh -L 7391:127.0.0.1:7391 remote
-ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
+ssh -L 7391:127.0.0.1:7391 <remote>
+ssh <remote> 'histo serve --bind 127.0.0.1:7391 --watch'
 histo tui --remote http://127.0.0.1:7391
 ```
 
@@ -152,13 +152,13 @@ histo tui --remote http://127.0.0.1:7391
 
 Exports include existing embedding records by default. Imports store those embeddings and refresh the local vector index, so the receiving machine can use compatible transferred embeddings without recreating them.
 
-Round-trip through an embedding-capable box:
+Round-trip through an embedding-capable host:
 
 ```bash
 histo export --jsonl [filters] \
-  | ssh gpu-box 'histo import --jsonl --json -'
+  | ssh <embedding-host> 'histo import --jsonl --json -'
 
-ssh gpu-box 'histo export --jsonl [filters]' \
+ssh <embedding-host> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 ```
 
@@ -166,7 +166,7 @@ Use `--embeddings omit` only when bandwidth or storage matters:
 
 ```bash
 histo export --jsonl --embeddings omit [filters] \
-  | ssh remote 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl --json -'
 ```
 
 Do not add `histo update` to these exchange flows. `update` scans local agent log files and is a separate maintenance concern.
@@ -220,22 +220,22 @@ History exchange:
 
 ```bash
 # Pull remote history and existing embeddings into local.
-ssh remote 'histo export --jsonl [filters]' \
+ssh <remote> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 
 # Push local history and existing embeddings to remote.
 histo export --jsonl [filters] \
-  | ssh remote 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl --json -'
 
 # Omit embeddings only when bandwidth or storage is constrained.
 histo export --jsonl --embeddings omit [filters] \
-  | ssh remote 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl --json -'
 
-# Round-trip through an embedding-capable box.
+# Round-trip through an embedding-capable host.
 histo export --jsonl [filters] \
-  | ssh gpu-box 'histo import --jsonl --json -'
+  | ssh <embedding-host> 'histo import --jsonl --json -'
 
-ssh gpu-box 'histo export --jsonl [filters]' \
+ssh <embedding-host> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 ```
 
@@ -243,10 +243,10 @@ Remote TUI:
 
 ```bash
 # Keep the server bound to loopback on the remote host.
-ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
+ssh <remote> 'histo serve --bind 127.0.0.1:7391 --watch'
 
 # Forward it locally and use the remote backend for search, preview, and Enter.
-ssh -L 7391:127.0.0.1:7391 remote
+ssh -L 7391:127.0.0.1:7391 <remote>
 histo tui --remote http://127.0.0.1:7391
 ```
 
