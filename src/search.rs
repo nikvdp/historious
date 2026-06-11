@@ -460,6 +460,7 @@ pub fn refresh_embeddings_repair_with_progress(
     )
 }
 
+#[cfg(test)]
 pub fn refresh_embeddings_incremental(
     store: &Store,
     machine_id: &str,

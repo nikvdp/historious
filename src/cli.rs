@@ -2024,15 +2024,13 @@ fn refresh_embeddings_after_update_with_progress(
     }
 }
 
-fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
+fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let stats = transport::import_jsonl_path(store, input)?;
     let projected = search::refresh_import_search_index_incremental(store, &stats.delta)?;
-    let embeddings = search::refresh_embeddings_incremental(
-        store,
-        &config.machine_id,
-        &config.embedder,
-        &stats.delta,
-    )?;
+    let embeddings = search::EmbeddingRefresh {
+        vectors_indexed: stats.vectors_indexed,
+        ..search::EmbeddingRefresh::default()
+    };
     Ok(ImportOutput {
         import: stats,
         search_index: SearchIndexOutput {
@@ -2042,7 +2040,7 @@ fn run_import_once(store: &Store, config: &AppConfig, input: &str) -> Result<Imp
     })
 }
 
-fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Result<ImportOutput> {
+fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let progress = ProgressUi::new();
     let mut import = progress.phase("Importing history stream");
     let mut last = transport::JsonlProgress::default();
@@ -2063,12 +2061,10 @@ fn run_import_once_human(store: &Store, config: &AppConfig, input: &str) -> Resu
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
-    let embeddings = search::refresh_embeddings_incremental(
-        store,
-        &config.machine_id,
-        &config.embedder,
-        &stats.delta,
-    )?;
+    let embeddings = search::EmbeddingRefresh {
+        vectors_indexed: stats.vectors_indexed,
+        ..search::EmbeddingRefresh::default()
+    };
     embed.finish(embedding_phase_detail(&embeddings));
 
     Ok(ImportOutput {
