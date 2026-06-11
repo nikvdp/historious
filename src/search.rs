@@ -323,6 +323,16 @@ pub fn refresh_search_index(store: &Store) -> Result<usize> {
 }
 
 pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
+    let indexed = refresh_search_index_incremental(store, delta)?;
+    if store.history_items_projection_ready()? {
+        store.refresh_history_items_for_events(&delta.touched_events)?;
+    } else {
+        store.refresh_history_items()?;
+    }
+    Ok(indexed)
+}
+
+pub fn refresh_search_index_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
     let search_event_ids = delta.search_index_event_ids();
     let mut indexed = store.refresh_search_index_for_events(
         crate::embed::HashEmbedder::MODEL_ID,
@@ -332,11 +342,6 @@ pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> 
     )?;
     if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
         indexed = refresh_search_index(store)?;
-    }
-    if store.history_items_projection_ready()? {
-        store.refresh_history_items_for_events(&delta.touched_events)?;
-    } else {
-        store.refresh_history_items()?;
     }
     Ok(indexed)
 }

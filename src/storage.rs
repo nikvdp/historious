@@ -878,21 +878,23 @@ impl Store {
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
-                tx.execute(
-                    "DELETE FROM history_items_fts
-                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                    [],
-                )?;
-                tx.execute(
-                    "DELETE FROM history_items_conversation_fts
-                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                    [],
-                )?;
-                tx.execute(
-                    "DELETE FROM history_items
-                     WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                    [],
-                )?;
+                if replaced_count > 0 {
+                    tx.execute(
+                        "DELETE FROM history_items_fts
+                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                        [],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM history_items_conversation_fts
+                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                        [],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM history_items
+                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
+                        [],
+                    )?;
+                }
                 let mut stmt = tx.prepare(
                     "SELECT e.id, e.session_id, e.source_id, e.machine_id, e.source_kind,
                             e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
