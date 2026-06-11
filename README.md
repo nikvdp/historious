@@ -30,24 +30,24 @@ Pull history from a remote machine into the local machine:
 
 ```bash
 ssh <remote> 'histo export --jsonl' \
-  | histo import --jsonl --json -
+  | histo import --jsonl -
 ```
 
 Push local history to a remote machine:
 
 ```bash
 histo export --jsonl \
-  | ssh <remote> 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl -'
 ```
 
 Run both commands for a reciprocal exchange:
 
 ```bash
 ssh <remote> 'histo export --jsonl' \
-  | histo import --jsonl --json -
+  | histo import --jsonl -
 
 histo export --jsonl \
-  | ssh <remote> 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl -'
 ```
 
 Useful export filters:
@@ -67,7 +67,7 @@ Use `--embeddings omit` only when bandwidth or storage matters:
 
 ```bash
 histo export --jsonl --embeddings omit \
-  | ssh <remote> 'histo import --jsonl --json -'
+  | ssh <remote> 'histo import --jsonl -'
 ```
 
 To use another machine for embedding work, pipe history to that machine, run any
@@ -75,10 +75,10 @@ embedding maintenance there, then export back from it:
 
 ```bash
 histo export --jsonl \
-  | ssh <embedding-host> 'histo import --jsonl --json -'
+  | ssh <embedding-host> 'histo import --jsonl -'
 
 ssh <embedding-host> 'histo export --jsonl' \
-  | histo import --jsonl --json -
+  | histo import --jsonl -
 ```
 
 Do not add `histo update` to these exchange flows. `update` scans local agent log
