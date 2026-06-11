@@ -72,6 +72,12 @@ impl ImportDelta {
         extend_unique(&mut self.touched_search_units, other.touched_search_units);
         extend_unique(&mut self.touched_embeddings, other.touched_embeddings);
     }
+
+    pub fn search_index_event_ids(&self) -> Vec<String> {
+        let mut event_ids = self.inserted_events.clone();
+        extend_unique(&mut event_ids, self.touched_events.clone());
+        event_ids
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1052,9 +1058,11 @@ impl Store {
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
+                 LEFT JOIN events_fts fts
+                   ON fts.event_id = e.id
                  WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND emb.event_id IS NULL
+                   AND (emb.event_id IS NULL OR fts.event_id IS NULL)
                  ORDER BY e.session_id, e.ordinal, e.id",
                 )?;
                 let rows = stmt.query_map(params![model], |row| {
@@ -1073,51 +1081,7 @@ impl Store {
                     })
                 })?;
                 for row in rows {
-                    let event = row?;
-                    let unit_id =
-                        crate::archive::stable_id(&["search_unit", &event.id, &event.text_hash]);
-                    let unit_hash = crate::archive::stable_hash(&(
-                        &unit_id,
-                        &event.id,
-                        &event.text_hash,
-                        &event.content,
-                        &event.search_kind,
-                    ))?;
-                    let unit = SearchUnitRecord {
-                        id: unit_id,
-                        event_id: event.id.clone(),
-                        session_id: event.session_id.clone(),
-                        source_id: event.source_id.clone(),
-                        machine_id: event.machine_id.clone(),
-                        source_kind: event.source_kind.clone(),
-                        role: event.role.clone(),
-                        search_kind: event.search_kind.clone(),
-                        text: event.content.clone(),
-                        text_hash: event.text_hash.clone(),
-                        occurred_at: event.occurred_at,
-                        metadata: serde_json::json!({
-                            "derived_from": "event.search_text",
-                            "indexer": "search_unit_v1"
-                        }),
-                        hash: unit_hash,
-                    };
-                    insert_search_unit(&tx, &unit)?;
-                    tx.execute(
-                        "INSERT INTO events_fts (event_id, session_id, source_kind, content)
-                     VALUES (?1, ?2, ?3, ?4)",
-                        params![event.id, event.session_id, event.source_kind, event.content],
-                    )?;
-                    let vector = embed(&event.content);
-                    tx.execute(
-                    "INSERT OR IGNORE INTO event_embeddings (event_id, model, dims, vector_json)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        event.id,
-                        model,
-                        dims as i64,
-                        serde_json::to_string(&vector)?
-                    ],
-                )?;
+                    insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
                 }
                 drop(stmt);
 
@@ -3551,8 +3515,13 @@ fn insert_search_index_rows(
         }),
         hash: unit_hash,
     };
-    let inserted_unit = insert_search_unit(conn, &unit)?;
-    if inserted_unit {
+    insert_search_unit(conn, &unit)?;
+    let has_fts_row: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events_fts WHERE event_id = ?1)",
+        params![event.id],
+        |row| row.get(0),
+    )?;
+    if has_fts_row == 0 {
         conn.execute(
             "INSERT INTO events_fts (event_id, session_id, source_kind, content)
              VALUES (?1, ?2, ?3, ?4)",
@@ -3738,6 +3707,7 @@ fn record_delta(
     if mode == ImportDeltaMode::InsertedOnly && !inserted {
         return;
     }
+    let track_touched = mode == ImportDeltaMode::Full || inserted;
     match record {
         ArchiveRecord::Source(source) => {
             if inserted {
@@ -3745,7 +3715,7 @@ fn record_delta(
             }
         }
         ArchiveRecord::RawArtifact(raw) => {
-            if mode == ImportDeltaMode::Full {
+            if track_touched {
                 push_unique(&mut delta.touched_paths, raw.path.clone());
             }
             if inserted {
@@ -3753,7 +3723,7 @@ fn record_delta(
             }
         }
         ArchiveRecord::Session(session) => {
-            if mode == ImportDeltaMode::Full {
+            if track_touched {
                 push_unique(&mut delta.touched_sessions, session.id.clone());
             }
             if inserted {
@@ -3761,7 +3731,7 @@ fn record_delta(
             }
         }
         ArchiveRecord::Event(event) => {
-            if mode == ImportDeltaMode::Full {
+            if track_touched {
                 push_unique(&mut delta.touched_events, event.id.clone());
                 push_unique(&mut delta.touched_sessions, event.session_id.clone());
             }
@@ -3770,7 +3740,7 @@ fn record_delta(
             }
         }
         ArchiveRecord::SearchUnit(unit) => {
-            if mode == ImportDeltaMode::Full {
+            if track_touched {
                 push_unique(&mut delta.touched_search_units, unit.id.clone());
                 push_unique(&mut delta.touched_events, unit.event_id.clone());
                 push_unique(&mut delta.touched_sessions, unit.session_id.clone());
@@ -3780,7 +3750,7 @@ fn record_delta(
             }
         }
         ArchiveRecord::Embedding(embedding) => {
-            if mode == ImportDeltaMode::Full {
+            if track_touched {
                 push_unique(&mut delta.touched_embeddings, embedding.id.clone());
                 push_unique(&mut delta.touched_search_units, embedding.unit_id.clone());
             }

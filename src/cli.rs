@@ -1951,16 +1951,17 @@ fn refresh_search_after_update_with_progress(
         let indexed = search::refresh(store)?;
         Ok(indexed)
     } else {
+        let search_event_ids = delta.search_index_event_ids();
         progress(format!(
             "indexing {} new events",
-            format_count(delta.inserted_events.len())
+            format_count(search_event_ids.len())
         ));
         let mut last_index_progress = Instant::now();
         let mut last_index_report: Option<(usize, usize)> = None;
         let indexed = store.refresh_search_index_for_events_with_progress(
             crate::embed::HashEmbedder::MODEL_ID,
             crate::embed::HashEmbedder::DIMS,
-            &delta.inserted_events,
+            &search_event_ids,
             crate::embed::hash_embed,
             |processed, total| {
                 if processed == 1
@@ -1983,7 +1984,7 @@ fn refresh_search_after_update_with_progress(
         progress("checking index health".to_string());
         let indexed = if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
             progress("repairing missing search index rows".to_string());
-            search::refresh(store)
+            search::refresh_search_index(store)
         } else {
             Ok(indexed)
         }?;

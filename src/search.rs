@@ -309,32 +309,36 @@ pub enum MatchType {
 }
 
 pub fn refresh(store: &Store) -> Result<usize> {
-    let indexed = store.refresh_search_index(
-        crate::embed::HashEmbedder::MODEL_ID,
-        crate::embed::HashEmbedder::DIMS,
-        crate::embed::hash_embed,
-    )?;
+    let indexed = refresh_search_index(store)?;
     store.refresh_history_items()?;
     Ok(indexed)
 }
 
-pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
-    let indexed = store.refresh_search_index_for_events(
+pub fn refresh_search_index(store: &Store) -> Result<usize> {
+    store.refresh_search_index(
         crate::embed::HashEmbedder::MODEL_ID,
         crate::embed::HashEmbedder::DIMS,
-        &delta.inserted_events,
+        crate::embed::hash_embed,
+    )
+}
+
+pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
+    let search_event_ids = delta.search_index_event_ids();
+    let mut indexed = store.refresh_search_index_for_events(
+        crate::embed::HashEmbedder::MODEL_ID,
+        crate::embed::HashEmbedder::DIMS,
+        &search_event_ids,
         crate::embed::hash_embed,
     )?;
     if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
-        refresh(store)
-    } else {
-        if store.history_items_projection_ready()? {
-            store.refresh_history_items_for_events(&delta.touched_events)?;
-        } else {
-            store.refresh_history_items()?;
-        }
-        Ok(indexed)
+        indexed = refresh_search_index(store)?;
     }
+    if store.history_items_projection_ready()? {
+        store.refresh_history_items_for_events(&delta.touched_events)?;
+    } else {
+        store.refresh_history_items()?;
+    }
+    Ok(indexed)
 }
 
 pub fn refresh_embeddings(
