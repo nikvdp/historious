@@ -3637,7 +3637,7 @@ fn run_static_fzf_search(
     color: bool,
 ) -> Result<()> {
     ensure_fzf_available()?;
-    let preview = fzf_preview_command(config, color);
+    let preview = local_fzf_preview_command(config, color);
     let copy = fzf_copy_session_command();
     let mut child = base_fzf_command()
         .arg("--query")
@@ -3664,7 +3664,7 @@ fn run_static_fzf_search(
     }
     let output = child.wait_with_output()?;
     if let Some(selection) = fzf_selection_from_output(&output)? {
-        handle_fzf_selection(store, selection, color)?;
+        handle_local_fzf_selection(store, selection, color)?;
     }
     Ok(())
 }
@@ -3705,7 +3705,7 @@ fn run_tui_search(
         machine.as_deref(),
         hostname.as_deref(),
     )?;
-    let preview = fzf_preview_command(config, color);
+    let preview = tui_preview_command(config, backend, color)?;
     let copy = fzf_copy_session_command();
     let child = base_fzf_command()
         .arg("--query")
@@ -3735,7 +3735,7 @@ fn run_tui_search(
         .spawn()?;
     let output = child.wait_with_output()?;
     if let Some(selection) = fzf_selection_from_output(&output)? {
-        handle_fzf_selection(store, selection, color)?;
+        handle_tui_fzf_selection(store, backend, selection, color)?;
     }
     Ok(())
 }
@@ -3767,8 +3767,11 @@ struct FzfSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FzfSelectedRow {
+    source_kind: String,
     session_id: String,
     event_id: String,
+    workspace: Option<String>,
+    machine_id: Option<String>,
     full: bool,
 }
 
@@ -3799,6 +3802,7 @@ fn parse_fzf_selection_output(output: &str) -> Result<Option<FzfSelection>> {
 
 fn parse_fzf_selected_row(row: &str) -> Result<FzfSelectedRow> {
     let fields = row.split('\t').collect::<Vec<_>>();
+    let source_kind = fields.get(1).copied().unwrap_or("-").to_string();
     let session_id = fields
         .get(5)
         .filter(|value| !value.trim().is_empty())
@@ -3808,8 +3812,19 @@ fn parse_fzf_selected_row(row: &str) -> Result<FzfSelectedRow> {
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("fzf selection is missing an event id"))?;
     Ok(FzfSelectedRow {
+        source_kind,
         session_id: (*session_id).to_string(),
         event_id: (*event_id).to_string(),
+        workspace: fields
+            .get(8)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        machine_id: fields
+            .get(9)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
         full: fields
             .get(11)
             .map(|value| !value.trim().is_empty())
@@ -3817,10 +3832,25 @@ fn parse_fzf_selected_row(row: &str) -> Result<FzfSelectedRow> {
     })
 }
 
-fn handle_fzf_selection(store: &Store, selection: FzfSelection, color: bool) -> Result<()> {
+fn handle_local_fzf_selection(store: &Store, selection: FzfSelection, color: bool) -> Result<()> {
     open_fzf_selection_in_pager(store, &selection.row, color)?;
     print_fzf_selection_details(store, &selection.row)?;
     Ok(())
+}
+
+fn handle_tui_fzf_selection(
+    store: &Store,
+    backend: &TuiBackend,
+    selection: FzfSelection,
+    color: bool,
+) -> Result<()> {
+    match backend {
+        TuiBackend::LocalAuto { .. } => handle_local_fzf_selection(store, selection, color),
+        TuiBackend::Remote { base_url } => {
+            open_remote_fzf_selection_in_pager(base_url, &selection.row, color)?;
+            print_remote_fzf_selection_details(&selection.row)
+        }
+    }
 }
 
 fn open_fzf_selection_in_pager(store: &Store, row: &FzfSelectedRow, color: bool) -> Result<()> {
@@ -3859,12 +3889,62 @@ fn open_fzf_selection_in_pager(store: &Store, row: &FzfSelectedRow, color: bool)
     Ok(())
 }
 
+fn open_remote_fzf_selection_in_pager(
+    server: &str,
+    row: &FzfSelectedRow,
+    color: bool,
+) -> Result<()> {
+    let rendered = fetch_remote_fzf_selection(server, row, color)?;
+    page_or_print(&rendered, Some(&row.event_id), false)
+}
+
+fn fetch_remote_fzf_selection(server: &str, row: &FzfSelectedRow, color: bool) -> Result<String> {
+    let transcript_url = server_url(server, "transcript")?;
+    let mut command = ProcessCommand::new("curl");
+    command
+        .arg("-fsSG")
+        .arg("--connect-timeout")
+        .arg("2")
+        .arg("--max-time")
+        .arg("10")
+        .arg(&transcript_url)
+        .arg("--data-urlencode")
+        .arg(format!("session={}", row.session_id))
+        .arg("--data-urlencode")
+        .arg(format!("at={}", row.event_id))
+        .arg("--data-urlencode")
+        .arg(format!("color={}", if color { "always" } else { "never" }));
+    if row.full {
+        command.arg("--data-urlencode").arg("full=true");
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("status {}", output.status)
+        } else {
+            stderr
+        };
+        bail!("remote transcript request failed for {transcript_url}: {detail}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn print_fzf_selection_details(store: &Store, row: &FzfSelectedRow) -> Result<()> {
     let source_path =
         fzf_selection_source_path(store, &row.session_id)?.unwrap_or_else(|| "-".to_string());
     write_stdout(&format!(
         "session_id: {}\nsource_path: {}\n",
         row.session_id, source_path
+    ))
+}
+
+fn print_remote_fzf_selection_details(row: &FzfSelectedRow) -> Result<()> {
+    let workspace = row.workspace.as_deref().unwrap_or("-");
+    let machine = row.machine_id.as_deref().unwrap_or("-");
+    write_stdout(&format!(
+        "session_id: {}\nevent_id: {}\nsource: {}\nworkspace: {}\nmachine_id: {}\n",
+        row.session_id, row.event_id, row.source_kind, workspace, machine
     ))
 }
 
@@ -3882,7 +3962,7 @@ fn fzf_copy_session_command() -> &'static str {
     "value={6}; (command -v pbcopy >/dev/null 2>&1 && printf %s \"$value\" | pbcopy) || (command -v wl-copy >/dev/null 2>&1 && printf %s \"$value\" | wl-copy) || (command -v xclip >/dev/null 2>&1 && printf %s \"$value\" | xclip -selection clipboard) || (command -v xsel >/dev/null 2>&1 && printf %s \"$value\" | xsel --clipboard --input) || (command -v clip.exe >/dev/null 2>&1 && printf %s \"$value\" | clip.exe) || true"
 }
 
-fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
+fn local_fzf_preview_command(config: &AppConfig, color: bool) -> String {
     let current_exe = std::env::current_exe().ok();
     let exe = current_exe
         .as_ref()
@@ -3897,6 +3977,21 @@ fn fzf_preview_command(config: &AppConfig, color: bool) -> String {
     format!(
         "mode={{12}}; if [ -n \"$mode\" ]; then {exe} --data-dir {data_dir} show {{7}} \"$mode\" --before 3 --after 5{color_flag}; else {exe} --data-dir {data_dir} show {{7}} --before 3 --after 5{color_flag}; fi"
     )
+}
+
+fn tui_preview_command(config: &AppConfig, backend: &TuiBackend, color: bool) -> Result<String> {
+    match backend {
+        TuiBackend::LocalAuto { .. } => Ok(local_fzf_preview_command(config, color)),
+        TuiBackend::Remote { base_url } => remote_fzf_preview_command(base_url, color),
+    }
+}
+
+fn remote_fzf_preview_command(server: &str, color: bool) -> Result<String> {
+    let show_url = shell_quote(&server_url(server, "show")?);
+    let color_value = if color { "always" } else { "never" };
+    Ok(format!(
+        "mode={{12}}; full_arg=; if [ -n \"$mode\" ]; then full_arg=' --data-urlencode full=true'; fi; curl -fsSG --connect-timeout 2 --max-time 10 {show_url} --data-urlencode event={{7}} --data-urlencode before=3 --data-urlencode after=5 --data-urlencode color={color_value}$full_arg 2>/dev/null || :"
+    ))
 }
 
 fn tui_reload_command(
@@ -4773,8 +4868,11 @@ mod tests {
         let enter = parse_fzf_selection_output(&format!("{row}\n"))
             .expect("parse enter")
             .expect("selection");
+        assert_eq!(enter.row.source_kind, "codex");
         assert_eq!(enter.row.session_id, "session_1");
         assert_eq!(enter.row.event_id, "event_1");
+        assert_eq!(enter.row.workspace.as_deref(), Some("/tmp/workspace"));
+        assert_eq!(enter.row.machine_id.as_deref(), Some("machine_1"));
         assert!(enter.row.full);
 
         let explicit_enter = parse_fzf_selection_output(&format!("\n{row}\n"))
@@ -5090,8 +5188,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
 
-        let with_color = fzf_preview_command(&config, true);
-        let without_color = fzf_preview_command(&config, false);
+        let with_color = local_fzf_preview_command(&config, true);
+        let without_color = local_fzf_preview_command(&config, false);
 
         assert!(with_color.contains("mode={12}; if [ -n \"$mode\" ]"));
         assert!(with_color.contains("show {7} \"$mode\""));
@@ -5099,6 +5197,21 @@ mod tests {
         assert!(with_color.contains("--color always"));
         assert!(!with_color.contains("--no-color"));
         assert!(without_color.contains("--no-color"));
+    }
+
+    #[test]
+    fn remote_fzf_preview_queries_server_show_endpoint() {
+        let command =
+            remote_fzf_preview_command("http://remote.example:7391/", true).expect("preview");
+
+        assert!(command.contains("curl -fsSG --connect-timeout 2 --max-time 10"));
+        assert!(command.contains("'http://remote.example:7391/show'"));
+        assert!(command.contains("--data-urlencode event={7}"));
+        assert!(command.contains("--data-urlencode before=3"));
+        assert!(command.contains("--data-urlencode after=5"));
+        assert!(command.contains("--data-urlencode color=always"));
+        assert!(command.contains("full_arg=' --data-urlencode full=true'"));
+        assert!(command.contains(" 2>/dev/null || :"));
     }
 
     #[test]
