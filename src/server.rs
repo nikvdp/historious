@@ -12,15 +12,48 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 struct AppState {
     store: Store,
     machine_id: String,
     default_search_mode: search::SearchMode,
+    embedder: Arc<RwLock<ServerEmbedderState>>,
+}
+
+struct ServerEmbedderState {
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
-    embedder_degraded_reason: Option<String>,
+    degraded_reason: Option<String>,
+}
+
+impl ServerEmbedderState {
+    fn loading() -> Self {
+        Self {
+            embedder: None,
+            degraded_reason: Some(
+                "query embedder is still loading; using lexical search only".to_string(),
+            ),
+        }
+    }
+
+    fn ready(embedder: Box<dyn crate::embed::Embedder>) -> Self {
+        Self {
+            embedder: Some(Arc::from(embedder)),
+            degraded_reason: None,
+        }
+    }
+
+    fn degraded(reason: String) -> Self {
+        Self {
+            embedder: None,
+            degraded_reason: Some(reason),
+        }
+    }
+
+    fn snapshot(&self) -> (Option<Arc<dyn crate::embed::Embedder>>, Option<String>) {
+        (self.embedder.clone(), self.degraded_reason.clone())
+    }
 }
 
 #[derive(Serialize)]
@@ -35,10 +68,8 @@ pub async fn serve(
     default_search_mode: search::SearchMode,
     embedder: crate::embed::EmbedderConfig,
 ) -> Result<()> {
-    let (embedder, embedder_degraded_reason) = match embedder.load() {
-        Ok(embedder) => (Some(Arc::from(embedder)), None),
-        Err(err) => (None, Some(err.to_string())),
-    };
+    let embedder_state = Arc::new(RwLock::new(ServerEmbedderState::loading()));
+    load_embedder_in_background(embedder, Arc::clone(&embedder_state));
     let app = Router::new()
         .route("/health", get(health))
         .route("/heads", get(heads))
@@ -51,13 +82,35 @@ pub async fn serve(
             store,
             machine_id,
             default_search_mode,
-            embedder,
-            embedder_degraded_reason,
+            embedder: embedder_state,
         });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving sync API on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn load_embedder_in_background(
+    config: crate::embed::EmbedderConfig,
+    state: Arc<RwLock<ServerEmbedderState>>,
+) {
+    let loader_state = Arc::clone(&state);
+    let spawn_result = std::thread::Builder::new()
+        .name("histo-embedder-loader".to_string())
+        .spawn(move || {
+            let next_state = match config.load() {
+                Ok(embedder) => ServerEmbedderState::ready(embedder),
+                Err(err) => ServerEmbedderState::degraded(err.to_string()),
+            };
+            let mut guard = loader_state
+                .write()
+                .expect("server embedder state lock poisoned");
+            *guard = next_state;
+        });
+    if let Err(err) = spawn_result {
+        let mut guard = state.write().expect("server embedder state lock poisoned");
+        *guard = ServerEmbedderState::degraded(format!("starting query embedder loader: {err}"));
+    }
 }
 
 async fn health() -> Json<Health> {
@@ -194,12 +247,17 @@ async fn search_endpoint(
         .with_time_window(after, before)
         .with_machine_filter(params.machine.clone(), params.hostname.clone())
         .with_workspace_scope(params.project.clone());
+    let (embedder, embedder_degraded_reason) = state
+        .embedder
+        .read()
+        .expect("server embedder state lock poisoned")
+        .snapshot();
     let response = search::search(
         &state.store,
         &query,
         options,
-        state.embedder.as_deref(),
-        state.embedder_degraded_reason.clone(),
+        embedder.as_deref(),
+        embedder_degraded_reason,
     )?;
     if params.format.as_deref() == Some("fzf") {
         let refs = state
@@ -357,11 +415,16 @@ async fn import_jsonl(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let stats = transport::import_jsonl_reader(&state.store, Cursor::new(body))?;
     let projected = search::refresh(&state.store)?;
+    let (embedder, embedder_degraded_reason) = state
+        .embedder
+        .read()
+        .expect("server embedder state lock poisoned")
+        .snapshot();
     let embeddings = search::refresh_embeddings(
         &state.store,
         &state.machine_id,
-        state.embedder.as_deref(),
-        state.embedder_degraded_reason.clone(),
+        embedder.as_deref(),
+        embedder_degraded_reason,
     )?;
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,

@@ -25,13 +25,13 @@ const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
 
 #[derive(Debug, Parser)]
-#[command(name = "super-cass")]
+#[command(name = "histo")]
 #[command(about = "Search and sync local coding-agent transcripts")]
 pub struct Cli {
     #[arg(
         long,
-        env = "SUPER_CASS_DATA_DIR",
-        help = "Use a custom super-cass data directory"
+        env = "HISTO_DATA_DIR",
+        help = "Use a custom Historious data directory"
     )]
     pub data_dir: Option<std::path::PathBuf>,
     #[arg(
@@ -171,7 +171,7 @@ pub enum Command {
             long,
             conflicts_with = "server",
             value_name = "BASE_URL",
-            help = "Use a remote super-cass server for TUI search requests"
+            help = "Use a remote Historious server for TUI search requests"
         )]
         remote: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
@@ -544,12 +544,12 @@ pub enum Command {
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
-    /// Output agent instructions for super-cass.
+    /// Output agent instructions for Historious.
     Onboard {
         #[arg(long, help = "Emit only the AGENTS.md-ready block")]
         agents_md: bool,
     },
-    /// List, emit, and install packaged super-cass skills.
+    /// List, emit, and install packaged Historious skills.
     Skill {
         #[command(subcommand)]
         command: SkillCommand,
@@ -563,7 +563,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum SkillCommand {
-    /// List packaged skills embedded in super-cass.
+    /// List packaged skills embedded in Historious.
     List,
     /// Print packaged skill content.
     Emit {
@@ -785,7 +785,7 @@ impl Cli {
                 let limit = search_limit(limit, fzf);
                 let query = query.unwrap_or_default();
                 if query.trim().is_empty() && fzf {
-                    bail!("search --fzf requires a query; use `super-cass tui` for live interactive search");
+                    bail!("search --fzf requires a query; use `histo tui` for live interactive search");
                 }
                 if query.trim().is_empty() && !fzf_rows {
                     bail!("search requires a query");
@@ -1003,7 +1003,7 @@ impl Cli {
                             show_output(&store, &context)?,
                             crate::output::EnvelopeOptions {
                                 hints: vec![format!(
-                                    "super-cass transcript {} --at {} --full --json",
+                                    "histo transcript {} --at {} --full --json",
                                     context.session.id, context.target_event.id
                                 )],
                                 ..Default::default()
@@ -1023,7 +1023,7 @@ impl Cli {
                             history_show_output(&store, &context)?,
                             crate::output::EnvelopeOptions {
                                 hints: vec![format!(
-                                    "super-cass transcript {} --at {} --json",
+                                    "histo transcript {} --at {} --json",
                                     context.session.id, target_hint
                                 )],
                                 ..Default::default()
@@ -1473,7 +1473,7 @@ impl Command {
 
 fn print_completion(shell: Shell) {
     let mut command = Cli::command();
-    clap_complete::generate(shell, &mut command, "super-cass", &mut io::stdout());
+    clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {
@@ -2090,11 +2090,11 @@ fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
 }
 
 fn embedder_probe_output(config: &AppConfig) -> Option<EmbedderProbeOutput> {
-    if std::env::var("SUPER_CASS_PROBE_EMBEDDER").as_deref() != Ok("1") {
+    if std::env::var("HISTO_PROBE_EMBEDDER").as_deref() != Ok("1") {
         return None;
     }
     Some(match config.embedder.load() {
-        Ok(loaded) => match loaded.embed_one("super cass query embedder probe") {
+        Ok(loaded) => match loaded.embed_one("historious query embedder probe") {
             Ok(vector) => EmbedderProbeOutput {
                 status: EmbedderProbeStatus::Ready,
                 model_id: Some(loaded.model_id().to_string()),
@@ -2982,13 +2982,8 @@ fn threads_output(
         },
         next_commands: results
             .first()
-            .map(|thread| {
-                vec![format!(
-                    "super-cass transcript {} --json",
-                    thread.session_id
-                )]
-            })
-            .unwrap_or_else(|| vec!["super-cass update --json".to_string()]),
+            .map(|thread| vec![format!("histo transcript {} --json", thread.session_id)])
+            .unwrap_or_else(|| vec!["histo update --json".to_string()]),
         results,
     }
 }
@@ -3166,15 +3161,15 @@ fn search_output(
 
 fn search_hints(results: &[search::SearchResult], refs: &[String]) -> Vec<String> {
     let Some(result) = results.first() else {
-        return vec!["super-cass update --json".to_string()];
+        return vec!["histo update --json".to_string()];
     };
     let Some(ref_id) = refs.first() else {
         return Vec::new();
     };
     vec![
-        format!("super-cass show {ref_id} --json"),
+        format!("histo show {ref_id} --json"),
         format!(
-            "super-cass transcript {} --at {ref_id} --json",
+            "histo transcript {} --at {ref_id} --json",
             result.session_id
         ),
     ]
@@ -3967,7 +3962,7 @@ fn local_fzf_preview_command(config: &AppConfig, color: bool) -> String {
     let exe = current_exe
         .as_ref()
         .map(|path| shell_quote(&path.to_string_lossy()))
-        .unwrap_or_else(|| "super-cass".to_string());
+        .unwrap_or_else(|| "histo".to_string());
     let data_dir = shell_quote(&config.data_dir.to_string_lossy());
     let color_flag = if color {
         " --color always"
@@ -4068,7 +4063,7 @@ fn tui_reload_command(
 fn ensure_fzf_available() -> Result<()> {
     if !command_exists("fzf") {
         bail!(
-            "fzf is not installed. Use `super-cass search <query>` and then `super-cass show <ref>` or `super-cass transcript <ref>`."
+            "fzf is not installed. Use `histo search <query>` and then `histo show <ref>` or `histo transcript <ref>`."
         );
     }
     Ok(())
@@ -4137,7 +4132,7 @@ fn ensure_tui_backend_available(
                 Ok(None)
             } else {
                 let health_url = server_url(base_url, "health")?;
-                bail!("could not reach remote super-cass server at {health_url}");
+                bail!("could not reach remote Historious server at {health_url}");
             }
         }
     }
@@ -4149,7 +4144,7 @@ fn ensure_server_available(config: &AppConfig, server: &str) -> Result<Option<St
     }
     let Some(bind) = local_server_bind_addr(server) else {
         let health_url = server_url(server, "health")?;
-        bail!("could not reach super-cass server at {health_url}");
+        bail!("could not reach Historious server at {health_url}");
     };
     let mut started = start_local_server(config, &bind)?;
     wait_for_started_server(server, &mut started)?;
@@ -4170,8 +4165,8 @@ fn server_health_available(server: &str) -> Result<bool> {
 }
 
 fn start_local_server(config: &AppConfig, bind: &str) -> Result<StartedServer> {
-    eprintln!("Starting local super-cass server at {bind}...");
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("super-cass"));
+    eprintln!("Starting local Historious server at {bind}...");
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("histo"));
     let child = ProcessCommand::new(exe)
         .arg("--data-dir")
         .arg(&config.data_dir)
@@ -4191,12 +4186,12 @@ fn wait_for_started_server(server: &str, started: &mut StartedServer) -> Result<
             return Ok(());
         }
         if let Some(status) = started.child.try_wait()? {
-            bail!("local super-cass server exited before it became ready: {status}");
+            bail!("local Historious server exited before it became ready: {status}");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let health_url = server_url(server, "health")?;
-    bail!("local super-cass server did not become ready at {health_url}")
+    bail!("local Historious server did not become ready at {health_url}")
 }
 
 fn server_url(server: &str, path: &str) -> Result<String> {
@@ -4819,7 +4814,7 @@ mod tests {
             semantic_rank: Some(2),
             occurred_at: None,
             session_title: Some("Planning Session".to_string()),
-            workspace_values: vec!["/home/example/projects/super-cass".to_string()],
+            workspace_values: vec!["/home/example/projects/historious".to_string()],
             snippet: "preview with\nnew line".to_string(),
             duplicate_group: Vec::new(),
         };
@@ -4835,7 +4830,7 @@ mod tests {
         assert_eq!(fields[5], "session_1");
         assert_eq!(fields[6], "event_1");
         assert_eq!(fields[7], "Planning Session");
-        assert_eq!(fields[8], "/home/example/projects/super-cass");
+        assert_eq!(fields[8], "/home/example/projects/historious");
         assert_eq!(fields[9], "machine_devbox_123");
         assert_eq!(fields[10], "hi_1");
         assert_eq!(fields[11], "");
@@ -5007,10 +5002,10 @@ mod tests {
             value["results"][0]["duplicate_group"][0]["history_item_id"],
             "hi_2"
         );
-        assert_eq!(value["next_commands"][0], "super-cass show ab3f --json");
+        assert_eq!(value["next_commands"][0], "histo show ab3f --json");
         assert_eq!(
             value["next_commands"][1],
-            "super-cass transcript session_1 --at ab3f --json"
+            "histo transcript session_1 --at ab3f --json"
         );
     }
 
@@ -5021,7 +5016,7 @@ mod tests {
 
     #[test]
     fn robot_mode_is_global_and_requests_structured_errors() {
-        let cli = Cli::try_parse_from(["super-cass", "--robot", "search", "needle"])
+        let cli = Cli::try_parse_from(["histo", "--robot", "search", "needle"])
             .expect("parse robot search");
 
         assert!(cli.robot);
@@ -5031,7 +5026,7 @@ mod tests {
 
     #[test]
     fn tui_accepts_missing_starting_query() {
-        let cli = Cli::try_parse_from(["super-cass", "tui"]).expect("parse tui search");
+        let cli = Cli::try_parse_from(["histo", "tui"]).expect("parse tui search");
 
         match cli.command {
             Command::Tui {
@@ -5053,7 +5048,7 @@ mod tests {
     #[test]
     fn tui_accepts_explicit_remote_backend() {
         let cli = Cli::try_parse_from([
-            "super-cass",
+            "histo",
             "tui",
             "--remote",
             "http://example.com:7391/",
@@ -5079,7 +5074,7 @@ mod tests {
     #[test]
     fn tui_rejects_remote_and_server_together() {
         assert!(Cli::try_parse_from([
-            "super-cass",
+            "histo",
             "tui",
             "--remote",
             "http://example.com:7391",

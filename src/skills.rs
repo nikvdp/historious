@@ -8,18 +8,18 @@ pub struct PackagedSkill {
     pub skill_md: &'static str,
 }
 
-const SEARCH_AGENT_HISTORY_SUPER_CASS: &str = r#"---
-name: search-agent-history-super-cass
-description: Search coding-agent conversation history with super-cass across Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, and other indexed local agent logs.
+const SEARCH_AGENT_HISTORY_HISTORIOUS: &str = r#"---
+name: search-agent-history-historious
+description: Search coding-agent conversation history with Historious across Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, and other indexed local agent logs.
 ---
 
-# Search Agent History With super-cass
+# Search Agent History With Historious
 
 Use this skill when the user asks what happened in a prior coding-agent session, wants to find a session ID, remembers a partial implementation detail, or asks to search across coding agents.
 
 ## Core Rules
 
-- Prefer `super-cass --robot` for agent usage. It emits stable JSON envelopes and disables interactive behavior.
+- Prefer `histo --robot` for agent usage. It emits stable JSON envelopes and disables interactive behavior.
 - Start with broad search, then inspect the best refs with `show` or `transcript`.
 - Group candidates by `session_id`; do not treat every matching event as a separate conversation.
 - Use transcript JSON for exact content. Do not parse human transcript markers when JSON is available.
@@ -29,7 +29,7 @@ Use this skill when the user asks what happened in a prior coding-agent session,
 ## Health Check
 
 ```bash
-super-cass --robot status
+histo --robot status
 ```
 
 Useful fields:
@@ -45,13 +45,13 @@ Useful fields:
 If the archive looks stale or empty, run:
 
 ```bash
-super-cass --robot update
+histo --robot update
 ```
 
 ## Search
 
 ```bash
-super-cass --robot search "distinctive query terms" --limit 20
+histo --robot search "distinctive query terms" --limit 20
 ```
 
 Each result includes:
@@ -67,8 +67,8 @@ Each result includes:
 Prefer refs for interactive follow-up:
 
 ```bash
-super-cass --robot show <ref>
-super-cass --robot transcript <session_id> --at <ref>
+histo --robot show <ref>
+histo --robot transcript <session_id> --at <ref>
 ```
 
 ## Inspect A Result
@@ -76,7 +76,7 @@ super-cass --robot transcript <session_id> --at <ref>
 Use `show` for nearby context:
 
 ```bash
-super-cass --robot show <ref> --before 5 --after 8
+histo --robot show <ref> --before 5 --after 8
 ```
 
 The JSON payload has:
@@ -88,7 +88,7 @@ The JSON payload has:
 Use `transcript` for the full conversation:
 
 ```bash
-super-cass --robot transcript <session_id> --at <ref>
+histo --robot transcript <session_id> --at <ref>
 ```
 
 The JSON payload has ordered `.data.events[]` with exact content, roles, event ids, metadata, and target index.
@@ -100,43 +100,43 @@ Use JSONL export/import over stdin/stdout to exchange history with another machi
 Pull remote history into the local machine:
 
 ```bash
-ssh remote 'super-cass export --jsonl [filters]' \
-  | super-cass import --jsonl --json -
+ssh remote 'histo export --jsonl [filters]' \
+  | histo import --jsonl --json -
 ```
 
 Push local history to a remote machine:
 
 ```bash
-super-cass export --jsonl [filters] \
-  | ssh remote 'super-cass import --jsonl --json -'
+histo export --jsonl [filters] \
+  | ssh remote 'histo import --jsonl --json -'
 ```
 
 Reciprocal exchange is just both directions:
 
 ```bash
-ssh remote 'super-cass export --jsonl [filters]' \
-  | super-cass import --jsonl --json -
+ssh remote 'histo export --jsonl [filters]' \
+  | histo import --jsonl --json -
 
-super-cass export --jsonl [filters] \
-  | ssh remote 'super-cass import --jsonl --json -'
+histo export --jsonl [filters] \
+  | ssh remote 'histo import --jsonl --json -'
 ```
 
 Useful filters:
 
 ```bash
-super-cass export --jsonl --source codex
-super-cass export --jsonl --workspace /absolute/repo/path
-super-cass export --jsonl --session <session_id>
-super-cass export --jsonl --since 2026-06-01
+histo export --jsonl --source codex
+histo export --jsonl --workspace /absolute/repo/path
+histo export --jsonl --session <session_id>
+histo export --jsonl --since 2026-06-01
 ```
 
 ## Remote TUI
 
-Use `--remote <base-url>` when an already-running super-cass server should back
+Use `--remote <base-url>` when an already-running Historious server should back
 the interactive TUI end to end:
 
 ```bash
-super-cass tui --remote http://127.0.0.1:7391
+histo tui --remote http://127.0.0.1:7391
 ```
 
 For another machine, prefer an SSH tunnel instead of exposing the unauthenticated
@@ -144,8 +144,8 @@ HTTP server directly:
 
 ```bash
 ssh -L 7391:127.0.0.1:7391 remote
-ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
-super-cass tui --remote http://127.0.0.1:7391
+ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
+histo tui --remote http://127.0.0.1:7391
 ```
 
 ### Embedding Transfer
@@ -155,21 +155,21 @@ Exports include existing embedding records by default. Imports store those embed
 Round-trip through an embedding-capable box:
 
 ```bash
-super-cass export --jsonl [filters] \
-  | ssh gpu-box 'super-cass import --jsonl --json -'
+histo export --jsonl [filters] \
+  | ssh gpu-box 'histo import --jsonl --json -'
 
-ssh gpu-box 'super-cass export --jsonl [filters]' \
-  | super-cass import --jsonl --json -
+ssh gpu-box 'histo export --jsonl [filters]' \
+  | histo import --jsonl --json -
 ```
 
 Use `--embeddings omit` only when bandwidth or storage matters:
 
 ```bash
-super-cass export --jsonl --embeddings omit [filters] \
-  | ssh remote 'super-cass import --jsonl --json -'
+histo export --jsonl --embeddings omit [filters] \
+  | ssh remote 'histo import --jsonl --json -'
 ```
 
-Do not add `super-cass update` to these exchange flows. `update` scans local agent log files and is a separate maintenance concern.
+Do not add `histo update` to these exchange flows. `update` scans local agent log files and is a separate maintenance concern.
 
 ## Search Strategy
 
@@ -194,17 +194,17 @@ Useful refs: <ref list>
 For workflow recovery, summarize the recovered recipe and cite the session id/ref used. Do not dump full transcripts unless the user explicitly asks.
 "#;
 
-const AGENTS_MD: &str = r#"## super-cass Agent History Search
+const AGENTS_MD: &str = r#"## Historious Agent History Search
 
-Use `super-cass` for cross-agent coding-history search.
+Use `histo` for cross-agent coding-history search.
 
 Preferred agent pattern:
 
 ```bash
-super-cass --robot status
-super-cass --robot search "distinctive query terms" --limit 20
-super-cass --robot show <ref> --before 5 --after 8
-super-cass --robot transcript <session_id> --at <ref>
+histo --robot status
+histo --robot search "distinctive query terms" --limit 20
+histo --robot show <ref> --before 5 --after 8
+histo --robot transcript <session_id> --at <ref>
 ```
 
 Rules:
@@ -214,40 +214,40 @@ Rules:
 - Use returned `ref` values for `show` and `transcript` follow-ups.
 - Use `transcript` JSON when exact wording, commands, or file paths matter.
 - Redact secrets found in transcripts.
-- Do not add a separate search command; the canonical entry point is `super-cass search`.
+- Do not add a separate search command; the canonical entry point is `histo search`.
 
 History exchange:
 
 ```bash
 # Pull remote history and existing embeddings into local.
-ssh remote 'super-cass export --jsonl [filters]' \
-  | super-cass import --jsonl --json -
+ssh remote 'histo export --jsonl [filters]' \
+  | histo import --jsonl --json -
 
 # Push local history and existing embeddings to remote.
-super-cass export --jsonl [filters] \
-  | ssh remote 'super-cass import --jsonl --json -'
+histo export --jsonl [filters] \
+  | ssh remote 'histo import --jsonl --json -'
 
 # Omit embeddings only when bandwidth or storage is constrained.
-super-cass export --jsonl --embeddings omit [filters] \
-  | ssh remote 'super-cass import --jsonl --json -'
+histo export --jsonl --embeddings omit [filters] \
+  | ssh remote 'histo import --jsonl --json -'
 
 # Round-trip through an embedding-capable box.
-super-cass export --jsonl [filters] \
-  | ssh gpu-box 'super-cass import --jsonl --json -'
+histo export --jsonl [filters] \
+  | ssh gpu-box 'histo import --jsonl --json -'
 
-ssh gpu-box 'super-cass export --jsonl [filters]' \
-  | super-cass import --jsonl --json -
+ssh gpu-box 'histo export --jsonl [filters]' \
+  | histo import --jsonl --json -
 ```
 
 Remote TUI:
 
 ```bash
 # Keep the server bound to loopback on the remote host.
-ssh remote 'super-cass serve --bind 127.0.0.1:7391 --watch'
+ssh remote 'histo serve --bind 127.0.0.1:7391 --watch'
 
 # Forward it locally and use the remote backend for search, preview, and Enter.
 ssh -L 7391:127.0.0.1:7391 remote
-super-cass tui --remote http://127.0.0.1:7391
+histo tui --remote http://127.0.0.1:7391
 ```
 
 Exchange rules:
@@ -256,20 +256,20 @@ Exchange rules:
 - Import stores transferred embeddings and refreshes the local vector index.
 - Use `--embeddings omit` only for bandwidth or storage constrained exchanges.
 - Use an embedding-capable machine by piping history to it, then exporting back from it.
-- Do not include `super-cass update` in exchange flows; local log scanning is separate.
+- Do not include `histo update` in exchange flows; local log scanning is separate.
 
 Packaged skill:
 
 ```bash
-super-cass skill emit search-agent-history-super-cass
-super-cass skill install search-agent-history-super-cass --codex
+histo skill emit search-agent-history-historious
+histo skill install search-agent-history-historious --codex
 ```
 "#;
 
 const SKILLS: &[PackagedSkill] = &[PackagedSkill {
-    name: "search-agent-history-super-cass",
-    description: "Search coding-agent conversation history through super-cass robot JSON.",
-    skill_md: SEARCH_AGENT_HISTORY_SUPER_CASS,
+    name: "search-agent-history-historious",
+    description: "Search coding-agent conversation history through Historious robot JSON.",
+    skill_md: SEARCH_AGENT_HISTORY_HISTORIOUS,
 }];
 
 pub fn list_skills() -> &'static [PackagedSkill] {

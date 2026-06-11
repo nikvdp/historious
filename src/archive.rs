@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const ARCHIVE_SCHEMA: &str = "super-cass.archive.v1";
+pub const ARCHIVE_SCHEMA: &str = "historious.archive.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawArtifact {
@@ -145,7 +145,7 @@ impl ArchiveEnvelope {
             schema: ARCHIVE_SCHEMA.to_string(),
             id: record.id().to_string(),
             hash: record.hash().to_string(),
-            producer: format!("super-cass/{}", env!("CARGO_PKG_VERSION")),
+            producer: format!("historious/{}", env!("CARGO_PKG_VERSION")),
             produced_at: Utc::now(),
             record,
         }
