@@ -132,20 +132,43 @@ histo export --jsonl --since 2026-06-01
 
 ## Remote TUI
 
-Use `--remote <base-url>` when an already-running Historious server should back
-the interactive TUI end to end:
+Use `--server-url <url>` when an already-running Historious server should back
+the interactive TUI end to end. Keep the server running in one terminal:
 
 ```bash
-histo tui --remote http://127.0.0.1:7391
+histo serve
+```
+
+Then connect from another terminal:
+
+```bash
+histo tui --server-url http://127.0.0.1:7391
 ```
 
 For another machine, prefer an SSH tunnel instead of exposing the unauthenticated
-HTTP server directly:
+HTTP server directly. Keep this running in one terminal:
 
 ```bash
-ssh -L 7391:127.0.0.1:7391 <remote>
-ssh <remote> 'histo serve --bind 127.0.0.1:7391 --watch'
-histo tui --remote http://127.0.0.1:7391
+ssh -L 7391:127.0.0.1:7391 <remote> 'histo serve'
+```
+
+Then connect the local TUI through the tunnel:
+
+```bash
+histo tui --server-url http://127.0.0.1:7391
+```
+
+Direct LAN exposure is explicit because the HTTP server is unauthenticated. Keep
+this running on the remote:
+
+```bash
+ssh <remote> 'histo serve --bind 0.0.0.0:7391 --allow-network-bind'
+```
+
+Then connect to the remote address:
+
+```bash
+histo tui --server-url http://<remote-ip>:7391
 ```
 
 ### Embedding Transfer
@@ -242,12 +265,18 @@ ssh <embedding-host> 'histo export --jsonl [filters]' \
 Remote TUI:
 
 ```bash
-# Keep the server bound to loopback on the remote host.
-ssh <remote> 'histo serve --bind 127.0.0.1:7391 --watch'
+# Terminal 1: keep the server bound to loopback on the remote host and forward it locally.
+ssh -L 7391:127.0.0.1:7391 <remote> 'histo serve'
 
-# Forward it locally and use the remote backend for search, preview, and Enter.
-ssh -L 7391:127.0.0.1:7391 <remote>
-histo tui --remote http://127.0.0.1:7391
+# Terminal 2: use the forwarded server for search, preview, and Enter.
+histo tui --server-url http://127.0.0.1:7391
+
+# Direct LAN exposure is explicit because the HTTP server is unauthenticated.
+# Terminal 1:
+ssh <remote> 'histo serve --bind 0.0.0.0:7391 --allow-network-bind'
+
+# Terminal 2:
+histo tui --server-url http://<remote-ip>:7391
 ```
 
 Exchange rules:
