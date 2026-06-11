@@ -171,7 +171,7 @@ pub enum Command {
             long,
             conflicts_with = "server",
             value_name = "BASE_URL",
-            help = "Use a remote super-cass server for TUI search requests"
+            help = "Use a remote Historious server for TUI search requests"
         )]
         remote: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
@@ -4132,7 +4132,7 @@ fn ensure_tui_backend_available(
                 Ok(None)
             } else {
                 let health_url = server_url(base_url, "health")?;
-                bail!("could not reach remote super-cass server at {health_url}");
+                bail!("could not reach remote Historious server at {health_url}");
             }
         }
     }
@@ -5048,7 +5048,7 @@ mod tests {
     #[test]
     fn tui_accepts_explicit_remote_backend() {
         let cli = Cli::try_parse_from([
-            "super-cass",
+            "histo",
             "tui",
             "--remote",
             "http://example.com:7391/",
@@ -5074,7 +5074,7 @@ mod tests {
     #[test]
     fn tui_rejects_remote_and_server_together() {
         assert!(Cli::try_parse_from([
-            "super-cass",
+            "histo",
             "tui",
             "--remote",
             "http://example.com:7391",
