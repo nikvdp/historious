@@ -1954,7 +1954,15 @@ fn refresh_search_after_update_with_progress(
 ) -> Result<usize> {
     if repair {
         progress("repairing all indexable events".to_string());
-        let indexed = search::refresh(store)?;
+        let indexed = refresh_search_index_repair_with_progress(store, &mut progress)?;
+        progress("projecting history items".to_string());
+        store.refresh_history_items_with_progress(|processed, total| {
+            progress(format!(
+                "projected {}/{} events into history items",
+                format_count(processed),
+                format_count(total)
+            ));
+        })?;
         Ok(indexed)
     } else {
         let search_event_ids = delta.search_index_event_ids();
@@ -1990,7 +1998,7 @@ fn refresh_search_after_update_with_progress(
         progress("checking index health".to_string());
         let indexed = if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
             progress("repairing missing search index rows".to_string());
-            search::refresh_search_index(store)
+            refresh_search_index_repair_with_progress(store, &mut progress)
         } else {
             Ok(indexed)
         }?;
@@ -2021,6 +2029,42 @@ fn refresh_search_after_update_with_progress(
         }
         Ok(indexed)
     }
+}
+
+fn refresh_search_index_repair_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(String),
+) -> Result<usize> {
+    let mut last_progress = Instant::now();
+    let mut last_report: Option<(&'static str, usize, usize)> = None;
+    store.refresh_search_index_with_progress(
+        crate::embed::HashEmbedder::MODEL_ID,
+        crate::embed::HashEmbedder::DIMS,
+        crate::embed::hash_embed,
+        |phase, processed, total| {
+            let report = (phase, processed, total);
+            if processed == 0
+                || processed == total
+                || last_progress.elapsed() >= Duration::from_secs(1)
+            {
+                if last_report != Some(report) {
+                    let label = match phase {
+                        "search_rows" => "search index rows",
+                        "search_units" => "search units",
+                        _ => "search rows",
+                    };
+                    progress(format!(
+                        "repaired {}/{} {}",
+                        format_count(processed),
+                        format_count(total),
+                        label
+                    ));
+                    last_progress = Instant::now();
+                    last_report = Some(report);
+                }
+            }
+        },
+    )
 }
 
 fn refresh_embeddings_after_update_with_progress(

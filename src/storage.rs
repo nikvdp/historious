@@ -166,6 +166,7 @@ pub struct EventForProjection {
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
     pub text_hash: String,
+    pub fts_indexed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1087,8 +1088,32 @@ impl Store {
         dims: usize,
         embed: impl Fn(&str) -> Vec<f32>,
     ) -> Result<usize> {
+        self.refresh_search_index_with_progress(model, dims, embed, |_, _, _| {})
+    }
+
+    pub fn refresh_search_index_with_progress(
+        &self,
+        model: &str,
+        dims: usize,
+        embed: impl Fn(&str) -> Vec<f32>,
+        mut progress: impl FnMut(&'static str, usize, usize),
+    ) -> Result<usize> {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                let total_index_rows: usize = tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM events e
+                     LEFT JOIN event_embeddings emb
+                       ON emb.event_id = e.id AND emb.model = ?1
+                     LEFT JOIN events_fts fts
+                       ON fts.event_id = e.id
+                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                       AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                       AND (emb.event_id IS NULL OR fts.event_id IS NULL)",
+                    params![model],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+                progress("search_rows", 0, total_index_rows);
                 let mut stmt = tx.prepare(
                     "SELECT e.id,
                         e.session_id,
@@ -1098,7 +1123,8 @@ impl Store {
                         e.role,
                         json_extract(e.metadata_json, '$.search_kind'),
                         json_extract(e.metadata_json, '$.search_text'),
-                        e.occurred_at
+                        e.occurred_at,
+                        fts.event_id IS NOT NULL
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
@@ -1122,13 +1148,34 @@ impl Store {
                         text_hash: crate::archive::blake3_hex(content.as_bytes()),
                         content,
                         occurred_at: parse_opt_dt(row.get(8)?),
+                        fts_indexed: row.get(9)?,
                     })
                 })?;
+                let mut indexed_rows = 0usize;
                 for row in rows {
                     insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                    indexed_rows += 1;
+                    if indexed_rows % 1_000 == 0 {
+                        progress("search_rows", indexed_rows, total_index_rows);
+                    }
+                }
+                if total_index_rows > 0 || indexed_rows > 0 {
+                    progress("search_rows", indexed_rows, total_index_rows);
                 }
                 drop(stmt);
 
+                let total_unit_rows: usize = tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM events e
+                     LEFT JOIN search_units su
+                       ON su.event_id = e.id
+                     WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+                       AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
+                       AND su.event_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+                progress("search_units", 0, total_unit_rows);
                 let mut missing_unit_stmt = tx.prepare(
                     "SELECT e.id,
                         e.session_id,
@@ -1138,7 +1185,8 @@ impl Store {
                         e.role,
                         json_extract(e.metadata_json, '$.search_kind'),
                         json_extract(e.metadata_json, '$.search_text'),
-                        e.occurred_at
+                        e.occurred_at,
+                        0
                  FROM events e
                  LEFT JOIN search_units su
                    ON su.event_id = e.id
@@ -1160,8 +1208,10 @@ impl Store {
                         text_hash: crate::archive::blake3_hex(content.as_bytes()),
                         content,
                         occurred_at: parse_opt_dt(row.get(8)?),
+                        fts_indexed: row.get(9)?,
                     })
                 })?;
+                let mut projected_units = 0usize;
                 for row in missing_unit_rows {
                     let event = row?;
                     let unit_id =
@@ -1192,6 +1242,13 @@ impl Store {
                         hash: unit_hash,
                     };
                     insert_search_unit(&tx, &unit)?;
+                    projected_units += 1;
+                    if projected_units % 1_000 == 0 {
+                        progress("search_units", projected_units, total_unit_rows);
+                    }
+                }
+                if total_unit_rows > 0 || projected_units > 0 {
+                    progress("search_units", projected_units, total_unit_rows);
                 }
                 let indexed_events = count_indexed_events(&tx, model)?;
                 update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
@@ -1245,9 +1302,12 @@ impl Store {
                             e.role,
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
-                            e.occurred_at
+                            e.occurred_at,
+                            fts.event_id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
+                     LEFT JOIN events_fts fts
+                       ON fts.event_id = e.id
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
@@ -1266,6 +1326,7 @@ impl Store {
                             text_hash: crate::archive::blake3_hex(content.as_bytes()),
                             content,
                             occurred_at: parse_opt_dt(row.get(8)?),
+                            fts_indexed: row.get(9)?,
                         })
                     })?;
                     for row in rows {
@@ -3572,7 +3633,7 @@ fn insert_search_index_rows(
             serde_json::to_string(&vector)?
         ],
     )? > 0;
-    if inserted_unit || inserted_embedding {
+    if inserted_unit || inserted_embedding || !event.fts_indexed {
         conn.execute(
             "INSERT INTO events_fts (event_id, session_id, source_kind, content)
              VALUES (?1, ?2, ?3, ?4)",
