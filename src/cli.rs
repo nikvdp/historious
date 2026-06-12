@@ -2048,9 +2048,105 @@ fn refresh_embeddings_after_update_with_progress(
     }
 }
 
+fn refresh_import_search_index_with_progress(
+    store: &Store,
+    delta: &crate::storage::ImportDelta,
+    mut progress: impl FnMut(String),
+) -> Result<usize> {
+    let search_event_ids = delta.search_index_event_ids();
+    progress(format!(
+        "indexing {} imported events",
+        format_count(search_event_ids.len())
+    ));
+    let mut last_index_progress = Instant::now();
+    let mut last_index_report: Option<(usize, usize)> = None;
+    let indexed = store.refresh_search_index_for_events_with_progress(
+        crate::embed::HashEmbedder::MODEL_ID,
+        crate::embed::HashEmbedder::DIMS,
+        &search_event_ids,
+        crate::embed::hash_embed,
+        |processed, total| {
+            if processed == 1
+                || processed == total
+                || last_index_progress.elapsed() >= Duration::from_secs(1)
+            {
+                let report = (processed, total);
+                if last_index_report != Some(report) {
+                    progress(format!(
+                        "indexed {}/{} imported events",
+                        format_count(processed),
+                        format_count(total)
+                    ));
+                    last_index_progress = Instant::now();
+                    last_index_report = Some(report);
+                }
+            }
+        },
+    )?;
+    Ok(indexed)
+}
+
+fn import_progress_event(
+    event: transport::ImportProgress,
+) -> (&'static str, String, serde_json::Value) {
+    match event {
+        transport::ImportProgress::Stream(state) => (
+            "stream",
+            jsonl_progress_detail(state),
+            serde_json::json!({
+                "status": "streaming",
+                "records": state.records,
+                "bytes": state.bytes,
+            }),
+        ),
+        transport::ImportProgress::HistoryItems { processed, total } => (
+            "history_items",
+            format!(
+                "projected {}/{} events into history items",
+                format_count(processed),
+                format_count(total)
+            ),
+            serde_json::json!({
+                "status": "projecting",
+                "processed": processed,
+                "total": total,
+            }),
+        ),
+        transport::ImportProgress::VectorProjectionStarted { embeddings } => (
+            "vectors",
+            format!(
+                "refreshing vector projection for {} embeddings",
+                format_count(embeddings)
+            ),
+            serde_json::json!({
+                "status": "refreshing",
+                "embeddings": embeddings,
+            }),
+        ),
+        transport::ImportProgress::VectorProjectionFinished { vectors_indexed } => (
+            "vectors",
+            format!("{} vectors indexed", format_count(vectors_indexed)),
+            serde_json::json!({
+                "status": "finished",
+                "vectors_indexed": vectors_indexed,
+            }),
+        ),
+    }
+}
+
 fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<ImportOutput> {
-    let stats = transport::import_jsonl_path(store, input)?;
-    let projected = search::refresh_import_search_index_incremental(store, &stats.delta)?;
+    let stats = transport::import_jsonl_path_with_import_progress(store, input, |event| {
+        let (phase, detail, data) = import_progress_event(event);
+        write_machine_progress("import", phase, detail, data);
+    })?;
+    let projected = refresh_import_search_index_with_progress(store, &stats.delta, |detail| {
+        write_machine_progress(
+            "import",
+            "search_index",
+            detail.clone(),
+            serde_json::json!({ "detail": detail }),
+        );
+    })?;
     let embeddings = search::EmbeddingRefresh {
         vectors_indexed: stats.vectors_indexed,
         ..search::EmbeddingRefresh::default()
@@ -2068,10 +2164,29 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
     let progress = ProgressUi::new();
     let mut import = progress.phase("Importing history stream");
     let mut last = transport::JsonlProgress::default();
-    let stats = transport::import_jsonl_path_with_progress(store, input, |event| {
-        last = event;
-        import.update(jsonl_progress_detail(event));
-    })?;
+    let stats =
+        transport::import_jsonl_path_with_import_progress(store, input, |event| match event {
+            transport::ImportProgress::Stream(state) => {
+                last = state;
+                import.update(jsonl_progress_detail(state));
+            }
+            transport::ImportProgress::HistoryItems { processed, total } => {
+                import.update(format!(
+                    "projected {}/{} events into history items",
+                    format_count(processed),
+                    format_count(total)
+                ));
+            }
+            transport::ImportProgress::VectorProjectionStarted { embeddings } => {
+                import.update(format!(
+                    "refreshing vector projection for {} embeddings",
+                    format_count(embeddings)
+                ));
+            }
+            transport::ImportProgress::VectorProjectionFinished { vectors_indexed } => {
+                import.update(format!("{} vectors indexed", format_count(vectors_indexed)));
+            }
+        })?;
     import.finish(format!(
         "{} new records, {} duplicates, read {} records, {}",
         format_count(stats.inserted),
@@ -2080,8 +2195,10 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
         format_bytes(last.bytes)
     ));
 
-    let index = progress.phase("Updating search index");
-    let projected = search::refresh_import_search_index_incremental(store, &stats.delta)?;
+    let mut index = progress.phase("Updating search index");
+    let projected = refresh_import_search_index_with_progress(store, &stats.delta, |detail| {
+        index.update(detail);
+    })?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embed = progress.phase("Updating embeddings");
@@ -2349,9 +2466,18 @@ struct MachineProgressEvent {
 }
 
 fn write_update_progress(phase: &'static str, detail: String, data: serde_json::Value) {
+    write_machine_progress("update", phase, detail, data);
+}
+
+fn write_machine_progress(
+    command: &'static str,
+    phase: &'static str,
+    detail: String,
+    data: serde_json::Value,
+) {
     let event = MachineProgressEvent {
         event_type: "progress",
-        command: "update",
+        command,
         phase,
         detail,
         data,
@@ -4639,8 +4765,11 @@ async fn run_daemon(
             format_count(stats.errors)
         ));
 
-        let index = progress.phase("Updating search index");
-        let projected = search::refresh_incremental(store, &stats.delta)?;
+        let mut index = progress.phase("Updating search index");
+        let projected =
+            refresh_search_after_update_with_progress(store, &stats.delta, false, |detail| {
+                index.update(detail);
+            })?;
         index.finish(format!("{} events indexed", format_count(projected)));
 
         let mut embed = progress.phase("Updating embeddings");

@@ -122,6 +122,14 @@ pub struct JsonlProgress {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportProgress {
+    Stream(JsonlProgress),
+    HistoryItems { processed: usize, total: usize },
+    VectorProjectionStarted { embeddings: usize },
+    VectorProjectionFinished { vectors_indexed: usize },
+}
+
 fn write_jsonl_records(records: Vec<ArchiveRecord>, writer: &mut impl Write) -> Result<usize> {
     write_jsonl_records_with_progress(records, writer, |_| {})
 }
@@ -180,40 +188,69 @@ fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
+#[allow(dead_code)]
 pub fn import_jsonl_path(store: &Store, path: &str) -> Result<ImportStats> {
-    import_jsonl_path_with_progress(store, path, |_| {})
+    import_jsonl_path_with_import_progress(store, path, |_| {})
 }
 
+#[allow(dead_code)]
 pub fn import_jsonl_path_with_progress(
     store: &Store,
     path: &str,
-    progress: impl FnMut(JsonlProgress),
+    mut progress: impl FnMut(JsonlProgress),
+) -> Result<ImportStats> {
+    import_jsonl_path_with_import_progress(store, path, |event| {
+        if let ImportProgress::Stream(state) = event {
+            progress(state);
+        }
+    })
+}
+
+pub fn import_jsonl_path_with_import_progress(
+    store: &Store,
+    path: &str,
+    progress: impl FnMut(ImportProgress),
 ) -> Result<ImportStats> {
     if path == "-" {
-        import_jsonl_stdin_with_progress(store, progress)
+        import_jsonl_stdin_with_import_progress(store, progress)
     } else {
         let file = File::open(Path::new(path)).with_context(|| format!("opening {path}"))?;
-        import_jsonl_reader_with_progress(store, file, progress)
+        import_jsonl_reader_with_import_progress(store, file, progress)
     }
 }
 
 pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<ImportStats> {
-    import_jsonl_reader_with_progress(store, reader, |_| {})
+    import_jsonl_reader_with_import_progress(store, reader, |_| {})
 }
 
+#[allow(dead_code)]
 pub fn import_jsonl_reader_with_progress(
     store: &Store,
     reader: impl io::Read,
-    progress: impl FnMut(JsonlProgress),
+    mut progress: impl FnMut(JsonlProgress),
 ) -> Result<ImportStats> {
-    let mut stats = import_jsonl_reader_records_with_progress(store, reader, progress)?;
-    finalize_import_stats(store, &mut stats)?;
+    import_jsonl_reader_with_import_progress(store, reader, |event| {
+        if let ImportProgress::Stream(state) = event {
+            progress(state);
+        }
+    })
+}
+
+pub fn import_jsonl_reader_with_import_progress(
+    store: &Store,
+    reader: impl io::Read,
+    mut progress: impl FnMut(ImportProgress),
+) -> Result<ImportStats> {
+    let mut stats = import_jsonl_reader_records_with_progress(store, reader, |event| {
+        progress(ImportProgress::Stream(event));
+    })?;
+    finalize_import_stats_with_progress(store, &mut stats, progress)?;
     Ok(stats)
 }
 
-fn import_jsonl_stdin_with_progress(
+fn import_jsonl_stdin_with_import_progress(
     store: &Store,
-    mut progress: impl FnMut(JsonlProgress),
+    mut progress: impl FnMut(ImportProgress),
 ) -> Result<ImportStats> {
     let (tx, rx) = sync_channel(IMPORT_STREAM_CHANNEL_BATCHES);
     let reader = thread::spawn(move || {
@@ -229,13 +266,13 @@ fn import_jsonl_stdin_with_progress(
                 progress: state,
             } => {
                 flush_import_batch(store, &mut stats, &mut records)?;
-                progress(state);
+                progress(ImportProgress::Stream(state));
             }
             ImportQueueMessage::Spill {
                 mut file,
                 progress: state,
             } => {
-                progress(state);
+                progress(ImportProgress::Stream(state));
                 file.as_file_mut()
                     .rewind()
                     .context("rewinding spilled streamed archive import")?;
@@ -250,7 +287,7 @@ fn import_jsonl_stdin_with_progress(
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("streamed archive import reader thread panicked"))??;
-    finalize_import_stats(store, &mut stats)?;
+    finalize_import_stats_with_progress(store, &mut stats, progress)?;
     Ok(stats)
 }
 
@@ -305,14 +342,36 @@ fn import_jsonl_reader_records_with_progress(
     Ok(stats)
 }
 
+#[allow(dead_code)]
 fn finalize_import_stats(store: &Store, stats: &mut ImportStats) -> Result<()> {
+    finalize_import_stats_with_progress(store, stats, |_| {})
+}
+
+fn finalize_import_stats_with_progress(
+    store: &Store,
+    stats: &mut ImportStats,
+    mut progress: impl FnMut(ImportProgress),
+) -> Result<()> {
     if store.history_items_projection_ready()? {
-        store.refresh_history_items_for_events(&stats.delta.touched_events)?;
+        store.refresh_history_items_for_events_with_progress(
+            &stats.delta.touched_events,
+            |processed, total| {
+                progress(ImportProgress::HistoryItems { processed, total });
+            },
+        )?;
     } else {
-        store.refresh_history_items()?;
+        store.refresh_history_items_with_progress(|processed, total| {
+            progress(ImportProgress::HistoryItems { processed, total });
+        })?;
     }
+    progress(ImportProgress::VectorProjectionStarted {
+        embeddings: stats.delta.inserted_embeddings.len(),
+    });
     stats.vectors_indexed =
         store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
+    progress(ImportProgress::VectorProjectionFinished {
+        vectors_indexed: stats.vectors_indexed,
+    });
     Ok(())
 }
 

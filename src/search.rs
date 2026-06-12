@@ -322,6 +322,7 @@ pub fn refresh_search_index(store: &Store) -> Result<usize> {
     )
 }
 
+#[allow(dead_code)]
 pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
     let indexed = refresh_search_index_incremental(store, delta)?;
     if store.history_items_projection_ready()? {
@@ -332,10 +333,12 @@ pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> 
     Ok(indexed)
 }
 
+#[allow(dead_code)]
 pub fn refresh_search_index_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
     refresh_search_index_delta(store, delta, true)
 }
 
+#[allow(dead_code)]
 pub fn refresh_import_search_index_incremental(
     store: &Store,
     delta: &ImportDelta,
@@ -343,6 +346,7 @@ pub fn refresh_import_search_index_incremental(
     refresh_search_index_delta(store, delta, false)
 }
 
+#[allow(dead_code)]
 fn refresh_search_index_delta(
     store: &Store,
     delta: &ImportDelta,
