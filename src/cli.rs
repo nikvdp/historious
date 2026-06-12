@@ -1995,11 +1995,29 @@ fn refresh_search_after_update_with_progress(
             Ok(indexed)
         }?;
         if store.history_items_projection_ready()? {
-            progress("projecting changed history items".to_string());
-            store.refresh_history_items_for_events(&delta.touched_events)?;
+            progress(format!(
+                "projecting changed history items for {} events",
+                format_count(delta.touched_events.len())
+            ));
+            store.refresh_history_items_for_events_with_progress(
+                &delta.touched_events,
+                |processed, total| {
+                    progress(format!(
+                        "projected {}/{} changed events into history items",
+                        format_count(processed),
+                        format_count(total)
+                    ));
+                },
+            )?;
         } else {
             progress("projecting history items".to_string());
-            store.refresh_history_items()?;
+            store.refresh_history_items_with_progress(|processed, total| {
+                progress(format!(
+                    "projected {}/{} events into history items",
+                    format_count(processed),
+                    format_count(total)
+                ));
+            })?;
         }
         Ok(indexed)
     }
@@ -2342,6 +2360,7 @@ fn write_update_progress(phase: &'static str, detail: String, data: serde_json::
     let mut handle = stderr.lock();
     if serde_json::to_writer(&mut handle, &event).is_ok() {
         let _ = writeln!(handle);
+        let _ = handle.flush();
     }
 }
 

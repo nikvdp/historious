@@ -830,11 +830,20 @@ impl Store {
     }
 
     pub fn refresh_history_items(&self) -> Result<usize> {
+        self.refresh_history_items_with_progress(|_, _| {})
+    }
+
+    pub fn refresh_history_items_with_progress(
+        &self,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 tx.execute("DELETE FROM history_items_fts", [])?;
                 tx.execute("DELETE FROM history_items_conversation_fts", [])?;
                 tx.execute("DELETE FROM history_items", [])?;
+                let total_events = count(tx, "events")? as usize;
+                progress(0, total_events);
                 let mut stmt = tx.prepare(
                     "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
                             event_type, role, content, raw_artifact_hash, occurred_at,
@@ -843,10 +852,18 @@ impl Store {
                      ORDER BY session_id, ordinal, id",
                 )?;
                 let rows = stmt.query_map([], row_event)?;
+                let mut processed_events = 0usize;
                 for row in rows {
+                    processed_events += 1;
                     for item in history_items_from_event(&row?)? {
                         insert_history_item(&tx, &item)?;
                     }
+                    if processed_events % 1_000 == 0 {
+                        progress(processed_events, total_events);
+                    }
+                }
+                if total_events > 0 || processed_events > 0 {
+                    progress(processed_events, total_events);
                 }
                 drop(stmt);
                 let count = count(tx, "history_items")? as usize;
@@ -858,6 +875,14 @@ impl Store {
     }
 
     pub fn refresh_history_items_for_events(&self, event_ids: &[String]) -> Result<usize> {
+        self.refresh_history_items_for_events_with_progress(event_ids, |_, _| {})
+    }
+
+    pub fn refresh_history_items_for_events_with_progress(
+        &self,
+        event_ids: &[String],
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
         let event_ids = normalized_ids(event_ids);
         if event_ids.is_empty() {
             return self.with_conn(|conn| {
@@ -871,6 +896,14 @@ impl Store {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
+                let total_events: usize = tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM temp_history_item_event_ids scope
+                     JOIN events e ON e.id = scope.id",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+                progress(0, total_events);
                 let replaced_count: usize = tx.query_row(
                     "SELECT COUNT(*)
                      FROM history_items
@@ -905,12 +938,20 @@ impl Store {
                 )?;
                 let rows = stmt.query_map([], row_event)?;
                 let mut inserted_count = 0usize;
+                let mut processed_events = 0usize;
                 for row in rows {
+                    processed_events += 1;
                     for item in history_items_from_event(&row?)? {
                         if insert_history_item(&tx, &item)? {
                             inserted_count += 1;
                         }
                     }
+                    if processed_events % 1_000 == 0 {
+                        progress(processed_events, total_events);
+                    }
+                }
+                if total_events > 0 || processed_events > 0 {
+                    progress(processed_events, total_events);
                 }
                 drop(stmt);
                 let count =

@@ -117,6 +117,7 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
     let mut handle = stdout.lock();
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(handle)?;
+    handle.flush()?;
     Ok(())
 }
 
