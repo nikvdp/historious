@@ -1100,16 +1100,17 @@ impl Store {
     ) -> Result<usize> {
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                prepare_temp_events_fts_scope(tx)?;
                 let total_index_rows: usize = tx.query_row(
                     "SELECT COUNT(*)
                      FROM events e
                      LEFT JOIN event_embeddings emb
                        ON emb.event_id = e.id AND emb.model = ?1
-                     LEFT JOIN events_fts fts
-                       ON fts.event_id = e.id
+                     LEFT JOIN temp_events_fts_event_ids fts
+                       ON fts.id = e.id
                      WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                       AND (emb.event_id IS NULL OR fts.event_id IS NULL)",
+                       AND (emb.event_id IS NULL OR fts.id IS NULL)",
                     params![model],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
@@ -1124,15 +1125,15 @@ impl Store {
                         json_extract(e.metadata_json, '$.search_kind'),
                         json_extract(e.metadata_json, '$.search_text'),
                         e.occurred_at,
-                        fts.event_id IS NOT NULL
+                        fts.id IS NOT NULL
                  FROM events e
                  LEFT JOIN event_embeddings emb
                    ON emb.event_id = e.id AND emb.model = ?1
-                 LEFT JOIN events_fts fts
-                   ON fts.event_id = e.id
+                 LEFT JOIN temp_events_fts_event_ids fts
+                   ON fts.id = e.id
                  WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
                    AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
-                   AND (emb.event_id IS NULL OR fts.event_id IS NULL)
+                   AND (emb.event_id IS NULL OR fts.id IS NULL)
                  ORDER BY e.session_id, e.ordinal, e.id",
                 )?;
                 let rows = stmt.query_map(params![model], |row| {
@@ -1280,6 +1281,7 @@ impl Store {
         let event_ids = normalized_ids(event_ids);
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
+                prepare_temp_events_fts_scope(tx)?;
                 let mut projected_events = 0;
                 if !event_ids.is_empty() {
                     prepare_temp_id_scope(&tx, "temp_search_index_event_ids", &event_ids)?;
@@ -1303,11 +1305,11 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at,
-                            fts.event_id IS NOT NULL
+                            fts.id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
-                     LEFT JOIN events_fts fts
-                       ON fts.event_id = e.id
+                     LEFT JOIN temp_events_fts_event_ids fts
+                       ON fts.id = e.id
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
@@ -2954,6 +2956,21 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
             params_from_iter(chunk.iter().map(String::as_str)),
         )?;
     }
+    Ok(())
+}
+
+fn prepare_temp_events_fts_scope(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS temp_events_fts_event_ids
+         (id TEXT PRIMARY KEY) WITHOUT ROWID",
+        [],
+    )?;
+    conn.execute("DELETE FROM temp_events_fts_event_ids", [])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp_events_fts_event_ids (id)
+         SELECT event_id FROM events_fts",
+        [],
+    )?;
     Ok(())
 }
 
