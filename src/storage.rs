@@ -874,6 +874,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn refresh_history_items_for_events(&self, event_ids: &[String]) -> Result<usize> {
         self.refresh_history_items_for_events_with_progress(event_ids, |_, _| {})
     }
@@ -1200,6 +1201,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn refresh_search_index_for_events(
         &self,
         model: &str,
