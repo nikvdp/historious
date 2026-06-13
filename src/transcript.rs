@@ -2,6 +2,7 @@ use crate::archive::{EventRecord, SessionRecord, SourceRecord};
 use crate::storage::{
     HistoryItemRecord, HistoryTranscriptContext, RawArtifactSummary, TranscriptContext,
 };
+use chrono::{DateTime, Local, Utc};
 
 #[derive(Debug, Clone, Default)]
 pub struct ViewMetadata {
@@ -137,11 +138,7 @@ fn push_view_header(
         if metadata.verbose {
             push_field(out, "when", &when.to_rfc3339());
         } else {
-            push_field(
-                out,
-                "when",
-                &when.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            );
+            push_field(out, "when", &format_local_timestamp_seconds(when));
         }
     }
     if let Some(title) = &session.title {
@@ -239,7 +236,7 @@ fn push_event(
         }
         if let Some(occurred_at) = event.occurred_at {
             out.push(' ');
-            out.push_str(&occurred_at.format("%Y-%m-%d %H:%M").to_string());
+            out.push_str(&format_local_timestamp_minutes(occurred_at));
         }
     }
     if target && color {
@@ -294,7 +291,7 @@ fn push_history_item(
         out.push_str(&item.kind);
         if let Some(occurred_at) = item.occurred_at {
             out.push(' ');
-            out.push_str(&occurred_at.format("%Y-%m-%d %H:%M").to_string());
+            out.push_str(&format_local_timestamp_minutes(occurred_at));
         }
     }
     if target && color {
@@ -323,6 +320,20 @@ fn should_compact_preview_event(event: &EventRecord, target: bool, mode: RenderM
         && !target
         && event.role.is_none()
         && (event.content.trim_start().starts_with('{') || event.content.chars().count() > 1200)
+}
+
+fn format_local_timestamp_seconds(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+fn format_local_timestamp_minutes(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M %Z")
+        .to_string()
 }
 
 #[cfg(test)]
