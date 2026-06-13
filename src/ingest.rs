@@ -124,10 +124,23 @@ pub fn update_local_with_progress(
     options: UpdateOptions,
     mut progress: impl FnMut(&UpdateProgress),
 ) -> Result<UpdateStats> {
+    update_local_with_progress_and_cancel(store, machine_id, options, &mut progress, || false)
+}
+
+pub fn update_local_with_progress_and_cancel(
+    store: &Store,
+    machine_id: &str,
+    options: UpdateOptions,
+    mut progress: impl FnMut(&UpdateProgress),
+    should_cancel: impl Fn() -> bool,
+) -> Result<UpdateStats> {
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
     for root in discover_roots() {
+        if should_cancel() {
+            return Ok(stats);
+        }
         if options
             .source
             .as_deref()
@@ -143,6 +156,9 @@ pub fn update_local_with_progress(
             .into_iter()
             .filter_entry(|entry| !is_hidden_noise(entry.path()))
         {
+            if should_cancel() {
+                return Ok(stats);
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -194,6 +210,9 @@ pub fn update_local_with_progress(
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
     for (idx, candidate) in candidates.into_iter().enumerate() {
+        if should_cancel() {
+            return Ok(stats);
+        }
         let kind = candidate.kind;
         let path = candidate.path;
         stats.files_seen += 1;
@@ -212,6 +231,9 @@ pub fn update_local_with_progress(
             source_file_count,
             stats: stats.clone(),
         });
+        if should_cancel() {
+            return Ok(stats);
+        }
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) => {

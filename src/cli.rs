@@ -13,6 +13,7 @@ use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,6 +26,8 @@ const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
+static TAIL_CANCELLED: AtomicBool = AtomicBool::new(false);
+static TAIL_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
 #[command(name = "histo")]
@@ -4016,12 +4019,15 @@ async fn run_transcript_tail(
     if interval_secs <= 0.0 {
         bail!("--interval must be greater than 0");
     }
+    install_tail_sigint_handler();
     let interval = Duration::from_secs_f64(interval_secs);
     let (session, _) = resolve_transcript_target(store, target, None, None)?;
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-    refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?;
+    if !refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)? {
+        return Ok(());
+    }
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
@@ -4038,14 +4044,17 @@ async fn run_transcript_tail(
     let mut last_cursor = context.items.last().map(history_item_cursor);
 
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = tokio::signal::ctrl_c() => {
-                break;
-            }
+        if tail_cancelled() {
+            break;
+        }
+        sleep_tail_interval(interval).await;
+        if tail_cancelled() {
+            break;
         }
 
-        refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?;
+        if !refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)? {
+            break;
+        }
         let context = store
             .history_items_for_transcript_session(&session)?
             .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
@@ -4069,8 +4078,8 @@ async fn run_transcript_tail(
     Ok(())
 }
 
-fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Result<()> {
-    let stats = ingest::update_local_with_progress(
+fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Result<bool> {
+    let stats = match ingest::update_local_with_progress_and_cancel(
         store,
         machine_id,
         ingest::UpdateOptions {
@@ -4078,11 +4087,88 @@ fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Re
             source: Some(source_kind.to_string()),
         },
         |_| {},
-    )?;
-    if stats.delta.touched_events.is_empty() {
-        return Ok(());
+        tail_cancelled,
+    ) {
+        Ok(stats) => stats,
+        Err(_) if tail_cancelled() => return Ok(false),
+        Err(err) if is_database_locked_error(&err) => {
+            warn_tail_database_locked_once();
+            return Ok(true);
+        }
+        Err(err) => return Err(err),
+    };
+    if tail_cancelled() {
+        return Ok(false);
     }
-    refresh_tail_history_items(store, &stats.delta.touched_events)
+    if stats.delta.touched_events.is_empty() {
+        return Ok(true);
+    }
+    if let Err(err) = refresh_tail_history_items(store, &stats.delta.touched_events) {
+        if tail_cancelled() {
+            return Ok(false);
+        }
+        if is_database_locked_error(&err) {
+            warn_tail_database_locked_once();
+            return Ok(true);
+        }
+        return Err(err);
+    }
+    Ok(!tail_cancelled())
+}
+
+async fn sleep_tail_interval(interval: Duration) {
+    let step = Duration::from_millis(100);
+    let started = Instant::now();
+    while started.elapsed() < interval && !tail_cancelled() {
+        let remaining = interval.saturating_sub(started.elapsed());
+        tokio::time::sleep(remaining.min(step)).await;
+    }
+}
+
+fn install_tail_sigint_handler() {
+    TAIL_CANCELLED.store(false, Ordering::SeqCst);
+    TAIL_LOCK_WARNED.store(false, Ordering::SeqCst);
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_tail_sigint as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+extern "C" fn handle_tail_sigint(_: libc::c_int) {
+    if TAIL_CANCELLED.swap(true, Ordering::SeqCst) {
+        unsafe {
+            libc::_exit(130);
+        }
+    }
+}
+
+fn tail_cancelled() -> bool {
+    TAIL_CANCELLED.load(Ordering::SeqCst)
+}
+
+fn is_database_locked_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|err| match err {
+                rusqlite::Error::SqliteFailure(error, _) => Some(error.code),
+                _ => None,
+            })
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
+fn warn_tail_database_locked_once() {
+    if !TAIL_LOCK_WARNED.swap(true, Ordering::SeqCst) && !tail_cancelled() {
+        eprintln!("tail: database is busy; showing stored transcript and retrying");
+    }
 }
 
 fn ensure_history_items_ready(store: &Store) -> Result<()> {
