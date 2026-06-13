@@ -1781,6 +1781,29 @@ impl Store {
         })
     }
 
+    pub fn update_session_title_for_external_id(
+        &self,
+        source_kind: &str,
+        external_id: &str,
+        title: &str,
+    ) -> Result<usize> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(0);
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET title = ?3
+                 WHERE source_kind = ?1
+                   AND external_id = ?2
+                   AND coalesce(title, '') != ?3",
+                params![source_kind, external_id, title],
+            )
+            .map_err(Into::into)
+        })
+    }
+
     pub fn events_around_event(
         &self,
         event_id: &str,

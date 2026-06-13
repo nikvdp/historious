@@ -190,6 +190,7 @@ pub fn update_local_with_progress(
     });
 
     let native_titles = NativeTitleIndex::load();
+    refresh_existing_native_titles(store, &native_titles)?;
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
     for (idx, candidate) in candidates.into_iter().enumerate() {
@@ -724,6 +725,13 @@ impl NativeTitleIndex {
             .cloned()
     }
 
+    fn iter(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.titles.iter().filter_map(|(key, title)| {
+            let (kind, external_session_id) = key.split_once('\0')?;
+            Some((kind, external_session_id, title.as_str()))
+        })
+    }
+
     fn load_jsonl_titles(
         &mut self,
         path: &Path,
@@ -747,6 +755,17 @@ impl NativeTitleIndex {
             self.insert(kind, &id, &title);
         }
     }
+}
+
+fn refresh_existing_native_titles(
+    store: &Store,
+    native_titles: &NativeTitleIndex,
+) -> Result<usize> {
+    let mut changed = 0;
+    for (kind, external_session_id, title) in native_titles.iter() {
+        changed += store.update_session_title_for_external_id(kind, external_session_id, title)?;
+    }
+    Ok(changed)
 }
 
 fn native_title_key(kind: &str, external_session_id: &str) -> String {

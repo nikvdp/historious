@@ -283,6 +283,11 @@ pub enum Command {
         all: bool,
         #[arg(long, help = "Print structured JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "List stored threads without first refreshing local inputs"
+        )]
+        no_update: bool,
         #[arg(long, help = "Disable colored output")]
         no_color: bool,
     },
@@ -1000,8 +1005,13 @@ impl Cli {
                 project,
                 all,
                 json,
+                no_update,
                 no_color,
             } => {
+                let implicit_update = !no_update;
+                if implicit_update {
+                    refresh_threads_inputs(&store, &config, json || robot)?;
+                }
                 let (after_bound, before_bound) = if today {
                     (
                         Some(parse_search_time("today", TimeFilterBound::After)?),
@@ -1032,7 +1042,15 @@ impl Cli {
                 if json || robot {
                     crate::output::write_success(
                         "threads",
-                        threads_output(limit, sort, after_bound, before_bound, &scope, &threads),
+                        threads_output(
+                            limit,
+                            sort,
+                            after_bound,
+                            before_bound,
+                            &scope,
+                            implicit_update,
+                            &threads,
+                        ),
                         Default::default(),
                     )?;
                 } else {
@@ -1817,6 +1835,7 @@ struct ThreadsOptionsOutput {
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     scope: ThreadScopeOutput,
+    implicit_update: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3382,26 +3401,60 @@ fn print_threads_output(scope: &ThreadScope, threads: &[crate::storage::ThreadRo
     }
     println!();
     for thread in threads {
-        let when = thread
-            .last_activity_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let when = format_thread_time(thread.last_activity_at);
+        let title = display_thread_title(thread);
         println!(
-            "{}  {}  {}",
+            "{}  {}",
             styled(&when, "1;36", color),
+            styled(&title, "1", color)
+        );
+        println!(
+            "  updated: {}  last event: {}  source: {}  events: {}",
+            format_thread_time(thread.session.updated_at),
+            format_thread_time(thread.last_event_at),
             thread.session.source_kind,
-            thread
-                .session
-                .title
-                .as_deref()
-                .unwrap_or("(untitled thread)")
+            format_count(thread.event_count as usize)
         );
         println!("  session: {}", thread.session.id);
-        println!("  events: {}", thread.event_count);
         if let Some(workspace) = &thread.workspace_path {
             println!("  project: {workspace}");
         }
     }
+}
+
+fn display_thread_title(thread: &crate::storage::ThreadRow) -> String {
+    thread
+        .session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("(untitled) {}", thread.session.external_id))
+}
+
+fn format_thread_time(value: Option<DateTime<Utc>>) -> String {
+    value
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Result<()> {
+    let stats = ingest::update_local_with_progress(
+        store,
+        &config.machine_id,
+        ingest::UpdateOptions {
+            max_files: None,
+            source: None,
+        },
+        |_| {},
+    )?;
+    if stats.errors > 0 && !quiet {
+        eprintln!(
+            "Warning: refreshed local inputs with {} ingest errors; some threads may be missing or stale.",
+            format_count(stats.errors)
+        );
+    }
+    Ok(())
 }
 
 fn show_output(store: &Store, context: &crate::storage::TranscriptContext) -> Result<ShowOutput> {
@@ -3477,6 +3530,7 @@ fn threads_output(
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     scope: &ThreadScope,
+    implicit_update: bool,
     threads: &[crate::storage::ThreadRow],
 ) -> ThreadsOutput {
     let results = threads.iter().map(thread_output).collect::<Vec<_>>();
@@ -3491,6 +3545,7 @@ fn threads_output(
                 path: scope.path.clone(),
                 inferred: scope.inferred,
             },
+            implicit_update,
         },
         next_commands: results
             .first()
