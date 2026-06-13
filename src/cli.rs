@@ -4087,6 +4087,10 @@ async fn run_transcript_tail(
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    let tail_source_path = store
+        .source_by_id(&session_record.source_id)?
+        .and_then(|source| source.path)
+        .map(PathBuf::from);
     let metadata = view_metadata_for_session(store, &session_record, None, verbose)?;
 
     ensure_history_items_ready(store)?;
@@ -4102,8 +4106,12 @@ async fn run_transcript_tail(
     flush_stdout()?;
     let mut last_cursor = context.items.last().map(history_item_cursor);
 
-    if refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?
-        && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
+    if refresh_tail_inputs(
+        store,
+        &config.machine_id,
+        &session_record.source_kind,
+        tail_source_path.as_deref(),
+    )? && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
     {
         return Ok(());
     }
@@ -4117,7 +4125,12 @@ async fn run_transcript_tail(
             break;
         }
 
-        if !refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)? {
+        if !refresh_tail_inputs(
+            store,
+            &config.machine_id,
+            &session_record.source_kind,
+            tail_source_path.as_deref(),
+        )? {
             break;
         }
         append_tail_updates(store, &session, &mut last_cursor, color, verbose)?;
@@ -4171,17 +4184,33 @@ fn append_tail_updates(
     Ok(!tail_cancelled())
 }
 
-fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Result<bool> {
-    let stats = match ingest::update_local_with_progress_and_cancel(
-        store,
-        machine_id,
-        ingest::UpdateOptions {
-            max_files: None,
-            source: Some(source_kind.to_string()),
-        },
-        |_| {},
-        tail_cancelled,
-    ) {
+fn refresh_tail_inputs(
+    store: &Store,
+    machine_id: &str,
+    source_kind: &str,
+    source_path: Option<&Path>,
+) -> Result<bool> {
+    let stats = match source_path {
+        Some(path) => ingest::update_source_path_with_progress_and_cancel(
+            store,
+            machine_id,
+            source_kind,
+            path,
+            |_| {},
+            tail_cancelled,
+        ),
+        None => ingest::update_local_with_progress_and_cancel(
+            store,
+            machine_id,
+            ingest::UpdateOptions {
+                max_files: None,
+                source: Some(source_kind.to_string()),
+            },
+            |_| {},
+            tail_cancelled,
+        ),
+    };
+    let stats = match stats {
         Ok(stats) => stats,
         Err(_) if tail_cancelled() => return Ok(false),
         Err(err) if is_database_locked_error(&err) => {
