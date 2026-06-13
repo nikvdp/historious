@@ -292,6 +292,87 @@ pub fn update_local_with_progress_and_cancel(
     Ok(stats)
 }
 
+pub fn update_source_path_with_progress_and_cancel(
+    store: &Store,
+    machine_id: &str,
+    kind: &str,
+    path: &Path,
+    mut progress: impl FnMut(&UpdateProgress),
+    should_cancel: impl Fn() -> bool,
+) -> Result<UpdateStats> {
+    let mut stats = UpdateStats::default();
+    if should_cancel() {
+        return Ok(stats);
+    }
+    let native_titles = NativeTitleIndex::load();
+    refresh_existing_native_titles(store, &native_titles)?;
+    if should_cancel() {
+        return Ok(stats);
+    }
+
+    let path = path.to_path_buf();
+    stats.files_seen += 1;
+    progress(&UpdateProgress::Processing {
+        kind: kind.to_string(),
+        path: path.clone(),
+        file_index: 1,
+        total_files: 1,
+        source_file_index: 1,
+        source_file_count: 1,
+        stats: stats.clone(),
+    });
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::debug!("failed to read metadata for {}: {err}", path.display());
+            stats.errors += 1;
+            progress(&UpdateProgress::CompletedFile {
+                kind: kind.to_string(),
+                path,
+                file_index: 1,
+                total_files: 1,
+                source_file_index: 1,
+                source_file_count: 1,
+                stats: stats.clone(),
+            });
+            return Ok(stats);
+        }
+    };
+    if should_cancel() {
+        return Ok(stats);
+    }
+
+    let size = metadata.len();
+    let mtime_ms = file_mtime_ms(&metadata);
+    let path_text = path.to_string_lossy().to_string();
+    let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
+    if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
+        stats.skipped_unchanged += 1;
+    } else {
+        match ingest_file(store, machine_id, kind, &path, &native_titles) {
+            Ok(delta) => {
+                stats.inserted += delta.inserted;
+                stats.duplicates += delta.duplicates;
+                stats.delta.merge(delta.delta);
+            }
+            Err(err) => {
+                tracing::debug!("failed to ingest {}: {err:#}", path.display());
+                stats.errors += 1;
+            }
+        }
+    }
+    progress(&UpdateProgress::CompletedFile {
+        kind: kind.to_string(),
+        path,
+        file_index: 1,
+        total_files: 1,
+        source_file_index: 1,
+        source_file_count: 1,
+        stats: stats.clone(),
+    });
+    Ok(stats)
+}
+
 #[derive(Debug, Clone)]
 struct MutableSourceSummary {
     kind: &'static str,
