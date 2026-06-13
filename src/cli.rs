@@ -550,6 +550,11 @@ pub enum Command {
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
+    /// Read and update persistent Historious configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Output agent instructions for Historious.
     Onboard {
         #[arg(long, help = "Emit only the AGENTS.md-ready block")]
@@ -589,6 +594,24 @@ pub enum SkillCommand {
         #[arg(long, help = "Install to ~/.pi/agent/skills")]
         pi: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show the config file path and effective settings.
+    Show,
+    /// Show or change persistent embedding behavior.
+    Embeddings {
+        #[arg(value_enum, default_value_t = ConfigEmbeddingState::Status)]
+        state: ConfigEmbeddingState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigEmbeddingState {
+    On,
+    Off,
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -726,13 +749,18 @@ impl Cli {
 
     pub async fn run(self) -> Result<()> {
         let robot = self.robot;
+        let data_dir = self.data_dir;
         let command = self.command;
         if let Command::Completion { shell } = command {
             print_completion(shell);
             return Ok(());
         }
+        if let Command::Config { command } = command {
+            run_config_command(data_dir, command, robot)?;
+            return Ok(());
+        }
 
-        let config = AppConfig::load(self.data_dir)?;
+        let config = AppConfig::load(data_dir)?;
         let human_update = matches!(&command, Command::Update { json: false, .. }) && !robot;
         let store = if human_update {
             let progress = ProgressUi::new();
@@ -1428,6 +1456,7 @@ impl Cli {
                 }
             }
             Command::Skill { command } => run_skill_command(command)?,
+            Command::Config { .. } => unreachable!("config returns before storage setup"),
             Command::Completion { .. } => unreachable!("completion returns before storage setup"),
         }
         Ok(())
@@ -1451,6 +1480,7 @@ impl Command {
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
+            Command::Config { .. } => "config",
             Command::Onboard { .. } => "onboard",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
@@ -1480,6 +1510,58 @@ impl Command {
 fn print_completion(shell: Shell) {
     let mut command = Cli::command();
     clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigOutput {
+    config_path: String,
+    embeddings_enabled: bool,
+}
+
+fn run_config_command(
+    data_dir: Option<PathBuf>,
+    command: ConfigCommand,
+    robot: bool,
+) -> Result<()> {
+    let data_dir = crate::config::resolve_data_dir(data_dir)?;
+    let path = crate::config::config_path(&data_dir);
+    match command {
+        ConfigCommand::Show => {
+            let output = ConfigOutput {
+                config_path: path.display().to_string(),
+                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+            };
+            if robot {
+                crate::output::write_success("config show", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
+        ConfigCommand::Embeddings { state } => {
+            let path = match state {
+                ConfigEmbeddingState::On => crate::config::set_embeddings_enabled(&data_dir, true)?,
+                ConfigEmbeddingState::Off => {
+                    crate::config::set_embeddings_enabled(&data_dir, false)?
+                }
+                ConfigEmbeddingState::Status => path,
+            };
+            let output = ConfigOutput {
+                config_path: path.display().to_string(),
+                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+            };
+            if robot {
+                crate::output::write_success("config embeddings", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_config_output(output: &ConfigOutput) {
+    println!("config_path={}", output.config_path);
+    println!("embeddings.enabled={}", output.embeddings_enabled);
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {

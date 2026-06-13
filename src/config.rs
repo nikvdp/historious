@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -16,15 +16,13 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn load(data_dir: Option<PathBuf>) -> Result<Self> {
-        let data_dir = match data_dir {
-            Some(path) => expand_home(path),
-            None => default_data_dir_with_legacy_migration()?,
-        };
+        let data_dir = resolve_data_dir(data_dir)?;
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         let file_config = load_file_config(&data_dir)?;
         let machine_id = load_machine_id(&data_dir)?;
-        let embedder = EmbedderConfig::from_env(&data_dir);
+        let embedder =
+            EmbedderConfig::from_config_and_env(&data_dir, file_config.embeddings.enabled);
         Ok(Self {
             data_dir,
             machine_id,
@@ -38,6 +36,8 @@ impl AppConfig {
 struct FileConfig {
     #[serde(default)]
     search: SearchConfig,
+    #[serde(default)]
+    embeddings: EmbeddingsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,11 +54,76 @@ impl Default for SearchConfig {
     }
 }
 
-fn load_file_config(data_dir: &PathBuf) -> Result<FileConfig> {
-    let path = data_dir.join("config.toml");
+#[derive(Debug, Clone, Deserialize)]
+struct EmbeddingsConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn resolve_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
+    match data_dir {
+        Some(path) => Ok(expand_home(path)),
+        None => default_data_dir_with_legacy_migration(),
+    }
+}
+
+pub fn config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("config.toml")
+}
+
+pub fn load_embeddings_enabled(data_dir: &Path) -> Result<bool> {
+    Ok(load_file_config(data_dir)?.embeddings.enabled)
+}
+
+pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    let path = config_path(data_dir);
+    let mut value = if path.exists() {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        text.parse::<toml::Value>()
+            .with_context(|| format!("parsing config {}", path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let root = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root must be a TOML table"))?;
+    let embeddings = root
+        .entry("embeddings".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !embeddings.is_table() {
+        *embeddings = toml::Value::Table(toml::map::Map::new());
+    }
+    embeddings
+        .as_table_mut()
+        .expect("embeddings table")
+        .insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    fs::write(
+        &path,
+        toml::to_string_pretty(&value).context("serializing config")?,
+    )
+    .with_context(|| format!("writing config {}", path.display()))?;
+    Ok(path)
+}
+
+fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
+    let path = config_path(data_dir);
     if !path.exists() {
         return Ok(FileConfig {
             search: SearchConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
         });
     }
     let text = std::fs::read_to_string(&path)
@@ -152,6 +217,18 @@ mod tests {
         let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
 
         assert_eq!(config.default_search_mode, SearchMode::Lexical);
+    }
+
+    #[test]
+    fn config_file_can_persist_disabled_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let path = set_embeddings_enabled(dir.path(), false).expect("write embeddings config");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert_eq!(path, dir.path().join("config.toml"));
+        assert!(config.embedder.is_disabled());
+        assert!(!load_embeddings_enabled(dir.path()).expect("load embeddings config"));
     }
 
     #[test]

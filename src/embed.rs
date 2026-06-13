@@ -99,15 +99,18 @@ pub struct EmbedderStatus {
 }
 
 impl EmbedderConfig {
-    pub fn from_env(data_dir: &Path) -> Self {
+    pub fn from_config_and_env(data_dir: &Path, embeddings_enabled: bool) -> Self {
         let provider = match std::env::var("HISTO_EMBEDDER")
-            .unwrap_or_else(|_| "fastembed".to_string())
-            .to_ascii_lowercase()
-            .as_str()
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
         {
-            "off" | "none" | "disabled" => EmbedderProvider::Disabled,
-            "hash" | "hash-fallback" => EmbedderProvider::HashFallback,
-            _ => EmbedderProvider::FastEmbed,
+            Some(value) => match value.as_str() {
+                "off" | "none" | "disabled" => EmbedderProvider::Disabled,
+                "hash" | "hash-fallback" => EmbedderProvider::HashFallback,
+                _ => EmbedderProvider::FastEmbed,
+            },
+            None if embeddings_enabled => EmbedderProvider::FastEmbed,
+            None => EmbedderProvider::Disabled,
         };
         let model_cache = std::env::var_os("HISTO_MODEL_CACHE")
             .map(PathBuf::from)
@@ -127,6 +130,14 @@ impl EmbedderConfig {
             model_cache,
             intra_threads,
         }
+    }
+
+    pub fn disable(&mut self) {
+        self.provider = EmbedderProvider::Disabled;
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.provider == EmbedderProvider::Disabled
     }
 
     pub fn status_without_loading(&self) -> EmbedderStatus {
