@@ -20,6 +20,31 @@ histo --robot show <ref> --before 5 --after 8
 histo --robot transcript <session_id> --at <ref>
 ```
 
+## Embedding Mode
+
+Historious can run with embeddings enabled or disabled. Embeddings are enabled
+by default. To persistently turn them off for this data directory:
+
+```bash
+histo config embeddings off
+```
+
+Turn them back on with:
+
+```bash
+histo config embeddings on
+```
+
+Inspect the current setting and the exact config file path with:
+
+```bash
+histo config show
+```
+
+Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`,
+`daemon`, or `serve` when you want a one-off lexical-only run without changing
+`config.toml`.
+
 ## Sync Between Machines
 
 The canonical way to exchange history between machines is JSONL over
@@ -59,19 +84,20 @@ histo export --jsonl --session <session_id>
 histo export --jsonl --since 2026-06-01
 ```
 
-Exports include existing embedding records by default. Imports store those
-embeddings and refresh the local vector index, so compatible transferred
-embeddings do not need to be recreated.
+When embeddings are enabled, exports include existing embedding records by
+default. Imports store those embeddings and refresh the local vector index, so
+compatible transferred embeddings do not need to be recreated.
 
-Use `--embeddings omit` only when bandwidth or storage matters:
+Use `--embeddings omit` when bandwidth or storage matters:
 
 ```bash
 histo export --jsonl --embeddings omit \
   | ssh <remote> 'histo import --jsonl -'
 ```
 
-To use another machine for embedding work, pipe history to that machine, run any
-embedding maintenance there, then export back from it:
+To use another machine for embedding work, keep embeddings enabled on that
+machine, pipe history to it, run any embedding maintenance there, then export
+back from it:
 
 ```bash
 histo export --jsonl \
