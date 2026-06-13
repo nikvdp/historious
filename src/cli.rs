@@ -4043,7 +4043,6 @@ async fn run_transcript_tail(
     let context = store
         .history_items_for_transcript_session(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-    let total_items = context.items.len();
     let initial_context = tail_initial_context(context.clone(), initial_lines);
     write_stdout(&crate::transcript::render_history_session(
         &initial_context,
@@ -4052,13 +4051,6 @@ async fn run_transcript_tail(
     ))?;
     flush_stdout()?;
     let mut last_cursor = context.items.last().map(history_item_cursor);
-    write_stdout(&format!(
-        "--- tail: showing last {} of {} items; following every {:.1}s (Ctrl-C to stop) ---\n\n",
-        initial_context.items.len(),
-        total_items,
-        interval_secs
-    ))?;
-    flush_stdout()?;
 
     if refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?
         && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
