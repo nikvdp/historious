@@ -101,6 +101,21 @@ impl Default for ExportOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ImportOptions {
+    pub include_embeddings: bool,
+    pub refresh_vector_projection: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            include_embeddings: true,
+            refresh_vector_projection: true,
+        }
+    }
+}
+
 fn filter_export_records(
     records: Vec<ArchiveRecord>,
     options: ExportOptions,
@@ -211,14 +226,29 @@ pub fn import_jsonl_path_with_import_progress(
     path: &str,
     progress: impl FnMut(ImportProgress),
 ) -> Result<ImportStats> {
+    import_jsonl_path_with_options_and_import_progress(
+        store,
+        path,
+        ImportOptions::default(),
+        progress,
+    )
+}
+
+pub fn import_jsonl_path_with_options_and_import_progress(
+    store: &Store,
+    path: &str,
+    options: ImportOptions,
+    progress: impl FnMut(ImportProgress),
+) -> Result<ImportStats> {
     if path == "-" {
-        import_jsonl_stdin_with_import_progress(store, progress)
+        import_jsonl_stdin_with_options_and_import_progress(store, options, progress)
     } else {
         let file = File::open(Path::new(path)).with_context(|| format!("opening {path}"))?;
-        import_jsonl_reader_with_import_progress(store, file, progress)
+        import_jsonl_reader_with_options_and_import_progress(store, file, options, progress)
     }
 }
 
+#[allow(dead_code)]
 pub fn import_jsonl_reader(store: &Store, reader: impl io::Read) -> Result<ImportStats> {
     import_jsonl_reader_with_import_progress(store, reader, |_| {})
 }
@@ -239,17 +269,33 @@ pub fn import_jsonl_reader_with_progress(
 pub fn import_jsonl_reader_with_import_progress(
     store: &Store,
     reader: impl io::Read,
+    progress: impl FnMut(ImportProgress),
+) -> Result<ImportStats> {
+    import_jsonl_reader_with_options_and_import_progress(
+        store,
+        reader,
+        ImportOptions::default(),
+        progress,
+    )
+}
+
+pub fn import_jsonl_reader_with_options_and_import_progress(
+    store: &Store,
+    reader: impl io::Read,
+    options: ImportOptions,
     mut progress: impl FnMut(ImportProgress),
 ) -> Result<ImportStats> {
-    let mut stats = import_jsonl_reader_records_with_progress(store, reader, |event| {
-        progress(ImportProgress::Stream(event));
-    })?;
-    finalize_import_stats_with_progress(store, &mut stats, progress)?;
+    let mut stats =
+        import_jsonl_reader_records_with_options_and_progress(store, reader, options, |event| {
+            progress(ImportProgress::Stream(event));
+        })?;
+    finalize_import_stats_with_options_and_progress(store, &mut stats, options, progress)?;
     Ok(stats)
 }
 
-fn import_jsonl_stdin_with_import_progress(
+fn import_jsonl_stdin_with_options_and_import_progress(
     store: &Store,
+    options: ImportOptions,
     mut progress: impl FnMut(ImportProgress),
 ) -> Result<ImportStats> {
     let (tx, rx) = sync_channel(IMPORT_STREAM_CHANNEL_BATCHES);
@@ -265,7 +311,7 @@ fn import_jsonl_stdin_with_import_progress(
                 mut records,
                 progress: state,
             } => {
-                flush_import_batch(store, &mut stats, &mut records)?;
+                flush_import_batch_with_options(store, &mut stats, &mut records, options)?;
                 progress(ImportProgress::Stream(state));
             }
             ImportQueueMessage::Spill {
@@ -276,8 +322,12 @@ fn import_jsonl_stdin_with_import_progress(
                 file.as_file_mut()
                     .rewind()
                     .context("rewinding spilled streamed archive import")?;
-                let spilled =
-                    import_jsonl_reader_records_with_progress(store, file.as_file_mut(), |_| {})?;
+                let spilled = import_jsonl_reader_records_with_options_and_progress(
+                    store,
+                    file.as_file_mut(),
+                    options,
+                    |_| {},
+                )?;
                 stats.inserted += spilled.inserted;
                 stats.duplicates += spilled.duplicates;
                 stats.delta.merge(spilled.delta);
@@ -287,13 +337,14 @@ fn import_jsonl_stdin_with_import_progress(
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("streamed archive import reader thread panicked"))??;
-    finalize_import_stats_with_progress(store, &mut stats, progress)?;
+    finalize_import_stats_with_options_and_progress(store, &mut stats, options, progress)?;
     Ok(stats)
 }
 
-fn import_jsonl_reader_records_with_progress(
+fn import_jsonl_reader_records_with_options_and_progress(
     store: &Store,
     reader: impl io::Read,
+    options: ImportOptions,
     mut progress: impl FnMut(JsonlProgress),
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
@@ -328,17 +379,22 @@ fn import_jsonl_reader_records_with_progress(
         }
         let is_inline_raw_artifact =
             matches!(&envelope.record, ArchiveRecord::RawArtifact(raw) if !raw.content.is_empty());
+        if !options.include_embeddings && matches!(envelope.record, ArchiveRecord::Embedding(_)) {
+            state.records += 1;
+            progress(state);
+            continue;
+        }
         if is_inline_raw_artifact && !batch.is_empty() {
-            flush_import_batch(store, &mut stats, &mut batch)?;
+            flush_import_batch_with_options(store, &mut stats, &mut batch, options)?;
         }
         batch.push(envelope.record);
         if batch.len() >= IMPORT_JSONL_BATCH_RECORDS || is_inline_raw_artifact {
-            flush_import_batch(store, &mut stats, &mut batch)?;
+            flush_import_batch_with_options(store, &mut stats, &mut batch, options)?;
         }
         state.records += 1;
         progress(state);
     }
-    flush_import_batch(store, &mut stats, &mut batch)?;
+    flush_import_batch_with_options(store, &mut stats, &mut batch, options)?;
     Ok(stats)
 }
 
@@ -350,6 +406,20 @@ fn finalize_import_stats(store: &Store, stats: &mut ImportStats) -> Result<()> {
 fn finalize_import_stats_with_progress(
     store: &Store,
     stats: &mut ImportStats,
+    progress: impl FnMut(ImportProgress),
+) -> Result<()> {
+    finalize_import_stats_with_options_and_progress(
+        store,
+        stats,
+        ImportOptions::default(),
+        progress,
+    )
+}
+
+fn finalize_import_stats_with_options_and_progress(
+    store: &Store,
+    stats: &mut ImportStats,
+    options: ImportOptions,
     mut progress: impl FnMut(ImportProgress),
 ) -> Result<()> {
     if store.history_items_projection_ready()? {
@@ -364,14 +434,16 @@ fn finalize_import_stats_with_progress(
             progress(ImportProgress::HistoryItems { processed, total });
         })?;
     }
-    progress(ImportProgress::VectorProjectionStarted {
-        embeddings: stats.delta.inserted_embeddings.len(),
-    });
-    stats.vectors_indexed =
-        store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
-    progress(ImportProgress::VectorProjectionFinished {
-        vectors_indexed: stats.vectors_indexed,
-    });
+    if options.refresh_vector_projection {
+        progress(ImportProgress::VectorProjectionStarted {
+            embeddings: stats.delta.inserted_embeddings.len(),
+        });
+        stats.vectors_indexed =
+            store.refresh_vector_projection_for_embeddings(&stats.delta.inserted_embeddings)?;
+        progress(ImportProgress::VectorProjectionFinished {
+            vectors_indexed: stats.vectors_indexed,
+        });
+    }
     Ok(())
 }
 
@@ -486,13 +558,20 @@ fn queue_or_spill_import_batch(
     }
 }
 
-fn flush_import_batch(
+fn flush_import_batch_with_options(
     store: &Store,
     stats: &mut ImportStats,
     batch: &mut Vec<ArchiveRecord>,
+    options: ImportOptions,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
+    }
+    if !options.include_embeddings {
+        batch.retain(|record| !matches!(record, ArchiveRecord::Embedding(_)));
+        if batch.is_empty() {
+            return Ok(());
+        }
     }
     let delta = store.import_archive_records(batch)?;
     stats.inserted += delta.inserted;
