@@ -56,6 +56,8 @@ pub enum Command {
         source: Option<String>,
         #[arg(long, help = "Fully reconcile derived search and vector indexes")]
         repair: bool,
+        #[arg(long, help = "Skip embedding work for this run")]
+        no_embeddings: bool,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
@@ -89,6 +91,8 @@ pub enum Command {
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
         mode: Option<SearchModeArg>,
+        #[arg(long, help = "Skip embedding-backed semantic search for this run")]
+        no_embeddings: bool,
         #[arg(
             long,
             help = "Search these history item tiers, comma-separated: conversation,tool,raw"
@@ -175,6 +179,8 @@ pub enum Command {
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
         mode: Option<SearchModeArg>,
+        #[arg(long, help = "Skip embedding-backed semantic search for this run")]
+        no_embeddings: bool,
         #[arg(
             long,
             help = "Search these history item tiers, comma-separated: conversation,tool,raw"
@@ -436,6 +442,8 @@ pub enum Command {
         jsonl: bool,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
+        #[arg(long, help = "Skip importing embedding records for this run")]
+        no_embeddings: bool,
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
     },
@@ -506,6 +514,8 @@ pub enum Command {
         max_files: Option<usize>,
         #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
         source: Option<String>,
+        #[arg(long, help = "Skip embedding work while this daemon runs")]
+        no_embeddings: bool,
     },
     /// Serve already-indexed local history over HTTP.
     Serve {
@@ -544,6 +554,8 @@ pub enum Command {
             help = "Scan only one source kind, such as codex or claude_code"
         )]
         source: Option<String>,
+        #[arg(long, help = "Skip embedding work for this server process")]
+        no_embeddings: bool,
     },
     /// Show local history and search health.
     Status {
@@ -760,7 +772,7 @@ impl Cli {
             return Ok(());
         }
 
-        let config = AppConfig::load(data_dir)?;
+        let mut config = AppConfig::load(data_dir)?;
         let human_update = matches!(&command, Command::Update { json: false, .. }) && !robot;
         let store = if human_update {
             let progress = ProgressUi::new();
@@ -776,8 +788,10 @@ impl Cli {
                 max_files,
                 source,
                 repair,
+                no_embeddings,
                 json,
             } => {
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 if json || robot {
                     let output =
                         run_update_once_machine(&store, &config, max_files, source, repair)?;
@@ -797,6 +811,7 @@ impl Cli {
                 exclude,
                 sort,
                 mode,
+                no_embeddings,
                 corpus,
                 include_tools,
                 raw,
@@ -827,6 +842,7 @@ impl Cli {
                 if fzf_rows && query.trim().is_empty() {
                     return Ok(());
                 }
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 let (after_bound, before_bound) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let workspace_scope = search_workspace_scope(project.as_deref(), all);
@@ -908,6 +924,7 @@ impl Cli {
                 server_url,
                 sort,
                 mode,
+                no_embeddings,
                 corpus,
                 include_tools,
                 raw,
@@ -925,6 +942,7 @@ impl Cli {
                 if robot {
                     bail!("--robot cannot be combined with tui");
                 }
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 let (after_bound, before_bound) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let workspace_scope = search_workspace_scope(project.as_deref(), all);
@@ -1206,7 +1224,11 @@ impl Cli {
                         since: transport::parse_since_arg(since.as_deref())?,
                     };
                     let options = transport::ExportOptions {
-                        include_embeddings: include_embedding_records(embeddings, no_embeddings),
+                        include_embeddings: include_embedding_records_for_config(
+                            embeddings,
+                            no_embeddings,
+                            &config,
+                        ),
                         include_raw_artifact_records: include_raw_artifact_records(
                             raw_artifacts,
                             no_raw_artifacts,
@@ -1247,7 +1269,13 @@ impl Cli {
                     anyhow::bail!("only --jsonl export is supported in v0");
                 }
             }
-            Command::Import { jsonl, json, input } => {
+            Command::Import {
+                jsonl,
+                json,
+                no_embeddings,
+                input,
+            } => {
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 if jsonl {
                     if json || robot {
                         let output = run_import_once(&store, &config, &input)?;
@@ -1384,7 +1412,9 @@ impl Cli {
                 interval_secs,
                 max_files,
                 source,
+                no_embeddings,
             } => {
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 run_daemon(
                     &store,
                     &config.machine_id,
@@ -1402,7 +1432,9 @@ impl Cli {
                 interval_secs,
                 max_files,
                 source,
+                no_embeddings,
             } => {
+                apply_no_embeddings_override(&mut config, no_embeddings);
                 let addr = parse_server_bind_addr(&bind, allow_network_bind)?;
                 if watch {
                     let server_store = store.clone();
@@ -1510,6 +1542,12 @@ impl Command {
 fn print_completion(shell: Shell) {
     let mut command = Cli::command();
     clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
+}
+
+fn apply_no_embeddings_override(config: &mut AppConfig, no_embeddings: bool) {
+    if no_embeddings {
+        config.embedder.disable();
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1932,33 +1970,39 @@ fn run_update_once_machine(
         }),
     );
 
-    let embeddings = refresh_embeddings_after_update_with_progress(
-        store,
-        config,
-        &ingest.delta,
-        repair,
-        |event| {
-            write_update_progress(
-                "embeddings",
-                embedding_progress_detail(event),
-                embedding_progress_payload(event),
-            );
-        },
-    )?;
-    write_update_progress(
-        "embeddings",
-        embedding_phase_detail(&embeddings),
-        serde_json::json!({
-            "status": "finished",
-            "embedded": embeddings.embedded,
-            "pending": embeddings.pending,
-            "vectors_indexed": embeddings.vectors_indexed,
-            "degraded_reason": embeddings.degraded_reason,
-            "deferred_reason": embeddings.deferred_reason,
-            "batch_size_reductions": embeddings.batch_size_reductions,
-            "final_batch_size": embeddings.final_batch_size,
-        }),
-    );
+    let embeddings = if config.embedder.is_disabled() {
+        search::EmbeddingRefresh::disabled()
+    } else {
+        let embeddings = refresh_embeddings_after_update_with_progress(
+            store,
+            config,
+            &ingest.delta,
+            repair,
+            |event| {
+                write_update_progress(
+                    "embeddings",
+                    embedding_progress_detail(event),
+                    embedding_progress_payload(event),
+                );
+            },
+        )?;
+        write_update_progress(
+            "embeddings",
+            embedding_phase_detail(&embeddings),
+            serde_json::json!({
+                "status": "finished",
+                "embedded": embeddings.embedded,
+                "pending": embeddings.pending,
+                "vectors_indexed": embeddings.vectors_indexed,
+                "disabled": embeddings.disabled,
+                "degraded_reason": embeddings.degraded_reason,
+                "deferred_reason": embeddings.deferred_reason,
+                "batch_size_reductions": embeddings.batch_size_reductions,
+                "final_batch_size": embeddings.final_batch_size,
+            }),
+        );
+        embeddings
+    };
 
     Ok(UpdateOutput {
         ingest,
@@ -2003,21 +2047,26 @@ fn run_update_once_human(
         })?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
-    let mut embed = progress.phase(if repair {
-        "Repairing embeddings"
+    let embeddings = if config.embedder.is_disabled() {
+        search::EmbeddingRefresh::disabled()
     } else {
-        "Updating embeddings"
-    });
-    let embeddings = refresh_embeddings_after_update_with_progress(
-        store,
-        config,
-        &ingest.delta,
-        repair,
-        |event| {
-            embed.update(embedding_progress_detail(event));
-        },
-    )?;
-    embed.finish(embedding_phase_detail(&embeddings));
+        let mut embed = progress.phase(if repair {
+            "Repairing embeddings"
+        } else {
+            "Updating embeddings"
+        });
+        let embeddings = refresh_embeddings_after_update_with_progress(
+            store,
+            config,
+            &ingest.delta,
+            repair,
+            |event| {
+                embed.update(embedding_progress_detail(event));
+            },
+        )?;
+        embed.finish(embedding_phase_detail(&embeddings));
+        embeddings
+    };
 
     Ok(UpdateOutput {
         ingest,
@@ -2261,10 +2310,16 @@ fn import_progress_event(
 }
 
 fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<ImportOutput> {
-    let stats = transport::import_jsonl_path_with_import_progress(store, input, |event| {
-        let (phase, detail, data) = import_progress_event(event);
-        write_machine_progress("import", phase, detail, data);
-    })?;
+    let import_options = import_options_for_config(_config);
+    let stats = transport::import_jsonl_path_with_options_and_import_progress(
+        store,
+        input,
+        import_options,
+        |event| {
+            let (phase, detail, data) = import_progress_event(event);
+            write_machine_progress("import", phase, detail, data);
+        },
+    )?;
     let projected = refresh_import_search_index_with_progress(store, &stats.delta, |detail| {
         write_machine_progress(
             "import",
@@ -2273,10 +2328,7 @@ fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<Im
             serde_json::json!({ "detail": detail }),
         );
     })?;
-    let embeddings = search::EmbeddingRefresh {
-        vectors_indexed: stats.vectors_indexed,
-        ..search::EmbeddingRefresh::default()
-    };
+    let embeddings = embedding_refresh_from_import_stats(_config, stats.vectors_indexed);
     Ok(ImportOutput {
         import: stats,
         search_index: SearchIndexOutput {
@@ -2290,8 +2342,12 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
     let progress = ProgressUi::new();
     let mut import = progress.phase("Importing history stream");
     let mut last = transport::JsonlProgress::default();
-    let stats =
-        transport::import_jsonl_path_with_import_progress(store, input, |event| match event {
+    let import_options = import_options_for_config(_config);
+    let stats = transport::import_jsonl_path_with_options_and_import_progress(
+        store,
+        input,
+        import_options,
+        |event| match event {
             transport::ImportProgress::Stream(state) => {
                 last = state;
                 import.update(jsonl_progress_detail(state));
@@ -2312,7 +2368,8 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
             transport::ImportProgress::VectorProjectionFinished { vectors_indexed } => {
                 import.update(format!("{} vectors indexed", format_count(vectors_indexed)));
             }
-        })?;
+        },
+    )?;
     import.finish(format!(
         "{} new records, {} duplicates, read {} records, {}",
         format_count(stats.inserted),
@@ -2327,12 +2384,11 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
     })?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
-    let embed = progress.phase("Updating embeddings");
-    let embeddings = search::EmbeddingRefresh {
-        vectors_indexed: stats.vectors_indexed,
-        ..search::EmbeddingRefresh::default()
-    };
-    embed.finish(embedding_phase_detail(&embeddings));
+    let embeddings = embedding_refresh_from_import_stats(_config, stats.vectors_indexed);
+    if !embeddings.disabled {
+        let embed = progress.phase("Updating embeddings");
+        embed.finish(embedding_phase_detail(&embeddings));
+    }
 
     Ok(ImportOutput {
         import: stats,
@@ -2341,6 +2397,28 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
         },
         embeddings,
     })
+}
+
+fn import_options_for_config(config: &AppConfig) -> transport::ImportOptions {
+    let enabled = !config.embedder.is_disabled();
+    transport::ImportOptions {
+        include_embeddings: enabled,
+        refresh_vector_projection: enabled,
+    }
+}
+
+fn embedding_refresh_from_import_stats(
+    config: &AppConfig,
+    vectors_indexed: usize,
+) -> search::EmbeddingRefresh {
+    if config.embedder.is_disabled() {
+        search::EmbeddingRefresh::disabled()
+    } else {
+        search::EmbeddingRefresh {
+            vectors_indexed,
+            ..search::EmbeddingRefresh::default()
+        }
+    }
 }
 
 fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
@@ -2355,6 +2433,9 @@ fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
 
 fn embedder_probe_output(config: &AppConfig) -> Option<EmbedderProbeOutput> {
     if std::env::var("HISTO_PROBE_EMBEDDER").as_deref() != Ok("1") {
+        return None;
+    }
+    if config.embedder.is_disabled() {
         return None;
     }
     Some(match config.embedder.load() {
@@ -2481,7 +2562,9 @@ fn print_search_summary(indexed_events: usize, color: bool) {
 }
 
 fn print_embedding_summary(embeddings: &search::EmbeddingRefresh, color: bool) {
-    let mode = if let Some(reason) = embeddings.deferred_reason.as_deref() {
+    let mode = if embeddings.disabled {
+        "disabled".to_string()
+    } else if let Some(reason) = embeddings.deferred_reason.as_deref() {
         format!("deferred ({reason})")
     } else {
         embeddings
@@ -2518,7 +2601,9 @@ fn print_section(title: &str, rows: &[(&str, String)], color: bool) {
 }
 
 fn embedding_phase_detail(embeddings: &search::EmbeddingRefresh) -> String {
-    if let Some(reason) = &embeddings.deferred_reason {
+    if embeddings.disabled {
+        "disabled".to_string()
+    } else if let Some(reason) = &embeddings.deferred_reason {
         format!(
             "deferred: {reason}; {} pending, {} new embeddings",
             format_count(embeddings.pending),
@@ -2853,6 +2938,14 @@ fn should_color(no_color: bool, color: Option<ColorArg>, robot: bool) -> bool {
 
 fn include_embedding_records(mode: EmbeddingExportMode, no_embeddings: bool) -> bool {
     !no_embeddings && matches!(mode, EmbeddingExportMode::Include)
+}
+
+fn include_embedding_records_for_config(
+    mode: EmbeddingExportMode,
+    no_embeddings: bool,
+    config: &AppConfig,
+) -> bool {
+    !config.embedder.is_disabled() && include_embedding_records(mode, no_embeddings)
 }
 
 fn include_raw_artifact_records(mode: RawArtifactExportMode, no_raw_artifacts: bool) -> bool {
@@ -4898,15 +4991,20 @@ async fn run_daemon(
             })?;
         index.finish(format!("{} events indexed", format_count(projected)));
 
-        let mut embed = progress.phase("Updating embeddings");
-        let embeddings = search::refresh_embeddings_incremental_with_progress(
-            store,
-            machine_id,
-            &embedder_config,
-            &stats.delta,
-            |event| embed.update(embedding_progress_detail(event)),
-        )?;
-        embed.finish(embedding_phase_detail(&embeddings));
+        let embeddings = if embedder_config.is_disabled() {
+            search::EmbeddingRefresh::disabled()
+        } else {
+            let mut embed = progress.phase("Updating embeddings");
+            let embeddings = search::refresh_embeddings_incremental_with_progress(
+                store,
+                machine_id,
+                &embedder_config,
+                &stats.delta,
+                |event| embed.update(embedding_progress_detail(event)),
+            )?;
+            embed.finish(embedding_phase_detail(&embeddings));
+            embeddings
+        };
 
         print_update_output(
             &UpdateOutput {
@@ -4935,6 +5033,9 @@ fn load_embedder(config: &AppConfig) -> (Option<Box<dyn crate::embed::Embedder>>
 fn load_embedder_config(
     config: &crate::embed::EmbedderConfig,
 ) -> (Option<Box<dyn crate::embed::Embedder>>, Option<String>) {
+    if config.is_disabled() {
+        return (None, None);
+    }
     match config.load() {
         Ok(embedder) => (Some(embedder), None),
         Err(err) => (None, Some(err.to_string())),

@@ -19,6 +19,7 @@ struct AppState {
     store: Store,
     machine_id: String,
     default_search_mode: search::SearchMode,
+    embeddings_enabled: bool,
     embedder: Arc<RwLock<ServerEmbedderState>>,
 }
 
@@ -51,6 +52,13 @@ impl ServerEmbedderState {
         }
     }
 
+    fn disabled() -> Self {
+        Self {
+            embedder: None,
+            degraded_reason: None,
+        }
+    }
+
     fn snapshot(&self) -> (Option<Arc<dyn crate::embed::Embedder>>, Option<String>) {
         (self.embedder.clone(), self.degraded_reason.clone())
     }
@@ -68,8 +76,15 @@ pub async fn serve(
     default_search_mode: search::SearchMode,
     embedder: crate::embed::EmbedderConfig,
 ) -> Result<()> {
-    let embedder_state = Arc::new(RwLock::new(ServerEmbedderState::loading()));
-    load_embedder_in_background(embedder, Arc::clone(&embedder_state));
+    let embeddings_enabled = !embedder.is_disabled();
+    let embedder_state = Arc::new(RwLock::new(if embeddings_enabled {
+        ServerEmbedderState::loading()
+    } else {
+        ServerEmbedderState::disabled()
+    }));
+    if embeddings_enabled {
+        load_embedder_in_background(embedder, Arc::clone(&embedder_state));
+    }
     let app = Router::new()
         .route("/health", get(health))
         .route("/heads", get(heads))
@@ -82,6 +97,7 @@ pub async fn serve(
             store,
             machine_id,
             default_search_mode,
+            embeddings_enabled,
             embedder: embedder_state,
         });
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -125,7 +141,14 @@ async fn heads(
 
 async fn export_jsonl(State(state): State<AppState>) -> Result<Response, ServerError> {
     let mut body = Vec::new();
-    transport::export_jsonl(&state.store, &mut body)?;
+    transport::export_jsonl_with_options(
+        &state.store,
+        transport::ExportOptions {
+            include_embeddings: state.embeddings_enabled,
+            ..Default::default()
+        },
+        &mut body,
+    )?;
     Ok((
         [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
         body,
@@ -413,19 +436,32 @@ async fn import_jsonl(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let stats = transport::import_jsonl_reader(&state.store, Cursor::new(body))?;
+    let import_options = transport::ImportOptions {
+        include_embeddings: state.embeddings_enabled,
+        refresh_vector_projection: state.embeddings_enabled,
+    };
+    let stats = transport::import_jsonl_reader_with_options_and_import_progress(
+        &state.store,
+        Cursor::new(body),
+        import_options,
+        |_| {},
+    )?;
     let projected = search::refresh(&state.store)?;
     let (embedder, embedder_degraded_reason) = state
         .embedder
         .read()
         .expect("server embedder state lock poisoned")
         .snapshot();
-    let embeddings = search::refresh_embeddings(
-        &state.store,
-        &state.machine_id,
-        embedder.as_deref(),
-        embedder_degraded_reason,
-    )?;
+    let embeddings = if state.embeddings_enabled {
+        search::refresh_embeddings(
+            &state.store,
+            &state.machine_id,
+            embedder.as_deref(),
+            embedder_degraded_reason,
+        )?
+    } else {
+        search::EmbeddingRefresh::disabled()
+    };
     Ok(Json(serde_json::json!({
         "inserted": stats.inserted,
         "duplicates": stats.duplicates,
@@ -884,8 +920,8 @@ mod tests {
                 store,
                 machine_id: "machine_remote".to_string(),
                 default_search_mode: search::SearchMode::Lexical,
-                embedder: None,
-                embedder_degraded_reason: Some("query embedder disabled".to_string()),
+                embeddings_enabled: false,
+                embedder: Arc::new(RwLock::new(ServerEmbedderState::disabled())),
             },
         )
     }

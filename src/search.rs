@@ -30,11 +30,21 @@ const EMBEDDING_RSS_SPIKE_BYTES: u64 = 512 * 1024 * 1024;
 pub struct EmbeddingRefresh {
     pub embedded: usize,
     pub vectors_indexed: usize,
+    pub disabled: bool,
     pub degraded_reason: Option<String>,
     pub pending: usize,
     pub deferred_reason: Option<String>,
     pub batch_size_reductions: usize,
     pub final_batch_size: Option<usize>,
+}
+
+impl EmbeddingRefresh {
+    pub fn disabled() -> Self {
+        Self {
+            disabled: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +589,7 @@ pub fn refresh_embeddings_incremental_with_progress(
         return Ok(EmbeddingRefresh {
             embedded: refresh.embedded + repair.embedded,
             vectors_indexed: repair.vectors_indexed,
+            disabled: false,
             degraded_reason: repair.degraded_reason,
             pending: repair.pending,
             deferred_reason: repair.deferred_reason,
@@ -638,6 +649,7 @@ fn refresh_embeddings_loaded(
                     store,
                     &vector_embedding_ids,
                 )?,
+                disabled: false,
                 degraded_reason,
                 pending,
                 deferred_reason: Some(reason),
