@@ -193,7 +193,7 @@ Inspect the current setting and config file path:
 histo config show
 ```
 
-Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`, `daemon`, or `serve` for a one-off lexical-only run without changing `config.toml`.
+Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`, `daemon`, or `serve` for a one-off lexical-only run without changing `config.toml`. This can speed up maintenance or sync work when semantic search is not needed right away; a later embedding-enabled `histo update` can backfill skipped embeddings.
 
 ### Embedding Transfer
 
