@@ -171,9 +171,33 @@ Then connect to the remote address:
 histo tui --server-url http://<remote-ip>:7391
 ```
 
+### Embedding Mode
+
+Historious can run with embeddings enabled or disabled. Embeddings are enabled by default.
+
+Persistently disable embeddings for this data directory:
+
+```bash
+histo config embeddings off
+```
+
+Re-enable them:
+
+```bash
+histo config embeddings on
+```
+
+Inspect the current setting and config file path:
+
+```bash
+histo config show
+```
+
+Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`, `daemon`, or `serve` for a one-off lexical-only run without changing `config.toml`.
+
 ### Embedding Transfer
 
-Exports include existing embedding records by default. Imports store those embeddings and refresh the local vector index, so the receiving machine can use compatible transferred embeddings without recreating them.
+When embeddings are enabled, exports include existing embedding records by default. Imports store those embeddings and refresh the local vector index, so the receiving machine can use compatible transferred embeddings without recreating them.
 
 Round-trip through an embedding-capable host:
 
@@ -185,7 +209,7 @@ ssh <embedding-host> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 ```
 
-Use `--embeddings omit` only when bandwidth or storage matters:
+Use `--embeddings omit` when bandwidth or storage matters:
 
 ```bash
 histo export --jsonl --embeddings omit [filters] \
@@ -242,15 +266,15 @@ Rules:
 History exchange:
 
 ```bash
-# Pull remote history and existing embeddings into local.
+# Pull remote history into local. Existing embeddings transfer when enabled.
 ssh <remote> 'histo export --jsonl [filters]' \
   | histo import --jsonl --json -
 
-# Push local history and existing embeddings to remote.
+# Push local history to remote. Existing embeddings transfer when enabled.
 histo export --jsonl [filters] \
   | ssh <remote> 'histo import --jsonl --json -'
 
-# Omit embeddings only when bandwidth or storage is constrained.
+# Omit embeddings when bandwidth or storage is constrained.
 histo export --jsonl --embeddings omit [filters] \
   | ssh <remote> 'histo import --jsonl --json -'
 
@@ -281,9 +305,9 @@ histo tui --server-url http://<remote-ip>:7391
 
 Exchange rules:
 
-- Export includes existing embeddings by default.
-- Import stores transferred embeddings and refreshes the local vector index.
-- Use `--embeddings omit` only for bandwidth or storage constrained exchanges.
+- Export includes existing embeddings by default when embeddings are enabled.
+- Import stores transferred embeddings and refreshes the local vector index when embeddings are enabled.
+- Use `--embeddings omit` for bandwidth or storage constrained exchanges.
 - Use an embedding-capable machine by piping history to it, then exporting back from it.
 - Do not include `histo update` in exchange flows; local log scanning is separate.
 
