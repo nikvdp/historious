@@ -470,7 +470,7 @@ fn ingest_file(
             hash: line_hash,
         }));
     }
-    store.import_records(&records)
+    store.import_archive_records(&records)
 }
 
 fn ingest_opencode_db(
@@ -636,7 +636,7 @@ fn ingest_opencode_db(
         }
     }
 
-    store.import_records(&records)
+    store.import_archive_records(&records)
 }
 
 fn clean_optional_title(title: &str) -> Option<String> {
@@ -1774,7 +1774,7 @@ mod tests {
         assert_eq!(second.inserted, 2);
         assert_eq!(second.duplicates, 2);
         assert_eq!(second.delta.inserted_events.len(), 1);
-        assert_eq!(second.delta.touched_events.len(), 2);
+        assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
         assert_eq!(second.delta.touched_paths.len(), 1);
         assert_eq!(stats.raw_artifacts, 2);
