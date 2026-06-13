@@ -4021,6 +4021,10 @@ async fn run_transcript_tail(
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?;
+    let session_record = store
+        .session_by_id(&session)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
     let metadata = view_metadata_for_session(store, &session_record, None, verbose)?;
 
     ensure_history_items_ready(store)?;

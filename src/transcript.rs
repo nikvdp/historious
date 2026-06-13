@@ -325,14 +325,14 @@ fn should_compact_preview_event(event: &EventRecord, target: bool, mode: RenderM
 fn format_local_timestamp_seconds(value: DateTime<Utc>) -> String {
     value
         .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S %Z")
+        .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
 
 fn format_local_timestamp_minutes(value: DateTime<Utc>) -> String {
     value
         .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M %Z")
+        .format("%Y-%m-%d %H:%M")
         .to_string()
 }
 
