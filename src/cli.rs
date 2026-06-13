@@ -287,9 +287,12 @@ pub enum Command {
         all: bool,
         #[arg(long, help = "Print structured JSON")]
         json: bool,
+        #[arg(long, help = "Refresh local inputs before listing threads")]
+        update: bool,
         #[arg(
             long,
-            help = "List stored threads without first refreshing local inputs"
+            hide = true,
+            help = "Deprecated; threads reads stored data unless --update is passed"
         )]
         no_update: bool,
         #[arg(long, help = "Disable colored output")]
@@ -1017,10 +1020,11 @@ impl Cli {
                 project,
                 all,
                 json,
+                update,
                 no_update,
                 no_color,
             } => {
-                let implicit_update = !no_update;
+                let implicit_update = update && !no_update;
                 if implicit_update {
                     refresh_threads_inputs(&store, &config, json || robot)?;
                 }
