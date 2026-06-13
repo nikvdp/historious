@@ -96,6 +96,14 @@ pub fn render_history_session(
     render_history_context(context, metadata, color)
 }
 
+pub fn render_history_items(items: &[HistoryItemRecord], color: bool, verbose: bool) -> String {
+    let mut out = String::new();
+    for item in items {
+        push_history_item(&mut out, item, false, color, verbose);
+    }
+    out
+}
+
 fn push_view_header(
     out: &mut String,
     label: &str,
