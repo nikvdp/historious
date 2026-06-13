@@ -23,6 +23,7 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_THREAD_LIMIT: usize = 10;
 const DEFAULT_FZF_LIMIT: usize = 25;
 const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
+const DEFAULT_TAIL_LINES: usize = 20;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
@@ -418,6 +419,14 @@ pub enum Command {
             help = "Seconds to wait between local input scans"
         )]
         interval: f64,
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = DEFAULT_TAIL_LINES,
+            value_name = "COUNT",
+            help = "Number of existing clean transcript items to print before following"
+        )]
+        lines: usize,
         #[arg(long, value_enum, help = "When to use colored output")]
         color: Option<ColorArg>,
         #[arg(long, help = "Disable colored output")]
@@ -1246,6 +1255,7 @@ impl Cli {
             Command::Tail {
                 target,
                 interval,
+                lines,
                 color,
                 no_color,
                 verbose,
@@ -1254,7 +1264,8 @@ impl Cli {
                     bail!("tail streams text output and cannot be combined with --robot");
                 }
                 let color = should_color(no_color, color, robot);
-                run_transcript_tail(&store, &config, &target, interval, color, verbose).await?;
+                run_transcript_tail(&store, &config, &target, interval, lines, color, verbose)
+                    .await?;
             }
             Command::Export {
                 jsonl,
@@ -4013,6 +4024,7 @@ async fn run_transcript_tail(
     config: &AppConfig,
     target: &str,
     interval_secs: f64,
+    initial_lines: usize,
     color: bool,
     verbose: bool,
 ) -> Result<()> {
@@ -4025,23 +4037,34 @@ async fn run_transcript_tail(
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-    if !refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)? {
-        return Ok(());
-    }
-    let session_record = store
-        .session_by_id(&session)?
-        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
     let metadata = view_metadata_for_session(store, &session_record, None, verbose)?;
 
     ensure_history_items_ready(store)?;
     let context = store
         .history_items_for_transcript_session(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    let total_items = context.items.len();
+    let initial_context = tail_initial_context(context.clone(), initial_lines);
     write_stdout(&crate::transcript::render_history_session(
-        &context, &metadata, color,
+        &initial_context,
+        &metadata,
+        color,
     ))?;
     flush_stdout()?;
     let mut last_cursor = context.items.last().map(history_item_cursor);
+    write_stdout(&format!(
+        "--- tail: showing last {} of {} items; following every {:.1}s (Ctrl-C to stop) ---\n\n",
+        initial_context.items.len(),
+        total_items,
+        interval_secs
+    ))?;
+    flush_stdout()?;
+
+    if refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?
+        && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
+    {
+        return Ok(());
+    }
 
     loop {
         if tail_cancelled() {
@@ -4055,27 +4078,55 @@ async fn run_transcript_tail(
         if !refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)? {
             break;
         }
-        let context = store
-            .history_items_for_transcript_session(&session)?
-            .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-        let new_items: Vec<_> = context
-            .items
-            .into_iter()
-            .filter(|item| match &last_cursor {
-                Some(cursor) => history_item_is_after(item, cursor),
-                None => true,
-            })
-            .collect();
-        if new_items.is_empty() {
-            continue;
-        }
-        last_cursor = new_items.last().map(history_item_cursor);
-        write_stdout(&crate::transcript::render_history_items(
-            &new_items, color, verbose,
-        ))?;
-        flush_stdout()?;
+        append_tail_updates(store, &session, &mut last_cursor, color, verbose)?;
     }
     Ok(())
+}
+
+fn tail_initial_context(
+    mut context: crate::storage::HistoryTranscriptContext,
+    initial_lines: usize,
+) -> crate::storage::HistoryTranscriptContext {
+    if context.items.len() > initial_lines {
+        let start = context.items.len() - initial_lines;
+        context.items = context.items.split_off(start);
+    }
+    context.target_event = None;
+    context.target_index = None;
+    context.omitted_target = false;
+    context
+}
+
+fn append_tail_updates(
+    store: &Store,
+    session: &str,
+    last_cursor: &mut Option<(i64, i64, String)>,
+    color: bool,
+    verbose: bool,
+) -> Result<bool> {
+    if tail_cancelled() {
+        return Ok(false);
+    }
+    let context = store
+        .history_items_for_transcript_session(session)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    let new_items: Vec<_> = context
+        .items
+        .into_iter()
+        .filter(|item| match last_cursor.as_ref() {
+            Some(cursor) => history_item_is_after(item, cursor),
+            None => true,
+        })
+        .collect();
+    if new_items.is_empty() {
+        return Ok(true);
+    }
+    *last_cursor = new_items.last().map(history_item_cursor);
+    write_stdout(&crate::transcript::render_history_items(
+        &new_items, color, verbose,
+    ))?;
+    flush_stdout()?;
+    Ok(!tail_cancelled())
 }
 
 fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Result<bool> {
