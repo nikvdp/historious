@@ -1631,6 +1631,24 @@ impl Store {
         })
     }
 
+    pub fn sessions_by_external_id(&self, external_id: &str) -> Result<Vec<SessionRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
+                        started_at, updated_at, metadata_json, hash
+                 FROM sessions
+                 WHERE external_id = ?1
+                 ORDER BY source_kind, id",
+            )?;
+            let rows = stmt.query_map(params![external_id], row_session)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn source_by_id(&self, source_id: &str) -> Result<Option<SourceRecord>> {
         self.with_conn(|conn| {
             conn.query_row(

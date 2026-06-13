@@ -1290,7 +1290,7 @@ impl Cli {
                             .iter()
                             .map(|path| transport::normalize_workspace_arg(path))
                             .collect(),
-                        sessions: session,
+                        sessions: resolve_session_filter_targets(&store, session)?,
                         since: transport::parse_since_arg(since.as_deref())?,
                     };
                     let options = transport::ExportOptions {
@@ -1377,7 +1377,7 @@ impl Cli {
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let filter = prune_filter(
                     source,
-                    session,
+                    resolve_session_filter_targets(&store, session)?,
                     after_bound,
                     before_bound,
                     search_workspace_scope(project.as_deref(), all),
@@ -1433,7 +1433,7 @@ impl Cli {
                             .iter()
                             .map(|path| transport::normalize_workspace_arg(path))
                             .collect(),
-                        sessions: session,
+                        sessions: resolve_session_filter_targets(&store, session)?,
                         since: transport::parse_since_arg(since.as_deref())?,
                     };
                     let hashes = store.missing_raw_artifact_blob_hashes(&filter)?;
@@ -3920,7 +3920,7 @@ fn resolve_transcript_target(
     at: Option<String>,
     search_unit: Option<String>,
 ) -> Result<(String, Option<String>)> {
-    if let Some(session) = store.session_by_id(target)? {
+    if let Some(session) = resolve_session_target(store, target)? {
         let target_event_id = resolve_optional_transcript_at(store, at, search_unit)?;
         if let Some(event_id) = &target_event_id {
             let event = store
@@ -3945,6 +3945,52 @@ fn resolve_transcript_target(
         .event_by_id(&event_id)?
         .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
     Ok((event.session_id, Some(event.id)))
+}
+
+fn resolve_session_filter_targets(store: &Store, targets: Vec<String>) -> Result<Vec<String>> {
+    targets
+        .into_iter()
+        .map(|target| {
+            resolve_session_target(store, &target)?
+                .map(|session| session.id)
+                .ok_or_else(|| anyhow::anyhow!("session/native id not found: {target}"))
+        })
+        .collect()
+}
+
+fn resolve_session_target(
+    store: &Store,
+    target: &str,
+) -> Result<Option<crate::archive::SessionRecord>> {
+    if let Some(session) = store.session_by_id(target)? {
+        return Ok(Some(session));
+    }
+    let sessions = store.sessions_by_external_id(target)?;
+    match sessions.len() {
+        0 => Ok(None),
+        1 => Ok(sessions.into_iter().next()),
+        _ => bail!(
+            "ambiguous native session id {target}; matched {} sessions: {}",
+            sessions.len(),
+            format_ambiguous_sessions(&sessions)
+        ),
+    }
+}
+
+fn format_ambiguous_sessions(sessions: &[crate::archive::SessionRecord]) -> String {
+    sessions
+        .iter()
+        .take(5)
+        .map(|session| {
+            let title = session
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("untitled");
+            format!("{}:{} ({title})", session.source_kind, session.id)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resolve_optional_transcript_at(
