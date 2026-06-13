@@ -396,6 +396,27 @@ pub enum Command {
         #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
     },
+    /// Follow a conversation transcript and append new clean messages to stdout.
+    Tail {
+        #[arg(
+            value_name = "SESSION_OR_REF",
+            help = "Session id, recent search ref, or full event id"
+        )]
+        target: String,
+        #[arg(
+            long,
+            default_value_t = 1.0,
+            value_name = "SECONDS",
+            help = "Seconds to wait between local input scans"
+        )]
+        interval: f64,
+        #[arg(long, value_enum, help = "When to use colored output")]
+        color: Option<ColorArg>,
+        #[arg(long, help = "Disable colored output")]
+        no_color: bool,
+        #[arg(long, help = "Show source file details and internal ids")]
+        verbose: bool,
+    },
     /// Write history records to JSONL for backup or transfer.
     Export {
         #[arg(long, help = "Write newline-delimited JSON records")]
@@ -1201,6 +1222,19 @@ impl Cli {
                     page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
                 }
             }
+            Command::Tail {
+                target,
+                interval,
+                color,
+                no_color,
+                verbose,
+            } => {
+                if robot {
+                    bail!("tail streams text output and cannot be combined with --robot");
+                }
+                let color = should_color(no_color, color, robot);
+                run_transcript_tail(&store, &config, &target, interval, color, verbose).await?;
+            }
             Command::Export {
                 jsonl,
                 embeddings,
@@ -1505,6 +1539,7 @@ impl Command {
             Command::Show { .. } => "show",
             Command::Expand { .. } => "expand",
             Command::Transcript { .. } => "transcript",
+            Command::Tail { .. } => "tail",
             Command::Export { .. } => "export",
             Command::Import { .. } => "import",
             Command::Prune { .. } => "prune",
@@ -3915,6 +3950,110 @@ fn view_metadata_for_session(
     })
 }
 
+async fn run_transcript_tail(
+    store: &Store,
+    config: &AppConfig,
+    target: &str,
+    interval_secs: f64,
+    color: bool,
+    verbose: bool,
+) -> Result<()> {
+    if interval_secs <= 0.0 {
+        bail!("--interval must be greater than 0");
+    }
+    let interval = Duration::from_secs_f64(interval_secs);
+    let (session, _) = resolve_transcript_target(store, target, None, None)?;
+    let session_record = store
+        .session_by_id(&session)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    let metadata = view_metadata_for_session(store, &session_record, None, verbose)?;
+
+    ensure_history_items_ready(store)?;
+    let context = store
+        .history_items_for_transcript_session(&session)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+    write_stdout(&crate::transcript::render_history_session(
+        &context, &metadata, color,
+    ))?;
+    flush_stdout()?;
+    let mut last_cursor = context.items.last().map(history_item_cursor);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+        }
+
+        refresh_tail_inputs(store, &config.machine_id, &session_record.source_kind)?;
+        let context = store
+            .history_items_for_transcript_session(&session)?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+        let new_items: Vec<_> = context
+            .items
+            .into_iter()
+            .filter(|item| match &last_cursor {
+                Some(cursor) => history_item_is_after(item, cursor),
+                None => true,
+            })
+            .collect();
+        if new_items.is_empty() {
+            continue;
+        }
+        last_cursor = new_items.last().map(history_item_cursor);
+        write_stdout(&crate::transcript::render_history_items(
+            &new_items, color, verbose,
+        ))?;
+        flush_stdout()?;
+    }
+    Ok(())
+}
+
+fn refresh_tail_inputs(store: &Store, machine_id: &str, source_kind: &str) -> Result<()> {
+    let stats = ingest::update_local_with_progress(
+        store,
+        machine_id,
+        ingest::UpdateOptions {
+            max_files: None,
+            source: Some(source_kind.to_string()),
+        },
+        |_| {},
+    )?;
+    if stats.delta.touched_events.is_empty() {
+        return Ok(());
+    }
+    refresh_tail_history_items(store, &stats.delta.touched_events)
+}
+
+fn ensure_history_items_ready(store: &Store) -> Result<()> {
+    if store.history_items_projection_ready()? {
+        return Ok(());
+    }
+    store.refresh_history_items()?;
+    Ok(())
+}
+
+fn refresh_tail_history_items(store: &Store, event_ids: &[String]) -> Result<()> {
+    if store.history_items_projection_ready()? {
+        store.refresh_history_items_for_events(event_ids)?;
+    } else {
+        store.refresh_history_items()?;
+    }
+    Ok(())
+}
+
+fn history_item_cursor(item: &crate::storage::HistoryItemRecord) -> (i64, i64, String) {
+    (item.ordinal, item.subordinal, item.id.clone())
+}
+
+fn history_item_is_after(
+    item: &crate::storage::HistoryItemRecord,
+    cursor: &(i64, i64, String),
+) -> bool {
+    (item.ordinal, item.subordinal, item.id.as_str()) > (cursor.0, cursor.1, cursor.2.as_str())
+}
+
 fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) -> Result<()> {
     if no_pager || !std::io::stdout().is_terminal() {
         return write_stdout(output);
@@ -4778,6 +4917,15 @@ fn command_exists(command: &str) -> bool {
 fn write_stdout(output: &str) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match stdout.write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn flush_stdout() -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout.flush() {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(err) => Err(err.into()),
