@@ -324,6 +324,12 @@ pub fn refresh(store: &Store) -> Result<usize> {
     Ok(indexed)
 }
 
+pub fn refresh_text(store: &Store) -> Result<usize> {
+    let indexed = store.refresh_search_text_index_with_progress(|_, _, _| {})?;
+    store.refresh_history_items()?;
+    Ok(indexed)
+}
+
 pub fn refresh_search_index(store: &Store) -> Result<usize> {
     store.refresh_search_index(
         crate::embed::HashEmbedder::MODEL_ID,

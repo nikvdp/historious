@@ -1953,14 +1953,19 @@ fn run_update_once_machine(
         }),
     );
 
-    let projected =
-        refresh_search_after_update_with_progress(store, &ingest.delta, repair, |detail| {
+    let projected = refresh_search_after_update_with_progress(
+        store,
+        &ingest.delta,
+        repair,
+        config.embedder.is_disabled(),
+        |detail| {
             write_update_progress(
                 "search_index",
                 detail.clone(),
                 serde_json::json!({ "detail": detail }),
             );
-        })?;
+        },
+    )?;
     write_update_progress(
         "search_index",
         format!("{} events indexed", format_count(projected)),
@@ -2041,10 +2046,15 @@ fn run_update_once_human(
     } else {
         "Updating search index"
     });
-    let projected =
-        refresh_search_after_update_with_progress(store, &ingest.delta, repair, |detail| {
+    let projected = refresh_search_after_update_with_progress(
+        store,
+        &ingest.delta,
+        repair,
+        config.embedder.is_disabled(),
+        |detail| {
             index.update(detail);
-        })?;
+        },
+    )?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embeddings = if config.embedder.is_disabled() {
@@ -2081,11 +2091,16 @@ fn refresh_search_after_update_with_progress(
     store: &Store,
     delta: &crate::storage::ImportDelta,
     repair: bool,
+    embeddings_disabled: bool,
     mut progress: impl FnMut(String),
 ) -> Result<usize> {
     if repair {
         progress("repairing all indexable events".to_string());
-        let indexed = refresh_search_index_repair_with_progress(store, &mut progress)?;
+        let indexed = if embeddings_disabled {
+            refresh_search_text_index_repair_with_progress(store, &mut progress)?
+        } else {
+            refresh_search_index_repair_with_progress(store, &mut progress)?
+        };
         progress("projecting history items".to_string());
         store.refresh_history_items_with_progress(|processed, total| {
             progress(format!(
@@ -2103,33 +2118,65 @@ fn refresh_search_after_update_with_progress(
         ));
         let mut last_index_progress = Instant::now();
         let mut last_index_report: Option<(usize, usize)> = None;
-        let indexed = store.refresh_search_index_for_events_with_progress(
-            crate::embed::HashEmbedder::MODEL_ID,
-            crate::embed::HashEmbedder::DIMS,
-            &search_event_ids,
-            crate::embed::hash_embed,
-            |processed, total| {
-                if processed == 1
-                    || processed == total
-                    || last_index_progress.elapsed() >= Duration::from_secs(1)
-                {
-                    let report = (processed, total);
-                    if last_index_report != Some(report) {
-                        progress(format!(
-                            "indexed {}/{} new events",
-                            format_count(processed),
-                            format_count(total)
-                        ));
-                        last_index_progress = Instant::now();
-                        last_index_report = Some(report);
+        let indexed = if embeddings_disabled {
+            store.refresh_search_text_index_for_events_with_progress(
+                &search_event_ids,
+                |processed, total| {
+                    if processed == 1
+                        || processed == total
+                        || last_index_progress.elapsed() >= Duration::from_secs(1)
+                    {
+                        let report = (processed, total);
+                        if last_index_report != Some(report) {
+                            progress(format!(
+                                "indexed {}/{} new events",
+                                format_count(processed),
+                                format_count(total)
+                            ));
+                            last_index_progress = Instant::now();
+                            last_index_report = Some(report);
+                        }
                     }
-                }
-            },
-        )?;
+                },
+            )
+        } else {
+            store.refresh_search_index_for_events_with_progress(
+                crate::embed::HashEmbedder::MODEL_ID,
+                crate::embed::HashEmbedder::DIMS,
+                &search_event_ids,
+                crate::embed::hash_embed,
+                |processed, total| {
+                    if processed == 1
+                        || processed == total
+                        || last_index_progress.elapsed() >= Duration::from_secs(1)
+                    {
+                        let report = (processed, total);
+                        if last_index_report != Some(report) {
+                            progress(format!(
+                                "indexed {}/{} new events",
+                                format_count(processed),
+                                format_count(total)
+                            ));
+                            last_index_progress = Instant::now();
+                            last_index_report = Some(report);
+                        }
+                    }
+                },
+            )
+        }?;
         progress("checking index health".to_string());
-        let indexed = if store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)? {
+        let needs_repair = if embeddings_disabled {
+            store.search_text_index_needs_repair()?
+        } else {
+            store.search_index_needs_repair(crate::embed::HashEmbedder::MODEL_ID)?
+        };
+        let indexed = if needs_repair {
             progress("repairing missing search index rows".to_string());
-            refresh_search_index_repair_with_progress(store, &mut progress)
+            if embeddings_disabled {
+                refresh_search_text_index_repair_with_progress(store, &mut progress)
+            } else {
+                refresh_search_index_repair_with_progress(store, &mut progress)
+            }
         } else {
             Ok(indexed)
         }?;
@@ -2198,6 +2245,35 @@ fn refresh_search_index_repair_with_progress(
     )
 }
 
+fn refresh_search_text_index_repair_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(String),
+) -> Result<usize> {
+    let mut last_progress = Instant::now();
+    let mut last_report: Option<(&'static str, usize, usize)> = None;
+    store.refresh_search_text_index_with_progress(|phase, processed, total| {
+        let report = (phase, processed, total);
+        if processed == 0 || processed == total || last_progress.elapsed() >= Duration::from_secs(1)
+        {
+            if last_report != Some(report) {
+                let label = match phase {
+                    "search_rows" => "search index rows",
+                    "search_units" => "search units",
+                    _ => "search rows",
+                };
+                progress(format!(
+                    "repaired {}/{} {}",
+                    format_count(processed),
+                    format_count(total),
+                    label
+                ));
+                last_progress = Instant::now();
+                last_report = Some(report);
+            }
+        }
+    })
+}
+
 fn refresh_embeddings_after_update_with_progress(
     store: &Store,
     config: &AppConfig,
@@ -2226,6 +2302,7 @@ fn refresh_embeddings_after_update_with_progress(
 fn refresh_import_search_index_with_progress(
     store: &Store,
     delta: &crate::storage::ImportDelta,
+    embeddings_disabled: bool,
     mut progress: impl FnMut(String),
 ) -> Result<usize> {
     let search_event_ids = delta.search_index_event_ids();
@@ -2235,29 +2312,52 @@ fn refresh_import_search_index_with_progress(
     ));
     let mut last_index_progress = Instant::now();
     let mut last_index_report: Option<(usize, usize)> = None;
-    let indexed = store.refresh_search_index_for_events_with_progress(
-        crate::embed::HashEmbedder::MODEL_ID,
-        crate::embed::HashEmbedder::DIMS,
-        &search_event_ids,
-        crate::embed::hash_embed,
-        |processed, total| {
-            if processed == 1
-                || processed == total
-                || last_index_progress.elapsed() >= Duration::from_secs(1)
-            {
-                let report = (processed, total);
-                if last_index_report != Some(report) {
-                    progress(format!(
-                        "indexed {}/{} imported events",
-                        format_count(processed),
-                        format_count(total)
-                    ));
-                    last_index_progress = Instant::now();
-                    last_index_report = Some(report);
+    let indexed = if embeddings_disabled {
+        store.refresh_search_text_index_for_events_with_progress(
+            &search_event_ids,
+            |processed, total| {
+                if processed == 1
+                    || processed == total
+                    || last_index_progress.elapsed() >= Duration::from_secs(1)
+                {
+                    let report = (processed, total);
+                    if last_index_report != Some(report) {
+                        progress(format!(
+                            "indexed {}/{} imported events",
+                            format_count(processed),
+                            format_count(total)
+                        ));
+                        last_index_progress = Instant::now();
+                        last_index_report = Some(report);
+                    }
                 }
-            }
-        },
-    )?;
+            },
+        )
+    } else {
+        store.refresh_search_index_for_events_with_progress(
+            crate::embed::HashEmbedder::MODEL_ID,
+            crate::embed::HashEmbedder::DIMS,
+            &search_event_ids,
+            crate::embed::hash_embed,
+            |processed, total| {
+                if processed == 1
+                    || processed == total
+                    || last_index_progress.elapsed() >= Duration::from_secs(1)
+                {
+                    let report = (processed, total);
+                    if last_index_report != Some(report) {
+                        progress(format!(
+                            "indexed {}/{} imported events",
+                            format_count(processed),
+                            format_count(total)
+                        ));
+                        last_index_progress = Instant::now();
+                        last_index_report = Some(report);
+                    }
+                }
+            },
+        )
+    }?;
     Ok(indexed)
 }
 
@@ -2320,14 +2420,19 @@ fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<Im
             write_machine_progress("import", phase, detail, data);
         },
     )?;
-    let projected = refresh_import_search_index_with_progress(store, &stats.delta, |detail| {
-        write_machine_progress(
-            "import",
-            "search_index",
-            detail.clone(),
-            serde_json::json!({ "detail": detail }),
-        );
-    })?;
+    let projected = refresh_import_search_index_with_progress(
+        store,
+        &stats.delta,
+        _config.embedder.is_disabled(),
+        |detail| {
+            write_machine_progress(
+                "import",
+                "search_index",
+                detail.clone(),
+                serde_json::json!({ "detail": detail }),
+            );
+        },
+    )?;
     let embeddings = embedding_refresh_from_import_stats(_config, stats.vectors_indexed);
     Ok(ImportOutput {
         import: stats,
@@ -2379,9 +2484,14 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
     ));
 
     let mut index = progress.phase("Updating search index");
-    let projected = refresh_import_search_index_with_progress(store, &stats.delta, |detail| {
-        index.update(detail);
-    })?;
+    let projected = refresh_import_search_index_with_progress(
+        store,
+        &stats.delta,
+        _config.embedder.is_disabled(),
+        |detail| {
+            index.update(detail);
+        },
+    )?;
     index.finish(format!("{} events indexed", format_count(projected)));
 
     let embeddings = embedding_refresh_from_import_stats(_config, stats.vectors_indexed);
@@ -4985,10 +5095,15 @@ async fn run_daemon(
         ));
 
         let mut index = progress.phase("Updating search index");
-        let projected =
-            refresh_search_after_update_with_progress(store, &stats.delta, false, |detail| {
+        let projected = refresh_search_after_update_with_progress(
+            store,
+            &stats.delta,
+            false,
+            embedder_config.is_disabled(),
+            |detail| {
                 index.update(detail);
-            })?;
+            },
+        )?;
         index.finish(format!("{} events indexed", format_count(projected)));
 
         let embeddings = if embedder_config.is_disabled() {

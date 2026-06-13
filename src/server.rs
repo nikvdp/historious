@@ -446,7 +446,11 @@ async fn import_jsonl(
         import_options,
         |_| {},
     )?;
-    let projected = search::refresh(&state.store)?;
+    let projected = if state.embeddings_enabled {
+        search::refresh(&state.store)?
+    } else {
+        search::refresh_text(&state.store)?
+    };
     let (embedder, embedder_degraded_reason) = state
         .embedder
         .read()
