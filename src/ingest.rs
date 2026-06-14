@@ -71,9 +71,14 @@ pub enum UpdateProgress {
 
 #[derive(Debug, Clone)]
 struct SourceRoot {
-    kind: &'static str,
     path: PathBuf,
     extensions: &'static [&'static str],
+}
+
+#[derive(Debug, Clone)]
+struct LocalTranscriptSource {
+    kind: &'static str,
+    roots: Vec<SourceRoot>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,11 +141,9 @@ pub fn update_local_with_progress_and_cancel(
                     if should_cancel() {
                         return Ok(stats);
                     }
-                    if options
-                        .source
-                        .as_deref()
-                        .is_some_and(|source| source != candidate.kind && source != adapter.kind())
-                    {
+                    if options.source.as_deref().is_some_and(|source| {
+                        !source_filter_matches(source, adapter.kind(), &candidate.kind)
+                    }) {
                         continue;
                     }
                     push_found_source_file(&mut source_summaries, &candidate.kind);
@@ -389,9 +392,15 @@ fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &str) -> us
 }
 
 fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegistry> {
-    let registry = SourceAdapterRegistry::new().register(LocalTranscriptAdapter {
-        native_titles: NativeTitleIndex::load(),
-    })?;
+    let native_titles = NativeTitleIndex::load();
+    let mut registry = SourceAdapterRegistry::new();
+    for source in local_transcript_sources() {
+        registry = registry.register(LocalTranscriptAdapter {
+            kind: source.kind,
+            roots: source.roots,
+            native_titles: native_titles.clone(),
+        })?;
+    }
     if let Some(adapter) = crate::treechat::TreechatAdapter::from_config(
         &options.sources.treechat,
         options.source.as_deref(),
@@ -401,18 +410,33 @@ fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegi
     Ok(registry)
 }
 
+fn source_filter_matches(source: &str, adapter_kind: &str, candidate_kind: &str) -> bool {
+    source == adapter_kind
+        || source == candidate_kind
+        || (source == "agent_logs" && is_local_transcript_kind(candidate_kind))
+}
+
+fn is_local_transcript_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "codex" | "claude_code" | "pi_agent" | "openclaw" | "hermes" | "opencode"
+    )
+}
+
 struct LocalTranscriptAdapter {
+    kind: &'static str,
+    roots: Vec<SourceRoot>,
     native_titles: NativeTitleIndex,
 }
 
 impl SourceAdapter for LocalTranscriptAdapter {
     fn kind(&self) -> &'static str {
-        "agent_logs"
+        self.kind
     }
 
     fn discover(&self) -> Result<Vec<SourceCandidate>> {
         let mut candidates = Vec::new();
-        for root in discover_roots() {
+        for root in &self.roots {
             if !root.path.exists() {
                 continue;
             }
@@ -453,7 +477,7 @@ impl SourceAdapter for LocalTranscriptAdapter {
                 let path = entry.path().to_path_buf();
                 candidates.push(SourceCandidate {
                     adapter_kind: self.kind(),
-                    kind: root.kind.to_string(),
+                    kind: self.kind().to_string(),
                     identity: path.to_string_lossy().to_string(),
                     path: Some(path),
                     modified,
@@ -475,7 +499,7 @@ impl SourceAdapter for LocalTranscriptAdapter {
             context
                 .store
                 .source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
-        Ok(candidate.kind != "opencode" && status.raw_current && !status.needs_workspace_refresh)
+        Ok(self.kind() != "opencode" && status.raw_current && !status.needs_workspace_refresh)
     }
 
     fn import(
@@ -490,53 +514,67 @@ impl SourceAdapter for LocalTranscriptAdapter {
         ingest_file(
             context.store,
             context.machine_id,
-            &candidate.kind,
+            self.kind(),
             path,
             &self.native_titles,
         )
     }
 }
 
-fn discover_roots() -> Vec<SourceRoot> {
-    let mut roots = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(SourceRoot {
+fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        LocalTranscriptSource {
             kind: "codex",
-            path: home.join(".codex/sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "codex",
-            path: home.join(".codex/archived_sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
+            roots: vec![
+                SourceRoot {
+                    path: home.join(".codex/sessions"),
+                    extensions: &["jsonl"],
+                },
+                SourceRoot {
+                    path: home.join(".codex/archived_sessions"),
+                    extensions: &["jsonl"],
+                },
+            ],
+        },
+        LocalTranscriptSource {
             kind: "claude_code",
-            path: home.join(".claude/projects"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
+            roots: vec![SourceRoot {
+                path: home.join(".claude/projects"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
             kind: "pi_agent",
-            path: home.join(".pi/agent/sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
+            roots: vec![SourceRoot {
+                path: home.join(".pi/agent/sessions"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
             kind: "openclaw",
-            path: home.join(".openclaw"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
+            roots: vec![SourceRoot {
+                path: home.join(".openclaw"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
             kind: "hermes",
-            path: home.join(".hermes/sessions"),
-            extensions: &["json", "jsonl"],
-        });
-        roots.push(SourceRoot {
+            roots: vec![SourceRoot {
+                path: home.join(".hermes/sessions"),
+                extensions: &["json", "jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
             kind: "opencode",
-            path: home.join(".local/share/opencode/opencode.db"),
-            extensions: &["db"],
-        });
-    }
-    roots
+            roots: vec![SourceRoot {
+                path: home.join(".local/share/opencode/opencode.db"),
+                extensions: &["db"],
+            }],
+        },
+    ]
 }
 
 fn ingest_file(
