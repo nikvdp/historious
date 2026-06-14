@@ -30,6 +30,7 @@ pub struct SourceSyncContext<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticPolicy {
     Required,
+    #[allow(dead_code)]
     Opportunistic,
     Never,
 }
@@ -160,6 +161,7 @@ impl SearchSegment {
         }
     }
 
+    #[allow(dead_code)]
     pub fn compat_metadata(&self) -> Value {
         let mut metadata = Map::new();
         self.apply_compat_metadata(&mut metadata);
