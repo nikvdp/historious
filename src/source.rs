@@ -1,5 +1,6 @@
 use crate::storage::{ImportStats, Store};
 use anyhow::{bail, Result};
+use serde_json::{Map, Value};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,141 @@ impl SourceCandidate {
 pub struct SourceSyncContext<'a> {
     pub store: &'a Store,
     pub machine_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticPolicy {
+    Required,
+    Opportunistic,
+    Never,
+}
+
+impl SemanticPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Opportunistic => "opportunistic",
+            Self::Never => "never",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSegment {
+    pub tier: String,
+    pub kind: String,
+    pub text: String,
+    pub lexical_indexable: bool,
+    pub semantic_policy: SemanticPolicy,
+    pub provenance: Option<String>,
+    pub stable_parts: Vec<String>,
+    pub metadata: Map<String, Value>,
+    pub skip_reason: Option<String>,
+}
+
+impl SearchSegment {
+    pub fn indexed(
+        tier: impl Into<String>,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+        semantic_policy: SemanticPolicy,
+    ) -> Self {
+        Self {
+            tier: tier.into(),
+            kind: kind.into(),
+            text: text.into(),
+            lexical_indexable: true,
+            semantic_policy,
+            provenance: None,
+            stable_parts: Vec::new(),
+            metadata: Map::new(),
+            skip_reason: None,
+        }
+    }
+
+    pub fn skipped(kind: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            tier: "raw".to_string(),
+            kind: kind.into(),
+            text: String::new(),
+            lexical_indexable: false,
+            semantic_policy: SemanticPolicy::Never,
+            provenance: None,
+            stable_parts: Vec::new(),
+            metadata: Map::new(),
+            skip_reason: Some(reason.into()),
+        }
+    }
+
+    pub fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
+        self.provenance = Some(provenance.into());
+        self
+    }
+
+    pub fn with_stable_part(mut self, part: impl Into<String>) -> Self {
+        self.stable_parts.push(part.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    pub fn is_searchable(&self) -> bool {
+        self.lexical_indexable && !self.text.trim().is_empty()
+    }
+
+    pub fn apply_compat_metadata(&self, metadata: &mut Map<String, Value>) {
+        metadata.insert(
+            "search_indexable".to_string(),
+            Value::Bool(self.is_searchable()),
+        );
+        metadata.insert("search_kind".to_string(), Value::String(self.kind.clone()));
+        metadata.insert("search_text".to_string(), Value::String(self.text.clone()));
+        metadata.insert(
+            "search_semantic_policy".to_string(),
+            Value::String(self.semantic_policy.as_str().to_string()),
+        );
+        metadata.insert("search_tier".to_string(), Value::String(self.tier.clone()));
+        metadata.insert(
+            "search_skip_reason".to_string(),
+            self.skip_reason
+                .as_ref()
+                .map(|reason| Value::String(reason.clone()))
+                .unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "search_provenance".to_string(),
+            self.provenance
+                .as_ref()
+                .map(|provenance| Value::String(provenance.clone()))
+                .unwrap_or(Value::Null),
+        );
+        if !self.stable_parts.is_empty() {
+            metadata.insert(
+                "search_stable_parts".to_string(),
+                Value::Array(
+                    self.stable_parts
+                        .iter()
+                        .map(|part| Value::String(part.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !self.metadata.is_empty() {
+            metadata.insert(
+                "search_segment_metadata".to_string(),
+                Value::Object(self.metadata.clone()),
+            );
+        }
+    }
+
+    pub fn compat_metadata(&self) -> Value {
+        let mut metadata = Map::new();
+        self.apply_compat_metadata(&mut metadata);
+        Value::Object(metadata)
+    }
 }
 
 pub trait SourceAdapter {
@@ -144,5 +280,52 @@ mod tests {
         };
 
         assert_eq!(context.machine_id, "machine-test");
+    }
+
+    #[test]
+    fn search_segment_exposes_compatibility_metadata() {
+        let segment = SearchSegment::indexed(
+            "conversation",
+            "user",
+            "find adapter notes",
+            SemanticPolicy::Required,
+        )
+        .with_provenance("message_text")
+        .with_stable_part("message-1")
+        .with_metadata("source_field", serde_json::json!("content"));
+
+        let metadata = segment.compat_metadata();
+
+        assert_eq!(metadata["search_indexable"], true);
+        assert_eq!(metadata["search_kind"], "user");
+        assert_eq!(metadata["search_text"], "find adapter notes");
+        assert_eq!(metadata["search_semantic_policy"], "required");
+        assert_eq!(metadata["search_tier"], "conversation");
+        assert_eq!(metadata["search_provenance"], "message_text");
+        assert_eq!(metadata["search_stable_parts"][0], "message-1");
+        assert_eq!(
+            metadata["search_segment_metadata"]["source_field"],
+            "content"
+        );
+    }
+
+    #[test]
+    fn skipped_search_segment_preserves_skip_reason_without_searching() {
+        let segment = SearchSegment::skipped("tool", "tool event");
+        let metadata = segment.compat_metadata();
+
+        assert!(!segment.is_searchable());
+        assert_eq!(metadata["search_indexable"], false);
+        assert_eq!(metadata["search_kind"], "tool");
+        assert_eq!(metadata["search_text"], "");
+        assert_eq!(metadata["search_semantic_policy"], "never");
+        assert_eq!(metadata["search_skip_reason"], "tool event");
+    }
+
+    #[test]
+    fn semantic_policy_renders_storage_values() {
+        assert_eq!(SemanticPolicy::Required.as_str(), "required");
+        assert_eq!(SemanticPolicy::Opportunistic.as_str(), "opportunistic");
+        assert_eq!(SemanticPolicy::Never.as_str(), "never");
     }
 }
