@@ -4379,12 +4379,15 @@ fn conversation_history_text(event: &EventRecord) -> Option<(String, &str)> {
         .to_ascii_lowercase();
     match kind.as_str() {
         "user" | "assistant" => Some((kind, text)),
-        "conversation" => event
-            .role
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .filter(|role| role == "user" || role == "assistant")
-            .map(|role| (role, text)),
+        "conversation" => {
+            let kind = event
+                .role
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .filter(|role| role == "user" || role == "assistant")
+                .unwrap_or_else(|| "conversation".to_string());
+            Some((kind, text))
+        }
         "thinking" | "reasoning" => Some(("thinking".to_string(), text)),
         _ => None,
     }
