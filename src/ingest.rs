@@ -1993,7 +1993,7 @@ mod tests {
         push_found_source_file(&mut summaries, "codex");
         let candidates = vec![
             SourceCandidate {
-                adapter_kind: "agent_logs",
+                adapter_kind: "codex",
                 modified: 3,
                 kind: "codex".to_string(),
                 identity: "codex-1.jsonl".to_string(),
@@ -2002,7 +2002,7 @@ mod tests {
                 mtime_ms: None,
             },
             SourceCandidate {
-                adapter_kind: "agent_logs",
+                adapter_kind: "hermes",
                 modified: 2,
                 kind: "hermes".to_string(),
                 identity: "hermes-1.json".to_string(),
@@ -2026,6 +2026,39 @@ mod tests {
         assert_eq!(codex.selected_files, 1);
         assert_eq!(hermes.found_files, 1);
         assert_eq!(hermes.selected_files, 1);
+    }
+
+    #[test]
+    fn source_filter_matches_specific_sources_and_agent_logs_alias() {
+        assert!(source_filter_matches("codex", "codex", "codex"));
+        assert!(source_filter_matches("agent_logs", "codex", "codex"));
+        assert!(source_filter_matches("agent_logs", "opencode", "opencode"));
+        assert!(source_filter_matches("treechat", "treechat", "treechat"));
+        assert!(!source_filter_matches("agent_logs", "treechat", "treechat"));
+        assert!(!source_filter_matches("codex", "hermes", "hermes"));
+    }
+
+    #[test]
+    fn local_transcript_adapter_discovers_candidates_with_source_adapter_kind() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log_path = temp.path().join("session.jsonl");
+        fs::write(&log_path, fixture_line("session-1", "hello from codex"))
+            .expect("write fixture");
+        let adapter = LocalTranscriptAdapter {
+            kind: "codex",
+            roots: vec![SourceRoot {
+                path: temp.path().to_path_buf(),
+                extensions: &["jsonl"],
+            }],
+            native_titles: NativeTitleIndex::default(),
+        };
+
+        let candidates = adapter.discover().expect("discover candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].adapter_kind, "codex");
+        assert_eq!(candidates[0].kind, "codex");
+        assert_eq!(candidates[0].path.as_deref(), Some(log_path.as_path()));
     }
 
     fn fixture_line(session_id: &str, text: &str) -> String {
