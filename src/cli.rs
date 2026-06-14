@@ -3473,6 +3473,7 @@ fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Res
         ingest::UpdateOptions {
             max_files: None,
             source: None,
+            sources: config.sources.clone(),
         },
         |_| {},
     )?;
@@ -4121,6 +4122,7 @@ async fn run_transcript_tail(
         &config.machine_id,
         &session_record.source_kind,
         tail_source_path.as_deref(),
+        &config.sources,
     )? && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
     {
         return Ok(());
@@ -4140,6 +4142,7 @@ async fn run_transcript_tail(
             &config.machine_id,
             &session_record.source_kind,
             tail_source_path.as_deref(),
+            &config.sources,
         )? {
             break;
         }
@@ -4199,6 +4202,7 @@ fn refresh_tail_inputs(
     machine_id: &str,
     source_kind: &str,
     source_path: Option<&Path>,
+    sources: &crate::config::SourceConfigs,
 ) -> Result<bool> {
     let stats = match source_path {
         Some(path) => ingest::update_source_path_with_progress_and_cancel(
@@ -4215,6 +4219,7 @@ fn refresh_tail_inputs(
             ingest::UpdateOptions {
                 max_files: None,
                 source: Some(source_kind.to_string()),
+                sources: sources.clone(),
             },
             |_| {},
             tail_cancelled,
