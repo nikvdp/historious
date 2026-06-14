@@ -2,7 +2,9 @@ use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
 use crate::config::TreechatSourceConfig;
-use crate::source::{SourceAdapter, SourceCandidate, SourceSyncContext};
+use crate::source::{
+    SearchSegment, SemanticPolicy, SourceAdapter, SourceCandidate, SourceSyncContext,
+};
 use crate::storage::ImportStats;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -238,6 +240,12 @@ impl SourceAdapter for TreechatAdapter {
                 let chunks = chunk_search_text(&part.text);
                 let chunk_count = chunks.len();
                 for (chunk_index, search_text) in chunks.into_iter().enumerate() {
+                    let search = part
+                        .search_segment(role, search_text.clone(), self.config.content_scope)
+                        .with_lexical_indexable(role == "user")
+                        .with_stable_part(quest.id.clone())
+                        .with_stable_part(answer_id.to_string())
+                        .with_stable_part(chunk_index.to_string());
                     let event_id = stable_id(&[
                         "event",
                         TREECHAT_SOURCE_KIND,
@@ -247,6 +255,32 @@ impl SourceAdapter for TreechatAdapter {
                         part.provenance,
                         &chunk_index.to_string(),
                     ]);
+                    let mut metadata = json!({
+                        "raw_artifact_hash": raw_hash,
+                        "capture_fidelity": "treechat_api_thread",
+                        "parser": "treechat_api_v1",
+                        "treechat_quest_id": quest.id,
+                        "treechat_answer_id": answer.id,
+                        "treechat_answer_path": answer.path,
+                        "treechat_user_id": answer.user_id,
+                        "treechat_user_name": answer.user.as_ref().and_then(|user| user.name.clone()),
+                        "treechat_message_type": answer.message_type,
+                        "treechat_is_clip": answer.is_clip,
+                        "treechat_url": answer.url.as_ref().map(|url| json!({
+                            "id": url.id,
+                            "address": url.address,
+                            "title": url.title,
+                            "full_text_attachment_id": url.full_text_attachment_id,
+                        })),
+                        "treechat_url_hash": answer.url_address().map(|address| blake3_hex(address.as_bytes())),
+                        "search_content_scope": self.config.content_scope.as_str(),
+                        "search_chunk_index": chunk_index,
+                        "search_chunk_count": chunk_count,
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                    search.apply_compat_metadata(&mut metadata);
                     records.push(ArchiveRecord::Event(EventRecord {
                         id: event_id,
                         session_id: session_id.clone(),
@@ -259,33 +293,7 @@ impl SourceAdapter for TreechatAdapter {
                         content: search_text.clone(),
                         raw_artifact_hash: Some(raw_hash.clone()),
                         occurred_at: answer.created_time(),
-                        metadata: json!({
-                            "raw_artifact_hash": raw_hash,
-                            "capture_fidelity": "treechat_api_thread",
-                            "parser": "treechat_api_v1",
-                            "treechat_quest_id": quest.id,
-                            "treechat_answer_id": answer.id,
-                            "treechat_answer_path": answer.path,
-                            "treechat_user_id": answer.user_id,
-                            "treechat_user_name": answer.user.as_ref().and_then(|user| user.name.clone()),
-                            "treechat_message_type": answer.message_type,
-                            "treechat_is_clip": answer.is_clip,
-                            "treechat_url": answer.url.as_ref().map(|url| json!({
-                                "id": url.id,
-                                "address": url.address,
-                                "title": url.title,
-                                "full_text_attachment_id": url.full_text_attachment_id,
-                            })),
-                            "treechat_url_hash": answer.url_address().map(|address| blake3_hex(address.as_bytes())),
-                            "search_indexable": role == "user",
-                            "search_kind": role,
-                            "search_text": search_text,
-                            "search_content_scope": self.config.content_scope.as_str(),
-                            "search_provenance": part.provenance,
-                            "search_chunk_index": chunk_index,
-                            "search_chunk_count": chunk_count,
-                            "search_skip_reason": null
-                        }),
+                        metadata: Value::Object(metadata),
                         hash: stable_hash(&(
                             TREECHAT_SOURCE_KIND,
                             &quest.id,
@@ -611,6 +619,20 @@ struct SearchPart {
     text: String,
 }
 
+impl SearchPart {
+    fn search_segment(
+        &self,
+        role: &str,
+        text: String,
+        scope: TreechatContentScope,
+    ) -> SearchSegment {
+        SearchSegment::indexed("conversation", role, text, SemanticPolicy::Required)
+            .with_provenance(self.provenance)
+            .with_metadata("event_type", json!(self.event_type))
+            .with_metadata("content_scope", json!(scope.as_str()))
+    }
+}
+
 fn built_in_profile(profile: &str) -> ResolvedTreechatConfig {
     let (backend_url, app_host) = match profile {
         "staging" => (
@@ -824,5 +846,32 @@ mod tests {
         assert!(full_text
             .iter()
             .any(|part| part.provenance == "url_full_text"));
+    }
+
+    #[test]
+    fn search_part_builds_explicit_segment_metadata() {
+        let part = SearchPart {
+            provenance: "url_metadata",
+            event_type: "treechat_url_metadata",
+            text: "Example Article\nhttps://example.com/article".to_string(),
+        };
+
+        let segment = part
+            .search_segment("user", part.text.clone(), TreechatContentScope::UrlMetadata)
+            .with_lexical_indexable(true);
+        let metadata = segment.compat_metadata();
+
+        assert_eq!(metadata["search_indexable"], true);
+        assert_eq!(metadata["search_kind"], "user");
+        assert_eq!(metadata["search_text"], part.text);
+        assert_eq!(metadata["search_provenance"], "url_metadata");
+        assert_eq!(
+            metadata["search_segment_metadata"]["event_type"],
+            "treechat_url_metadata"
+        );
+        assert_eq!(
+            metadata["search_segment_metadata"]["content_scope"],
+            "url_metadata"
+        );
     }
 }
