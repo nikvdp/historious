@@ -2078,13 +2078,48 @@ mod tests {
     }
 
     #[test]
-    fn source_filter_matches_specific_sources_and_agent_logs_alias() {
-        assert!(source_filter_matches("codex", "codex", "codex"));
-        assert!(source_filter_matches("agent_logs", "codex", "codex"));
-        assert!(source_filter_matches("agent_logs", "opencode", "opencode"));
-        assert!(source_filter_matches("treechat", "treechat", "treechat"));
-        assert!(!source_filter_matches("agent_logs", "treechat", "treechat"));
-        assert!(!source_filter_matches("codex", "hermes", "hermes"));
+    fn source_selection_matches_specific_sources_and_agent_logs_alias() {
+        let codex = SourceSelection::single("codex").expect("codex selection");
+        let agent_logs = SourceSelection::single("agent_logs").expect("agent logs selection");
+        let treechat = SourceSelection::single("treechat").expect("treechat selection");
+
+        assert!(codex.matches_candidate("codex", "codex"));
+        assert!(agent_logs.matches_candidate("codex", "codex"));
+        assert!(agent_logs.matches_candidate("opencode", "opencode"));
+        assert!(treechat.matches_candidate("treechat", "treechat"));
+        assert!(!agent_logs.matches_candidate("treechat", "treechat"));
+        assert!(!codex.matches_candidate("hermes", "hermes"));
+    }
+
+    #[test]
+    fn source_selection_accepts_repeated_and_comma_separated_sources() {
+        let selection =
+            SourceSelection::parse(["codex, claude_code".to_string(), "treechat".to_string()])
+                .expect("selection");
+
+        assert!(selection.includes_adapter("codex"));
+        assert!(selection.includes_adapter("claude_code"));
+        assert!(selection.includes_adapter("treechat"));
+        assert!(!selection.includes_adapter("hermes"));
+    }
+
+    #[test]
+    fn source_selection_skips_treechat_discovery_for_other_sources() {
+        let mut sources = SourceConfigs::default();
+        sources.treechat.enabled = true;
+        let options = UpdateOptions {
+            max_files: None,
+            source_selection: SourceSelection::single("codex").expect("selection"),
+            sources,
+        };
+
+        let registry = built_in_source_adapters(&options).expect("registry");
+        let kinds = registry
+            .iter()
+            .map(|adapter| adapter.kind())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["codex"]);
     }
 
     #[test]

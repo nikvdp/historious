@@ -274,6 +274,18 @@ mod tests {
     }
 
     #[test]
+    fn config_file_can_persist_treechat_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let path = set_treechat_enabled(dir.path(), true).expect("write treechat config");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert_eq!(path, dir.path().join("config.toml"));
+        assert!(config.sources.treechat.enabled);
+        assert!(load_treechat_enabled(dir.path()).expect("load treechat config"));
+    }
+
+    #[test]
     fn invalid_search_mode_in_config_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
