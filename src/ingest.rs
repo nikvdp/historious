@@ -2042,8 +2042,7 @@ mod tests {
     fn local_transcript_adapter_discovers_candidates_with_source_adapter_kind() {
         let temp = tempfile::tempdir().expect("temp dir");
         let log_path = temp.path().join("session.jsonl");
-        fs::write(&log_path, fixture_line("session-1", "hello from codex"))
-            .expect("write fixture");
+        fs::write(&log_path, fixture_line("session-1", "hello from codex")).expect("write fixture");
         let adapter = LocalTranscriptAdapter {
             kind: "codex",
             roots: vec![SourceRoot {
