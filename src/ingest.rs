@@ -1292,11 +1292,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
     }
 }
 
-fn derive_search_segment(
-    value: &Value,
-    role: Option<&str>,
-    event_type: &str,
-) -> SearchSegment {
+fn derive_search_segment(value: &Value, role: Option<&str>, event_type: &str) -> SearchSegment {
     let normalized_role = role.map(str::to_ascii_lowercase);
     let search_role = normalized_role.as_deref().or_else(|| match event_type {
         "user" | "assistant" => Some(event_type),
