@@ -5435,6 +5435,39 @@ mod tests {
     }
 
     #[test]
+    fn history_item_projector_honors_roleless_conversation_segments() {
+        let source = fixture_source("source_roleless_conversation");
+        let session = fixture_session("session_roleless_conversation", &source.id);
+        let mut event = fixture_event(
+            "event_roleless_conversation",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_roleless_conversation",
+        );
+        event.role = None;
+        event.event_type = "event".to_string();
+        event.content =
+            r#"{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}"#
+                .to_string();
+        event.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "conversation",
+            "search_text": "hello\nhi"
+        });
+
+        let items = history_items_from_event(&event).expect("history items");
+
+        assert_eq!(
+            tier_kinds(&items),
+            vec![("conversation", "conversation"), ("raw", "event")]
+        );
+        assert_eq!(items[0].text, "hello\nhi");
+        assert_eq!(items[0].semantic_policy, "required");
+    }
+
+    #[test]
     fn clean_transcript_context_marks_hidden_raw_target_as_omitted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
