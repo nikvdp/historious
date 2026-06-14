@@ -96,6 +96,11 @@ impl SearchSegment {
         self
     }
 
+    pub fn with_lexical_indexable(mut self, lexical_indexable: bool) -> Self {
+        self.lexical_indexable = lexical_indexable;
+        self
+    }
+
     pub fn with_stable_part(mut self, part: impl Into<String>) -> Self {
         self.stable_parts.push(part.into());
         self
