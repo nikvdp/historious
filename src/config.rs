@@ -110,7 +110,19 @@ pub fn load_embeddings_enabled(data_dir: &Path) -> Result<bool> {
     Ok(load_file_config(data_dir)?.embeddings.enabled)
 }
 
+pub fn load_treechat_enabled(data_dir: &Path) -> Result<bool> {
+    Ok(load_file_config(data_dir)?.sources.treechat.enabled)
+}
+
 pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
+    set_config_bool(data_dir, &["embeddings", "enabled"], enabled)
+}
+
+pub fn set_treechat_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
+    set_config_bool(data_dir, &["sources", "treechat", "enabled"], enabled)
+}
+
+fn set_config_bool(data_dir: &Path, path_parts: &[&str], enabled: bool) -> Result<PathBuf> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
     let path = config_path(data_dir);
@@ -125,16 +137,20 @@ pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf>
     let root = value
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root must be a TOML table"))?;
-    let embeddings = root
-        .entry("embeddings".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if !embeddings.is_table() {
-        *embeddings = toml::Value::Table(toml::map::Map::new());
+    let Some((last, parents)) = path_parts.split_last() else {
+        anyhow::bail!("config path must not be empty");
+    };
+    let mut cursor = root;
+    for part in parents {
+        let value = cursor
+            .entry((*part).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !value.is_table() {
+            *value = toml::Value::Table(toml::map::Map::new());
+        }
+        cursor = value.as_table_mut().expect("config table");
     }
-    embeddings
-        .as_table_mut()
-        .expect("embeddings table")
-        .insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    cursor.insert((*last).to_string(), toml::Value::Boolean(enabled));
     fs::write(
         &path,
         toml::to_string_pretty(&value).context("serializing config")?,

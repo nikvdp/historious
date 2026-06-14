@@ -13,7 +13,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
@@ -32,8 +32,50 @@ pub struct UpdateStats {
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     pub max_files: Option<usize>,
-    pub source: Option<String>,
+    pub source_selection: SourceSelection,
     pub sources: SourceConfigs,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SourceSelection {
+    sources: BTreeSet<String>,
+}
+
+impl SourceSelection {
+    pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut sources = BTreeSet::new();
+        for value in values {
+            for part in value.split(',') {
+                let source = part.trim();
+                if source.is_empty() {
+                    continue;
+                }
+                sources.insert(source.to_ascii_lowercase());
+            }
+        }
+        Ok(Self { sources })
+    }
+
+    pub fn single(source: impl Into<String>) -> Result<Self> {
+        Self::parse([source.into()])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    fn includes_adapter(&self, adapter_kind: &str) -> bool {
+        self.is_empty()
+            || self.sources.contains(adapter_kind)
+            || (self.sources.contains("agent_logs") && is_local_transcript_kind(adapter_kind))
+    }
+
+    fn matches_candidate(&self, adapter_kind: &str, candidate_kind: &str) -> bool {
+        self.is_empty()
+            || self.sources.contains(adapter_kind)
+            || self.sources.contains(candidate_kind)
+            || (self.sources.contains("agent_logs") && is_local_transcript_kind(candidate_kind))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,15 +177,19 @@ pub fn update_local_with_progress_and_cancel(
         if should_cancel() {
             return Ok(stats);
         }
+        if !options.source_selection.includes_adapter(adapter.kind()) {
+            continue;
+        }
         match adapter.discover() {
             Ok(discovered) => {
                 for candidate in discovered {
                     if should_cancel() {
                         return Ok(stats);
                     }
-                    if options.source.as_deref().is_some_and(|source| {
-                        !source_filter_matches(source, adapter.kind(), &candidate.kind)
-                    }) {
+                    if !options
+                        .source_selection
+                        .matches_candidate(adapter.kind(), &candidate.kind)
+                    {
                         continue;
                     }
                     push_found_source_file(&mut source_summaries, &candidate.kind);
@@ -395,25 +441,28 @@ fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegi
     let native_titles = NativeTitleIndex::load();
     let mut registry = SourceAdapterRegistry::new();
     for source in local_transcript_sources() {
+        if !options.source_selection.includes_adapter(source.kind) {
+            continue;
+        }
         registry = registry.register(LocalTranscriptAdapter {
             kind: source.kind,
             roots: source.roots,
             native_titles: native_titles.clone(),
         })?;
     }
-    if let Some(adapter) = crate::treechat::TreechatAdapter::from_config(
-        &options.sources.treechat,
-        options.source.as_deref(),
-    )? {
-        return registry.register(adapter);
+    if options.source_selection.includes_adapter("treechat") {
+        if let Some(adapter) = crate::treechat::TreechatAdapter::from_config(
+            &options.sources.treechat,
+            selected_treechat_source(&options.source_selection),
+        )? {
+            return registry.register(adapter);
+        }
     }
     Ok(registry)
 }
 
-fn source_filter_matches(source: &str, adapter_kind: &str, candidate_kind: &str) -> bool {
-    source == adapter_kind
-        || source == candidate_kind
-        || (source == "agent_logs" && is_local_transcript_kind(candidate_kind))
+fn selected_treechat_source(selection: &SourceSelection) -> Option<&'static str> {
+    selection.sources.contains("treechat").then_some("treechat")
 }
 
 fn is_local_transcript_kind(kind: &str) -> bool {

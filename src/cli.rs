@@ -56,8 +56,12 @@ pub enum Command {
     Update {
         #[arg(long, help = "Scan at most this many newest files")]
         max_files: Option<usize>,
-        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
-        source: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Scan these source kinds; may be repeated or comma-separated"
+        )]
+        source: Vec<String>,
         #[arg(long, help = "Fully reconcile derived search and vector indexes")]
         repair: bool,
         #[arg(long, help = "Skip embedding work for this run")]
@@ -553,8 +557,12 @@ pub enum Command {
         interval_secs: u64,
         #[arg(long, help = "Scan at most this many newest files each pass")]
         max_files: Option<usize>,
-        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
-        source: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Scan these source kinds each pass; may be repeated or comma-separated"
+        )]
+        source: Vec<String>,
         #[arg(long, help = "Skip embedding work while this daemon runs")]
         no_embeddings: bool,
     },
@@ -592,9 +600,10 @@ pub enum Command {
         #[arg(
             long,
             requires = "watch",
-            help = "Scan only one source kind, such as codex or claude_code"
+            value_delimiter = ',',
+            help = "Scan these source kinds when watching; may be repeated or comma-separated"
         )]
-        source: Option<String>,
+        source: Vec<String>,
         #[arg(long, help = "Skip embedding work for this server process")]
         no_embeddings: bool,
     },
@@ -658,10 +667,22 @@ pub enum ConfigCommand {
         #[arg(value_enum, default_value_t = ConfigEmbeddingState::Status)]
         state: ConfigEmbeddingState,
     },
+    /// Show or change Treechat ingestion opt-in behavior.
+    Treechat {
+        #[arg(value_enum, default_value_t = ConfigSourceState::Status)]
+        state: ConfigSourceState,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigEmbeddingState {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigSourceState {
     On,
     Off,
     Status,
@@ -1627,6 +1648,7 @@ fn apply_no_embeddings_override(config: &mut AppConfig, no_embeddings: bool) {
 struct ConfigOutput {
     config_path: String,
     embeddings_enabled: bool,
+    treechat_enabled: bool,
 }
 
 fn run_config_command(
@@ -1641,6 +1663,7 @@ fn run_config_command(
             let output = ConfigOutput {
                 config_path: path.display().to_string(),
                 embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
             };
             if robot {
                 crate::output::write_success("config show", output, Default::default())?;
@@ -1659,9 +1682,27 @@ fn run_config_command(
             let output = ConfigOutput {
                 config_path: path.display().to_string(),
                 embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
             };
             if robot {
                 crate::output::write_success("config embeddings", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
+        ConfigCommand::Treechat { state } => {
+            let path = match state {
+                ConfigSourceState::On => crate::config::set_treechat_enabled(&data_dir, true)?,
+                ConfigSourceState::Off => crate::config::set_treechat_enabled(&data_dir, false)?,
+                ConfigSourceState::Status => path,
+            };
+            let output = ConfigOutput {
+                config_path: path.display().to_string(),
+                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
+            };
+            if robot {
+                crate::output::write_success("config treechat", output, Default::default())?;
             } else {
                 print_config_output(&output);
             }
@@ -1673,6 +1714,7 @@ fn run_config_command(
 fn print_config_output(output: &ConfigOutput) {
     println!("config_path={}", output.config_path);
     println!("embeddings.enabled={}", output.embeddings_enabled);
+    println!("sources.treechat.enabled={}", output.treechat_enabled);
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {
@@ -1994,15 +2036,16 @@ fn run_update_once_machine(
     store: &Store,
     config: &AppConfig,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
     repair: bool,
 ) -> Result<UpdateOutput> {
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
         ingest::UpdateOptions {
             max_files,
-            source,
+            source_selection,
             sources: config.sources.clone(),
         },
         |event| {
@@ -2100,9 +2143,10 @@ fn run_update_once_human(
     store: &Store,
     config: &AppConfig,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
     repair: bool,
 ) -> Result<UpdateOutput> {
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let progress = ProgressUi::new();
     let mut scan = progress.phase("Scanning local agent logs");
     let ingest = ingest::update_local_with_progress(
@@ -2110,7 +2154,7 @@ fn run_update_once_human(
         &config.machine_id,
         ingest::UpdateOptions {
             max_files,
-            source,
+            source_selection,
             sources: config.sources.clone(),
         },
         |event| scan.update(update_progress_detail(event)),
@@ -3472,7 +3516,7 @@ fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Res
         &config.machine_id,
         ingest::UpdateOptions {
             max_files: None,
-            source: None,
+            source_selection: ingest::SourceSelection::default(),
             sources: config.sources.clone(),
         },
         |_| {},
@@ -4218,7 +4262,7 @@ fn refresh_tail_inputs(
             machine_id,
             ingest::UpdateOptions {
                 max_files: None,
-                source: Some(source_kind.to_string()),
+                source_selection: ingest::SourceSelection::single(source_kind)?,
                 sources: sources.clone(),
             },
             |_| {},
@@ -5502,9 +5546,10 @@ async fn run_daemon(
     source_configs: crate::config::SourceConfigs,
     interval_secs: u64,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let progress = ProgressUi::new();
     loop {
         let mut scan = progress.phase("Scanning local agent logs");
@@ -5513,7 +5558,7 @@ async fn run_daemon(
             machine_id,
             ingest::UpdateOptions {
                 max_files,
-                source: source.clone(),
+                source_selection: source_selection.clone(),
                 sources: source_configs.clone(),
             },
             |event| scan.update(update_progress_detail(event)),
