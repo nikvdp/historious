@@ -2,7 +2,10 @@ use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
 use crate::config::SourceConfigs;
-use crate::source::{SourceAdapter, SourceAdapterRegistry, SourceCandidate, SourceSyncContext};
+use crate::source::{
+    SearchSegment, SemanticPolicy, SourceAdapter, SourceAdapterRegistry, SourceCandidate,
+    SourceSyncContext,
+};
 use crate::storage::{ImportDelta, ImportStats, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -80,22 +83,11 @@ struct ParsedLine {
     byte_offset: usize,
     byte_len: usize,
     content: String,
-    search_text: String,
-    search_kind: String,
-    search_indexable: bool,
-    search_skip_reason: Option<String>,
+    search: SearchSegment,
     role: Option<String>,
     event_type: String,
     occurred_at: Option<DateTime<Utc>>,
     external_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SearchProjection {
-    text: String,
-    kind: String,
-    indexable: bool,
-    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -630,6 +622,16 @@ fn ingest_file(
         ]);
         let byte_offset = line.byte_offset;
         let byte_len = line.byte_len;
+        let mut metadata = json!({
+            "raw_artifact_hash": raw_hash.clone(),
+            "byte_offset": byte_offset,
+            "byte_len": byte_len,
+            "capture_fidelity": "exact_local_log",
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        line.search.apply_compat_metadata(&mut metadata);
         records.push(ArchiveRecord::Event(EventRecord {
             id: event_id,
             session_id: session_id.clone(),
@@ -642,16 +644,7 @@ fn ingest_file(
             content: line.content,
             raw_artifact_hash: Some(raw_hash.clone()),
             occurred_at: line.occurred_at,
-            metadata: json!({
-                "raw_artifact_hash": raw_hash.clone(),
-                "byte_offset": byte_offset,
-                "byte_len": byte_len,
-                "capture_fidelity": "exact_local_log",
-                "search_indexable": line.search_indexable,
-                "search_kind": line.search_kind,
-                "search_text": line.search_text,
-                "search_skip_reason": line.search_skip_reason
-            }),
+            metadata: Value::Object(metadata),
             hash: line_hash,
         }));
     }
@@ -789,6 +782,27 @@ fn ingest_opencode_db(
                 &part_type,
                 &content,
             ))?;
+            let search = SearchSegment::indexed(
+                "conversation",
+                role.clone(),
+                content.clone(),
+                SemanticPolicy::Required,
+            )
+            .with_provenance("opencode_part_text")
+            .with_stable_part(part_id.clone());
+            let mut metadata = json!({
+                "raw_artifact_hash": raw_artifact.hash.clone(),
+                "capture_fidelity": "native_opencode_sqlite",
+                "parser": "opencode_sqlite_v1",
+                "opencode_session_id": external_session_id.clone(),
+                "opencode_message_id": message_id.clone(),
+                "opencode_part_id": part_id.clone(),
+                "opencode_part_type": part_type.clone(),
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+            search.apply_compat_metadata(&mut metadata);
             records.push(ArchiveRecord::Event(EventRecord {
                 id: event_id,
                 session_id: session_id.clone(),
@@ -802,19 +816,7 @@ fn ingest_opencode_db(
                 raw_artifact_hash: Some(raw_artifact.hash.clone()),
                 occurred_at: unix_millis_to_utc(part_time)
                     .or_else(|| unix_millis_to_utc(message_time)),
-                metadata: json!({
-                    "raw_artifact_hash": raw_artifact.hash.clone(),
-                    "capture_fidelity": "native_opencode_sqlite",
-                    "parser": "opencode_sqlite_v1",
-                    "opencode_session_id": external_session_id.clone(),
-                    "opencode_message_id": message_id.clone(),
-                    "opencode_part_id": part_id.clone(),
-                    "opencode_part_type": part_type.clone(),
-                    "search_indexable": true,
-                    "search_kind": role.clone(),
-                    "search_text": content.clone(),
-                    "search_skip_reason": null
-                }),
+                metadata: Value::Object(metadata),
                 hash: event_hash,
             }));
             ordinal += 1;
@@ -1268,7 +1270,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         .or_else(|| string_at(&value, &["payload", "type"]))
         .unwrap_or_else(|| role.clone().unwrap_or_else(|| "event".to_string()));
     let content = extract_text(&value).unwrap_or_else(|| value.to_string());
-    let search = derive_search_projection(&value, role.as_deref(), &event_type);
+    let search = derive_search_segment(&value, role.as_deref(), &event_type);
     let occurred_at = string_at(&value, &["timestamp"])
         .or_else(|| string_at(&value, &["created_at"]))
         .or_else(|| string_at(&value, &["message", "created_at"]))
@@ -1282,10 +1284,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         byte_offset,
         byte_len,
         content,
-        search_text: search.text,
-        search_kind: search.kind,
-        search_indexable: search.indexable,
-        search_skip_reason: search.skip_reason,
+        search,
         role,
         event_type,
         occurred_at,
@@ -1293,11 +1292,11 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
     }
 }
 
-fn derive_search_projection(
+fn derive_search_segment(
     value: &Value,
     role: Option<&str>,
     event_type: &str,
-) -> SearchProjection {
+) -> SearchSegment {
     let normalized_role = role.map(str::to_ascii_lowercase);
     let search_role = normalized_role.as_deref().or_else(|| match event_type {
         "user" | "assistant" => Some(event_type),
@@ -1327,40 +1326,25 @@ fn derive_search_projection(
                 "no conversation text",
             )
         }
-        Some("tool") => SearchProjection::skipped("tool event"),
-        Some("system") | Some("developer") => SearchProjection::skipped("instruction event"),
+        Some("tool") => SearchSegment::skipped("none", "tool event"),
+        Some("system") | Some("developer") => SearchSegment::skipped("none", "instruction event"),
         _ => {
             if looks_like_tool_event(value, event_type) {
-                SearchProjection::skipped("tool event")
+                SearchSegment::skipped("none", "tool event")
             } else {
-                SearchProjection::skipped("non-message event")
+                SearchSegment::skipped("none", "non-message event")
             }
         }
     }
 }
 
-impl SearchProjection {
-    fn skipped(reason: &str) -> Self {
-        Self {
-            text: String::new(),
-            kind: "none".to_string(),
-            indexable: false,
-            skip_reason: Some(reason.to_string()),
-        }
-    }
-}
-
-fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> SearchProjection {
+fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> SearchSegment {
     let text = normalize_parts(parts);
     if text.is_empty() {
-        SearchProjection::skipped(empty_reason)
+        SearchSegment::skipped("none", empty_reason)
     } else {
-        SearchProjection {
-            text,
-            kind: kind.to_string(),
-            indexable: true,
-            skip_reason: None,
-        }
+        SearchSegment::indexed("conversation", kind, text, SemanticPolicy::Required)
+            .with_provenance("message_text")
     }
 }
 
@@ -1588,9 +1572,9 @@ mod tests {
             1,
         );
 
-        assert!(line.search_indexable);
-        assert_eq!(line.search_kind, "user");
-        assert_eq!(line.search_text, "search this exact request");
+        assert!(line.search.is_searchable());
+        assert_eq!(line.search.kind, "user");
+        assert_eq!(line.search.text, "search this exact request");
     }
 
     #[test]
@@ -1607,9 +1591,9 @@ mod tests {
             1,
         );
 
-        assert!(!line.search_indexable);
-        assert!(line.search_text.is_empty());
-        assert_eq!(line.search_skip_reason.as_deref(), Some("tool event"));
+        assert!(!line.search.is_searchable());
+        assert!(line.search.text.is_empty());
+        assert_eq!(line.search.skip_reason.as_deref(), Some("tool event"));
     }
 
     #[test]
@@ -1629,9 +1613,9 @@ mod tests {
             1,
         );
 
-        assert!(line.search_indexable);
-        assert_eq!(line.search_kind, "conversation");
-        assert_eq!(line.search_text, "human question\nassistant answer");
+        assert!(line.search.is_searchable());
+        assert_eq!(line.search.kind, "conversation");
+        assert_eq!(line.search.text, "human question\nassistant answer");
     }
 
     #[test]
