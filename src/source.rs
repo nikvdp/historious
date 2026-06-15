@@ -169,7 +169,7 @@ impl SearchSegment {
     }
 }
 
-pub trait SourceAdapter {
+pub trait SourceAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
     fn discover(&self) -> Result<Vec<SourceCandidate>>;
     fn is_current(
