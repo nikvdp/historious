@@ -3,9 +3,9 @@ use crate::archive::{
 };
 use crate::config::TreechatSourceConfig;
 use crate::source::{
-    SearchSegment, SemanticPolicy, SourceAdapter, SourceCandidate, SourceSyncContext,
+    PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter, SourceCandidate,
+    SourceCheckpointUpsert, SourceSyncContext, SourceUpsert,
 };
-use crate::storage::ImportStats;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use directories::BaseDirs;
@@ -153,22 +153,22 @@ impl SourceAdapter for TreechatAdapter {
             .is_some_and(|cursor| cursor == candidate.modified.to_string()))
     }
 
-    fn import(
+    fn prepare_import(
         &self,
-        context: &SourceSyncContext<'_>,
+        machine_id: &str,
         candidate: &SourceCandidate,
-    ) -> Result<ImportStats> {
+    ) -> Result<PreparedImport> {
         let (quest, raw) = self.fetch_thread(&candidate.identity)?;
         let raw_hash = blake3_hex(&raw);
         let source_identity = format!("{}:{}", self.config.profile, quest.id);
         let source_id = stable_id(&["source", TREECHAT_SOURCE_KIND, &source_identity]);
         let source_path = quest.quest_url.as_deref().or(quest.path.as_deref());
-        context.store.upsert_source(
-            &source_id,
-            TREECHAT_SOURCE_KIND,
-            &source_identity,
-            source_path,
-        )?;
+        let source_upsert = SourceUpsert {
+            id: source_id.clone(),
+            kind: TREECHAT_SOURCE_KIND.to_string(),
+            identity: source_identity,
+            path: source_path.map(ToOwned::to_owned),
+        };
 
         let session_id = stable_id(&["session", TREECHAT_SOURCE_KIND, &quest.id]);
         let answers = quest.searchable_answers();
@@ -200,7 +200,7 @@ impl SourceAdapter for TreechatAdapter {
             ArchiveRecord::Session(SessionRecord {
                 id: session_id.clone(),
                 source_id: source_id.clone(),
-                machine_id: context.machine_id.to_string(),
+                machine_id: machine_id.to_string(),
                 source_kind: TREECHAT_SOURCE_KIND.to_string(),
                 external_id: quest.id.clone(),
                 title,
@@ -285,7 +285,7 @@ impl SourceAdapter for TreechatAdapter {
                         id: event_id,
                         session_id: session_id.clone(),
                         source_id: source_id.clone(),
-                        machine_id: context.machine_id.to_string(),
+                        machine_id: machine_id.to_string(),
                         source_kind: TREECHAT_SOURCE_KIND.to_string(),
                         ordinal,
                         event_type: part.event_type.to_string(),
@@ -309,21 +309,21 @@ impl SourceAdapter for TreechatAdapter {
             }
         }
 
-        let stats = context.store.import_records(&records)?;
+        let mut prepared = PreparedImport::full(vec![source_upsert], records);
         if candidate.modified > 0 {
-            context.store.upsert_source_checkpoint(
-                TREECHAT_SOURCE_KIND,
-                &candidate.identity,
-                Some(&candidate.modified.to_string()),
-                &json!({
+            prepared = prepared.with_checkpoint(SourceCheckpointUpsert {
+                source_kind: TREECHAT_SOURCE_KIND.to_string(),
+                source_identity: candidate.identity.clone(),
+                cursor: Some(candidate.modified.to_string()),
+                metadata: json!({
                     "profile": self.config.profile,
                     "scope": "clips",
                     "quest_id": candidate.identity,
                     "updated_at": updated_at.map(|time| time.to_rfc3339())
                 }),
-            )?;
+            });
         }
-        Ok(stats)
+        Ok(prepared)
     }
 }
 
