@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -173,14 +174,9 @@ pub fn update_local_with_progress_and_cancel(
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
     let registry = built_in_source_adapters(&options)?;
-    for adapter in registry.iter() {
-        if should_cancel() {
-            return Ok(stats);
-        }
-        if !options.source_selection.includes_adapter(adapter.kind()) {
-            continue;
-        }
-        match adapter.discover() {
+    let discoveries = discover_selected_sources(&registry, &options, &should_cancel)?;
+    for discovery in discoveries {
+        match discovery.result {
             Ok(discovered) => {
                 for candidate in discovered {
                     if should_cancel() {
@@ -188,7 +184,7 @@ pub fn update_local_with_progress_and_cancel(
                     }
                     if !options
                         .source_selection
-                        .matches_candidate(adapter.kind(), &candidate.kind)
+                        .matches_candidate(discovery.adapter_kind, &candidate.kind)
                     {
                         continue;
                     }
@@ -197,7 +193,10 @@ pub fn update_local_with_progress_and_cancel(
                 }
             }
             Err(err) => {
-                tracing::debug!("failed to discover {} sources: {err:#}", adapter.kind());
+                tracing::debug!(
+                    "failed to discover {} sources: {err:#}",
+                    discovery.adapter_kind
+                );
                 stats.errors += 1;
             }
         }
@@ -304,6 +303,56 @@ pub fn update_local_with_progress_and_cancel(
         });
     }
     Ok(stats)
+}
+
+struct AdapterDiscovery {
+    adapter_kind: &'static str,
+    result: Result<Vec<SourceCandidate>>,
+}
+
+fn discover_selected_sources(
+    registry: &SourceAdapterRegistry,
+    options: &UpdateOptions,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<AdapterDiscovery>> {
+    let adapters = registry
+        .iter()
+        .filter(|adapter| options.source_selection.includes_adapter(adapter.kind()))
+        .collect::<Vec<_>>();
+    if adapters.is_empty() || should_cancel() {
+        return Ok(Vec::new());
+    }
+
+    thread::scope(|scope| {
+        let handles = adapters
+            .into_iter()
+            .map(|adapter| {
+                let adapter_kind = adapter.kind();
+                (
+                    adapter_kind,
+                    scope.spawn(move || AdapterDiscovery {
+                        adapter_kind,
+                        result: adapter.discover(),
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut discoveries = Vec::with_capacity(handles.len());
+        for (adapter_kind, handle) in handles {
+            if should_cancel() {
+                return Ok(discoveries);
+            }
+            match handle.join() {
+                Ok(discovery) => discoveries.push(discovery),
+                Err(_) => discoveries.push(AdapterDiscovery {
+                    adapter_kind,
+                    result: Err(anyhow::anyhow!("source discovery worker panicked")),
+                }),
+            }
+        }
+        Ok(discoveries)
+    })
 }
 
 pub fn update_source_path_with_progress_and_cancel(
