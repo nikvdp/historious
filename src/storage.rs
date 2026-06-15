@@ -959,7 +959,8 @@ impl Store {
                 let total_events: usize = tx.query_row(
                     "SELECT COUNT(*)
                      FROM temp_history_item_event_ids scope
-                     JOIN events e ON e.id = scope.id",
+                     CROSS JOIN events e
+                     WHERE e.id = scope.id",
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
@@ -993,7 +994,8 @@ impl Store {
                             e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
                             e.occurred_at, e.metadata_json, e.hash
                      FROM temp_history_item_event_ids scope
-                     JOIN events e ON e.id = scope.id
+                     CROSS JOIN events e
+                     WHERE e.id = scope.id
                      ORDER BY e.session_id, e.ordinal, e.id",
                 )?;
                 let rows = stmt.query_map([], row_event)?;
@@ -1131,6 +1133,28 @@ impl Store {
                      AND json_extract(metadata_json, '$.workspace_path') IS NULL
                  )",
                 ["/tmp/fixture.jsonl"],
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn incremental_history_items_event_lookup_query_plan(
+        &self,
+        event_ids: &[String],
+    ) -> Result<String> {
+        self.with_conn(|conn| {
+            prepare_temp_id_scope(conn, "temp_history_item_event_ids", event_ids)?;
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 SELECT e.id, e.session_id, e.source_id, e.machine_id, e.source_kind,
+                        e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
+                        e.occurred_at, e.metadata_json, e.hash
+                 FROM temp_history_item_event_ids scope
+                 CROSS JOIN events e
+                 WHERE e.id = scope.id
+                 ORDER BY e.session_id, e.ordinal, e.id",
+                [],
             )
         })
     }
@@ -5552,6 +5576,23 @@ mod tests {
     fn update_hot_path_query_plans_are_visible() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_query_plan");
+        let session = fixture_session("session_query_plan", &source.id);
+        let event = fixture_event(
+            "event_query_plan",
+            &session.id,
+            &source.id,
+            1,
+            Some("user"),
+            "event_hash_query_plan",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event.clone()),
+            ])
+            .expect("import query plan fixture");
 
         let raw_plan = store
             .raw_artifact_current_query_plan()
@@ -5562,6 +5603,9 @@ mod tests {
         let index_plan = store
             .search_index_missing_rows_query_plan()
             .expect("search index plan");
+        let history_plan = store
+            .incremental_history_items_event_lookup_query_plan(&[event.id])
+            .expect("history item event lookup plan");
 
         assert!(
             raw_plan.contains("SEARCH raw_artifacts"),
@@ -5574,6 +5618,14 @@ mod tests {
         assert!(
             index_plan.contains("SCAN e") || index_plan.contains("SCAN events"),
             "unexpected search index missing-row plan:\n{index_plan}"
+        );
+        assert!(
+            history_plan.contains("SCAN scope"),
+            "incremental history projection should start from scoped event ids:\n{history_plan}"
+        );
+        assert!(
+            history_plan.contains("SEARCH e"),
+            "incremental history projection should look up events by id:\n{history_plan}"
         );
     }
 
