@@ -4,7 +4,8 @@ use crate::archive::{
 use crate::config::SourceConfigs;
 use crate::source::{
     AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
-    SourceAdapterRegistry, SourceCandidate, SourceSyncContext, SourceUpsert,
+    SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
+    SourceUpsert,
 };
 use crate::storage::{ImportDelta, Store};
 use anyhow::{Context, Result};
@@ -781,12 +782,25 @@ impl SourceAdapter for LocalTranscriptAdapter {
         context: &SourceSyncContext<'_>,
         candidate: &SourceCandidate,
     ) -> Result<bool> {
+        if self.kind() == "opencode" {
+            let path = candidate
+                .path
+                .as_deref()
+                .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+            let cursor = opencode_checkpoint_cursor(path)?;
+            let checkpoint = context
+                .store
+                .source_checkpoint(self.kind(), &candidate.identity)?;
+            return Ok(checkpoint
+                .and_then(|checkpoint| checkpoint.cursor)
+                .is_some_and(|stored| stored == cursor));
+        }
         let size = candidate.size.unwrap_or(0);
         let status =
             context
                 .store
                 .source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
-        Ok(self.kind() != "opencode" && status.raw_current && !status.needs_workspace_refresh)
+        Ok(status.raw_current && !status.needs_workspace_refresh)
     }
 
     fn prepare_import(
@@ -798,7 +812,19 @@ impl SourceAdapter for LocalTranscriptAdapter {
             .path
             .as_deref()
             .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
-        prepare_file_import(machine_id, self.kind(), path, &self.native_titles)
+        let prepared = prepare_file_import(machine_id, self.kind(), path, &self.native_titles)?;
+        if self.kind() == "opencode" {
+            return Ok(prepared.with_checkpoint(SourceCheckpointUpsert {
+                source_kind: self.kind().to_string(),
+                source_identity: candidate.identity.clone(),
+                cursor: Some(opencode_checkpoint_cursor(path)?),
+                metadata: json!({
+                    "strategy": "sqlite_file_trio_metadata_v1",
+                    "path": candidate.identity,
+                }),
+            }));
+        }
+        Ok(prepared)
     }
 }
 
@@ -855,6 +881,41 @@ fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
                 extensions: &["db"],
             }],
         },
+    ]
+}
+
+fn opencode_checkpoint_cursor(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for path in opencode_sqlite_fingerprint_paths(path) {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        match fs::metadata(&path) {
+            Ok(metadata) => parts.push(format!(
+                "{}:{}:{}",
+                label,
+                metadata.len(),
+                file_mtime_ms(&metadata)
+                    .map(|mtime| mtime.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                parts.push(format!("{label}:missing"));
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    Ok(parts.join("|"))
+}
+
+fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
+    let path_text = path.to_string_lossy();
+    vec![
+        path.to_path_buf(),
+        PathBuf::from(format!("{path_text}-wal")),
+        PathBuf::from(format!("{path_text}-shm")),
     ]
 }
 
@@ -2180,6 +2241,47 @@ mod tests {
         assert_eq!(events[0].content, "user asks for OpenCode ingestion");
         assert_eq!(events[1].role.as_deref(), Some("assistant"));
         assert_eq!(events[1].content, "assistant explains the OpenCode parser");
+    }
+
+    #[test]
+    fn opencode_adapter_skips_when_sqlite_checkpoint_matches() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let db_path = temp.path().join("opencode.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"wal").expect("write wal");
+        fs::write(&shm_path, b"shm").expect("write shm");
+        let identity = db_path.to_string_lossy().to_string();
+        let cursor = opencode_checkpoint_cursor(&db_path).expect("checkpoint cursor");
+        store
+            .upsert_source_checkpoint("opencode", &identity, Some(&cursor), &json!({}))
+            .expect("store checkpoint");
+        let adapter = LocalTranscriptAdapter {
+            kind: "opencode",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let candidate = SourceCandidate {
+            adapter_kind: "opencode",
+            kind: "opencode".to_string(),
+            identity,
+            path: Some(db_path.clone()),
+            modified: 0,
+            size: None,
+            mtime_ms: None,
+        };
+        let context = SourceSyncContext { store: &store };
+
+        assert!(adapter
+            .is_current(&context, &candidate)
+            .expect("matching checkpoint"));
+
+        fs::write(&wal_path, b"wal changed").expect("change wal");
+        assert!(!adapter
+            .is_current(&context, &candidate)
+            .expect("changed checkpoint"));
     }
 
     #[test]
