@@ -2999,6 +2999,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             }
         }
         ingest::UpdateProgress::Processing {
+            adapter_kind: _,
             kind,
             path,
             file_index,
@@ -3019,6 +3020,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.errors)
         ),
         ingest::UpdateProgress::CompletedFile {
+            adapter_kind: _,
             kind,
             path,
             file_index,
@@ -3058,6 +3060,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             }).collect::<Vec<_>>(),
         }),
         ingest::UpdateProgress::Processing {
+            adapter_kind,
             kind,
             path,
             file_index,
@@ -3067,6 +3070,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             stats,
         } => serde_json::json!({
             "status": "processing",
+            "adapter_kind": adapter_kind,
             "kind": kind,
             "path": path.display().to_string(),
             "file_index": file_index,
@@ -3076,6 +3080,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "stats": stats,
         }),
         ingest::UpdateProgress::CompletedFile {
+            adapter_kind,
             kind,
             path,
             file_index,
@@ -3085,6 +3090,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             stats,
         } => serde_json::json!({
             "status": "completed_file",
+            "adapter_kind": adapter_kind,
             "kind": kind,
             "path": path.display().to_string(),
             "file_index": file_index,

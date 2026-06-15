@@ -93,6 +93,7 @@ pub enum UpdateProgress {
         selected_files: usize,
     },
     Processing {
+        adapter_kind: String,
         kind: String,
         path: PathBuf,
         file_index: usize,
@@ -102,6 +103,7 @@ pub enum UpdateProgress {
         stats: UpdateStats,
     },
     CompletedFile {
+        adapter_kind: String,
         kind: String,
         path: PathBuf,
         file_index: usize,
@@ -238,6 +240,7 @@ pub fn update_local_with_progress_and_cancel(
             .map(|source| source.selected_files)
             .unwrap_or(0);
         progress(&UpdateProgress::Processing {
+            adapter_kind: candidate.adapter_kind.to_string(),
             kind: kind.to_string(),
             path: path.clone(),
             file_index: idx + 1,
@@ -259,6 +262,7 @@ pub fn update_local_with_progress_and_cancel(
             );
             stats.errors += 1;
             progress(&UpdateProgress::CompletedFile {
+                adapter_kind: candidate.adapter_kind.to_string(),
                 kind: kind.to_string(),
                 path,
                 file_index: idx + 1,
@@ -272,6 +276,7 @@ pub fn update_local_with_progress_and_cancel(
         if adapter.is_current(&context, &candidate)? {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
+                adapter_kind: candidate.adapter_kind.to_string(),
                 kind: kind.to_string(),
                 path,
                 file_index: idx + 1,
@@ -319,6 +324,7 @@ pub fn update_local_with_progress_and_cancel(
             }
         }
         progress(&UpdateProgress::CompletedFile {
+            adapter_kind: prepared.adapter_kind.to_string(),
             kind: prepared.kind,
             path: prepared.path,
             file_index: prepared.file_index,
@@ -396,6 +402,7 @@ struct PendingImport {
 
 struct PreparedPendingImport {
     order: usize,
+    adapter_kind: &'static str,
     kind: String,
     path: PathBuf,
     file_index: usize,
@@ -438,6 +445,7 @@ fn prepare_pending_imports(
         else {
             prepared.extend(imports.into_iter().map(|pending| PreparedPendingImport {
                 order: pending.order,
+                adapter_kind: pending.adapter_kind,
                 kind: pending.kind,
                 path: pending.path,
                 file_index: pending.file_index,
@@ -478,37 +486,43 @@ fn prepare_pending_import_batch(
         let handles = pending_imports
             .into_iter()
             .map(|pending| {
-                scope.spawn(move || {
-                    let result = adapter.prepare_import(machine_id, &pending.candidate);
-                    PreparedPendingImport {
-                        order: pending.order,
-                        kind: pending.kind,
-                        path: pending.path,
-                        file_index: pending.file_index,
-                        total_files: pending.total_files,
-                        source_file_index: pending.source_file_index,
-                        source_file_count: pending.source_file_count,
-                        result,
-                    }
-                })
+                let fallback = pending.clone();
+                (
+                    fallback,
+                    scope.spawn(move || {
+                        let result = adapter.prepare_import(machine_id, &pending.candidate);
+                        PreparedPendingImport {
+                            order: pending.order,
+                            adapter_kind: pending.adapter_kind,
+                            kind: pending.kind,
+                            path: pending.path,
+                            file_index: pending.file_index,
+                            total_files: pending.total_files,
+                            source_file_index: pending.source_file_index,
+                            source_file_count: pending.source_file_count,
+                            result,
+                        }
+                    }),
+                )
             })
             .collect::<Vec<_>>();
 
         let mut prepared = Vec::with_capacity(handles.len());
-        for handle in handles {
+        for (fallback, handle) in handles {
             if should_cancel() {
                 return Ok(prepared);
             }
             match handle.join() {
                 Ok(import) => prepared.push(import),
                 Err(_) => prepared.push(PreparedPendingImport {
-                    order: usize::MAX,
-                    kind: "unknown".to_string(),
-                    path: PathBuf::from("unknown"),
-                    file_index: 0,
-                    total_files: 0,
-                    source_file_index: 0,
-                    source_file_count: 0,
+                    order: fallback.order,
+                    adapter_kind: fallback.adapter_kind,
+                    kind: fallback.kind,
+                    path: fallback.path,
+                    file_index: fallback.file_index,
+                    total_files: fallback.total_files,
+                    source_file_index: fallback.source_file_index,
+                    source_file_count: fallback.source_file_count,
                     result: Err(anyhow::anyhow!("source import preparation worker panicked")),
                 }),
             }
@@ -538,6 +552,7 @@ pub fn update_source_path_with_progress_and_cancel(
     let path = path.to_path_buf();
     stats.files_seen += 1;
     progress(&UpdateProgress::Processing {
+        adapter_kind: kind.to_string(),
         kind: kind.to_string(),
         path: path.clone(),
         file_index: 1,
@@ -552,6 +567,7 @@ pub fn update_source_path_with_progress_and_cancel(
             tracing::debug!("failed to read metadata for {}: {err}", path.display());
             stats.errors += 1;
             progress(&UpdateProgress::CompletedFile {
+                adapter_kind: kind.to_string(),
                 kind: kind.to_string(),
                 path,
                 file_index: 1,
@@ -589,6 +605,7 @@ pub fn update_source_path_with_progress_and_cancel(
         }
     }
     progress(&UpdateProgress::CompletedFile {
+        adapter_kind: kind.to_string(),
         kind: kind.to_string(),
         path,
         file_index: 1,
