@@ -3,8 +3,8 @@ use crate::archive::{
 };
 use crate::config::SourceConfigs;
 use crate::source::{
-    PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter, SourceAdapterRegistry,
-    SourceCandidate, SourceSyncContext, SourceUpsert,
+    AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
+    SourceAdapterRegistry, SourceCandidate, SourceSyncContext, SourceUpsert,
 };
 use crate::storage::{ImportDelta, Store};
 use anyhow::{Context, Result};
@@ -283,6 +283,7 @@ pub fn update_local_with_progress_and_cancel(
             continue;
         }
         pending_imports.push(PendingImport {
+            order: idx,
             adapter_kind: candidate.adapter_kind,
             candidate,
             kind,
@@ -380,7 +381,9 @@ fn discover_selected_sources(
     })
 }
 
+#[derive(Clone)]
 struct PendingImport {
+    order: usize,
     adapter_kind: &'static str,
     candidate: SourceCandidate,
     kind: String,
@@ -392,6 +395,7 @@ struct PendingImport {
 }
 
 struct PreparedPendingImport {
+    order: usize,
     kind: String,
     path: PathBuf,
     file_index: usize,
@@ -411,22 +415,73 @@ fn prepare_pending_imports(
         return Ok(Vec::new());
     }
 
+    let mut groups: Vec<(&'static str, Vec<PendingImport>)> = Vec::new();
+    for pending in pending_imports {
+        if let Some((_, items)) = groups
+            .iter_mut()
+            .find(|(adapter_kind, _)| *adapter_kind == pending.adapter_kind)
+        {
+            items.push(pending);
+        } else {
+            groups.push((pending.adapter_kind, vec![pending]));
+        }
+    }
+
+    let mut prepared = Vec::new();
+    for (adapter_kind, imports) in groups {
+        if should_cancel() {
+            break;
+        }
+        let Some(adapter) = registry
+            .iter()
+            .find(|adapter| adapter.kind() == adapter_kind)
+        else {
+            prepared.extend(imports.into_iter().map(|pending| PreparedPendingImport {
+                order: pending.order,
+                kind: pending.kind,
+                path: pending.path,
+                file_index: pending.file_index,
+                total_files: pending.total_files,
+                source_file_index: pending.source_file_index,
+                source_file_count: pending.source_file_count,
+                result: Err(anyhow::anyhow!(
+                    "source adapter {} disappeared during import preparation",
+                    pending.adapter_kind
+                )),
+            }));
+            continue;
+        };
+        let concurrency = adapter.concurrency().normalized().prepare;
+        for batch in imports.chunks(concurrency) {
+            if should_cancel() {
+                break;
+            }
+            prepared.extend(prepare_pending_import_batch(
+                adapter,
+                machine_id,
+                batch.to_vec(),
+                should_cancel,
+            )?);
+        }
+    }
+    prepared.sort_by_key(|prepared| prepared.order);
+    Ok(prepared)
+}
+
+fn prepare_pending_import_batch(
+    adapter: &dyn SourceAdapter,
+    machine_id: &str,
+    pending_imports: Vec<PendingImport>,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<PreparedPendingImport>> {
     thread::scope(|scope| {
         let handles = pending_imports
             .into_iter()
             .map(|pending| {
-                let adapter = registry
-                    .iter()
-                    .find(|adapter| adapter.kind() == pending.adapter_kind);
                 scope.spawn(move || {
-                    let result = match adapter {
-                        Some(adapter) => adapter.prepare_import(machine_id, &pending.candidate),
-                        None => Err(anyhow::anyhow!(
-                            "source adapter {} disappeared during import preparation",
-                            pending.adapter_kind
-                        )),
-                    };
+                    let result = adapter.prepare_import(machine_id, &pending.candidate);
                     PreparedPendingImport {
+                        order: pending.order,
                         kind: pending.kind,
                         path: pending.path,
                         file_index: pending.file_index,
@@ -447,6 +502,7 @@ fn prepare_pending_imports(
             match handle.join() {
                 Ok(import) => prepared.push(import),
                 Err(_) => prepared.push(PreparedPendingImport {
+                    order: usize::MAX,
                     kind: "unknown".to_string(),
                     path: PathBuf::from("unknown"),
                     file_index: 0,
@@ -638,6 +694,14 @@ struct LocalTranscriptAdapter {
 impl SourceAdapter for LocalTranscriptAdapter {
     fn kind(&self) -> &'static str {
         self.kind
+    }
+
+    fn concurrency(&self) -> AdapterConcurrency {
+        if self.kind() == "opencode" {
+            AdapterConcurrency::new(1, 1)
+        } else {
+            AdapterConcurrency::new(1, 4)
+        }
     }
 
     fn discover(&self) -> Result<Vec<SourceCandidate>> {
