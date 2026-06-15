@@ -3,8 +3,8 @@ use crate::archive::{
 };
 use crate::config::TreechatSourceConfig;
 use crate::source::{
-    PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter, SourceCandidate,
-    SourceCheckpointUpsert, SourceSyncContext, SourceUpsert,
+    AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
+    SourceCandidate, SourceCheckpointUpsert, SourceSyncContext, SourceUpsert,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -112,6 +112,10 @@ impl TreechatAdapter {
 impl SourceAdapter for TreechatAdapter {
     fn kind(&self) -> &'static str {
         TREECHAT_SOURCE_KIND
+    }
+
+    fn concurrency(&self) -> AdapterConcurrency {
+        AdapterConcurrency::new(1, 2)
     }
 
     fn discover(&self) -> Result<Vec<SourceCandidate>> {

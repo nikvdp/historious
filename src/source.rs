@@ -27,6 +27,31 @@ pub struct SourceSyncContext<'a> {
     pub store: &'a Store,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterConcurrency {
+    pub discovery: usize,
+    pub prepare: usize,
+}
+
+impl AdapterConcurrency {
+    pub const fn new(discovery: usize, prepare: usize) -> Self {
+        Self { discovery, prepare }
+    }
+
+    pub fn normalized(self) -> Self {
+        Self {
+            discovery: self.discovery.max(1),
+            prepare: self.prepare.max(1),
+        }
+    }
+}
+
+impl Default for AdapterConcurrency {
+    fn default() -> Self {
+        Self::new(1, 1)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceUpsert {
     pub id: String,
@@ -250,6 +275,9 @@ impl SearchSegment {
 
 pub trait SourceAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
+    fn concurrency(&self) -> AdapterConcurrency {
+        AdapterConcurrency::default()
+    }
     fn discover(&self) -> Result<Vec<SourceCandidate>>;
     fn is_current(
         &self,
@@ -354,6 +382,61 @@ mod tests {
         };
 
         assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn adapter_concurrency_normalizes_zero_values() {
+        let concurrency = AdapterConcurrency::new(0, 0).normalized();
+
+        assert_eq!(concurrency.discovery, 1);
+        assert_eq!(concurrency.prepare, 1);
+    }
+
+    #[test]
+    fn registry_exposes_adapter_concurrency_overrides() {
+        struct ParallelFakeAdapter;
+
+        impl SourceAdapter for ParallelFakeAdapter {
+            fn kind(&self) -> &'static str {
+                "parallel"
+            }
+
+            fn concurrency(&self) -> AdapterConcurrency {
+                AdapterConcurrency::new(2, 3)
+            }
+
+            fn discover(&self) -> Result<Vec<SourceCandidate>> {
+                Ok(Vec::new())
+            }
+
+            fn is_current(
+                &self,
+                _context: &SourceSyncContext<'_>,
+                _candidate: &SourceCandidate,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+
+            fn prepare_import(
+                &self,
+                _machine_id: &str,
+                _candidate: &SourceCandidate,
+            ) -> Result<PreparedImport> {
+                Ok(PreparedImport::archive(Vec::new(), Vec::new()))
+            }
+        }
+
+        let registry = SourceAdapterRegistry::new()
+            .register(ParallelFakeAdapter)
+            .expect("register parallel adapter");
+        let concurrency = registry
+            .iter()
+            .next()
+            .expect("adapter")
+            .concurrency()
+            .normalized();
+
+        assert_eq!(concurrency, AdapterConcurrency::new(2, 3));
     }
 
     #[test]
