@@ -3,10 +3,10 @@ use crate::archive::{
 };
 use crate::config::SourceConfigs;
 use crate::source::{
-    SearchSegment, SemanticPolicy, SourceAdapter, SourceAdapterRegistry, SourceCandidate,
-    SourceSyncContext,
+    PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter, SourceAdapterRegistry,
+    SourceCandidate, SourceSyncContext, SourceUpsert,
 };
-use crate::storage::{ImportDelta, ImportStats, Store};
+use crate::storage::{ImportDelta, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -222,7 +222,8 @@ pub fn update_local_with_progress_and_cancel(
     refresh_existing_native_titles(store, &native_titles)?;
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
-    let context = SourceSyncContext { store, machine_id };
+    let mut pending_imports = Vec::new();
+    let context = SourceSyncContext { store };
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
@@ -281,24 +282,48 @@ pub fn update_local_with_progress_and_cancel(
             });
             continue;
         }
-        match adapter.import(&context, &candidate) {
-            Ok(delta) => {
-                stats.inserted += delta.inserted;
-                stats.duplicates += delta.duplicates;
-                stats.delta.merge(delta.delta);
-            }
-            Err(err) => {
-                tracing::debug!("failed to ingest {}: {err:#}", path.display());
-                stats.errors += 1;
-            }
-        }
-        progress(&UpdateProgress::CompletedFile {
-            kind: kind.to_string(),
+        pending_imports.push(PendingImport {
+            adapter_kind: candidate.adapter_kind,
+            candidate,
+            kind,
             path,
             file_index: idx + 1,
             total_files,
             source_file_index,
             source_file_count,
+        });
+    }
+
+    let prepared_imports =
+        prepare_pending_imports(&registry, machine_id, pending_imports, &should_cancel)?;
+    for prepared in prepared_imports {
+        if should_cancel() {
+            return Ok(stats);
+        }
+        match prepared.result {
+            Ok(import) => match import.commit(store) {
+                Ok(delta) => {
+                    stats.inserted += delta.inserted;
+                    stats.duplicates += delta.duplicates;
+                    stats.delta.merge(delta.delta);
+                }
+                Err(err) => {
+                    tracing::debug!("failed to ingest {}: {err:#}", prepared.path.display());
+                    stats.errors += 1;
+                }
+            },
+            Err(err) => {
+                tracing::debug!("failed to ingest {}: {err:#}", prepared.path.display());
+                stats.errors += 1;
+            }
+        }
+        progress(&UpdateProgress::CompletedFile {
+            kind: prepared.kind,
+            path: prepared.path,
+            file_index: prepared.file_index,
+            total_files: prepared.total_files,
+            source_file_index: prepared.source_file_index,
+            source_file_count: prepared.source_file_count,
             stats: stats.clone(),
         });
     }
@@ -352,6 +377,87 @@ fn discover_selected_sources(
             }
         }
         Ok(discoveries)
+    })
+}
+
+struct PendingImport {
+    adapter_kind: &'static str,
+    candidate: SourceCandidate,
+    kind: String,
+    path: PathBuf,
+    file_index: usize,
+    total_files: usize,
+    source_file_index: usize,
+    source_file_count: usize,
+}
+
+struct PreparedPendingImport {
+    kind: String,
+    path: PathBuf,
+    file_index: usize,
+    total_files: usize,
+    source_file_index: usize,
+    source_file_count: usize,
+    result: Result<PreparedImport>,
+}
+
+fn prepare_pending_imports(
+    registry: &SourceAdapterRegistry,
+    machine_id: &str,
+    pending_imports: Vec<PendingImport>,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<PreparedPendingImport>> {
+    if pending_imports.is_empty() || should_cancel() {
+        return Ok(Vec::new());
+    }
+
+    thread::scope(|scope| {
+        let handles = pending_imports
+            .into_iter()
+            .map(|pending| {
+                let adapter = registry
+                    .iter()
+                    .find(|adapter| adapter.kind() == pending.adapter_kind);
+                scope.spawn(move || {
+                    let result = match adapter {
+                        Some(adapter) => adapter.prepare_import(machine_id, &pending.candidate),
+                        None => Err(anyhow::anyhow!(
+                            "source adapter {} disappeared during import preparation",
+                            pending.adapter_kind
+                        )),
+                    };
+                    PreparedPendingImport {
+                        kind: pending.kind,
+                        path: pending.path,
+                        file_index: pending.file_index,
+                        total_files: pending.total_files,
+                        source_file_index: pending.source_file_index,
+                        source_file_count: pending.source_file_count,
+                        result,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut prepared = Vec::with_capacity(handles.len());
+        for handle in handles {
+            if should_cancel() {
+                return Ok(prepared);
+            }
+            match handle.join() {
+                Ok(import) => prepared.push(import),
+                Err(_) => prepared.push(PreparedPendingImport {
+                    kind: "unknown".to_string(),
+                    path: PathBuf::from("unknown"),
+                    file_index: 0,
+                    total_files: 0,
+                    source_file_index: 0,
+                    source_file_count: 0,
+                    result: Err(anyhow::anyhow!("source import preparation worker panicked")),
+                }),
+            }
+        }
+        Ok(prepared)
     })
 }
 
@@ -412,7 +518,9 @@ pub fn update_source_path_with_progress_and_cancel(
     if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
         stats.skipped_unchanged += 1;
     } else {
-        match ingest_file(store, machine_id, kind, &path, &native_titles) {
+        match prepare_file_import(machine_id, kind, &path, &native_titles)
+            .and_then(|prepared| prepared.commit(store))
+        {
             Ok(delta) => {
                 stats.inserted += delta.inserted;
                 stats.duplicates += delta.duplicates;
@@ -600,22 +708,16 @@ impl SourceAdapter for LocalTranscriptAdapter {
         Ok(self.kind() != "opencode" && status.raw_current && !status.needs_workspace_refresh)
     }
 
-    fn import(
+    fn prepare_import(
         &self,
-        context: &SourceSyncContext<'_>,
+        machine_id: &str,
         candidate: &SourceCandidate,
-    ) -> Result<ImportStats> {
+    ) -> Result<PreparedImport> {
         let path = candidate
             .path
             .as_deref()
             .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
-        ingest_file(
-            context.store,
-            context.machine_id,
-            self.kind(),
-            path,
-            &self.native_titles,
-        )
+        prepare_file_import(machine_id, self.kind(), path, &self.native_titles)
     }
 }
 
@@ -675,18 +777,22 @@ fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
     ]
 }
 
-fn ingest_file(
-    store: &Store,
+fn prepare_file_import(
     machine_id: &str,
     kind: &str,
     path: &Path,
     native_titles: &NativeTitleIndex,
-) -> Result<ImportStats> {
+) -> Result<PreparedImport> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let raw_hash = blake3_hex(&bytes);
     let path_text = path.to_string_lossy().to_string();
     let source_id = stable_id(&["source", kind, &path_text]);
-    store.upsert_source(&source_id, kind, &path_text, Some(&path_text))?;
+    let source_upsert = SourceUpsert {
+        id: source_id.clone(),
+        kind: kind.to_string(),
+        identity: path_text.clone(),
+        path: Some(path_text.clone()),
+    };
 
     let metadata =
         fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
@@ -705,12 +811,12 @@ fn ingest_file(
     records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
 
     if kind == "opencode" {
-        return ingest_opencode_db(
-            store,
+        return prepare_opencode_db_import(
             machine_id,
             path,
             &path_text,
             &source_id,
+            source_upsert,
             raw_artifact,
         );
     }
@@ -784,17 +890,17 @@ fn ingest_file(
             hash: line_hash,
         }));
     }
-    store.import_archive_records(&records)
+    Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
-fn ingest_opencode_db(
-    store: &Store,
+fn prepare_opencode_db_import(
     machine_id: &str,
     path: &Path,
     path_text: &str,
     source_id: &str,
+    source_upsert: SourceUpsert,
     raw_artifact: RawArtifact,
-) -> Result<ImportStats> {
+) -> Result<PreparedImport> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -959,7 +1065,7 @@ fn ingest_opencode_db(
         }
     }
 
-    store.import_archive_records(&records)
+    Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
 fn clean_optional_title(title: &str) -> Option<String> {
@@ -1973,14 +2079,9 @@ mod tests {
         drop(conn);
 
         let native_titles = NativeTitleIndex::default();
-        let imported = ingest_file(
-            &store,
-            "machine_fixture",
-            "opencode",
-            &db_path,
-            &native_titles,
-        )
-        .expect("ingest opencode");
+        let imported = prepare_file_import("machine_fixture", "opencode", &db_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("ingest opencode");
         let path_text = db_path.to_string_lossy().to_string();
         let session_id = stable_id(&["session", "opencode", &path_text, "ses_fixture"]);
         let session = store
@@ -2030,14 +2131,9 @@ mod tests {
         fs::write(&log_path, fixture_line("session-1", "first question")).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
-        let first = ingest_file(
-            &store,
-            "machine_fixture",
-            "codex",
-            &log_path,
-            &native_titles,
-        )
-        .expect("first ingest");
+        let first = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("first ingest");
         let metadata = fs::metadata(&log_path).expect("first metadata");
         let current = store
             .raw_artifact_is_current(
@@ -2062,14 +2158,9 @@ mod tests {
             ),
         )
         .expect("append second log line");
-        let second = ingest_file(
-            &store,
-            "machine_fixture",
-            "codex",
-            &log_path,
-            &native_titles,
-        )
-        .expect("second ingest");
+        let second = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("second ingest");
         let stats = store.stats().expect("stats");
 
         assert_eq!(second.inserted, 2);

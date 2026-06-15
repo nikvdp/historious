@@ -1,3 +1,4 @@
+use crate::archive::ArchiveRecord;
 use crate::storage::{ImportStats, Store};
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -24,7 +25,85 @@ impl SourceCandidate {
 
 pub struct SourceSyncContext<'a> {
     pub store: &'a Store,
-    pub machine_id: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceUpsert {
+    pub id: String,
+    pub kind: String,
+    pub identity: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceCheckpointUpsert {
+    pub source_kind: String,
+    pub source_identity: String,
+    pub cursor: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PreparedImportMode {
+    Archive,
+    Full,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedImport {
+    pub source_upserts: Vec<SourceUpsert>,
+    pub records: Vec<ArchiveRecord>,
+    pub checkpoints: Vec<SourceCheckpointUpsert>,
+    pub mode: PreparedImportMode,
+}
+
+impl PreparedImport {
+    pub fn archive(source_upserts: Vec<SourceUpsert>, records: Vec<ArchiveRecord>) -> Self {
+        Self {
+            source_upserts,
+            records,
+            checkpoints: Vec::new(),
+            mode: PreparedImportMode::Archive,
+        }
+    }
+
+    pub fn full(source_upserts: Vec<SourceUpsert>, records: Vec<ArchiveRecord>) -> Self {
+        Self {
+            source_upserts,
+            records,
+            checkpoints: Vec::new(),
+            mode: PreparedImportMode::Full,
+        }
+    }
+
+    pub fn with_checkpoint(mut self, checkpoint: SourceCheckpointUpsert) -> Self {
+        self.checkpoints.push(checkpoint);
+        self
+    }
+
+    pub fn commit(self, store: &Store) -> Result<ImportStats> {
+        for source in &self.source_upserts {
+            store.upsert_source(
+                &source.id,
+                &source.kind,
+                &source.identity,
+                source.path.as_deref(),
+            )?;
+        }
+        let stats = match self.mode {
+            PreparedImportMode::Archive => store.import_archive_records(&self.records)?,
+            PreparedImportMode::Full => store.import_records(&self.records)?,
+        };
+        for checkpoint in &self.checkpoints {
+            store.upsert_source_checkpoint(
+                &checkpoint.source_kind,
+                &checkpoint.source_identity,
+                checkpoint.cursor.as_deref(),
+                &checkpoint.metadata,
+            )?;
+        }
+        Ok(stats)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,11 +256,11 @@ pub trait SourceAdapter: Send + Sync {
         context: &SourceSyncContext<'_>,
         candidate: &SourceCandidate,
     ) -> Result<bool>;
-    fn import(
+    fn prepare_import(
         &self,
-        context: &SourceSyncContext<'_>,
+        machine_id: &str,
         candidate: &SourceCandidate,
-    ) -> Result<ImportStats>;
+    ) -> Result<PreparedImport>;
 }
 
 #[derive(Default)]
@@ -240,12 +319,12 @@ mod tests {
             Ok(false)
         }
 
-        fn import(
+        fn prepare_import(
             &self,
-            _context: &SourceSyncContext<'_>,
+            _machine_id: &str,
             _candidate: &SourceCandidate,
-        ) -> Result<ImportStats> {
-            Ok(ImportStats::default())
+        ) -> Result<PreparedImport> {
+            Ok(PreparedImport::archive(Vec::new(), Vec::new()))
         }
     }
 
@@ -278,15 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn source_context_carries_store_and_machine_id() {
+    fn source_context_carries_store() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let context = SourceSyncContext {
-            store: &store,
-            machine_id: "machine-test",
-        };
+        let context = SourceSyncContext { store: &store };
 
-        assert_eq!(context.machine_id, "machine-test");
+        assert_eq!(context.store.stats().expect("stats").events, 0);
     }
 
     #[test]
