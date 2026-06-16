@@ -48,6 +48,19 @@ If the archive looks stale or empty, run:
 histo --robot update
 ```
 
+## Timeline Discovery
+
+Use `threads` when the user remembers when work happened, but not the exact words
+used in the session:
+
+```bash
+histo --robot threads --all --today
+histo --robot threads --all --after 2026-06-01
+histo --robot threads --project /absolute/repo/path --after "3 days ago"
+```
+
+Then search or inspect likely sessions from that timeline.
+
 ## Search
 
 ```bash
@@ -63,6 +76,22 @@ Each result includes:
 - `match_type`: `lexical`, `semantic`, or `hybrid`
 - `snippet`: indexed text near the hit
 - ranks and score fields for debugging result quality
+
+Focused search options that matter most for agents:
+
+```bash
+histo --robot search "query" --project /absolute/repo/path
+histo --robot search "query" --all --today
+histo --robot search "query" --after "3 days ago"
+histo --robot search "query" --mode lexical
+histo --robot search "query" --include-tools
+histo --robot search "query" --raw
+```
+
+Use `--project` for the current repo, `--all` only when cross-project recall
+matters, `--today` or `--after` for recent work, `--mode lexical|semantic|hybrid`
+to tune matching, `--include-tools` when commands or tool output matter, and
+`--raw` when clean conversation text is not enough.
 
 Prefer refs for interactive follow-up:
 
@@ -129,6 +158,18 @@ histo export --jsonl --workspace /absolute/repo/path
 histo export --jsonl --session <session_id>
 histo export --jsonl --since 2026-06-01
 ```
+
+Raw artifact export choices:
+
+```bash
+histo export --jsonl --raw-artifacts inline
+histo export --jsonl --raw-artifacts metadata
+histo export --jsonl --raw-artifacts omit
+histo export --jsonl --no-raw-artifacts
+```
+
+Use `inline` for complete portable archives, `metadata` when blob content should
+travel separately, and `omit` or `--no-raw-artifacts` for search-only syncs.
 
 ## Remote TUI
 
@@ -249,6 +290,7 @@ Preferred agent pattern:
 
 ```bash
 histo --robot status
+histo --robot threads --all --today
 histo --robot search "distinctive query terms" --limit 20
 histo --robot show <ref> --before 5 --after 8
 histo --robot transcript <session_id> --at <ref>
@@ -262,6 +304,9 @@ Rules:
 - Use `transcript` JSON when exact wording, commands, or file paths matter.
 - Redact secrets found in transcripts.
 - Do not add a separate search command; the canonical entry point is `histo search`.
+- Use `threads --all --today`, `--after`, or `--project` for timeline-style discovery.
+- Use search flags like `--project`, `--all`, `--today`, `--after`, `--mode`,
+  `--include-tools`, and `--raw` to narrow noisy recall.
 
 History exchange:
 
@@ -277,6 +322,12 @@ histo export --jsonl [filters] \
 # Omit embeddings when bandwidth or storage is constrained.
 histo export --jsonl --embeddings omit [filters] \
   | ssh <remote> 'histo import --jsonl --json -'
+
+# Raw artifacts can be inline, metadata-only, or omitted for search-only sync.
+histo export --jsonl --raw-artifacts inline [filters]
+histo export --jsonl --raw-artifacts metadata [filters]
+histo export --jsonl --raw-artifacts omit [filters]
+histo export --jsonl --no-raw-artifacts [filters]
 
 # Round-trip through an embedding-capable host.
 histo export --jsonl [filters] \
@@ -308,6 +359,7 @@ Exchange rules:
 - Export includes existing embeddings by default when embeddings are enabled.
 - Import stores transferred embeddings and refreshes the local vector index when embeddings are enabled.
 - Use `--embeddings omit` for bandwidth or storage constrained exchanges.
+- Use `--raw-artifacts inline|metadata|omit` or `--no-raw-artifacts` to control raw artifact transfer.
 - Use an embedding-capable machine by piping history to it, then exporting back from it.
 - Do not include `histo update` in exchange flows; local log scanning is separate.
 
