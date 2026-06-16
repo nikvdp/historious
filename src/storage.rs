@@ -1465,34 +1465,51 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at,
-                            fts.id IS NOT NULL
+                            fts.id IS NOT NULL,
+                            su.event_id IS NOT NULL,
+                            emb.event_id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
                      LEFT JOIN temp_events_fts_event_ids fts
                        ON fts.id = e.id
+                     LEFT JOIN search_units su
+                       ON su.event_id = e.id
+                     LEFT JOIN event_embeddings emb
+                       ON emb.event_id = e.id AND emb.model = ?1
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
                      ORDER BY scope.id",
                     )?;
-                    let rows = stmt.query_map([], |row| {
+                    let rows = stmt.query_map(params![model], |row| {
                         let content: String = row.get(7)?;
-                        Ok(EventForProjection {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            machine_id: row.get(3)?,
-                            source_kind: row.get(4)?,
-                            role: row.get(5)?,
-                            search_kind: row.get(6)?,
-                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                            content,
-                            occurred_at: parse_opt_dt(row.get(8)?),
-                            fts_indexed: row.get(9)?,
-                        })
+                        let fts_indexed: bool = row.get(9)?;
+                        let unit_indexed: bool = row.get(10)?;
+                        let embedding_indexed: bool = row.get(11)?;
+                        Ok((
+                            EventForProjection {
+                                id: row.get(0)?,
+                                session_id: row.get(1)?,
+                                source_id: row.get(2)?,
+                                machine_id: row.get(3)?,
+                                source_kind: row.get(4)?,
+                                role: row.get(5)?,
+                                search_kind: row.get(6)?,
+                                text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                                content,
+                                occurred_at: parse_opt_dt(row.get(8)?),
+                                fts_indexed,
+                            },
+                            fts_indexed && unit_indexed && embedding_indexed,
+                        ))
                     })?;
+                    let mut newly_complete_events = 0usize;
                     for row in rows {
-                        insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                        let (event, complete_before) = row?;
+                        insert_search_index_rows(&tx, &event, model, dims, &embed)?;
+                        if !complete_before {
+                            newly_complete_events += 1;
+                        }
                         projected_events += 1;
                         progress(projected_events, total_events);
                     }
@@ -1500,9 +1517,14 @@ impl Store {
                         progress(projected_events, total_events);
                     }
                     drop(stmt);
+                    let indexed_events = indexed_count_after_incremental_refresh(
+                        &tx,
+                        newly_complete_events,
+                        || count_indexed_events(&tx, model),
+                    )?;
+                    update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                    return Ok(projected_events);
                 }
-                let indexed_events = count_indexed_events(&tx, model)?;
-                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
                 Ok(projected_events)
             })
         })
@@ -1540,11 +1562,14 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at,
-                            fts.id IS NOT NULL
+                            fts.id IS NOT NULL,
+                            su.event_id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
                      LEFT JOIN temp_events_fts_event_ids fts
                        ON fts.id = e.id
+                     LEFT JOIN search_units su
+                       ON su.event_id = e.id
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
@@ -1552,22 +1577,32 @@ impl Store {
                     )?;
                     let rows = stmt.query_map([], |row| {
                         let content: String = row.get(7)?;
-                        Ok(EventForProjection {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            machine_id: row.get(3)?,
-                            source_kind: row.get(4)?,
-                            role: row.get(5)?,
-                            search_kind: row.get(6)?,
-                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                            content,
-                            occurred_at: parse_opt_dt(row.get(8)?),
-                            fts_indexed: row.get(9)?,
-                        })
+                        let fts_indexed: bool = row.get(9)?;
+                        let unit_indexed: bool = row.get(10)?;
+                        Ok((
+                            EventForProjection {
+                                id: row.get(0)?,
+                                session_id: row.get(1)?,
+                                source_id: row.get(2)?,
+                                machine_id: row.get(3)?,
+                                source_kind: row.get(4)?,
+                                role: row.get(5)?,
+                                search_kind: row.get(6)?,
+                                text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                                content,
+                                occurred_at: parse_opt_dt(row.get(8)?),
+                                fts_indexed,
+                            },
+                            fts_indexed && unit_indexed,
+                        ))
                     })?;
+                    let mut newly_complete_events = 0usize;
                     for row in rows {
-                        insert_search_text_index_rows(&tx, &row?)?;
+                        let (event, complete_before) = row?;
+                        insert_search_text_index_rows(&tx, &event)?;
+                        if !complete_before {
+                            newly_complete_events += 1;
+                        }
                         projected_events += 1;
                         progress(projected_events, total_events);
                     }
@@ -1575,9 +1610,14 @@ impl Store {
                         progress(projected_events, total_events);
                     }
                     drop(stmt);
+                    let indexed_events = indexed_count_after_incremental_refresh(
+                        &tx,
+                        newly_complete_events,
+                        || count_text_indexed_events(&tx),
+                    )?;
+                    update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                    return Ok(projected_events);
                 }
-                let indexed_events = count_text_indexed_events(&tx)?;
-                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
                 Ok(projected_events)
             })
         })
@@ -4025,18 +4065,31 @@ fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
 fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
     let search_units: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
-    let fts_events: i64 =
-        conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
     let embeddings: i64 = conn.query_row(
         "SELECT COUNT(*) FROM event_embeddings WHERE model = ?1",
         params![model],
         |row| row.get(0),
     )?;
 
-    if search_units > 0 && search_units == fts_events && search_units == embeddings {
+    if embeddings < search_units {
+        return Ok(true);
+    }
+    if let Some(indexed_events) = projection_status_count(conn, "search_rrf_v1")? {
+        let indexed_events = indexed_events as i64;
+        if search_units > 0 && indexed_events == search_units {
+            return Ok(false);
+        }
+        if indexed_events < search_units {
+            return Ok(true);
+        }
+    }
+
+    let fts_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
+    if search_units > 0 && search_units == fts_events && search_units <= embeddings {
         return Ok(false);
     }
-    if fts_events < search_units || embeddings < search_units {
+    if fts_events < search_units {
         return Ok(true);
     }
 
@@ -4047,9 +4100,19 @@ fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
 fn search_text_index_needs_repair(conn: &Connection) -> Result<bool> {
     let search_units: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
+
+    if let Some(indexed_events) = projection_status_count(conn, "search_rrf_v1")? {
+        let indexed_events = indexed_events as i64;
+        if search_units > 0 && indexed_events == search_units {
+            return Ok(false);
+        }
+        if indexed_events < search_units {
+            return Ok(true);
+        }
+    }
+
     let fts_events: i64 =
         conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
-
     if search_units > 0 && search_units == fts_events {
         return Ok(false);
     }
@@ -4280,6 +4343,18 @@ fn count_text_indexed_events(conn: &Connection) -> Result<usize> {
     let unit_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
     Ok(fts_count.min(unit_count) as usize)
+}
+
+fn indexed_count_after_incremental_refresh(
+    conn: &Connection,
+    newly_complete_events: usize,
+    fallback: impl FnOnce() -> Result<usize>,
+) -> Result<usize> {
+    if let Some(current_count) = projection_status_count(conn, "search_rrf_v1")? {
+        Ok(current_count.saturating_add(newly_complete_events))
+    } else {
+        fallback()
+    }
 }
 
 fn projection_status_ready(conn: &Connection, name: &str) -> Result<bool> {
@@ -5627,6 +5702,121 @@ mod tests {
             history_plan.contains("SEARCH e"),
             "incremental history projection should look up events by id:\n{history_plan}"
         );
+    }
+
+    #[test]
+    fn incremental_text_index_refresh_advances_projection_status_from_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_incremental_index_status");
+        let session = fixture_session("session_incremental_index_status", &source.id);
+        let first = fixture_event(
+            "event_incremental_index_status_first",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_incremental_index_status_first",
+        );
+        let second = fixture_event(
+            "event_incremental_index_status_second",
+            &session.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_incremental_index_status_second",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(first.clone()),
+                ArchiveRecord::Event(second.clone()),
+            ])
+            .expect("import events");
+
+        assert_eq!(
+            store
+                .refresh_search_text_index_for_events_with_progress(
+                    std::slice::from_ref(&first.id),
+                    |_, _| {}
+                )
+                .expect("index first event"),
+            1
+        );
+        let first_count = store
+            .with_conn(|conn| projection_status_count(conn, "search_rrf_v1"))
+            .expect("projection status")
+            .expect("ready projection status");
+        assert_eq!(first_count, 1);
+
+        assert_eq!(
+            store
+                .refresh_search_text_index_for_events_with_progress(
+                    &[first.id.clone(), second.id.clone()],
+                    |_, _| {}
+                )
+                .expect("index first and second event"),
+            2
+        );
+        let second_count = store
+            .with_conn(|conn| projection_status_count(conn, "search_rrf_v1"))
+            .expect("projection status")
+            .expect("ready projection status");
+        assert_eq!(second_count, 2);
+    }
+
+    #[test]
+    fn search_text_repair_check_uses_ready_status_and_detects_stale_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_text_repair_status");
+        let session = fixture_session("session_text_repair_status", &source.id);
+        let event = fixture_event(
+            "event_text_repair_status",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_text_repair_status",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event.clone()),
+            ])
+            .expect("import event");
+        store
+            .refresh_search_text_index_for_events_with_progress(
+                std::slice::from_ref(&event.id),
+                |_, _| {},
+            )
+            .expect("index event");
+
+        assert!(!store
+            .search_text_index_needs_repair()
+            .expect("ready status should be healthy"));
+
+        store
+            .with_conn(|conn| update_projection_status(conn, "search_rrf_v1", 0))
+            .expect("make status stale");
+        assert!(store
+            .search_text_index_needs_repair()
+            .expect("stale status should need repair"));
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM projection_status WHERE projection_name = ?1",
+                    params!["search_rrf_v1"],
+                )?;
+                Ok(())
+            })
+            .expect("remove status");
+        assert!(!store
+            .search_text_index_needs_repair()
+            .expect("missing status should fall back to full check"));
     }
 
     #[test]
