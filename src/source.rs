@@ -1,7 +1,8 @@
 use crate::archive::ArchiveRecord;
-use crate::storage::{ImportStats, Store};
+use crate::storage::{ImportStats, SourceFileStatus, Store};
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,40 @@ impl SourceCandidate {
 
 pub struct SourceSyncContext<'a> {
     pub store: &'a Store,
+    source_file_statuses: Option<&'a HashMap<String, SourceFileStatus>>,
+}
+
+impl<'a> SourceSyncContext<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            source_file_statuses: None,
+        }
+    }
+
+    pub fn with_source_file_statuses(
+        mut self,
+        source_file_statuses: &'a HashMap<String, SourceFileStatus>,
+    ) -> Self {
+        self.source_file_statuses = Some(source_file_statuses);
+        self
+    }
+
+    pub fn source_file_status(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ms: Option<i64>,
+    ) -> Result<SourceFileStatus> {
+        if let Some(status) = self
+            .source_file_statuses
+            .and_then(|statuses| statuses.get(path))
+            .copied()
+        {
+            return Ok(status);
+        }
+        self.store.source_file_status(path, size, mtime_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,7 +478,7 @@ mod tests {
     fn source_context_carries_store() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
-        let context = SourceSyncContext { store: &store };
+        let context = SourceSyncContext::new(&store);
 
         assert_eq!(context.store.stats().expect("stats").events, 0);
     }

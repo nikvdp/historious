@@ -7,7 +7,7 @@ use crate::source::{
     SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
     SourceUpsert,
 };
-use crate::storage::{ImportDelta, Store};
+use crate::storage::{ImportDelta, SourceFileFingerprint, SourceFileStatus, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -226,7 +226,8 @@ pub fn update_local_with_progress_and_cancel(
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
     let mut pending_imports = Vec::new();
-    let context = SourceSyncContext { store };
+    let source_file_statuses = precompute_local_source_file_statuses(store, &candidates)?;
+    let context = SourceSyncContext::new(store).with_source_file_statuses(&source_file_statuses);
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
@@ -336,6 +337,26 @@ pub fn update_local_with_progress_and_cancel(
         });
     }
     Ok(stats)
+}
+
+fn precompute_local_source_file_statuses(
+    store: &Store,
+    candidates: &[SourceCandidate],
+) -> Result<HashMap<String, SourceFileStatus>> {
+    let fingerprints = candidates
+        .iter()
+        .filter(|candidate| {
+            is_local_transcript_kind(&candidate.kind) && candidate.kind.as_str() != "opencode"
+        })
+        .filter_map(|candidate| {
+            Some(SourceFileFingerprint {
+                path: candidate.identity.clone(),
+                size: candidate.size?,
+                mtime_ms: candidate.mtime_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    store.source_file_statuses(&fingerprints)
 }
 
 struct AdapterDiscovery {
@@ -796,10 +817,7 @@ impl SourceAdapter for LocalTranscriptAdapter {
                 .is_some_and(|stored| stored == cursor));
         }
         let size = candidate.size.unwrap_or(0);
-        let status =
-            context
-                .store
-                .source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
+        let status = context.source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
         Ok(status.raw_current && !status.needs_workspace_refresh)
     }
 
@@ -2272,7 +2290,7 @@ mod tests {
             size: None,
             mtime_ms: None,
         };
-        let context = SourceSyncContext { store: &store };
+        let context = SourceSyncContext::new(&store);
 
         assert!(adapter
             .is_current(&context, &candidate)
@@ -2282,6 +2300,41 @@ mod tests {
         assert!(!adapter
             .is_current(&context, &candidate)
             .expect("changed checkpoint"));
+    }
+
+    #[test]
+    fn local_transcript_adapter_uses_cached_source_file_status() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let identity = temp.path().join("cached-status.jsonl");
+        let identity = identity.to_string_lossy().to_string();
+        let adapter = LocalTranscriptAdapter {
+            kind: "codex",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let candidate = SourceCandidate {
+            adapter_kind: "codex",
+            kind: "codex".to_string(),
+            identity: identity.clone(),
+            path: Some(PathBuf::from(&identity)),
+            modified: 0,
+            size: Some(123),
+            mtime_ms: Some(456),
+        };
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            identity,
+            SourceFileStatus {
+                raw_current: true,
+                needs_workspace_refresh: false,
+            },
+        );
+        let context = SourceSyncContext::new(&store).with_source_file_statuses(&statuses);
+
+        assert!(adapter
+            .is_current(&context, &candidate)
+            .expect("cached source status"));
     }
 
     #[test]
