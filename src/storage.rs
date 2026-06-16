@@ -10,7 +10,7 @@ use rusqlite::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -162,6 +162,13 @@ pub struct PruneOutcome {
 pub struct SourceFileStatus {
     pub raw_current: bool,
     pub needs_workspace_refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceFileFingerprint {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1082,6 +1089,68 @@ impl Store {
                 raw_current,
                 needs_workspace_refresh,
             })
+        })
+    }
+
+    pub fn source_file_statuses(
+        &self,
+        files: &[SourceFileFingerprint],
+    ) -> Result<HashMap<String, SourceFileStatus>> {
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_conn(|conn| {
+            prepare_temp_source_file_status_scope(conn, files)?;
+            let mut stmt = conn.prepare(
+                "SELECT scope.path,
+                        CASE
+                          WHEN raw.size = scope.size
+                           AND (
+                             raw.mtime_ms = scope.mtime_ms
+                             OR (raw.mtime_ms IS NULL AND scope.mtime_ms IS NULL)
+                           )
+                          THEN 1
+                          ELSE 0
+                        END AS raw_current,
+                        CASE
+                          WHEN raw.size = scope.size
+                           AND (
+                             raw.mtime_ms = scope.mtime_ms
+                             OR (raw.mtime_ms IS NULL AND scope.mtime_ms IS NULL)
+                           )
+                          THEN EXISTS(
+                            SELECT 1
+                            FROM sessions
+                            WHERE json_extract(metadata_json, '$.path') = scope.path
+                              AND json_extract(metadata_json, '$.workspace_path') IS NULL
+                          )
+                          ELSE 0
+                        END AS needs_workspace_refresh
+                 FROM temp_source_file_status_scope scope
+                 LEFT JOIN raw_artifacts raw
+                   ON raw.rowid = (
+                     SELECT latest.rowid
+                     FROM raw_artifacts latest
+                     WHERE latest.path = scope.path
+                     ORDER BY latest.first_seen_at DESC
+                     LIMIT 1
+                   )",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SourceFileStatus {
+                        raw_current: row.get::<_, i64>(1)? != 0,
+                        needs_workspace_refresh: row.get::<_, i64>(2)? != 0,
+                    },
+                ))
+            })?;
+            let mut out = HashMap::with_capacity(files.len());
+            for row in rows {
+                let (path, status) = row?;
+                out.insert(path, status);
+            }
+            Ok(out)
         })
     }
 
@@ -3274,6 +3343,41 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
         conn.execute(
             &format!("INSERT OR IGNORE INTO {table} (id) VALUES {values}"),
             params_from_iter(chunk.iter().map(String::as_str)),
+        )?;
+    }
+    Ok(())
+}
+
+fn prepare_temp_source_file_status_scope(
+    conn: &Connection,
+    files: &[SourceFileFingerprint],
+) -> Result<()> {
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS temp_source_file_status_scope
+         (path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ms INTEGER) WITHOUT ROWID",
+        [],
+    )?;
+    conn.execute("DELETE FROM temp_source_file_status_scope", [])?;
+    for chunk in files.chunks(SQLITE_BIND_CHUNK_SIZE) {
+        let values = std::iter::repeat("(?, ?, ?)")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut params = Vec::with_capacity(chunk.len() * 3);
+        for file in chunk {
+            params.push(SqlValue::Text(file.path.clone()));
+            params.push(SqlValue::Integer(file.size as i64));
+            params.push(match file.mtime_ms {
+                Some(mtime_ms) => SqlValue::Integer(mtime_ms),
+                None => SqlValue::Null,
+            });
+        }
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO temp_source_file_status_scope
+                 (path, size, mtime_ms) VALUES {values}"
+            ),
+            params_from_iter(params),
         )?;
     }
     Ok(())
@@ -5817,6 +5921,76 @@ mod tests {
         assert!(!store
             .search_text_index_needs_repair()
             .expect("missing status should fall back to full check"));
+    }
+
+    #[test]
+    fn batched_source_file_statuses_match_individual_statuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_batched_status");
+        let current_path = "/tmp/batched-current.jsonl";
+        let changed_path = "/tmp/batched-changed.jsonl";
+        let missing_path = "/tmp/batched-missing.jsonl";
+        let mut current_raw = fixture_raw_artifact(&source.id);
+        current_raw.hash = "raw_batched_current".to_string();
+        current_raw.path = current_path.to_string();
+        current_raw.size = 10;
+        current_raw.mtime_ms = Some(100);
+        let mut changed_raw = fixture_raw_artifact(&source.id);
+        changed_raw.hash = "raw_batched_changed".to_string();
+        changed_raw.path = changed_path.to_string();
+        changed_raw.size = 20;
+        changed_raw.mtime_ms = Some(200);
+        let mut legacy_session = fixture_session("session_batched_status", &source.id);
+        legacy_session.metadata = json!({"path": current_path});
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::RawArtifact(current_raw),
+                ArchiveRecord::RawArtifact(changed_raw),
+                ArchiveRecord::Session(legacy_session),
+            ])
+            .expect("import fixtures");
+        let fingerprints = vec![
+            SourceFileFingerprint {
+                path: current_path.to_string(),
+                size: 10,
+                mtime_ms: Some(100),
+            },
+            SourceFileFingerprint {
+                path: changed_path.to_string(),
+                size: 21,
+                mtime_ms: Some(200),
+            },
+            SourceFileFingerprint {
+                path: missing_path.to_string(),
+                size: 1,
+                mtime_ms: None,
+            },
+        ];
+
+        let batched = store
+            .source_file_statuses(&fingerprints)
+            .expect("batched statuses");
+
+        for fingerprint in &fingerprints {
+            let individual = store
+                .source_file_status(&fingerprint.path, fingerprint.size, fingerprint.mtime_ms)
+                .expect("individual status");
+            let batched_status = batched
+                .get(&fingerprint.path)
+                .copied()
+                .expect("batched status");
+            assert_eq!(batched_status.raw_current, individual.raw_current);
+            assert_eq!(
+                batched_status.needs_workspace_refresh,
+                individual.needs_workspace_refresh
+            );
+        }
+        assert!(batched[current_path].raw_current);
+        assert!(batched[current_path].needs_workspace_refresh);
+        assert!(!batched[changed_path].raw_current);
+        assert!(!batched[missing_path].raw_current);
     }
 
     #[test]
