@@ -11,6 +11,8 @@ use rusqlite::{
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -154,6 +156,17 @@ pub struct PrunePlan {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PruneOutcome {
     pub plan: PrunePlan,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RawArtifactCompactionOutcome {
+    pub paths_inspected: usize,
+    pub raw_artifacts_compacted: usize,
+    pub raw_blob_bytes_compacted: u64,
+    pub events_repointed: usize,
+    pub raw_artifacts_skipped: usize,
     pub raw_blobs_deleted: usize,
     pub raw_blob_bytes_deleted: u64,
 }
@@ -537,7 +550,7 @@ impl Store {
         records: &[ArchiveRecord],
         delta_mode: ImportDeltaMode,
     ) -> Result<ImportStats> {
-        self.with_conn(|conn| {
+        let stats = self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 let mut stats = ImportStats::default();
                 for record in records {
@@ -560,7 +573,11 @@ impl Store {
                 }
                 Ok(stats)
             })
-        })
+        })?;
+        if !stats.delta.touched_paths.is_empty() {
+            self.compact_append_raw_artifacts_for_paths(&stats.delta.touched_paths)?;
+        }
+        Ok(stats)
     }
 
     pub fn export_records(&self) -> Result<Vec<ArchiveRecord>> {
@@ -885,6 +902,26 @@ impl Store {
             raw_blobs_deleted,
             raw_blob_bytes_deleted,
         })
+    }
+
+    pub fn compact_append_raw_artifacts_for_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<RawArtifactCompactionOutcome> {
+        let paths = normalized_string_set(paths);
+        if paths.is_empty() {
+            return Ok(RawArtifactCompactionOutcome::default());
+        }
+        let (mut outcome, raw_hashes) = self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                compact_append_raw_artifacts_tx(tx, &self.blob_dir, Some(&paths))
+            })
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &raw_hashes)?;
+        outcome.raw_blobs_deleted = raw_blobs_deleted;
+        outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
+        Ok(outcome)
     }
 
     pub fn vacuum(&self) -> Result<()> {
@@ -2779,6 +2816,136 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RawArtifactCompactionRow {
+    rowid: i64,
+    hash: String,
+    path: String,
+    size: u64,
+    first_seen_at: String,
+}
+
+fn compact_append_raw_artifacts_tx(
+    conn: &Connection,
+    blob_dir: &Path,
+    paths: Option<&HashSet<String>>,
+) -> Result<(RawArtifactCompactionOutcome, Vec<String>)> {
+    let rows = raw_artifact_compaction_rows(conn, paths)?;
+    let mut by_path: HashMap<String, Vec<RawArtifactCompactionRow>> = HashMap::new();
+    for row in rows {
+        by_path.entry(row.path.clone()).or_default().push(row);
+    }
+
+    let mut outcome = RawArtifactCompactionOutcome {
+        paths_inspected: by_path.len(),
+        ..RawArtifactCompactionOutcome::default()
+    };
+    let mut raw_hashes_to_delete = Vec::new();
+
+    for (_path, mut rows) in by_path {
+        if rows.len() < 2 {
+            continue;
+        }
+        rows.sort_by(|left, right| {
+            left.first_seen_at
+                .cmp(&right.first_seen_at)
+                .then(left.rowid.cmp(&right.rowid))
+        });
+        let Some(keep) = rows.last().cloned() else {
+            continue;
+        };
+        let keep_path = blob_path(blob_dir, &keep.hash);
+        if !keep_path.exists() {
+            outcome.raw_artifacts_skipped += rows.len().saturating_sub(1);
+            continue;
+        }
+
+        for old in rows.iter().filter(|row| row.hash != keep.hash) {
+            let old_path = blob_path(blob_dir, &old.hash);
+            if !old_path.exists()
+                || old.size > keep.size
+                || !blob_file_is_prefix(&old_path, &keep_path, old.size, keep.size)?
+            {
+                outcome.raw_artifacts_skipped += 1;
+                continue;
+            }
+
+            let events_repointed = conn.execute(
+                "UPDATE events
+                 SET raw_artifact_hash = ?2,
+                     metadata_json = CASE
+                       WHEN json_valid(metadata_json)
+                       THEN json_set(metadata_json, '$.raw_artifact_hash', ?2)
+                       ELSE metadata_json
+                     END
+                 WHERE raw_artifact_hash = ?1",
+                params![old.hash, keep.hash],
+            )?;
+            conn.execute(
+                "DELETE FROM raw_artifacts WHERE hash = ?1",
+                params![old.hash],
+            )?;
+            outcome.raw_artifacts_compacted += 1;
+            outcome.raw_blob_bytes_compacted += old.size;
+            outcome.events_repointed += events_repointed;
+            raw_hashes_to_delete.push(old.hash.clone());
+        }
+    }
+
+    Ok((outcome, raw_hashes_to_delete))
+}
+
+fn raw_artifact_compaction_rows(
+    conn: &Connection,
+    paths: Option<&HashSet<String>>,
+) -> Result<Vec<RawArtifactCompactionRow>> {
+    let mut rows = Vec::new();
+    if let Some(paths) = paths {
+        if paths.is_empty() {
+            return Ok(rows);
+        }
+        let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let placeholders = placeholders(paths.len());
+        let sql = format!(
+            "SELECT rowid, hash, path, size, first_seen_at
+             FROM raw_artifacts
+             WHERE path IN ({placeholders})
+             ORDER BY path, first_seen_at, rowid"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map(params_from_iter(paths), row_raw_artifact_compaction)?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, hash, path, size, first_seen_at
+             FROM raw_artifacts
+             WHERE path IN (
+               SELECT path FROM raw_artifacts GROUP BY path HAVING COUNT(*) > 1
+             )
+             ORDER BY path, first_seen_at, rowid",
+        )?;
+        let mapped = stmt.query_map([], row_raw_artifact_compaction)?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
+}
+
+fn row_raw_artifact_compaction(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawArtifactCompactionRow> {
+    Ok(RawArtifactCompactionRow {
+        rowid: row.get(0)?,
+        hash: row.get(1)?,
+        path: row.get(2)?,
+        size: row.get::<_, i64>(3)? as u64,
+        first_seen_at: row.get(4)?,
+    })
+}
+
 fn remove_raw_artifact_blobs(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64)> {
     let mut deleted = 0;
     let mut bytes = 0;
@@ -3816,6 +3983,40 @@ fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
 fn read_blob(blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
     let path = blob_path(blob_dir, hash);
     std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))
+}
+
+fn blob_file_is_prefix(
+    prefix_path: &Path,
+    full_path: &Path,
+    prefix_size: u64,
+    full_size: u64,
+) -> Result<bool> {
+    if prefix_size > full_size {
+        return Ok(false);
+    }
+
+    let mut prefix = File::open(prefix_path)
+        .with_context(|| format!("opening blob {}", prefix_path.display()))?;
+    let mut full =
+        File::open(full_path).with_context(|| format!("opening blob {}", full_path.display()))?;
+    let mut prefix_buf = vec![0; 1024 * 1024];
+    let mut full_buf = vec![0; 1024 * 1024];
+    let mut remaining = prefix_size;
+
+    while remaining > 0 {
+        let to_read = remaining.min(prefix_buf.len() as u64) as usize;
+        prefix
+            .read_exact(&mut prefix_buf[..to_read])
+            .with_context(|| format!("reading blob {}", prefix_path.display()))?;
+        full.read_exact(&mut full_buf[..to_read])
+            .with_context(|| format!("reading blob {}", full_path.display()))?;
+        if prefix_buf[..to_read] != full_buf[..to_read] {
+            return Ok(false);
+        }
+        remaining -= to_read as u64;
+    }
+
+    Ok(true)
 }
 
 fn blob_path(blob_dir: &Path, hash: &str) -> PathBuf {
