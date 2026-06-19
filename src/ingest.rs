@@ -1,16 +1,23 @@
 use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
 };
-use crate::storage::{ImportDelta, ImportStats, Store};
+use crate::config::SourceConfigs;
+use crate::source::{
+    AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
+    SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
+    SourceUpsert,
+};
+use crate::storage::{ImportDelta, SourceFileFingerprint, SourceFileStatus, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -27,7 +34,50 @@ pub struct UpdateStats {
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     pub max_files: Option<usize>,
-    pub source: Option<String>,
+    pub source_selection: SourceSelection,
+    pub sources: SourceConfigs,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SourceSelection {
+    sources: BTreeSet<String>,
+}
+
+impl SourceSelection {
+    pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut sources = BTreeSet::new();
+        for value in values {
+            for part in value.split(',') {
+                let source = part.trim();
+                if source.is_empty() {
+                    continue;
+                }
+                sources.insert(source.to_ascii_lowercase());
+            }
+        }
+        Ok(Self { sources })
+    }
+
+    pub fn single(source: impl Into<String>) -> Result<Self> {
+        Self::parse([source.into()])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    fn includes_adapter(&self, adapter_kind: &str) -> bool {
+        self.is_empty()
+            || self.sources.contains(adapter_kind)
+            || (self.sources.contains("agent_logs") && is_local_transcript_kind(adapter_kind))
+    }
+
+    fn matches_candidate(&self, adapter_kind: &str, candidate_kind: &str) -> bool {
+        self.is_empty()
+            || self.sources.contains(adapter_kind)
+            || self.sources.contains(candidate_kind)
+            || (self.sources.contains("agent_logs") && is_local_transcript_kind(candidate_kind))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +94,7 @@ pub enum UpdateProgress {
         selected_files: usize,
     },
     Processing {
+        adapter_kind: String,
         kind: String,
         path: PathBuf,
         file_index: usize,
@@ -53,6 +104,7 @@ pub enum UpdateProgress {
         stats: UpdateStats,
     },
     CompletedFile {
+        adapter_kind: String,
         kind: String,
         path: PathBuf,
         file_index: usize,
@@ -65,16 +117,14 @@ pub enum UpdateProgress {
 
 #[derive(Debug, Clone)]
 struct SourceRoot {
-    kind: &'static str,
     path: PathBuf,
     extensions: &'static [&'static str],
 }
 
 #[derive(Debug, Clone)]
-struct UpdateCandidate {
-    modified: i128,
+struct LocalTranscriptSource {
     kind: &'static str,
-    path: PathBuf,
+    roots: Vec<SourceRoot>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,22 +134,11 @@ struct ParsedLine {
     byte_offset: usize,
     byte_len: usize,
     content: String,
-    search_text: String,
-    search_kind: String,
-    search_indexable: bool,
-    search_skip_reason: Option<String>,
+    search: SearchSegment,
     role: Option<String>,
     event_type: String,
     occurred_at: Option<DateTime<Utc>>,
     external_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SearchProjection {
-    text: String,
-    kind: String,
-    indexable: bool,
-    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -137,55 +176,32 @@ pub fn update_local_with_progress_and_cancel(
     let mut stats = UpdateStats::default();
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
-    for root in discover_roots() {
-        if should_cancel() {
-            return Ok(stats);
-        }
-        if options
-            .source
-            .as_deref()
-            .is_some_and(|source| source != root.kind)
-        {
-            continue;
-        }
-        if !root.path.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(&root.path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !is_hidden_noise(entry.path()))
-        {
-            if should_cancel() {
-                return Ok(stats);
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    tracing::debug!(
-                        "skipping unreadable entry under {}: {err}",
-                        root.path.display()
-                    );
-                    stats.errors += 1;
-                    continue;
+    let registry = built_in_source_adapters(&options)?;
+    let discoveries = discover_selected_sources(&registry, &options, &should_cancel)?;
+    for discovery in discoveries {
+        match discovery.result {
+            Ok(discovered) => {
+                for candidate in discovered {
+                    if should_cancel() {
+                        return Ok(stats);
+                    }
+                    if !options
+                        .source_selection
+                        .matches_candidate(discovery.adapter_kind, &candidate.kind)
+                    {
+                        continue;
+                    }
+                    push_found_source_file(&mut source_summaries, &candidate.kind);
+                    candidates.push(candidate);
                 }
-            };
-            if !entry.file_type().is_file() || !has_extension(entry.path(), root.extensions) {
-                continue;
             }
-            let modified = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as i128)
-                .unwrap_or(0);
-            push_found_source_file(&mut source_summaries, root.kind);
-            candidates.push(UpdateCandidate {
-                modified,
-                kind: root.kind,
-                path: entry.path().to_path_buf(),
-            });
+            Err(err) => {
+                tracing::debug!(
+                    "failed to discover {} sources: {err:#}",
+                    discovery.adapter_kind
+                );
+                stats.errors += 1;
+            }
         }
     }
     candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
@@ -209,20 +225,24 @@ pub fn update_local_with_progress_and_cancel(
     refresh_existing_native_titles(store, &native_titles)?;
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
+    let mut pending_imports = Vec::new();
+    let source_file_statuses = precompute_local_source_file_statuses(store, &candidates)?;
+    let context = SourceSyncContext::new(store).with_source_file_statuses(&source_file_statuses);
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
         }
-        let kind = candidate.kind;
-        let path = candidate.path;
+        let kind = candidate.kind.clone();
+        let path = candidate.progress_path();
         stats.files_seen += 1;
-        let source_file_index = increment_source_seen(&mut source_seen, kind);
+        let source_file_index = increment_source_seen(&mut source_seen, &kind);
         let source_file_count = source_summaries
             .iter()
             .find(|source| source.kind == kind)
             .map(|source| source.selected_files)
             .unwrap_or(0);
         progress(&UpdateProgress::Processing {
+            adapter_kind: candidate.adapter_kind.to_string(),
             kind: kind.to_string(),
             path: path.clone(),
             file_index: idx + 1,
@@ -234,30 +254,31 @@ pub fn update_local_with_progress_and_cancel(
         if should_cancel() {
             return Ok(stats);
         }
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                tracing::debug!("failed to read metadata for {}: {err}", path.display());
-                stats.errors += 1;
-                progress(&UpdateProgress::CompletedFile {
-                    kind: kind.to_string(),
-                    path,
-                    file_index: idx + 1,
-                    total_files,
-                    source_file_index,
-                    source_file_count,
-                    stats: stats.clone(),
-                });
-                continue;
-            }
+        let Some(adapter) = registry
+            .iter()
+            .find(|adapter| adapter.kind() == candidate.adapter_kind)
+        else {
+            tracing::debug!(
+                "source adapter {} disappeared during update",
+                candidate.adapter_kind
+            );
+            stats.errors += 1;
+            progress(&UpdateProgress::CompletedFile {
+                adapter_kind: candidate.adapter_kind.to_string(),
+                kind: kind.to_string(),
+                path,
+                file_index: idx + 1,
+                total_files,
+                source_file_index,
+                source_file_count,
+                stats: stats.clone(),
+            });
+            continue;
         };
-        let size = metadata.len();
-        let mtime_ms = file_mtime_ms(&metadata);
-        let path_text = path.to_string_lossy().to_string();
-        let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
-        if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
+        if adapter.is_current(&context, &candidate)? {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
+                adapter_kind: candidate.adapter_kind.to_string(),
                 kind: kind.to_string(),
                 path,
                 file_index: idx + 1,
@@ -268,28 +289,268 @@ pub fn update_local_with_progress_and_cancel(
             });
             continue;
         }
-        match ingest_file(store, machine_id, kind, &path, &native_titles) {
-            Ok(delta) => {
-                stats.inserted += delta.inserted;
-                stats.duplicates += delta.duplicates;
-                stats.delta.merge(delta.delta);
-            }
-            Err(err) => {
-                tracing::debug!("failed to ingest {}: {err:#}", path.display());
-                stats.errors += 1;
-            }
-        }
-        progress(&UpdateProgress::CompletedFile {
-            kind: kind.to_string(),
+        pending_imports.push(PendingImport {
+            order: idx,
+            adapter_kind: candidate.adapter_kind,
+            candidate,
+            kind,
             path,
             file_index: idx + 1,
             total_files,
             source_file_index,
             source_file_count,
+        });
+    }
+
+    let prepared_imports =
+        prepare_pending_imports(&registry, machine_id, pending_imports, &should_cancel)?;
+    for prepared in prepared_imports {
+        if should_cancel() {
+            return Ok(stats);
+        }
+        match prepared.result {
+            Ok(import) => match import.commit(store) {
+                Ok(delta) => {
+                    stats.inserted += delta.inserted;
+                    stats.duplicates += delta.duplicates;
+                    stats.delta.merge(delta.delta);
+                }
+                Err(err) => {
+                    tracing::debug!("failed to ingest {}: {err:#}", prepared.path.display());
+                    stats.errors += 1;
+                }
+            },
+            Err(err) => {
+                tracing::debug!("failed to ingest {}: {err:#}", prepared.path.display());
+                stats.errors += 1;
+            }
+        }
+        progress(&UpdateProgress::CompletedFile {
+            adapter_kind: prepared.adapter_kind.to_string(),
+            kind: prepared.kind,
+            path: prepared.path,
+            file_index: prepared.file_index,
+            total_files: prepared.total_files,
+            source_file_index: prepared.source_file_index,
+            source_file_count: prepared.source_file_count,
             stats: stats.clone(),
         });
     }
     Ok(stats)
+}
+
+fn precompute_local_source_file_statuses(
+    store: &Store,
+    candidates: &[SourceCandidate],
+) -> Result<HashMap<String, SourceFileStatus>> {
+    let fingerprints = candidates
+        .iter()
+        .filter(|candidate| {
+            is_local_transcript_kind(&candidate.kind) && candidate.kind.as_str() != "opencode"
+        })
+        .filter_map(|candidate| {
+            Some(SourceFileFingerprint {
+                path: candidate.identity.clone(),
+                size: candidate.size?,
+                mtime_ms: candidate.mtime_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    store.source_file_statuses(&fingerprints)
+}
+
+struct AdapterDiscovery {
+    adapter_kind: &'static str,
+    result: Result<Vec<SourceCandidate>>,
+}
+
+fn discover_selected_sources(
+    registry: &SourceAdapterRegistry,
+    options: &UpdateOptions,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<AdapterDiscovery>> {
+    let adapters = registry
+        .iter()
+        .filter(|adapter| options.source_selection.includes_adapter(adapter.kind()))
+        .collect::<Vec<_>>();
+    if adapters.is_empty() || should_cancel() {
+        return Ok(Vec::new());
+    }
+
+    thread::scope(|scope| {
+        let handles = adapters
+            .into_iter()
+            .map(|adapter| {
+                let adapter_kind = adapter.kind();
+                (
+                    adapter_kind,
+                    scope.spawn(move || AdapterDiscovery {
+                        adapter_kind,
+                        result: adapter.discover(),
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut discoveries = Vec::with_capacity(handles.len());
+        for (adapter_kind, handle) in handles {
+            if should_cancel() {
+                return Ok(discoveries);
+            }
+            match handle.join() {
+                Ok(discovery) => discoveries.push(discovery),
+                Err(_) => discoveries.push(AdapterDiscovery {
+                    adapter_kind,
+                    result: Err(anyhow::anyhow!("source discovery worker panicked")),
+                }),
+            }
+        }
+        Ok(discoveries)
+    })
+}
+
+#[derive(Clone)]
+struct PendingImport {
+    order: usize,
+    adapter_kind: &'static str,
+    candidate: SourceCandidate,
+    kind: String,
+    path: PathBuf,
+    file_index: usize,
+    total_files: usize,
+    source_file_index: usize,
+    source_file_count: usize,
+}
+
+struct PreparedPendingImport {
+    order: usize,
+    adapter_kind: &'static str,
+    kind: String,
+    path: PathBuf,
+    file_index: usize,
+    total_files: usize,
+    source_file_index: usize,
+    source_file_count: usize,
+    result: Result<PreparedImport>,
+}
+
+fn prepare_pending_imports(
+    registry: &SourceAdapterRegistry,
+    machine_id: &str,
+    pending_imports: Vec<PendingImport>,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<PreparedPendingImport>> {
+    if pending_imports.is_empty() || should_cancel() {
+        return Ok(Vec::new());
+    }
+
+    let mut groups: Vec<(&'static str, Vec<PendingImport>)> = Vec::new();
+    for pending in pending_imports {
+        if let Some((_, items)) = groups
+            .iter_mut()
+            .find(|(adapter_kind, _)| *adapter_kind == pending.adapter_kind)
+        {
+            items.push(pending);
+        } else {
+            groups.push((pending.adapter_kind, vec![pending]));
+        }
+    }
+
+    let mut prepared = Vec::new();
+    for (adapter_kind, imports) in groups {
+        if should_cancel() {
+            break;
+        }
+        let Some(adapter) = registry
+            .iter()
+            .find(|adapter| adapter.kind() == adapter_kind)
+        else {
+            prepared.extend(imports.into_iter().map(|pending| PreparedPendingImport {
+                order: pending.order,
+                adapter_kind: pending.adapter_kind,
+                kind: pending.kind,
+                path: pending.path,
+                file_index: pending.file_index,
+                total_files: pending.total_files,
+                source_file_index: pending.source_file_index,
+                source_file_count: pending.source_file_count,
+                result: Err(anyhow::anyhow!(
+                    "source adapter {} disappeared during import preparation",
+                    pending.adapter_kind
+                )),
+            }));
+            continue;
+        };
+        let concurrency = adapter.concurrency().normalized().prepare;
+        for batch in imports.chunks(concurrency) {
+            if should_cancel() {
+                break;
+            }
+            prepared.extend(prepare_pending_import_batch(
+                adapter,
+                machine_id,
+                batch.to_vec(),
+                should_cancel,
+            )?);
+        }
+    }
+    prepared.sort_by_key(|prepared| prepared.order);
+    Ok(prepared)
+}
+
+fn prepare_pending_import_batch(
+    adapter: &dyn SourceAdapter,
+    machine_id: &str,
+    pending_imports: Vec<PendingImport>,
+    should_cancel: &impl Fn() -> bool,
+) -> Result<Vec<PreparedPendingImport>> {
+    thread::scope(|scope| {
+        let handles = pending_imports
+            .into_iter()
+            .map(|pending| {
+                let fallback = pending.clone();
+                (
+                    fallback,
+                    scope.spawn(move || {
+                        let result = adapter.prepare_import(machine_id, &pending.candidate);
+                        PreparedPendingImport {
+                            order: pending.order,
+                            adapter_kind: pending.adapter_kind,
+                            kind: pending.kind,
+                            path: pending.path,
+                            file_index: pending.file_index,
+                            total_files: pending.total_files,
+                            source_file_index: pending.source_file_index,
+                            source_file_count: pending.source_file_count,
+                            result,
+                        }
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut prepared = Vec::with_capacity(handles.len());
+        for (fallback, handle) in handles {
+            if should_cancel() {
+                return Ok(prepared);
+            }
+            match handle.join() {
+                Ok(import) => prepared.push(import),
+                Err(_) => prepared.push(PreparedPendingImport {
+                    order: fallback.order,
+                    adapter_kind: fallback.adapter_kind,
+                    kind: fallback.kind,
+                    path: fallback.path,
+                    file_index: fallback.file_index,
+                    total_files: fallback.total_files,
+                    source_file_index: fallback.source_file_index,
+                    source_file_count: fallback.source_file_count,
+                    result: Err(anyhow::anyhow!("source import preparation worker panicked")),
+                }),
+            }
+        }
+        Ok(prepared)
+    })
 }
 
 pub fn update_source_path_with_progress_and_cancel(
@@ -313,6 +574,7 @@ pub fn update_source_path_with_progress_and_cancel(
     let path = path.to_path_buf();
     stats.files_seen += 1;
     progress(&UpdateProgress::Processing {
+        adapter_kind: kind.to_string(),
         kind: kind.to_string(),
         path: path.clone(),
         file_index: 1,
@@ -327,6 +589,7 @@ pub fn update_source_path_with_progress_and_cancel(
             tracing::debug!("failed to read metadata for {}: {err}", path.display());
             stats.errors += 1;
             progress(&UpdateProgress::CompletedFile {
+                adapter_kind: kind.to_string(),
                 kind: kind.to_string(),
                 path,
                 file_index: 1,
@@ -349,7 +612,9 @@ pub fn update_source_path_with_progress_and_cancel(
     if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
         stats.skipped_unchanged += 1;
     } else {
-        match ingest_file(store, machine_id, kind, &path, &native_titles) {
+        match prepare_file_import(machine_id, kind, &path, &native_titles)
+            .and_then(|prepared| prepared.commit(store))
+        {
             Ok(delta) => {
                 stats.inserted += delta.inserted;
                 stats.duplicates += delta.duplicates;
@@ -362,6 +627,7 @@ pub fn update_source_path_with_progress_and_cancel(
         }
     }
     progress(&UpdateProgress::CompletedFile {
+        adapter_kind: kind.to_string(),
         kind: kind.to_string(),
         path,
         file_index: 1,
@@ -375,17 +641,17 @@ pub fn update_source_path_with_progress_and_cancel(
 
 #[derive(Debug, Clone)]
 struct MutableSourceSummary {
-    kind: &'static str,
+    kind: String,
     found_files: usize,
     selected_files: usize,
 }
 
-fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &'static str) {
+fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &str) {
     if let Some(summary) = summaries.iter_mut().find(|summary| summary.kind == kind) {
         summary.found_files += 1;
     } else {
         summaries.push(MutableSourceSummary {
-            kind,
+            kind: kind.to_string(),
             found_files: 1,
             selected_files: 0,
         });
@@ -394,7 +660,7 @@ fn push_found_source_file(summaries: &mut Vec<MutableSourceSummary>, kind: &'sta
 
 fn mark_selected_source_files(
     summaries: &mut [MutableSourceSummary],
-    candidates: &[UpdateCandidate],
+    candidates: &[SourceCandidate],
 ) {
     for summary in summaries.iter_mut() {
         summary.selected_files = 0;
@@ -409,13 +675,13 @@ fn mark_selected_source_files(
     }
 }
 
-fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &'static str) -> usize {
+fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &str) -> usize {
     if let Some(summary) = seen.iter_mut().find(|summary| summary.kind == kind) {
         summary.found_files += 1;
         summary.found_files
     } else {
         seen.push(MutableSourceSummary {
-            kind,
+            kind: kind.to_string(),
             found_files: 1,
             selected_files: 0,
         });
@@ -423,60 +689,270 @@ fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &'static st
     }
 }
 
-fn discover_roots() -> Vec<SourceRoot> {
-    let mut roots = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(SourceRoot {
-            kind: "codex",
-            path: home.join(".codex/sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "codex",
-            path: home.join(".codex/archived_sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "claude_code",
-            path: home.join(".claude/projects"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "pi_agent",
-            path: home.join(".pi/agent/sessions"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "openclaw",
-            path: home.join(".openclaw"),
-            extensions: &["jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "hermes",
-            path: home.join(".hermes/sessions"),
-            extensions: &["json", "jsonl"],
-        });
-        roots.push(SourceRoot {
-            kind: "opencode",
-            path: home.join(".local/share/opencode/opencode.db"),
-            extensions: &["db"],
-        });
+fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegistry> {
+    let native_titles = NativeTitleIndex::load();
+    let mut registry = SourceAdapterRegistry::new();
+    for source in local_transcript_sources() {
+        if !options.source_selection.includes_adapter(source.kind) {
+            continue;
+        }
+        registry = registry.register(LocalTranscriptAdapter {
+            kind: source.kind,
+            roots: source.roots,
+            native_titles: native_titles.clone(),
+        })?;
     }
-    roots
+    if options.source_selection.includes_adapter("treechat") {
+        if let Some(adapter) = crate::treechat::TreechatAdapter::from_config(
+            &options.sources.treechat,
+            selected_treechat_source(&options.source_selection),
+        )? {
+            return registry.register(adapter);
+        }
+    }
+    Ok(registry)
 }
 
-fn ingest_file(
-    store: &Store,
+fn selected_treechat_source(selection: &SourceSelection) -> Option<&'static str> {
+    selection.sources.contains("treechat").then_some("treechat")
+}
+
+fn is_local_transcript_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "codex" | "claude_code" | "pi_agent" | "openclaw" | "hermes" | "opencode"
+    )
+}
+
+struct LocalTranscriptAdapter {
+    kind: &'static str,
+    roots: Vec<SourceRoot>,
+    native_titles: NativeTitleIndex,
+}
+
+impl SourceAdapter for LocalTranscriptAdapter {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    fn concurrency(&self) -> AdapterConcurrency {
+        if self.kind() == "opencode" {
+            AdapterConcurrency::new(1, 1)
+        } else {
+            AdapterConcurrency::new(1, 4)
+        }
+    }
+
+    fn discover(&self) -> Result<Vec<SourceCandidate>> {
+        let mut candidates = Vec::new();
+        for root in &self.roots {
+            if !root.path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root.path)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| !is_hidden_noise(entry.path()))
+            {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::debug!(
+                            "skipping unreadable entry under {}: {err}",
+                            root.path.display()
+                        );
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file() || !has_extension(entry.path(), root.extensions) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to read metadata for {}: {err}",
+                            entry.path().display()
+                        );
+                        continue;
+                    }
+                };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as i128)
+                    .unwrap_or(0);
+                let path = entry.path().to_path_buf();
+                candidates.push(SourceCandidate {
+                    adapter_kind: self.kind(),
+                    kind: self.kind().to_string(),
+                    identity: path.to_string_lossy().to_string(),
+                    path: Some(path),
+                    modified,
+                    size: Some(metadata.len()),
+                    mtime_ms: file_mtime_ms(&metadata),
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn is_current(
+        &self,
+        context: &SourceSyncContext<'_>,
+        candidate: &SourceCandidate,
+    ) -> Result<bool> {
+        if self.kind() == "opencode" {
+            let path = candidate
+                .path
+                .as_deref()
+                .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+            let cursor = opencode_checkpoint_cursor(path)?;
+            let checkpoint = context
+                .store
+                .source_checkpoint(self.kind(), &candidate.identity)?;
+            return Ok(checkpoint
+                .and_then(|checkpoint| checkpoint.cursor)
+                .is_some_and(|stored| stored == cursor));
+        }
+        let size = candidate.size.unwrap_or(0);
+        let status = context.source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
+        Ok(status.raw_current && !status.needs_workspace_refresh)
+    }
+
+    fn prepare_import(
+        &self,
+        machine_id: &str,
+        candidate: &SourceCandidate,
+    ) -> Result<PreparedImport> {
+        let path = candidate
+            .path
+            .as_deref()
+            .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+        let prepared = prepare_file_import(machine_id, self.kind(), path, &self.native_titles)?;
+        if self.kind() == "opencode" {
+            return Ok(prepared.with_checkpoint(SourceCheckpointUpsert {
+                source_kind: self.kind().to_string(),
+                source_identity: candidate.identity.clone(),
+                cursor: Some(opencode_checkpoint_cursor(path)?),
+                metadata: json!({
+                    "strategy": "sqlite_file_trio_metadata_v1",
+                    "path": candidate.identity,
+                }),
+            }));
+        }
+        Ok(prepared)
+    }
+}
+
+fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        LocalTranscriptSource {
+            kind: "codex",
+            roots: vec![
+                SourceRoot {
+                    path: home.join(".codex/sessions"),
+                    extensions: &["jsonl"],
+                },
+                SourceRoot {
+                    path: home.join(".codex/archived_sessions"),
+                    extensions: &["jsonl"],
+                },
+            ],
+        },
+        LocalTranscriptSource {
+            kind: "claude_code",
+            roots: vec![SourceRoot {
+                path: home.join(".claude/projects"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
+            kind: "pi_agent",
+            roots: vec![SourceRoot {
+                path: home.join(".pi/agent/sessions"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
+            kind: "openclaw",
+            roots: vec![SourceRoot {
+                path: home.join(".openclaw"),
+                extensions: &["jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
+            kind: "hermes",
+            roots: vec![SourceRoot {
+                path: home.join(".hermes/sessions"),
+                extensions: &["json", "jsonl"],
+            }],
+        },
+        LocalTranscriptSource {
+            kind: "opencode",
+            roots: vec![SourceRoot {
+                path: home.join(".local/share/opencode/opencode.db"),
+                extensions: &["db"],
+            }],
+        },
+    ]
+}
+
+fn opencode_checkpoint_cursor(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for path in opencode_sqlite_fingerprint_paths(path) {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        match fs::metadata(&path) {
+            Ok(metadata) => parts.push(format!(
+                "{}:{}:{}",
+                label,
+                metadata.len(),
+                file_mtime_ms(&metadata)
+                    .map(|mtime| mtime.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                parts.push(format!("{label}:missing"));
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    Ok(parts.join("|"))
+}
+
+fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
+    let path_text = path.to_string_lossy();
+    vec![
+        path.to_path_buf(),
+        PathBuf::from(format!("{path_text}-wal")),
+        PathBuf::from(format!("{path_text}-shm")),
+    ]
+}
+
+fn prepare_file_import(
     machine_id: &str,
     kind: &str,
     path: &Path,
     native_titles: &NativeTitleIndex,
-) -> Result<ImportStats> {
+) -> Result<PreparedImport> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let raw_hash = blake3_hex(&bytes);
     let path_text = path.to_string_lossy().to_string();
     let source_id = stable_id(&["source", kind, &path_text]);
-    store.upsert_source(&source_id, kind, &path_text, Some(&path_text))?;
+    let source_upsert = SourceUpsert {
+        id: source_id.clone(),
+        kind: kind.to_string(),
+        identity: path_text.clone(),
+        path: Some(path_text.clone()),
+    };
 
     let metadata =
         fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
@@ -495,12 +971,12 @@ fn ingest_file(
     records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
 
     if kind == "opencode" {
-        return ingest_opencode_db(
-            store,
+        return prepare_opencode_db_import(
             machine_id,
             path,
             &path_text,
             &source_id,
+            source_upsert,
             raw_artifact,
         );
     }
@@ -548,6 +1024,16 @@ fn ingest_file(
         ]);
         let byte_offset = line.byte_offset;
         let byte_len = line.byte_len;
+        let mut metadata = json!({
+            "raw_artifact_hash": raw_hash.clone(),
+            "byte_offset": byte_offset,
+            "byte_len": byte_len,
+            "capture_fidelity": "exact_local_log",
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        line.search.apply_compat_metadata(&mut metadata);
         records.push(ArchiveRecord::Event(EventRecord {
             id: event_id,
             session_id: session_id.clone(),
@@ -560,30 +1046,21 @@ fn ingest_file(
             content: line.content,
             raw_artifact_hash: Some(raw_hash.clone()),
             occurred_at: line.occurred_at,
-            metadata: json!({
-                "raw_artifact_hash": raw_hash.clone(),
-                "byte_offset": byte_offset,
-                "byte_len": byte_len,
-                "capture_fidelity": "exact_local_log",
-                "search_indexable": line.search_indexable,
-                "search_kind": line.search_kind,
-                "search_text": line.search_text,
-                "search_skip_reason": line.search_skip_reason
-            }),
+            metadata: Value::Object(metadata),
             hash: line_hash,
         }));
     }
-    store.import_archive_records(&records)
+    Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
-fn ingest_opencode_db(
-    store: &Store,
+fn prepare_opencode_db_import(
     machine_id: &str,
     path: &Path,
     path_text: &str,
     source_id: &str,
+    source_upsert: SourceUpsert,
     raw_artifact: RawArtifact,
-) -> Result<ImportStats> {
+) -> Result<PreparedImport> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -707,6 +1184,27 @@ fn ingest_opencode_db(
                 &part_type,
                 &content,
             ))?;
+            let search = SearchSegment::indexed(
+                "conversation",
+                role.clone(),
+                content.clone(),
+                SemanticPolicy::Required,
+            )
+            .with_provenance("opencode_part_text")
+            .with_stable_part(part_id.clone());
+            let mut metadata = json!({
+                "raw_artifact_hash": raw_artifact.hash.clone(),
+                "capture_fidelity": "native_opencode_sqlite",
+                "parser": "opencode_sqlite_v1",
+                "opencode_session_id": external_session_id.clone(),
+                "opencode_message_id": message_id.clone(),
+                "opencode_part_id": part_id.clone(),
+                "opencode_part_type": part_type.clone(),
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+            search.apply_compat_metadata(&mut metadata);
             records.push(ArchiveRecord::Event(EventRecord {
                 id: event_id,
                 session_id: session_id.clone(),
@@ -720,26 +1218,14 @@ fn ingest_opencode_db(
                 raw_artifact_hash: Some(raw_artifact.hash.clone()),
                 occurred_at: unix_millis_to_utc(part_time)
                     .or_else(|| unix_millis_to_utc(message_time)),
-                metadata: json!({
-                    "raw_artifact_hash": raw_artifact.hash.clone(),
-                    "capture_fidelity": "native_opencode_sqlite",
-                    "parser": "opencode_sqlite_v1",
-                    "opencode_session_id": external_session_id.clone(),
-                    "opencode_message_id": message_id.clone(),
-                    "opencode_part_id": part_id.clone(),
-                    "opencode_part_type": part_type.clone(),
-                    "search_indexable": true,
-                    "search_kind": role.clone(),
-                    "search_text": content.clone(),
-                    "search_skip_reason": null
-                }),
+                metadata: Value::Object(metadata),
                 hash: event_hash,
             }));
             ordinal += 1;
         }
     }
 
-    store.import_archive_records(&records)
+    Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
 fn clean_optional_title(title: &str) -> Option<String> {
@@ -1186,7 +1672,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         .or_else(|| string_at(&value, &["payload", "type"]))
         .unwrap_or_else(|| role.clone().unwrap_or_else(|| "event".to_string()));
     let content = extract_text(&value).unwrap_or_else(|| value.to_string());
-    let search = derive_search_projection(&value, role.as_deref(), &event_type);
+    let search = derive_search_segment(&value, role.as_deref(), &event_type);
     let occurred_at = string_at(&value, &["timestamp"])
         .or_else(|| string_at(&value, &["created_at"]))
         .or_else(|| string_at(&value, &["message", "created_at"]))
@@ -1200,10 +1686,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         byte_offset,
         byte_len,
         content,
-        search_text: search.text,
-        search_kind: search.kind,
-        search_indexable: search.indexable,
-        search_skip_reason: search.skip_reason,
+        search,
         role,
         event_type,
         occurred_at,
@@ -1211,11 +1694,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
     }
 }
 
-fn derive_search_projection(
-    value: &Value,
-    role: Option<&str>,
-    event_type: &str,
-) -> SearchProjection {
+fn derive_search_segment(value: &Value, role: Option<&str>, event_type: &str) -> SearchSegment {
     let normalized_role = role.map(str::to_ascii_lowercase);
     let search_role = normalized_role.as_deref().or_else(|| match event_type {
         "user" | "assistant" => Some(event_type),
@@ -1245,40 +1724,25 @@ fn derive_search_projection(
                 "no conversation text",
             )
         }
-        Some("tool") => SearchProjection::skipped("tool event"),
-        Some("system") | Some("developer") => SearchProjection::skipped("instruction event"),
+        Some("tool") => SearchSegment::skipped("none", "tool event"),
+        Some("system") | Some("developer") => SearchSegment::skipped("none", "instruction event"),
         _ => {
             if looks_like_tool_event(value, event_type) {
-                SearchProjection::skipped("tool event")
+                SearchSegment::skipped("none", "tool event")
             } else {
-                SearchProjection::skipped("non-message event")
+                SearchSegment::skipped("none", "non-message event")
             }
         }
     }
 }
 
-impl SearchProjection {
-    fn skipped(reason: &str) -> Self {
-        Self {
-            text: String::new(),
-            kind: "none".to_string(),
-            indexable: false,
-            skip_reason: Some(reason.to_string()),
-        }
-    }
-}
-
-fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> SearchProjection {
+fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> SearchSegment {
     let text = normalize_parts(parts);
     if text.is_empty() {
-        SearchProjection::skipped(empty_reason)
+        SearchSegment::skipped("none", empty_reason)
     } else {
-        SearchProjection {
-            text,
-            kind: kind.to_string(),
-            indexable: true,
-            skip_reason: None,
-        }
+        SearchSegment::indexed("conversation", kind, text, SemanticPolicy::Required)
+            .with_provenance("message_text")
     }
 }
 
@@ -1506,9 +1970,9 @@ mod tests {
             1,
         );
 
-        assert!(line.search_indexable);
-        assert_eq!(line.search_kind, "user");
-        assert_eq!(line.search_text, "search this exact request");
+        assert!(line.search.is_searchable());
+        assert_eq!(line.search.kind, "user");
+        assert_eq!(line.search.text, "search this exact request");
     }
 
     #[test]
@@ -1525,9 +1989,9 @@ mod tests {
             1,
         );
 
-        assert!(!line.search_indexable);
-        assert!(line.search_text.is_empty());
-        assert_eq!(line.search_skip_reason.as_deref(), Some("tool event"));
+        assert!(!line.search.is_searchable());
+        assert!(line.search.text.is_empty());
+        assert_eq!(line.search.skip_reason.as_deref(), Some("tool event"));
     }
 
     #[test]
@@ -1547,9 +2011,9 @@ mod tests {
             1,
         );
 
-        assert!(line.search_indexable);
-        assert_eq!(line.search_kind, "conversation");
-        assert_eq!(line.search_text, "human question\nassistant answer");
+        assert!(line.search.is_searchable());
+        assert_eq!(line.search.kind, "conversation");
+        assert_eq!(line.search.text, "human question\nassistant answer");
     }
 
     #[test]
@@ -1775,14 +2239,9 @@ mod tests {
         drop(conn);
 
         let native_titles = NativeTitleIndex::default();
-        let imported = ingest_file(
-            &store,
-            "machine_fixture",
-            "opencode",
-            &db_path,
-            &native_titles,
-        )
-        .expect("ingest opencode");
+        let imported = prepare_file_import("machine_fixture", "opencode", &db_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("ingest opencode");
         let path_text = db_path.to_string_lossy().to_string();
         let session_id = stable_id(&["session", "opencode", &path_text, "ses_fixture"]);
         let session = store
@@ -1800,6 +2259,82 @@ mod tests {
         assert_eq!(events[0].content, "user asks for OpenCode ingestion");
         assert_eq!(events[1].role.as_deref(), Some("assistant"));
         assert_eq!(events[1].content, "assistant explains the OpenCode parser");
+    }
+
+    #[test]
+    fn opencode_adapter_skips_when_sqlite_checkpoint_matches() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let db_path = temp.path().join("opencode.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"wal").expect("write wal");
+        fs::write(&shm_path, b"shm").expect("write shm");
+        let identity = db_path.to_string_lossy().to_string();
+        let cursor = opencode_checkpoint_cursor(&db_path).expect("checkpoint cursor");
+        store
+            .upsert_source_checkpoint("opencode", &identity, Some(&cursor), &json!({}))
+            .expect("store checkpoint");
+        let adapter = LocalTranscriptAdapter {
+            kind: "opencode",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let candidate = SourceCandidate {
+            adapter_kind: "opencode",
+            kind: "opencode".to_string(),
+            identity,
+            path: Some(db_path.clone()),
+            modified: 0,
+            size: None,
+            mtime_ms: None,
+        };
+        let context = SourceSyncContext::new(&store);
+
+        assert!(adapter
+            .is_current(&context, &candidate)
+            .expect("matching checkpoint"));
+
+        fs::write(&wal_path, b"wal changed").expect("change wal");
+        assert!(!adapter
+            .is_current(&context, &candidate)
+            .expect("changed checkpoint"));
+    }
+
+    #[test]
+    fn local_transcript_adapter_uses_cached_source_file_status() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let identity = temp.path().join("cached-status.jsonl");
+        let identity = identity.to_string_lossy().to_string();
+        let adapter = LocalTranscriptAdapter {
+            kind: "codex",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let candidate = SourceCandidate {
+            adapter_kind: "codex",
+            kind: "codex".to_string(),
+            identity: identity.clone(),
+            path: Some(PathBuf::from(&identity)),
+            modified: 0,
+            size: Some(123),
+            mtime_ms: Some(456),
+        };
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            identity,
+            SourceFileStatus {
+                raw_current: true,
+                needs_workspace_refresh: false,
+            },
+        );
+        let context = SourceSyncContext::new(&store).with_source_file_statuses(&statuses);
+
+        assert!(adapter
+            .is_current(&context, &candidate)
+            .expect("cached source status"));
     }
 
     #[test]
@@ -1829,17 +2364,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
         let log_path = temp.path().join("session.jsonl");
-        fs::write(&log_path, fixture_line("session-1", "first question")).expect("write first log");
+        let first_log = fixture_line("session-1", "first question");
+        let first_hash = blake3_hex(first_log.as_bytes());
+        fs::write(&log_path, &first_log).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
-        let first = ingest_file(
-            &store,
-            "machine_fixture",
-            "codex",
-            &log_path,
-            &native_titles,
-        )
-        .expect("first ingest");
+        let first = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("first ingest");
         let metadata = fs::metadata(&log_path).expect("first metadata");
         let current = store
             .raw_artifact_is_current(
@@ -1859,20 +2391,20 @@ mod tests {
             &log_path,
             format!(
                 "{}{}",
-                fixture_line("session-1", "first question"),
+                first_log,
                 fixture_line("session-1", "second question")
             ),
         )
         .expect("append second log line");
-        let second = ingest_file(
-            &store,
-            "machine_fixture",
-            "codex",
-            &log_path,
-            &native_titles,
-        )
-        .expect("second ingest");
+        let full_log = fs::read(&log_path).expect("read full log");
+        let full_hash = blake3_hex(&full_log);
+        let second = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("second ingest");
         let stats = store.stats().expect("stats");
+        let path_text = log_path.to_string_lossy().to_string();
+        let session_id = stable_id(&["session", "codex", &path_text, "session-1"]);
+        let events = store.events_for_session(&session_id).expect("events");
 
         assert_eq!(second.inserted, 2);
         assert_eq!(second.duplicates, 2);
@@ -1880,9 +2412,61 @@ mod tests {
         assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
         assert_eq!(second.delta.touched_paths.len(), 1);
+        assert_eq!(stats.raw_artifacts, 1);
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.events, 2);
+        assert!(!store.raw_artifact_blob_exists(&first_hash));
+        assert!(store.raw_artifact_blob_exists(&full_hash));
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.raw_artifact_hash.as_deref() == Some(full_hash.as_str())));
+        assert_eq!(
+            events[0].metadata["raw_artifact_hash"].as_str(),
+            Some(full_hash.as_str())
+        );
+        assert_eq!(events[0].metadata["byte_offset"].as_u64(), Some(0));
+        assert_eq!(
+            events[0].metadata["byte_len"].as_u64(),
+            Some(first_log.len() as u64)
+        );
+        let kept_raw = store
+            .read_raw_artifact_blob(&full_hash)
+            .expect("read kept raw");
+        assert_eq!(&kept_raw[..first_log.len()], first_log.as_bytes());
+    }
+
+    #[test]
+    fn non_prefix_rewrite_keeps_prior_raw_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("session.jsonl");
+        let first_log = fixture_line("session-1", "first question");
+        let first_hash = blake3_hex(first_log.as_bytes());
+        fs::write(&log_path, &first_log).expect("write first log");
+
+        let native_titles = NativeTitleIndex::default();
+        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("first ingest");
+
+        let rewritten_log = format!(
+            "{}{}",
+            fixture_line("session-1", "rewritten first question"),
+            fixture_line("session-1", "second question")
+        );
+        let rewritten_hash = blake3_hex(rewritten_log.as_bytes());
+        fs::write(&log_path, &rewritten_log).expect("rewrite log");
+        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("second ingest");
+        let stats = store.stats().expect("stats");
+
         assert_eq!(stats.raw_artifacts, 2);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
+        assert!(store.raw_artifact_blob_exists(&first_hash));
+        assert!(store.raw_artifact_blob_exists(&rewritten_hash));
     }
 
     #[test]
@@ -1892,15 +2476,23 @@ mod tests {
         push_found_source_file(&mut summaries, "hermes");
         push_found_source_file(&mut summaries, "codex");
         let candidates = vec![
-            UpdateCandidate {
+            SourceCandidate {
+                adapter_kind: "codex",
                 modified: 3,
-                kind: "codex",
-                path: PathBuf::from("codex-1.jsonl"),
+                kind: "codex".to_string(),
+                identity: "codex-1.jsonl".to_string(),
+                path: Some(PathBuf::from("codex-1.jsonl")),
+                size: None,
+                mtime_ms: None,
             },
-            UpdateCandidate {
+            SourceCandidate {
+                adapter_kind: "hermes",
                 modified: 2,
-                kind: "hermes",
-                path: PathBuf::from("hermes-1.json"),
+                kind: "hermes".to_string(),
+                identity: "hermes-1.json".to_string(),
+                path: Some(PathBuf::from("hermes-1.json")),
+                size: None,
+                mtime_ms: None,
             },
         ];
 
@@ -1918,6 +2510,73 @@ mod tests {
         assert_eq!(codex.selected_files, 1);
         assert_eq!(hermes.found_files, 1);
         assert_eq!(hermes.selected_files, 1);
+    }
+
+    #[test]
+    fn source_selection_matches_specific_sources_and_agent_logs_alias() {
+        let codex = SourceSelection::single("codex").expect("codex selection");
+        let agent_logs = SourceSelection::single("agent_logs").expect("agent logs selection");
+        let treechat = SourceSelection::single("treechat").expect("treechat selection");
+
+        assert!(codex.matches_candidate("codex", "codex"));
+        assert!(agent_logs.matches_candidate("codex", "codex"));
+        assert!(agent_logs.matches_candidate("opencode", "opencode"));
+        assert!(treechat.matches_candidate("treechat", "treechat"));
+        assert!(!agent_logs.matches_candidate("treechat", "treechat"));
+        assert!(!codex.matches_candidate("hermes", "hermes"));
+    }
+
+    #[test]
+    fn source_selection_accepts_repeated_and_comma_separated_sources() {
+        let selection =
+            SourceSelection::parse(["codex, claude_code".to_string(), "treechat".to_string()])
+                .expect("selection");
+
+        assert!(selection.includes_adapter("codex"));
+        assert!(selection.includes_adapter("claude_code"));
+        assert!(selection.includes_adapter("treechat"));
+        assert!(!selection.includes_adapter("hermes"));
+    }
+
+    #[test]
+    fn source_selection_skips_treechat_discovery_for_other_sources() {
+        let mut sources = SourceConfigs::default();
+        sources.treechat.enabled = true;
+        let options = UpdateOptions {
+            max_files: None,
+            source_selection: SourceSelection::single("codex").expect("selection"),
+            sources,
+        };
+
+        let registry = built_in_source_adapters(&options).expect("registry");
+        let kinds = registry
+            .iter()
+            .map(|adapter| adapter.kind())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["codex"]);
+    }
+
+    #[test]
+    fn local_transcript_adapter_discovers_candidates_with_source_adapter_kind() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log_path = temp.path().join("session.jsonl");
+        fs::write(&log_path, fixture_line("session-1", "hello from codex")).expect("write fixture");
+        let adapter = LocalTranscriptAdapter {
+            kind: "codex",
+            roots: vec![SourceRoot {
+                path: temp.path().to_path_buf(),
+                extensions: &["jsonl"],
+            }],
+            native_titles: NativeTitleIndex::default(),
+        };
+
+        let candidates = adapter.discover().expect("discover candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].adapter_kind, "codex");
+        assert_eq!(candidates[0].kind, "codex");
+        assert_eq!(candidates[0].path.as_deref(), Some(log_path.as_path()));
     }
 
     fn fixture_line(session_id: &str, text: &str) -> String {

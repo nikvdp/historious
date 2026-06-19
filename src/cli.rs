@@ -56,8 +56,12 @@ pub enum Command {
     Update {
         #[arg(long, help = "Scan at most this many newest files")]
         max_files: Option<usize>,
-        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
-        source: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Scan these source kinds; may be repeated or comma-separated"
+        )]
+        source: Vec<String>,
         #[arg(long, help = "Fully reconcile derived search and vector indexes")]
         repair: bool,
         #[arg(long, help = "Skip embedding work for this run")]
@@ -553,8 +557,12 @@ pub enum Command {
         interval_secs: u64,
         #[arg(long, help = "Scan at most this many newest files each pass")]
         max_files: Option<usize>,
-        #[arg(long, help = "Scan only one source kind, such as codex or claude_code")]
-        source: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Scan these source kinds each pass; may be repeated or comma-separated"
+        )]
+        source: Vec<String>,
         #[arg(long, help = "Skip embedding work while this daemon runs")]
         no_embeddings: bool,
     },
@@ -592,9 +600,10 @@ pub enum Command {
         #[arg(
             long,
             requires = "watch",
-            help = "Scan only one source kind, such as codex or claude_code"
+            value_delimiter = ',',
+            help = "Scan these source kinds when watching; may be repeated or comma-separated"
         )]
-        source: Option<String>,
+        source: Vec<String>,
         #[arg(long, help = "Skip embedding work for this server process")]
         no_embeddings: bool,
     },
@@ -658,10 +667,22 @@ pub enum ConfigCommand {
         #[arg(value_enum, default_value_t = ConfigEmbeddingState::Status)]
         state: ConfigEmbeddingState,
     },
+    /// Show or change Treechat ingestion opt-in behavior.
+    Treechat {
+        #[arg(value_enum, default_value_t = ConfigSourceState::Status)]
+        state: ConfigSourceState,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigEmbeddingState {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigSourceState {
     On,
     Off,
     Status,
@@ -699,6 +720,23 @@ pub enum RawBlobCommand {
         json: bool,
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
+    },
+    /// Preview or remove superseded append-only raw artifact snapshots.
+    Compact {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview compactable append snapshots without deleting anything"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Repoint covered raw artifact references and delete superseded blobs"
+        )]
+        confirm: bool,
     },
 }
 
@@ -1477,6 +1515,31 @@ impl Cli {
                         );
                     }
                 }
+                RawBlobCommand::Compact {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let compaction = if confirm {
+                        store.compact_append_raw_artifacts()?
+                    } else {
+                        store.preview_append_raw_artifact_compaction()?
+                    };
+                    let output = RawBlobCompactOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        compaction,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs compact",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_raw_blob_compact_output(&output);
+                    }
+                }
             },
             Command::Daemon {
                 interval_secs,
@@ -1489,6 +1552,7 @@ impl Cli {
                     &store,
                     &config.machine_id,
                     config.embedder.clone(),
+                    config.sources.clone(),
                     interval_secs,
                     max_files,
                     source,
@@ -1525,6 +1589,7 @@ impl Cli {
                         &store,
                         &config.machine_id,
                         config.embedder.clone(),
+                        config.sources.clone(),
                         interval_secs,
                         max_files,
                         source,
@@ -1603,7 +1668,8 @@ impl Command {
                 | Command::Prune { json: true, .. }
                 | Command::RawBlobs {
                     command: RawBlobCommand::Missing { json: true, .. }
-                        | RawBlobCommand::Import { json: true, .. },
+                        | RawBlobCommand::Import { json: true, .. }
+                        | RawBlobCommand::Compact { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
         )
@@ -1625,6 +1691,7 @@ fn apply_no_embeddings_override(config: &mut AppConfig, no_embeddings: bool) {
 struct ConfigOutput {
     config_path: String,
     embeddings_enabled: bool,
+    treechat_enabled: bool,
 }
 
 fn run_config_command(
@@ -1639,6 +1706,7 @@ fn run_config_command(
             let output = ConfigOutput {
                 config_path: path.display().to_string(),
                 embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
             };
             if robot {
                 crate::output::write_success("config show", output, Default::default())?;
@@ -1657,9 +1725,27 @@ fn run_config_command(
             let output = ConfigOutput {
                 config_path: path.display().to_string(),
                 embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
             };
             if robot {
                 crate::output::write_success("config embeddings", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
+        ConfigCommand::Treechat { state } => {
+            let path = match state {
+                ConfigSourceState::On => crate::config::set_treechat_enabled(&data_dir, true)?,
+                ConfigSourceState::Off => crate::config::set_treechat_enabled(&data_dir, false)?,
+                ConfigSourceState::Status => path,
+            };
+            let output = ConfigOutput {
+                config_path: path.display().to_string(),
+                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
+                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
+            };
+            if robot {
+                crate::output::write_success("config treechat", output, Default::default())?;
             } else {
                 print_config_output(&output);
             }
@@ -1671,6 +1757,7 @@ fn run_config_command(
 fn print_config_output(output: &ConfigOutput) {
     println!("config_path={}", output.config_path);
     println!("embeddings.enabled={}", output.embeddings_enabled);
+    println!("sources.treechat.enabled={}", output.treechat_enabled);
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {
@@ -1786,6 +1873,13 @@ struct PruneDeletedOutput {
 struct RawBlobMissingOutput {
     count: usize,
     hashes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RawBlobCompactOutput {
+    dry_run: bool,
+    confirmed: bool,
+    compaction: crate::storage::RawArtifactCompactionOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -1992,13 +2086,18 @@ fn run_update_once_machine(
     store: &Store,
     config: &AppConfig,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
     repair: bool,
 ) -> Result<UpdateOutput> {
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
-        ingest::UpdateOptions { max_files, source },
+        ingest::UpdateOptions {
+            max_files,
+            source_selection,
+            sources: config.sources.clone(),
+        },
         |event| {
             write_update_progress(
                 "scan",
@@ -2094,15 +2193,20 @@ fn run_update_once_human(
     store: &Store,
     config: &AppConfig,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
     repair: bool,
 ) -> Result<UpdateOutput> {
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let progress = ProgressUi::new();
     let mut scan = progress.phase("Scanning local agent logs");
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
-        ingest::UpdateOptions { max_files, source },
+        ingest::UpdateOptions {
+            max_files,
+            source_selection,
+            sources: config.sources.clone(),
+        },
         |event| scan.update(update_progress_detail(event)),
     )?;
     scan.finish(format!(
@@ -2735,6 +2839,55 @@ fn print_prune_output(output: &PruneOutput) {
     }
 }
 
+fn print_raw_blob_compact_output(output: &RawBlobCompactOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Raw blob compaction preview"
+    } else {
+        "Raw blob compaction complete"
+    };
+    println!("{title}");
+    print_section(
+        "Append snapshots",
+        &[
+            (
+                "Paths inspected",
+                format_count(output.compaction.paths_inspected),
+            ),
+            (
+                "Raw artifacts compactable",
+                format_count(output.compaction.raw_artifacts_compacted),
+            ),
+            (
+                "Raw blob bytes compactable",
+                format_bytes(output.compaction.raw_blob_bytes_compacted),
+            ),
+            (
+                "Events repointed",
+                format_count(output.compaction.events_repointed),
+            ),
+            (
+                "Raw artifacts skipped",
+                format_count(output.compaction.raw_artifacts_skipped),
+            ),
+            (
+                "Raw blobs deleted",
+                format_count(output.compaction.raw_blobs_deleted),
+            ),
+            (
+                "Raw blob bytes deleted",
+                format_bytes(output.compaction.raw_blob_bytes_deleted),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run && output.compaction.raw_artifacts_compacted > 0 {
+        println!("Run again with --confirm to apply this compaction.");
+    } else if output.compaction.raw_artifacts_compacted == 0 {
+        println!("No append-covered raw artifacts found.");
+    }
+}
+
 fn print_search_summary(indexed_events: usize, color: bool) {
     print_section(
         "Search",
@@ -2945,6 +3098,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             }
         }
         ingest::UpdateProgress::Processing {
+            adapter_kind: _,
             kind,
             path,
             file_index,
@@ -2965,6 +3119,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.errors)
         ),
         ingest::UpdateProgress::CompletedFile {
+            adapter_kind: _,
             kind,
             path,
             file_index,
@@ -3004,6 +3159,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             }).collect::<Vec<_>>(),
         }),
         ingest::UpdateProgress::Processing {
+            adapter_kind,
             kind,
             path,
             file_index,
@@ -3013,6 +3169,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             stats,
         } => serde_json::json!({
             "status": "processing",
+            "adapter_kind": adapter_kind,
             "kind": kind,
             "path": path.display().to_string(),
             "file_index": file_index,
@@ -3022,6 +3179,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "stats": stats,
         }),
         ingest::UpdateProgress::CompletedFile {
+            adapter_kind,
             kind,
             path,
             file_index,
@@ -3031,6 +3189,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             stats,
         } => serde_json::json!({
             "status": "completed_file",
+            "adapter_kind": adapter_kind,
             "kind": kind,
             "path": path.display().to_string(),
             "file_index": file_index,
@@ -3462,7 +3621,8 @@ fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Res
         &config.machine_id,
         ingest::UpdateOptions {
             max_files: None,
-            source: None,
+            source_selection: ingest::SourceSelection::default(),
+            sources: config.sources.clone(),
         },
         |_| {},
     )?;
@@ -4111,6 +4271,7 @@ async fn run_transcript_tail(
         &config.machine_id,
         &session_record.source_kind,
         tail_source_path.as_deref(),
+        &config.sources,
     )? && !append_tail_updates(store, &session, &mut last_cursor, color, verbose)?
     {
         return Ok(());
@@ -4130,6 +4291,7 @@ async fn run_transcript_tail(
             &config.machine_id,
             &session_record.source_kind,
             tail_source_path.as_deref(),
+            &config.sources,
         )? {
             break;
         }
@@ -4189,6 +4351,7 @@ fn refresh_tail_inputs(
     machine_id: &str,
     source_kind: &str,
     source_path: Option<&Path>,
+    sources: &crate::config::SourceConfigs,
 ) -> Result<bool> {
     let stats = match source_path {
         Some(path) => ingest::update_source_path_with_progress_and_cancel(
@@ -4204,7 +4367,8 @@ fn refresh_tail_inputs(
             machine_id,
             ingest::UpdateOptions {
                 max_files: None,
-                source: Some(source_kind.to_string()),
+                source_selection: ingest::SourceSelection::single(source_kind)?,
+                sources: sources.clone(),
             },
             |_| {},
             tail_cancelled,
@@ -5484,11 +5648,13 @@ async fn run_daemon(
     store: &Store,
     machine_id: &str,
     embedder_config: crate::embed::EmbedderConfig,
+    source_configs: crate::config::SourceConfigs,
     interval_secs: u64,
     max_files: Option<usize>,
-    source: Option<String>,
+    source: Vec<String>,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let source_selection = ingest::SourceSelection::parse(source)?;
     let progress = ProgressUi::new();
     loop {
         let mut scan = progress.phase("Scanning local agent logs");
@@ -5497,7 +5663,8 @@ async fn run_daemon(
             machine_id,
             ingest::UpdateOptions {
                 max_files,
-                source: source.clone(),
+                source_selection: source_selection.clone(),
+                sources: source_configs.clone(),
             },
             |event| scan.update(update_progress_detail(event)),
         )?;

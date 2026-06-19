@@ -10,7 +10,9 @@ use rusqlite::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +25,16 @@ const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 pub struct Store {
     db_path: PathBuf,
     blob_dir: PathBuf,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SourceCheckpoint {
+    pub source_kind: String,
+    pub source_identity: String,
+    pub cursor: Option<String>,
+    pub metadata: Value,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -148,10 +160,28 @@ pub struct PruneOutcome {
     pub raw_blob_bytes_deleted: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RawArtifactCompactionOutcome {
+    pub paths_inspected: usize,
+    pub raw_artifacts_compacted: usize,
+    pub raw_blob_bytes_compacted: u64,
+    pub events_repointed: usize,
+    pub raw_artifacts_skipped: usize,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceFileStatus {
     pub raw_current: bool,
     pub needs_workspace_refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceFileFingerprint {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +484,54 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
+    pub fn source_checkpoint(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+    ) -> Result<Option<SourceCheckpoint>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT source_kind, source_identity, cursor, metadata_json, updated_at
+                 FROM source_checkpoints
+                 WHERE source_kind = ?1 AND source_identity = ?2",
+                params![source_kind, source_identity],
+                row_source_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_source_checkpoint(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+        cursor: Option<&str>,
+        metadata: &Value,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO source_checkpoints
+                 (source_kind, source_identity, cursor, metadata_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_kind, source_identity) DO UPDATE SET
+                   cursor = excluded.cursor,
+                   metadata_json = excluded.metadata_json,
+                   updated_at = excluded.updated_at",
+                params![
+                    source_kind,
+                    source_identity,
+                    cursor,
+                    metadata.to_string(),
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     #[cfg(test)]
     pub fn import_record(&self, record: &ArchiveRecord) -> Result<ImportStats> {
         self.import_records(std::slice::from_ref(record))
@@ -472,7 +550,7 @@ impl Store {
         records: &[ArchiveRecord],
         delta_mode: ImportDeltaMode,
     ) -> Result<ImportStats> {
-        self.with_conn(|conn| {
+        let stats = self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 let mut stats = ImportStats::default();
                 for record in records {
@@ -495,7 +573,11 @@ impl Store {
                 }
                 Ok(stats)
             })
-        })
+        })?;
+        if !stats.delta.touched_paths.is_empty() {
+            self.compact_append_raw_artifacts_for_paths(&stats.delta.touched_paths)?;
+        }
+        Ok(stats)
     }
 
     pub fn export_records(&self) -> Result<Vec<ArchiveRecord>> {
@@ -822,6 +904,46 @@ impl Store {
         })
     }
 
+    pub fn compact_append_raw_artifacts_for_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<RawArtifactCompactionOutcome> {
+        let paths = normalized_string_set(paths);
+        if paths.is_empty() {
+            return Ok(RawArtifactCompactionOutcome::default());
+        }
+        let (mut outcome, raw_hashes) = self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                compact_append_raw_artifacts_tx(tx, &self.blob_dir, Some(&paths), true)
+            })
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &raw_hashes)?;
+        outcome.raw_blobs_deleted = raw_blobs_deleted;
+        outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
+        Ok(outcome)
+    }
+
+    pub fn preview_append_raw_artifact_compaction(&self) -> Result<RawArtifactCompactionOutcome> {
+        self.with_conn(|conn| {
+            compact_append_raw_artifacts_tx(conn, &self.blob_dir, None, false)
+                .map(|(outcome, _)| outcome)
+        })
+    }
+
+    pub fn compact_append_raw_artifacts(&self) -> Result<RawArtifactCompactionOutcome> {
+        let (mut outcome, raw_hashes) = self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                compact_append_raw_artifacts_tx(tx, &self.blob_dir, None, true)
+            })
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &raw_hashes)?;
+        outcome.raw_blobs_deleted = raw_blobs_deleted;
+        outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
+        Ok(outcome)
+    }
+
     pub fn vacuum(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch("VACUUM")
@@ -901,7 +1023,8 @@ impl Store {
                 let total_events: usize = tx.query_row(
                     "SELECT COUNT(*)
                      FROM temp_history_item_event_ids scope
-                     JOIN events e ON e.id = scope.id",
+                     CROSS JOIN events e
+                     WHERE e.id = scope.id",
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
@@ -935,7 +1058,8 @@ impl Store {
                             e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
                             e.occurred_at, e.metadata_json, e.hash
                      FROM temp_history_item_event_ids scope
-                     JOIN events e ON e.id = scope.id
+                     CROSS JOIN events e
+                     WHERE e.id = scope.id
                      ORDER BY e.session_id, e.ordinal, e.id",
                 )?;
                 let rows = stmt.query_map([], row_event)?;
@@ -1025,6 +1149,68 @@ impl Store {
         })
     }
 
+    pub fn source_file_statuses(
+        &self,
+        files: &[SourceFileFingerprint],
+    ) -> Result<HashMap<String, SourceFileStatus>> {
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_conn(|conn| {
+            prepare_temp_source_file_status_scope(conn, files)?;
+            let mut stmt = conn.prepare(
+                "SELECT scope.path,
+                        CASE
+                          WHEN raw.size = scope.size
+                           AND (
+                             raw.mtime_ms = scope.mtime_ms
+                             OR (raw.mtime_ms IS NULL AND scope.mtime_ms IS NULL)
+                           )
+                          THEN 1
+                          ELSE 0
+                        END AS raw_current,
+                        CASE
+                          WHEN raw.size = scope.size
+                           AND (
+                             raw.mtime_ms = scope.mtime_ms
+                             OR (raw.mtime_ms IS NULL AND scope.mtime_ms IS NULL)
+                           )
+                          THEN EXISTS(
+                            SELECT 1
+                            FROM sessions
+                            WHERE json_extract(metadata_json, '$.path') = scope.path
+                              AND json_extract(metadata_json, '$.workspace_path') IS NULL
+                          )
+                          ELSE 0
+                        END AS needs_workspace_refresh
+                 FROM temp_source_file_status_scope scope
+                 LEFT JOIN raw_artifacts raw
+                   ON raw.rowid = (
+                     SELECT latest.rowid
+                     FROM raw_artifacts latest
+                     WHERE latest.path = scope.path
+                     ORDER BY latest.first_seen_at DESC
+                     LIMIT 1
+                   )",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SourceFileStatus {
+                        raw_current: row.get::<_, i64>(1)? != 0,
+                        needs_workspace_refresh: row.get::<_, i64>(2)? != 0,
+                    },
+                ))
+            })?;
+            let mut out = HashMap::with_capacity(files.len());
+            for row in rows {
+                let (path, status) = row?;
+                out.insert(path, status);
+            }
+            Ok(out)
+        })
+    }
+
     #[cfg(test)]
     fn raw_artifact_current_query_plan(&self) -> Result<String> {
         self.with_conn(|conn| {
@@ -1073,6 +1259,28 @@ impl Store {
                      AND json_extract(metadata_json, '$.workspace_path') IS NULL
                  )",
                 ["/tmp/fixture.jsonl"],
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn incremental_history_items_event_lookup_query_plan(
+        &self,
+        event_ids: &[String],
+    ) -> Result<String> {
+        self.with_conn(|conn| {
+            prepare_temp_id_scope(conn, "temp_history_item_event_ids", event_ids)?;
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 SELECT e.id, e.session_id, e.source_id, e.machine_id, e.source_kind,
+                        e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
+                        e.occurred_at, e.metadata_json, e.hash
+                 FROM temp_history_item_event_ids scope
+                 CROSS JOIN events e
+                 WHERE e.id = scope.id
+                 ORDER BY e.session_id, e.ordinal, e.id",
+                [],
             )
         })
     }
@@ -1383,34 +1591,51 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at,
-                            fts.id IS NOT NULL
+                            fts.id IS NOT NULL,
+                            su.event_id IS NOT NULL,
+                            emb.event_id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
                      LEFT JOIN temp_events_fts_event_ids fts
                        ON fts.id = e.id
+                     LEFT JOIN search_units su
+                       ON su.event_id = e.id
+                     LEFT JOIN event_embeddings emb
+                       ON emb.event_id = e.id AND emb.model = ?1
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
                      ORDER BY scope.id",
                     )?;
-                    let rows = stmt.query_map([], |row| {
+                    let rows = stmt.query_map(params![model], |row| {
                         let content: String = row.get(7)?;
-                        Ok(EventForProjection {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            machine_id: row.get(3)?,
-                            source_kind: row.get(4)?,
-                            role: row.get(5)?,
-                            search_kind: row.get(6)?,
-                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                            content,
-                            occurred_at: parse_opt_dt(row.get(8)?),
-                            fts_indexed: row.get(9)?,
-                        })
+                        let fts_indexed: bool = row.get(9)?;
+                        let unit_indexed: bool = row.get(10)?;
+                        let embedding_indexed: bool = row.get(11)?;
+                        Ok((
+                            EventForProjection {
+                                id: row.get(0)?,
+                                session_id: row.get(1)?,
+                                source_id: row.get(2)?,
+                                machine_id: row.get(3)?,
+                                source_kind: row.get(4)?,
+                                role: row.get(5)?,
+                                search_kind: row.get(6)?,
+                                text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                                content,
+                                occurred_at: parse_opt_dt(row.get(8)?),
+                                fts_indexed,
+                            },
+                            fts_indexed && unit_indexed && embedding_indexed,
+                        ))
                     })?;
+                    let mut newly_complete_events = 0usize;
                     for row in rows {
-                        insert_search_index_rows(&tx, &row?, model, dims, &embed)?;
+                        let (event, complete_before) = row?;
+                        insert_search_index_rows(&tx, &event, model, dims, &embed)?;
+                        if !complete_before {
+                            newly_complete_events += 1;
+                        }
                         projected_events += 1;
                         progress(projected_events, total_events);
                     }
@@ -1418,9 +1643,14 @@ impl Store {
                         progress(projected_events, total_events);
                     }
                     drop(stmt);
+                    let indexed_events = indexed_count_after_incremental_refresh(
+                        &tx,
+                        newly_complete_events,
+                        || count_indexed_events(&tx, model),
+                    )?;
+                    update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                    return Ok(projected_events);
                 }
-                let indexed_events = count_indexed_events(&tx, model)?;
-                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
                 Ok(projected_events)
             })
         })
@@ -1458,11 +1688,14 @@ impl Store {
                             json_extract(e.metadata_json, '$.search_kind'),
                             json_extract(e.metadata_json, '$.search_text'),
                             e.occurred_at,
-                            fts.id IS NOT NULL
+                            fts.id IS NOT NULL,
+                            su.event_id IS NOT NULL
                      FROM temp_search_index_event_ids scope
                      CROSS JOIN events e
                      LEFT JOIN temp_events_fts_event_ids fts
                        ON fts.id = e.id
+                     LEFT JOIN search_units su
+                       ON su.event_id = e.id
                      WHERE e.id = scope.id
                        AND json_extract(e.metadata_json, '$.search_indexable') = 1
                        AND length(trim(json_extract(e.metadata_json, '$.search_text'))) > 0
@@ -1470,22 +1703,32 @@ impl Store {
                     )?;
                     let rows = stmt.query_map([], |row| {
                         let content: String = row.get(7)?;
-                        Ok(EventForProjection {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            machine_id: row.get(3)?,
-                            source_kind: row.get(4)?,
-                            role: row.get(5)?,
-                            search_kind: row.get(6)?,
-                            text_hash: crate::archive::blake3_hex(content.as_bytes()),
-                            content,
-                            occurred_at: parse_opt_dt(row.get(8)?),
-                            fts_indexed: row.get(9)?,
-                        })
+                        let fts_indexed: bool = row.get(9)?;
+                        let unit_indexed: bool = row.get(10)?;
+                        Ok((
+                            EventForProjection {
+                                id: row.get(0)?,
+                                session_id: row.get(1)?,
+                                source_id: row.get(2)?,
+                                machine_id: row.get(3)?,
+                                source_kind: row.get(4)?,
+                                role: row.get(5)?,
+                                search_kind: row.get(6)?,
+                                text_hash: crate::archive::blake3_hex(content.as_bytes()),
+                                content,
+                                occurred_at: parse_opt_dt(row.get(8)?),
+                                fts_indexed,
+                            },
+                            fts_indexed && unit_indexed,
+                        ))
                     })?;
+                    let mut newly_complete_events = 0usize;
                     for row in rows {
-                        insert_search_text_index_rows(&tx, &row?)?;
+                        let (event, complete_before) = row?;
+                        insert_search_text_index_rows(&tx, &event)?;
+                        if !complete_before {
+                            newly_complete_events += 1;
+                        }
                         projected_events += 1;
                         progress(projected_events, total_events);
                     }
@@ -1493,9 +1736,14 @@ impl Store {
                         progress(projected_events, total_events);
                     }
                     drop(stmt);
+                    let indexed_events = indexed_count_after_incremental_refresh(
+                        &tx,
+                        newly_complete_events,
+                        || count_text_indexed_events(&tx),
+                    )?;
+                    update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
+                    return Ok(projected_events);
                 }
-                let indexed_events = count_text_indexed_events(&tx)?;
-                update_projection_status(&tx, "search_rrf_v1", indexed_events)?;
                 Ok(projected_events)
             })
         })
@@ -2588,6 +2836,149 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RawArtifactCompactionRow {
+    rowid: i64,
+    hash: String,
+    path: String,
+    size: u64,
+    first_seen_at: String,
+}
+
+fn compact_append_raw_artifacts_tx(
+    conn: &Connection,
+    blob_dir: &Path,
+    paths: Option<&HashSet<String>>,
+    apply: bool,
+) -> Result<(RawArtifactCompactionOutcome, Vec<String>)> {
+    let rows = raw_artifact_compaction_rows(conn, paths)?;
+    let mut by_path: HashMap<String, Vec<RawArtifactCompactionRow>> = HashMap::new();
+    for row in rows {
+        by_path.entry(row.path.clone()).or_default().push(row);
+    }
+
+    let mut outcome = RawArtifactCompactionOutcome {
+        paths_inspected: by_path.len(),
+        ..RawArtifactCompactionOutcome::default()
+    };
+    let mut raw_hashes_to_delete = Vec::new();
+
+    for (_path, mut rows) in by_path {
+        if rows.len() < 2 {
+            continue;
+        }
+        rows.sort_by(|left, right| {
+            left.first_seen_at
+                .cmp(&right.first_seen_at)
+                .then(left.rowid.cmp(&right.rowid))
+        });
+        let Some(keep) = rows.last().cloned() else {
+            continue;
+        };
+        let keep_path = blob_path(blob_dir, &keep.hash);
+        if !keep_path.exists() {
+            outcome.raw_artifacts_skipped += rows.len().saturating_sub(1);
+            continue;
+        }
+
+        for old in rows.iter().filter(|row| row.hash != keep.hash) {
+            let old_path = blob_path(blob_dir, &old.hash);
+            if !old_path.exists()
+                || old.size > keep.size
+                || !blob_file_is_prefix(&old_path, &keep_path, old.size, keep.size)?
+            {
+                outcome.raw_artifacts_skipped += 1;
+                continue;
+            }
+
+            let events_repointed = count_events_for_raw_artifact(conn, &old.hash)?;
+            if apply {
+                conn.execute(
+                    "UPDATE events
+                     SET raw_artifact_hash = ?2,
+                         metadata_json = CASE
+                           WHEN json_valid(metadata_json)
+                           THEN json_set(metadata_json, '$.raw_artifact_hash', ?2)
+                           ELSE metadata_json
+                         END
+                     WHERE raw_artifact_hash = ?1",
+                    params![old.hash, keep.hash],
+                )?;
+                conn.execute(
+                    "DELETE FROM raw_artifacts WHERE hash = ?1",
+                    params![old.hash],
+                )?;
+                raw_hashes_to_delete.push(old.hash.clone());
+            }
+            outcome.raw_artifacts_compacted += 1;
+            outcome.raw_blob_bytes_compacted += old.size;
+            outcome.events_repointed += events_repointed;
+        }
+    }
+
+    Ok((outcome, raw_hashes_to_delete))
+}
+
+fn raw_artifact_compaction_rows(
+    conn: &Connection,
+    paths: Option<&HashSet<String>>,
+) -> Result<Vec<RawArtifactCompactionRow>> {
+    let mut rows = Vec::new();
+    if let Some(paths) = paths {
+        if paths.is_empty() {
+            return Ok(rows);
+        }
+        let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let placeholders = placeholders(paths.len());
+        let sql = format!(
+            "SELECT rowid, hash, path, size, first_seen_at
+             FROM raw_artifacts
+             WHERE path IN ({placeholders})
+             ORDER BY path, first_seen_at, rowid"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map(params_from_iter(paths), row_raw_artifact_compaction)?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, hash, path, size, first_seen_at
+             FROM raw_artifacts
+             WHERE path IN (
+               SELECT path FROM raw_artifacts GROUP BY path HAVING COUNT(*) > 1
+             )
+             ORDER BY path, first_seen_at, rowid",
+        )?;
+        let mapped = stmt.query_map([], row_raw_artifact_compaction)?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
+}
+
+fn row_raw_artifact_compaction(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawArtifactCompactionRow> {
+    Ok(RawArtifactCompactionRow {
+        rowid: row.get(0)?,
+        hash: row.get(1)?,
+        path: row.get(2)?,
+        size: row.get::<_, i64>(3)? as u64,
+        first_seen_at: row.get(4)?,
+    })
+}
+
+fn count_events_for_raw_artifact(conn: &Connection, hash: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE raw_artifact_hash = ?1",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 fn remove_raw_artifact_blobs(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64)> {
     let mut deleted = 0;
     let mut bytes = 0;
@@ -3157,6 +3548,41 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
     Ok(())
 }
 
+fn prepare_temp_source_file_status_scope(
+    conn: &Connection,
+    files: &[SourceFileFingerprint],
+) -> Result<()> {
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS temp_source_file_status_scope
+         (path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ms INTEGER) WITHOUT ROWID",
+        [],
+    )?;
+    conn.execute("DELETE FROM temp_source_file_status_scope", [])?;
+    for chunk in files.chunks(SQLITE_BIND_CHUNK_SIZE) {
+        let values = std::iter::repeat("(?, ?, ?)")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut params = Vec::with_capacity(chunk.len() * 3);
+        for file in chunk {
+            params.push(SqlValue::Text(file.path.clone()));
+            params.push(SqlValue::Integer(file.size as i64));
+            params.push(match file.mtime_ms {
+                Some(mtime_ms) => SqlValue::Integer(mtime_ms),
+                None => SqlValue::Null,
+            });
+        }
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO temp_source_file_status_scope
+                 (path, size, mtime_ms) VALUES {values}"
+            ),
+            params_from_iter(params),
+        )?;
+    }
+    Ok(())
+}
+
 fn prepare_temp_events_fts_scope(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TEMP TABLE IF NOT EXISTS temp_events_fts_event_ids
@@ -3410,6 +3836,18 @@ fn migrate(conn: &Connection) -> Result<()> {
           updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS source_checkpoints (
+          source_kind TEXT NOT NULL,
+          source_identity TEXT NOT NULL,
+          cursor TEXT,
+          metadata_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source_kind, source_identity)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_checkpoints_kind_updated
+          ON source_checkpoints(source_kind, updated_at);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
           event_id UNINDEXED,
           session_id UNINDEXED,
@@ -3578,6 +4016,40 @@ fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
 fn read_blob(blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
     let path = blob_path(blob_dir, hash);
     std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))
+}
+
+fn blob_file_is_prefix(
+    prefix_path: &Path,
+    full_path: &Path,
+    prefix_size: u64,
+    full_size: u64,
+) -> Result<bool> {
+    if prefix_size > full_size {
+        return Ok(false);
+    }
+
+    let mut prefix = File::open(prefix_path)
+        .with_context(|| format!("opening blob {}", prefix_path.display()))?;
+    let mut full =
+        File::open(full_path).with_context(|| format!("opening blob {}", full_path.display()))?;
+    let mut prefix_buf = vec![0; 1024 * 1024];
+    let mut full_buf = vec![0; 1024 * 1024];
+    let mut remaining = prefix_size;
+
+    while remaining > 0 {
+        let to_read = remaining.min(prefix_buf.len() as u64) as usize;
+        prefix
+            .read_exact(&mut prefix_buf[..to_read])
+            .with_context(|| format!("reading blob {}", prefix_path.display()))?;
+        full.read_exact(&mut full_buf[..to_read])
+            .with_context(|| format!("reading blob {}", full_path.display()))?;
+        if prefix_buf[..to_read] != full_buf[..to_read] {
+            return Ok(false);
+        }
+        remaining -= to_read as u64;
+    }
+
+    Ok(true)
 }
 
 fn blob_path(blob_dir: &Path, hash: &str) -> PathBuf {
@@ -3931,18 +4403,31 @@ fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
 fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
     let search_units: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
-    let fts_events: i64 =
-        conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
     let embeddings: i64 = conn.query_row(
         "SELECT COUNT(*) FROM event_embeddings WHERE model = ?1",
         params![model],
         |row| row.get(0),
     )?;
 
-    if search_units > 0 && search_units == fts_events && search_units == embeddings {
+    if embeddings < search_units {
+        return Ok(true);
+    }
+    if let Some(indexed_events) = projection_status_count(conn, "search_rrf_v1")? {
+        let indexed_events = indexed_events as i64;
+        if search_units > 0 && indexed_events == search_units {
+            return Ok(false);
+        }
+        if indexed_events < search_units {
+            return Ok(true);
+        }
+    }
+
+    let fts_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
+    if search_units > 0 && search_units == fts_events && search_units <= embeddings {
         return Ok(false);
     }
-    if fts_events < search_units || embeddings < search_units {
+    if fts_events < search_units {
         return Ok(true);
     }
 
@@ -3953,9 +4438,19 @@ fn search_index_needs_repair(conn: &Connection, model: &str) -> Result<bool> {
 fn search_text_index_needs_repair(conn: &Connection) -> Result<bool> {
     let search_units: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_units", [], |row| row.get(0))?;
+
+    if let Some(indexed_events) = projection_status_count(conn, "search_rrf_v1")? {
+        let indexed_events = indexed_events as i64;
+        if search_units > 0 && indexed_events == search_units {
+            return Ok(false);
+        }
+        if indexed_events < search_units {
+            return Ok(true);
+        }
+    }
+
     let fts_events: i64 =
         conn.query_row("SELECT COUNT(*) FROM events_fts", [], |row| row.get(0))?;
-
     if search_units > 0 && search_units == fts_events {
         return Ok(false);
     }
@@ -4188,6 +4683,18 @@ fn count_text_indexed_events(conn: &Connection) -> Result<usize> {
     Ok(fts_count.min(unit_count) as usize)
 }
 
+fn indexed_count_after_incremental_refresh(
+    conn: &Connection,
+    newly_complete_events: usize,
+    fallback: impl FnOnce() -> Result<usize>,
+) -> Result<usize> {
+    if let Some(current_count) = projection_status_count(conn, "search_rrf_v1")? {
+        Ok(current_count.saturating_add(newly_complete_events))
+    } else {
+        fallback()
+    }
+}
+
 fn projection_status_ready(conn: &Connection, name: &str) -> Result<bool> {
     let ready: i64 = conn.query_row(
         "SELECT EXISTS(
@@ -4309,12 +4816,15 @@ fn conversation_history_text(event: &EventRecord) -> Option<(String, &str)> {
         .to_ascii_lowercase();
     match kind.as_str() {
         "user" | "assistant" => Some((kind, text)),
-        "conversation" => event
-            .role
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .filter(|role| role == "user" || role == "assistant")
-            .map(|role| (role, text)),
+        "conversation" => {
+            let kind = event
+                .role
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .filter(|role| role == "user" || role == "assistant")
+                .unwrap_or_else(|| "conversation".to_string());
+            Some((kind, text))
+        }
         "thinking" | "reasoning" => Some(("thinking".to_string(), text)),
         _ => None,
     }
@@ -4487,6 +4997,18 @@ fn row_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRecord> {
         first_seen_at: parse_dt(row.get::<_, String>(4)?),
         updated_at: parse_dt(row.get::<_, String>(5)?),
         hash: row.get(6)?,
+    })
+}
+
+#[allow(dead_code)]
+fn row_source_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceCheckpoint> {
+    let metadata_json: String = row.get(3)?;
+    Ok(SourceCheckpoint {
+        source_kind: row.get(0)?,
+        source_identity: row.get(1)?,
+        cursor: row.get(2)?,
+        metadata: serde_json::from_str(&metadata_json).unwrap_or(Value::Null),
+        updated_at: parse_dt(row.get(4)?),
     })
 }
 
@@ -5350,6 +5872,39 @@ mod tests {
     }
 
     #[test]
+    fn history_item_projector_honors_roleless_conversation_segments() {
+        let source = fixture_source("source_roleless_conversation");
+        let session = fixture_session("session_roleless_conversation", &source.id);
+        let mut event = fixture_event(
+            "event_roleless_conversation",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_roleless_conversation",
+        );
+        event.role = None;
+        event.event_type = "event".to_string();
+        event.content =
+            r#"{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}"#
+                .to_string();
+        event.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "conversation",
+            "search_text": "hello\nhi"
+        });
+
+        let items = history_items_from_event(&event).expect("history items");
+
+        assert_eq!(
+            tier_kinds(&items),
+            vec![("conversation", "conversation"), ("raw", "event")]
+        );
+        assert_eq!(items[0].text, "hello\nhi");
+        assert_eq!(items[0].semantic_policy, "required");
+    }
+
+    #[test]
     fn clean_transcript_context_marks_hidden_raw_target_as_omitted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -5434,6 +5989,23 @@ mod tests {
     fn update_hot_path_query_plans_are_visible() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_query_plan");
+        let session = fixture_session("session_query_plan", &source.id);
+        let event = fixture_event(
+            "event_query_plan",
+            &session.id,
+            &source.id,
+            1,
+            Some("user"),
+            "event_hash_query_plan",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event.clone()),
+            ])
+            .expect("import query plan fixture");
 
         let raw_plan = store
             .raw_artifact_current_query_plan()
@@ -5444,6 +6016,9 @@ mod tests {
         let index_plan = store
             .search_index_missing_rows_query_plan()
             .expect("search index plan");
+        let history_plan = store
+            .incremental_history_items_event_lookup_query_plan(&[event.id])
+            .expect("history item event lookup plan");
 
         assert!(
             raw_plan.contains("SEARCH raw_artifacts"),
@@ -5457,6 +6032,199 @@ mod tests {
             index_plan.contains("SCAN e") || index_plan.contains("SCAN events"),
             "unexpected search index missing-row plan:\n{index_plan}"
         );
+        assert!(
+            history_plan.contains("SCAN scope"),
+            "incremental history projection should start from scoped event ids:\n{history_plan}"
+        );
+        assert!(
+            history_plan.contains("SEARCH e"),
+            "incremental history projection should look up events by id:\n{history_plan}"
+        );
+    }
+
+    #[test]
+    fn incremental_text_index_refresh_advances_projection_status_from_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_incremental_index_status");
+        let session = fixture_session("session_incremental_index_status", &source.id);
+        let first = fixture_event(
+            "event_incremental_index_status_first",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_incremental_index_status_first",
+        );
+        let second = fixture_event(
+            "event_incremental_index_status_second",
+            &session.id,
+            &source.id,
+            2,
+            None,
+            "event_hash_incremental_index_status_second",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(first.clone()),
+                ArchiveRecord::Event(second.clone()),
+            ])
+            .expect("import events");
+
+        assert_eq!(
+            store
+                .refresh_search_text_index_for_events_with_progress(
+                    std::slice::from_ref(&first.id),
+                    |_, _| {}
+                )
+                .expect("index first event"),
+            1
+        );
+        let first_count = store
+            .with_conn(|conn| projection_status_count(conn, "search_rrf_v1"))
+            .expect("projection status")
+            .expect("ready projection status");
+        assert_eq!(first_count, 1);
+
+        assert_eq!(
+            store
+                .refresh_search_text_index_for_events_with_progress(
+                    &[first.id.clone(), second.id.clone()],
+                    |_, _| {}
+                )
+                .expect("index first and second event"),
+            2
+        );
+        let second_count = store
+            .with_conn(|conn| projection_status_count(conn, "search_rrf_v1"))
+            .expect("projection status")
+            .expect("ready projection status");
+        assert_eq!(second_count, 2);
+    }
+
+    #[test]
+    fn search_text_repair_check_uses_ready_status_and_detects_stale_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_text_repair_status");
+        let session = fixture_session("session_text_repair_status", &source.id);
+        let event = fixture_event(
+            "event_text_repair_status",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_text_repair_status",
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event.clone()),
+            ])
+            .expect("import event");
+        store
+            .refresh_search_text_index_for_events_with_progress(
+                std::slice::from_ref(&event.id),
+                |_, _| {},
+            )
+            .expect("index event");
+
+        assert!(!store
+            .search_text_index_needs_repair()
+            .expect("ready status should be healthy"));
+
+        store
+            .with_conn(|conn| update_projection_status(conn, "search_rrf_v1", 0))
+            .expect("make status stale");
+        assert!(store
+            .search_text_index_needs_repair()
+            .expect("stale status should need repair"));
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM projection_status WHERE projection_name = ?1",
+                    params!["search_rrf_v1"],
+                )?;
+                Ok(())
+            })
+            .expect("remove status");
+        assert!(!store
+            .search_text_index_needs_repair()
+            .expect("missing status should fall back to full check"));
+    }
+
+    #[test]
+    fn batched_source_file_statuses_match_individual_statuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_batched_status");
+        let current_path = "/tmp/batched-current.jsonl";
+        let changed_path = "/tmp/batched-changed.jsonl";
+        let missing_path = "/tmp/batched-missing.jsonl";
+        let mut current_raw = fixture_raw_artifact(&source.id);
+        current_raw.hash = "raw_batched_current".to_string();
+        current_raw.path = current_path.to_string();
+        current_raw.size = 10;
+        current_raw.mtime_ms = Some(100);
+        let mut changed_raw = fixture_raw_artifact(&source.id);
+        changed_raw.hash = "raw_batched_changed".to_string();
+        changed_raw.path = changed_path.to_string();
+        changed_raw.size = 20;
+        changed_raw.mtime_ms = Some(200);
+        let mut legacy_session = fixture_session("session_batched_status", &source.id);
+        legacy_session.metadata = json!({"path": current_path});
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::RawArtifact(current_raw),
+                ArchiveRecord::RawArtifact(changed_raw),
+                ArchiveRecord::Session(legacy_session),
+            ])
+            .expect("import fixtures");
+        let fingerprints = vec![
+            SourceFileFingerprint {
+                path: current_path.to_string(),
+                size: 10,
+                mtime_ms: Some(100),
+            },
+            SourceFileFingerprint {
+                path: changed_path.to_string(),
+                size: 21,
+                mtime_ms: Some(200),
+            },
+            SourceFileFingerprint {
+                path: missing_path.to_string(),
+                size: 1,
+                mtime_ms: None,
+            },
+        ];
+
+        let batched = store
+            .source_file_statuses(&fingerprints)
+            .expect("batched statuses");
+
+        for fingerprint in &fingerprints {
+            let individual = store
+                .source_file_status(&fingerprint.path, fingerprint.size, fingerprint.mtime_ms)
+                .expect("individual status");
+            let batched_status = batched
+                .get(&fingerprint.path)
+                .copied()
+                .expect("batched status");
+            assert_eq!(batched_status.raw_current, individual.raw_current);
+            assert_eq!(
+                batched_status.needs_workspace_refresh,
+                individual.needs_workspace_refresh
+            );
+        }
+        assert!(batched[current_path].raw_current);
+        assert!(batched[current_path].needs_workspace_refresh);
+        assert!(!batched[changed_path].raw_current);
+        assert!(!batched[missing_path].raw_current);
     }
 
     #[test]

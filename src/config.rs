@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub machine_id: String,
     pub embedder: EmbedderConfig,
     pub default_search_mode: SearchMode,
+    pub sources: SourceConfigs,
 }
 
 impl AppConfig {
@@ -28,6 +29,7 @@ impl AppConfig {
             machine_id,
             embedder,
             default_search_mode: file_config.search.default_mode,
+            sources: file_config.sources,
         })
     }
 }
@@ -38,6 +40,8 @@ struct FileConfig {
     search: SearchConfig,
     #[serde(default)]
     embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    sources: SourceConfigs,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +74,27 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourceConfigs {
+    #[serde(default)]
+    pub treechat: TreechatSourceConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TreechatSourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub profile: Option<String>,
+    pub backend_url: Option<String>,
+    pub app_host: Option<String>,
+    pub access_token: Option<String>,
+    pub client: Option<String>,
+    pub uid: Option<String>,
+    pub page_limit: Option<usize>,
+    pub thread_limit: Option<usize>,
+    pub content_scope: Option<String>,
+}
+
 pub fn resolve_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
     match data_dir {
         Some(path) => Ok(expand_home(path)),
@@ -85,7 +110,19 @@ pub fn load_embeddings_enabled(data_dir: &Path) -> Result<bool> {
     Ok(load_file_config(data_dir)?.embeddings.enabled)
 }
 
+pub fn load_treechat_enabled(data_dir: &Path) -> Result<bool> {
+    Ok(load_file_config(data_dir)?.sources.treechat.enabled)
+}
+
 pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
+    set_config_bool(data_dir, &["embeddings", "enabled"], enabled)
+}
+
+pub fn set_treechat_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
+    set_config_bool(data_dir, &["sources", "treechat", "enabled"], enabled)
+}
+
+fn set_config_bool(data_dir: &Path, path_parts: &[&str], enabled: bool) -> Result<PathBuf> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
     let path = config_path(data_dir);
@@ -100,16 +137,20 @@ pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf>
     let root = value
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root must be a TOML table"))?;
-    let embeddings = root
-        .entry("embeddings".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if !embeddings.is_table() {
-        *embeddings = toml::Value::Table(toml::map::Map::new());
+    let Some((last, parents)) = path_parts.split_last() else {
+        anyhow::bail!("config path must not be empty");
+    };
+    let mut cursor = root;
+    for part in parents {
+        let value = cursor
+            .entry((*part).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !value.is_table() {
+            *value = toml::Value::Table(toml::map::Map::new());
+        }
+        cursor = value.as_table_mut().expect("config table");
     }
-    embeddings
-        .as_table_mut()
-        .expect("embeddings table")
-        .insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    cursor.insert((*last).to_string(), toml::Value::Boolean(enabled));
     fs::write(
         &path,
         toml::to_string_pretty(&value).context("serializing config")?,
@@ -124,6 +165,7 @@ fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
         return Ok(FileConfig {
             search: SearchConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            sources: SourceConfigs::default(),
         });
     }
     let text = std::fs::read_to_string(&path)
@@ -229,6 +271,18 @@ mod tests {
         assert_eq!(path, dir.path().join("config.toml"));
         assert!(config.embedder.is_disabled());
         assert!(!load_embeddings_enabled(dir.path()).expect("load embeddings config"));
+    }
+
+    #[test]
+    fn config_file_can_persist_treechat_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let path = set_treechat_enabled(dir.path(), true).expect("write treechat config");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert_eq!(path, dir.path().join("config.toml"));
+        assert!(config.sources.treechat.enabled);
+        assert!(load_treechat_enabled(dir.path()).expect("load treechat config"));
     }
 
     #[test]

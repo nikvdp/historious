@@ -8,9 +8,11 @@ mod output;
 mod search;
 mod server;
 mod skills;
+mod source;
 mod storage;
 mod transcript;
 mod transport;
+mod treechat;
 
 use anyhow::Result;
 use clap::Parser;
