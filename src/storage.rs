@@ -914,7 +914,27 @@ impl Store {
         }
         let (mut outcome, raw_hashes) = self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
-                compact_append_raw_artifacts_tx(tx, &self.blob_dir, Some(&paths))
+                compact_append_raw_artifacts_tx(tx, &self.blob_dir, Some(&paths), true)
+            })
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &raw_hashes)?;
+        outcome.raw_blobs_deleted = raw_blobs_deleted;
+        outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
+        Ok(outcome)
+    }
+
+    pub fn preview_append_raw_artifact_compaction(&self) -> Result<RawArtifactCompactionOutcome> {
+        self.with_conn(|conn| {
+            compact_append_raw_artifacts_tx(conn, &self.blob_dir, None, false)
+                .map(|(outcome, _)| outcome)
+        })
+    }
+
+    pub fn compact_append_raw_artifacts(&self) -> Result<RawArtifactCompactionOutcome> {
+        let (mut outcome, raw_hashes) = self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                compact_append_raw_artifacts_tx(tx, &self.blob_dir, None, true)
             })
         })?;
         let (raw_blobs_deleted, raw_blob_bytes_deleted) =
@@ -2829,6 +2849,7 @@ fn compact_append_raw_artifacts_tx(
     conn: &Connection,
     blob_dir: &Path,
     paths: Option<&HashSet<String>>,
+    apply: bool,
 ) -> Result<(RawArtifactCompactionOutcome, Vec<String>)> {
     let rows = raw_artifact_compaction_rows(conn, paths)?;
     let mut by_path: HashMap<String, Vec<RawArtifactCompactionRow>> = HashMap::new();
@@ -2870,25 +2891,28 @@ fn compact_append_raw_artifacts_tx(
                 continue;
             }
 
-            let events_repointed = conn.execute(
-                "UPDATE events
-                 SET raw_artifact_hash = ?2,
-                     metadata_json = CASE
-                       WHEN json_valid(metadata_json)
-                       THEN json_set(metadata_json, '$.raw_artifact_hash', ?2)
-                       ELSE metadata_json
-                     END
-                 WHERE raw_artifact_hash = ?1",
-                params![old.hash, keep.hash],
-            )?;
-            conn.execute(
-                "DELETE FROM raw_artifacts WHERE hash = ?1",
-                params![old.hash],
-            )?;
+            let events_repointed = count_events_for_raw_artifact(conn, &old.hash)?;
+            if apply {
+                conn.execute(
+                    "UPDATE events
+                     SET raw_artifact_hash = ?2,
+                         metadata_json = CASE
+                           WHEN json_valid(metadata_json)
+                           THEN json_set(metadata_json, '$.raw_artifact_hash', ?2)
+                           ELSE metadata_json
+                         END
+                     WHERE raw_artifact_hash = ?1",
+                    params![old.hash, keep.hash],
+                )?;
+                conn.execute(
+                    "DELETE FROM raw_artifacts WHERE hash = ?1",
+                    params![old.hash],
+                )?;
+                raw_hashes_to_delete.push(old.hash.clone());
+            }
             outcome.raw_artifacts_compacted += 1;
             outcome.raw_blob_bytes_compacted += old.size;
             outcome.events_repointed += events_repointed;
-            raw_hashes_to_delete.push(old.hash.clone());
         }
     }
 
@@ -2944,6 +2968,15 @@ fn row_raw_artifact_compaction(
         size: row.get::<_, i64>(3)? as u64,
         first_seen_at: row.get(4)?,
     })
+}
+
+fn count_events_for_raw_artifact(conn: &Connection, hash: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE raw_artifact_hash = ?1",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 fn remove_raw_artifact_blobs(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64)> {
