@@ -2059,9 +2059,28 @@ struct HistoryItemOutput {
 struct StatusOutput {
     data_dir: String,
     db_path: String,
+    config: StatusConfigOutput,
+    disk_usage: StatusDiskUsageOutput,
     stats: crate::storage::ArchiveStats,
     query_embedder: crate::embed::EmbedderStatus,
     query_embedder_probe: Option<EmbedderProbeOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusConfigOutput {
+    machine_id: String,
+    default_search_mode: search::SearchMode,
+    embeddings_enabled: bool,
+    treechat_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusDiskUsageOutput {
+    total_bytes: u64,
+    database_bytes: u64,
+    raw_blobs_bytes: u64,
+    models_bytes: u64,
+    other_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2708,9 +2727,17 @@ fn embedding_refresh_from_import_stats(
 }
 
 fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
+    let disk_usage = status_disk_usage(&config.data_dir, store.db_path());
     Ok(StatusOutput {
         data_dir: config.data_dir.display().to_string(),
         db_path: store.db_path().display().to_string(),
+        config: StatusConfigOutput {
+            machine_id: config.machine_id.clone(),
+            default_search_mode: config.default_search_mode,
+            embeddings_enabled: !config.embedder.is_disabled(),
+            treechat_enabled: config.sources.treechat.enabled,
+        },
+        disk_usage,
         stats: store.stats()?,
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
@@ -2749,6 +2776,49 @@ fn degraded_probe(err: impl std::fmt::Display) -> EmbedderProbeOutput {
         sample_dims: None,
         reason: Some(format!("{err:#}")),
     }
+}
+
+fn status_disk_usage(data_dir: &Path, db_path: &Path) -> StatusDiskUsageOutput {
+    let database_bytes = database_file_bytes(db_path);
+    let raw_blobs_bytes = path_bytes(&data_dir.join("blobs"));
+    let models_bytes = path_bytes(&data_dir.join("models"));
+    let total_bytes = path_bytes(data_dir);
+    let other_bytes = total_bytes.saturating_sub(database_bytes + raw_blobs_bytes + models_bytes);
+    StatusDiskUsageOutput {
+        total_bytes,
+        database_bytes,
+        raw_blobs_bytes,
+        models_bytes,
+        other_bytes,
+    }
+}
+
+fn database_file_bytes(db_path: &Path) -> u64 {
+    let mut bytes = path_bytes(db_path);
+    for suffix in ["-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.to_string_lossy()));
+        bytes += path_bytes(&path);
+    }
+    bytes
+}
+
+fn path_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| path_bytes(&entry.path()))
+        .sum()
 }
 
 fn print_update_output(output: &UpdateOutput, color: bool) {
@@ -3222,7 +3292,15 @@ fn compact_path(path: &Path) -> String {
 }
 
 fn format_count(value: usize) -> String {
+    format_number_text(&value.to_string())
+}
+
+fn format_count_u64(value: u64) -> String {
     let text = value.to_string();
+    format_number_text(&text)
+}
+
+fn format_number_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + text.len() / 3);
     for (idx, ch) in text.chars().rev().enumerate() {
         if idx > 0 && idx % 3 == 0 {
@@ -3520,45 +3598,172 @@ fn format_elapsed(duration: Duration) -> String {
 }
 
 fn print_status_output(output: &StatusOutput) {
-    println!("data_dir={}", output.data_dir);
-    println!("db_path={}", output.db_path);
-    println!("sources={}", output.stats.sources);
-    println!("raw_artifacts={}", output.stats.raw_artifacts);
-    println!("sessions={}", output.stats.sessions);
-    println!("events={}", output.stats.events);
-    println!("history_items={}", output.stats.history_items);
-    println!("search_units={}", output.stats.search_units);
-    println!("embeddings={}", output.stats.embeddings);
-    println!(
-        "query_embedder={} semantic={} available={} intra_threads={} degraded_reason={}",
-        output.query_embedder.provider,
-        output.query_embedder.semantic,
-        output.query_embedder.available,
-        output
-            .query_embedder
-            .intra_threads
-            .map(|threads| threads.to_string())
-            .unwrap_or_else(|| "n/a".to_string()),
-        output
-            .query_embedder
-            .degraded_reason
-            .clone()
-            .unwrap_or_else(|| "none".to_string())
+    let color = std::io::stdout().is_terminal();
+    println!();
+    println!("{}", styled("Historious status", "1;32", color));
+    println!("  {}", status_summary(output));
+    print_section(
+        "Search",
+        &[
+            (
+                "Default mode",
+                output.config.default_search_mode.as_str().to_string(),
+            ),
+            ("Semantic search", semantic_status(output)),
+            ("Query embedder", embedder_status(output)),
+            ("Embedder threads", embedder_threads(output)),
+        ],
+        color,
     );
+    if let Some(reason) = output.query_embedder.degraded_reason.as_deref() {
+        print_section(
+            "Attention",
+            &[("Semantic fallback", reason.to_string())],
+            color,
+        );
+    }
     if let Some(probe) = &output.query_embedder_probe {
         match probe.status {
-            EmbedderProbeStatus::Ready => println!(
-                "query_embedder_probe=ready model_id={} dims={} semantic={} sample_dims={}",
-                probe.model_id.as_deref().unwrap_or("unknown"),
-                probe.dims.unwrap_or(0),
-                probe.semantic.unwrap_or(false),
-                probe.sample_dims.unwrap_or(0)
+            EmbedderProbeStatus::Ready => print_section(
+                "Embedder probe",
+                &[
+                    ("Status", "ready".to_string()),
+                    (
+                        "Model",
+                        probe.model_id.as_deref().unwrap_or("unknown").to_string(),
+                    ),
+                    ("Dimensions", probe.dims.unwrap_or(0).to_string()),
+                    ("Sample vector", probe.sample_dims.unwrap_or(0).to_string()),
+                ],
+                color,
             ),
-            EmbedderProbeStatus::Degraded => println!(
-                "query_embedder_probe=degraded reason={}",
-                probe.reason.as_deref().unwrap_or("unknown")
+            EmbedderProbeStatus::Degraded => print_section(
+                "Embedder probe",
+                &[
+                    ("Status", "degraded".to_string()),
+                    (
+                        "Reason",
+                        probe.reason.as_deref().unwrap_or("unknown").to_string(),
+                    ),
+                ],
+                color,
             ),
         }
+    }
+    print_section(
+        "Indexed history",
+        &[
+            ("Sessions", format_count_u64(output.stats.sessions)),
+            (
+                "History items",
+                format_count_u64(output.stats.history_items),
+            ),
+            ("Events", format_count_u64(output.stats.events)),
+            ("Sources", format_count_u64(output.stats.sources)),
+            (
+                "Raw artifacts",
+                format_count_u64(output.stats.raw_artifacts),
+            ),
+            ("Search units", format_count_u64(output.stats.search_units)),
+            ("Embeddings", format_count_u64(output.stats.embeddings)),
+        ],
+        color,
+    );
+    print_section(
+        "Disk usage",
+        &[
+            ("Total", format_bytes(output.disk_usage.total_bytes)),
+            (
+                "Database + indexes",
+                format_bytes(output.disk_usage.database_bytes),
+            ),
+            ("Raw blobs", format_bytes(output.disk_usage.raw_blobs_bytes)),
+            ("Models", format_bytes(output.disk_usage.models_bytes)),
+            (
+                "Other app files",
+                format_bytes(output.disk_usage.other_bytes),
+            ),
+        ],
+        color,
+    );
+    print_section(
+        "Config",
+        &[
+            (
+                "Embeddings",
+                enabled_label(output.config.embeddings_enabled).to_string(),
+            ),
+            (
+                "Treechat",
+                enabled_label(output.config.treechat_enabled).to_string(),
+            ),
+            ("Machine", output.config.machine_id.clone()),
+        ],
+        color,
+    );
+    print_section(
+        "Storage",
+        &[
+            ("Data directory", output.data_dir.clone()),
+            ("Database", output.db_path.clone()),
+        ],
+        color,
+    );
+}
+
+fn status_summary(output: &StatusOutput) -> String {
+    if output.stats.history_items > 0 {
+        format!(
+            "{} sessions indexed into {} searchable history items.",
+            format_count_u64(output.stats.sessions),
+            format_count_u64(output.stats.history_items)
+        )
+    } else if output.stats.events > 0 {
+        format!(
+            "{} events indexed; history-item projection has not been built yet.",
+            format_count_u64(output.stats.events)
+        )
+    } else {
+        "No indexed history yet. Run `histo update` when you are ready to ingest local sessions."
+            .to_string()
+    }
+}
+
+fn semantic_status(output: &StatusOutput) -> String {
+    if output.query_embedder.semantic && output.query_embedder.available {
+        "available".to_string()
+    } else if output.config.default_search_mode == search::SearchMode::Semantic {
+        "unavailable for semantic-only searches".to_string()
+    } else {
+        "not available; lexical search is available".to_string()
+    }
+}
+
+fn embedder_status(output: &StatusOutput) -> String {
+    let mut label = output.query_embedder.provider.clone();
+    if let Some(model_id) = output.query_embedder.model_id.as_deref() {
+        label.push_str(" / ");
+        label.push_str(model_id);
+    }
+    if let Some(dims) = output.query_embedder.dims {
+        label.push_str(&format!(" ({dims} dims)"));
+    }
+    label
+}
+
+fn embedder_threads(output: &StatusOutput) -> String {
+    output
+        .query_embedder
+        .intra_threads
+        .map(|threads| threads.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn enabled_label(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
     }
 }
 
