@@ -2364,7 +2364,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
         let log_path = temp.path().join("session.jsonl");
-        fs::write(&log_path, fixture_line("session-1", "first question")).expect("write first log");
+        let first_log = fixture_line("session-1", "first question");
+        let first_hash = blake3_hex(first_log.as_bytes());
+        fs::write(&log_path, &first_log).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
         let first = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
@@ -2389,15 +2391,20 @@ mod tests {
             &log_path,
             format!(
                 "{}{}",
-                fixture_line("session-1", "first question"),
+                first_log,
                 fixture_line("session-1", "second question")
             ),
         )
         .expect("append second log line");
+        let full_log = fs::read(&log_path).expect("read full log");
+        let full_hash = blake3_hex(&full_log);
         let second = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
             .and_then(|prepared| prepared.commit(&store))
             .expect("second ingest");
         let stats = store.stats().expect("stats");
+        let path_text = log_path.to_string_lossy().to_string();
+        let session_id = stable_id(&["session", "codex", &path_text, "session-1"]);
+        let events = store.events_for_session(&session_id).expect("events");
 
         assert_eq!(second.inserted, 2);
         assert_eq!(second.duplicates, 2);
@@ -2405,9 +2412,61 @@ mod tests {
         assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
         assert_eq!(second.delta.touched_paths.len(), 1);
+        assert_eq!(stats.raw_artifacts, 1);
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.events, 2);
+        assert!(!store.raw_artifact_blob_exists(&first_hash));
+        assert!(store.raw_artifact_blob_exists(&full_hash));
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.raw_artifact_hash.as_deref() == Some(full_hash.as_str())));
+        assert_eq!(
+            events[0].metadata["raw_artifact_hash"].as_str(),
+            Some(full_hash.as_str())
+        );
+        assert_eq!(events[0].metadata["byte_offset"].as_u64(), Some(0));
+        assert_eq!(
+            events[0].metadata["byte_len"].as_u64(),
+            Some(first_log.len() as u64)
+        );
+        let kept_raw = store
+            .read_raw_artifact_blob(&full_hash)
+            .expect("read kept raw");
+        assert_eq!(&kept_raw[..first_log.len()], first_log.as_bytes());
+    }
+
+    #[test]
+    fn non_prefix_rewrite_keeps_prior_raw_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("session.jsonl");
+        let first_log = fixture_line("session-1", "first question");
+        let first_hash = blake3_hex(first_log.as_bytes());
+        fs::write(&log_path, &first_log).expect("write first log");
+
+        let native_titles = NativeTitleIndex::default();
+        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("first ingest");
+
+        let rewritten_log = format!(
+            "{}{}",
+            fixture_line("session-1", "rewritten first question"),
+            fixture_line("session-1", "second question")
+        );
+        let rewritten_hash = blake3_hex(rewritten_log.as_bytes());
+        fs::write(&log_path, &rewritten_log).expect("rewrite log");
+        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("second ingest");
+        let stats = store.stats().expect("stats");
+
         assert_eq!(stats.raw_artifacts, 2);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
+        assert!(store.raw_artifact_blob_exists(&first_hash));
+        assert!(store.raw_artifact_blob_exists(&rewritten_hash));
     }
 
     #[test]
