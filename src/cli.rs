@@ -721,6 +721,23 @@ pub enum RawBlobCommand {
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
     },
+    /// Preview or remove superseded append-only raw artifact snapshots.
+    Compact {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview compactable append snapshots without deleting anything"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Repoint covered raw artifact references and delete superseded blobs"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1498,6 +1515,31 @@ impl Cli {
                         );
                     }
                 }
+                RawBlobCommand::Compact {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let compaction = if confirm {
+                        store.compact_append_raw_artifacts()?
+                    } else {
+                        store.preview_append_raw_artifact_compaction()?
+                    };
+                    let output = RawBlobCompactOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        compaction,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs compact",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_raw_blob_compact_output(&output);
+                    }
+                }
             },
             Command::Daemon {
                 interval_secs,
@@ -1626,7 +1668,8 @@ impl Command {
                 | Command::Prune { json: true, .. }
                 | Command::RawBlobs {
                     command: RawBlobCommand::Missing { json: true, .. }
-                        | RawBlobCommand::Import { json: true, .. },
+                        | RawBlobCommand::Import { json: true, .. }
+                        | RawBlobCommand::Compact { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
         )
@@ -1830,6 +1873,13 @@ struct PruneDeletedOutput {
 struct RawBlobMissingOutput {
     count: usize,
     hashes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RawBlobCompactOutput {
+    dry_run: bool,
+    confirmed: bool,
+    compaction: crate::storage::RawArtifactCompactionOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -2786,6 +2836,55 @@ fn print_prune_output(output: &PruneOutput) {
         println!("Run again with --confirm to remove these sessions.");
     } else {
         println!("No matching sessions.");
+    }
+}
+
+fn print_raw_blob_compact_output(output: &RawBlobCompactOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Raw blob compaction preview"
+    } else {
+        "Raw blob compaction complete"
+    };
+    println!("{title}");
+    print_section(
+        "Append snapshots",
+        &[
+            (
+                "Paths inspected",
+                format_count(output.compaction.paths_inspected),
+            ),
+            (
+                "Raw artifacts compactable",
+                format_count(output.compaction.raw_artifacts_compacted),
+            ),
+            (
+                "Raw blob bytes compactable",
+                format_bytes(output.compaction.raw_blob_bytes_compacted),
+            ),
+            (
+                "Events repointed",
+                format_count(output.compaction.events_repointed),
+            ),
+            (
+                "Raw artifacts skipped",
+                format_count(output.compaction.raw_artifacts_skipped),
+            ),
+            (
+                "Raw blobs deleted",
+                format_count(output.compaction.raw_blobs_deleted),
+            ),
+            (
+                "Raw blob bytes deleted",
+                format_bytes(output.compaction.raw_blob_bytes_deleted),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run && output.compaction.raw_artifacts_compacted > 0 {
+        println!("Run again with --confirm to apply this compaction.");
+    } else if output.compaction.raw_artifacts_compacted == 0 {
+        println!("No append-covered raw artifacts found.");
     }
 }
 
