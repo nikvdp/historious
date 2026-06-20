@@ -6,7 +6,7 @@ use crate::storage::{RecentResultRefInput, Store, ThreadListOptions, ThreadSortM
 use crate::transport;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
@@ -277,18 +277,8 @@ pub enum Command {
             help = "Only show threads active today"
         )]
         today: bool,
-        #[arg(
-            long,
-            conflicts_with = "all",
-            help = "Show threads for this folder scope instead of cwd"
-        )]
-        project: Option<PathBuf>,
-        #[arg(
-            long,
-            conflicts_with = "project",
-            help = "Show threads across every project"
-        )]
-        all: bool,
+        #[command(flatten)]
+        filters: SessionFilterArgs,
         #[arg(long, help = "Print structured JSON")]
         json: bool,
         #[arg(long, help = "Refresh local inputs before listing threads")]
@@ -506,11 +496,6 @@ pub enum Command {
             help = "Compact the SQLite database after deleting rows"
         )]
         vacuum: bool,
-        #[arg(
-            long,
-            help = "Match only one source kind, such as codex or claude_code"
-        )]
-        source: Vec<String>,
         #[arg(long, help = "Match this session id")]
         session: Vec<String>,
         #[arg(
@@ -529,22 +514,8 @@ pub enum Command {
             help = "Match sessions active today"
         )]
         today: bool,
-        #[arg(
-            long,
-            conflicts_with = "all",
-            help = "Match sessions from this folder scope"
-        )]
-        project: Option<PathBuf>,
-        #[arg(long, conflicts_with = "project", help = "Match every project scope")]
-        all: bool,
-        #[arg(long, help = "Match this exact machine id")]
-        machine: Option<String>,
-        #[arg(
-            long,
-            alias = "host",
-            help = "Match machine ids generated for this hostname"
-        )]
-        hostname: Option<String>,
+        #[command(flatten)]
+        filters: SessionFilterArgs,
     },
     /// List, export, and import raw artifact blobs by content hash.
     RawBlobs {
@@ -738,6 +709,50 @@ pub enum RawBlobCommand {
         )]
         confirm: bool,
     },
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct SessionFilterArgs {
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Only include sessions from these source kinds; may be repeated or comma-separated"
+    )]
+    source: Vec<String>,
+    #[command(flatten)]
+    workspace: WorkspaceFilterArgs,
+    #[command(flatten)]
+    machine: MachineFilterArgs,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct WorkspaceFilterArgs {
+    #[arg(
+        long,
+        visible_alias = "dir",
+        conflicts_with = "all",
+        help = "Only include sessions from this folder scope"
+    )]
+    project: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Only include sessions whose project folder basename matches this name"
+    )]
+    basename: Option<String>,
+    #[arg(long, conflicts_with = "project", help = "Include every project scope")]
+    all: bool,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct MachineFilterArgs {
+    #[arg(long, help = "Only include sessions from this exact machine id")]
+    machine: Option<String>,
+    #[arg(
+        long,
+        alias = "host",
+        help = "Only include sessions from machine ids generated for this hostname"
+    )]
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1055,8 +1070,7 @@ impl Cli {
                 after,
                 before,
                 today,
-                project,
-                all,
+                filters,
                 json,
                 update,
                 no_update,
@@ -1077,7 +1091,8 @@ impl Cli {
                         parse_optional_search_time(before.as_deref(), TimeFilterBound::Before)?,
                     )
                 };
-                let scope = resolve_thread_scope(project.as_deref(), all)?;
+                let resolved_filters = resolve_session_filter(&filters, true)?;
+                let scope = thread_scope_from_filter(&resolved_filters);
                 if scope.inferred {
                     if let Some(path) = &scope.path {
                         eprintln!(
@@ -1090,7 +1105,7 @@ impl Cli {
                     sort: sort.into(),
                     after: after_bound,
                     before: before_bound,
-                    workspace_scope: scope.path.clone(),
+                    filter: resolved_filters.filter.clone(),
                 };
                 let threads = store.list_threads(&options)?;
                 if json || robot {
@@ -1102,6 +1117,7 @@ impl Cli {
                             after_bound,
                             before_bound,
                             &scope,
+                            &resolved_filters,
                             implicit_update,
                             &threads,
                         ),
@@ -1109,7 +1125,7 @@ impl Cli {
                     )?;
                 } else {
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
-                    print_threads_output(&scope, &threads, color);
+                    print_threads_output(&scope, &resolved_filters, &threads, color);
                 }
             }
             Command::Show {
@@ -1401,26 +1417,19 @@ impl Cli {
                 confirm,
                 dry_run,
                 vacuum,
-                source,
                 session,
                 after,
                 before,
                 today,
-                project,
-                all,
-                machine,
-                hostname,
+                filters,
             } => {
                 let (after_bound, before_bound) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let filter = prune_filter(
-                    source,
+                    filters,
                     resolve_session_filter_targets(&store, session)?,
                     after_bound,
                     before_bound,
-                    search_workspace_scope(project.as_deref(), all),
-                    machine,
-                    hostname,
                 )?;
                 let dry_run = dry_run || !confirm;
                 let output = if dry_run {
@@ -1950,6 +1959,7 @@ struct ThreadsOptionsOutput {
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     scope: ThreadScopeOutput,
+    filters: SessionFilterOutput,
     implicit_update: bool,
 }
 
@@ -1958,6 +1968,14 @@ struct ThreadScopeOutput {
     mode: &'static str,
     path: Option<String>,
     inferred: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionFilterOutput {
+    source: Vec<String>,
+    machine: Option<String>,
+    machine_prefix: Option<String>,
+    project_basename: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3855,7 +3873,12 @@ fn enabled_label(enabled: bool) -> &'static str {
     }
 }
 
-fn print_threads_output(scope: &ThreadScope, threads: &[crate::storage::ThreadRow], color: bool) {
+fn print_threads_output(
+    scope: &ThreadScope,
+    filters: &ResolvedSessionFilter,
+    threads: &[crate::storage::ThreadRow],
+    color: bool,
+) {
     println!();
     println!("{}", styled("Threads", "1;32", color));
     match scope.mode {
@@ -3864,6 +3887,7 @@ fn print_threads_output(scope: &ThreadScope, threads: &[crate::storage::ThreadRo
             println!("scope: {}", scope.path.as_deref().unwrap_or("unknown"));
         }
     }
+    print_thread_filter_summary(filters);
     if threads.is_empty() {
         println!();
         println!("No threads found.");
@@ -3889,6 +3913,22 @@ fn print_threads_output(scope: &ThreadScope, threads: &[crate::storage::ThreadRo
         if let Some(workspace) = &thread.workspace_path {
             println!("  project: {workspace}");
         }
+    }
+}
+
+fn print_thread_filter_summary(filters: &ResolvedSessionFilter) {
+    let filter = &filters.filter;
+    if !filter.sources.is_empty() {
+        println!("source: {}", filter.sources.join(", "));
+    }
+    if let Some(machine) = &filter.machine_id {
+        println!("machine: {machine}");
+    }
+    if let Some(machine_prefix) = &filter.machine_id_prefix {
+        println!("machine prefix: {machine_prefix}");
+    }
+    if let Some(basename) = &filter.workspace_basename {
+        println!("project basename: {basename}");
     }
 }
 
@@ -4001,6 +4041,7 @@ fn threads_output(
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     scope: &ThreadScope,
+    filters: &ResolvedSessionFilter,
     implicit_update: bool,
     threads: &[crate::storage::ThreadRow],
 ) -> ThreadsOutput {
@@ -4016,6 +4057,7 @@ fn threads_output(
                 path: scope.path.clone(),
                 inferred: scope.inferred,
             },
+            filters: session_filter_output(filters),
             implicit_update,
         },
         next_commands: results
@@ -4023,6 +4065,15 @@ fn threads_output(
             .map(|thread| vec![format!("histo transcript {} --json", thread.session_id)])
             .unwrap_or_else(|| vec!["histo update --json".to_string()]),
         results,
+    }
+}
+
+fn session_filter_output(filters: &ResolvedSessionFilter) -> SessionFilterOutput {
+    SessionFilterOutput {
+        source: filters.filter.sources.clone(),
+        machine: filters.filter.machine_id.clone(),
+        machine_prefix: filters.filter.machine_id_prefix.clone(),
+        project_basename: filters.filter.workspace_basename.clone(),
     }
 }
 
@@ -4239,6 +4290,12 @@ struct ThreadScope {
     inferred: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedSessionFilter {
+    filter: crate::storage::SessionFilter,
+    workspace_inferred: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ThreadScopeMode {
     All,
@@ -4254,27 +4311,77 @@ impl ThreadScopeMode {
     }
 }
 
-fn resolve_thread_scope(project: Option<&std::path::Path>, all: bool) -> Result<ThreadScope> {
-    if all {
-        return Ok(ThreadScope {
+fn resolve_session_filter(
+    args: &SessionFilterArgs,
+    infer_cwd_scope: bool,
+) -> Result<ResolvedSessionFilter> {
+    let (workspace_scope, workspace_inferred) = if args.workspace.all {
+        (None, false)
+    } else if let Some(project) = args.workspace.project.as_deref() {
+        (Some(transport::normalize_workspace_arg(project)), false)
+    } else if infer_cwd_scope {
+        let cwd = std::env::current_dir()?;
+        (Some(transport::normalize_workspace_arg(&cwd)), true)
+    } else {
+        (None, false)
+    };
+    let workspace_basename = args
+        .workspace
+        .basename
+        .as_deref()
+        .map(normalize_basename_arg)
+        .transpose()?;
+    Ok(ResolvedSessionFilter {
+        filter: crate::storage::SessionFilter {
+            sources: args.source.clone(),
+            workspace_scope,
+            workspace_basename,
+            machine_id: args
+                .machine
+                .machine
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            machine_id_prefix: args
+                .machine
+                .hostname
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| search::machine_id_prefix_for_hostname(&value)),
+        },
+        workspace_inferred,
+    })
+}
+
+fn normalize_basename_arg(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("--basename cannot be empty");
+    }
+    let basename = Path::new(value)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(value)
+        .trim();
+    if basename.is_empty() {
+        bail!("--basename must include a folder name");
+    }
+    Ok(basename.to_string())
+}
+
+fn thread_scope_from_filter(filter: &ResolvedSessionFilter) -> ThreadScope {
+    if let Some(path) = &filter.filter.workspace_scope {
+        ThreadScope {
+            mode: ThreadScopeMode::Path,
+            path: Some(path.clone()),
+            inferred: filter.workspace_inferred,
+        }
+    } else {
+        ThreadScope {
             mode: ThreadScopeMode::All,
             path: None,
             inferred: false,
-        });
+        }
     }
-    if let Some(project) = project {
-        return Ok(ThreadScope {
-            mode: ThreadScopeMode::Path,
-            path: Some(transport::normalize_workspace_arg(project)),
-            inferred: false,
-        });
-    }
-    let cwd = std::env::current_dir()?;
-    Ok(ThreadScope {
-        mode: ThreadScopeMode::Path,
-        path: Some(transport::normalize_workspace_arg(&cwd)),
-        inferred: true,
-    })
 }
 
 fn resolve_columns(
@@ -4845,28 +4952,21 @@ fn search_workspace_scope(project: Option<&std::path::Path>, all: bool) -> Optio
 }
 
 fn prune_filter(
-    sources: Vec<String>,
+    filter_args: SessionFilterArgs,
     sessions: Vec<String>,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
-    workspace_scope: Option<String>,
-    machine_id: Option<String>,
-    hostname: Option<String>,
 ) -> Result<crate::storage::PruneFilter> {
+    let resolved = resolve_session_filter(&filter_args, false)?;
     let filter = crate::storage::PruneFilter {
-        sources,
+        session_filter: resolved.filter,
         sessions,
         after,
         before,
-        workspace_scope,
-        machine_id,
-        machine_id_prefix: hostname
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| search::machine_id_prefix_for_hostname(&value)),
     };
     if !filter.has_selector() {
         bail!(
-            "prune requires at least one filter, such as --before, --today, --project, --machine, --hostname, --source, or --session"
+            "prune requires at least one filter, such as --before, --today, --project, --basename, --machine, --hostname, --source, or --session"
         );
     }
     Ok(filter)

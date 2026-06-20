@@ -174,13 +174,13 @@ fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
 }
 
 fn default_data_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "example", "historious")
+    let dirs = ProjectDirs::from("com", "historious", "historious")
         .context("could not resolve platform data directory")?;
     Ok(dirs.data_dir().to_path_buf())
 }
 
 fn legacy_data_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "example", "super-cass")
+    let dirs = ProjectDirs::from("com", "historious", "super-cass")
         .context("could not resolve legacy platform data directory")?;
     Ok(dirs.data_dir().to_path_buf())
 }
