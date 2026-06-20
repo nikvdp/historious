@@ -2129,12 +2129,16 @@ mod tests {
 
     #[test]
     fn falls_back_to_claude_project_directory() {
-        let source_path =
-            Path::new("/home/example/.claude/projects/-home-example-workspace-project-alpha/session.jsonl");
+        let source_path = Path::new(
+            "/home/example/.claude/projects/-home-example-workspace-project-alpha/session.jsonl",
+        );
 
         let workspace = workspace_from_source_path("claude_code", source_path).expect("workspace");
 
-        assert_eq!(workspace.workspace_path, "/home/example/workspace/project/alpha");
+        assert_eq!(
+            workspace.workspace_path,
+            "/home/example/workspace/project/alpha"
+        );
         assert_eq!(workspace.cwd, None);
         assert_eq!(workspace.source, "source_path.claude_project_dir");
         assert_eq!(workspace.confidence, "inferred");

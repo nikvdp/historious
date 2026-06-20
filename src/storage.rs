@@ -5,8 +5,8 @@ use crate::archive::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{
-    named_params, params, params_from_iter, types::Value as SqlValue, Connection,
-    OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -105,33 +105,18 @@ pub struct ArchiveStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct PruneFilter {
-    pub sources: Vec<String>,
+    pub session_filter: SessionFilter,
     pub sessions: Vec<String>,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
-    pub workspace_scope: Option<String>,
-    pub machine_id: Option<String>,
-    pub machine_id_prefix: Option<String>,
 }
 
 impl PruneFilter {
     pub fn has_selector(&self) -> bool {
-        !self.sources.is_empty()
+        self.session_filter.has_selector()
             || !self.sessions.is_empty()
             || self.after.is_some()
             || self.before.is_some()
-            || self
-                .workspace_scope
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .machine_id
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .machine_id_prefix
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
     }
 }
 
@@ -277,12 +262,55 @@ pub enum ThreadSortMode {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionFilter {
+    pub sources: Vec<String>,
+    pub workspace_scope: Option<String>,
+    pub workspace_basename: Option<String>,
+    pub machine_id: Option<String>,
+    pub machine_id_prefix: Option<String>,
+}
+
+impl Default for SessionFilter {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            workspace_scope: None,
+            workspace_basename: None,
+            machine_id: None,
+            machine_id_prefix: None,
+        }
+    }
+}
+
+impl SessionFilter {
+    pub fn has_selector(&self) -> bool {
+        !self.sources.is_empty()
+            || self
+                .workspace_scope
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .workspace_basename
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .machine_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .machine_id_prefix
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ThreadListOptions {
     pub limit: usize,
     pub sort: ThreadSortMode,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
-    pub workspace_scope: Option<String>,
+    pub filter: SessionFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -1959,7 +1987,6 @@ impl Store {
     pub fn list_threads(&self, options: &ThreadListOptions) -> Result<Vec<ThreadRow>> {
         self.with_conn(|conn| {
             let last_activity = thread_last_activity_sql();
-            let workspace_filter = thread_workspace_scope_sql();
             let order = match options.sort {
                 ThreadSortMode::Newest => {
                     "last_activity_at IS NULL ASC, last_activity_at DESC, s.id DESC"
@@ -1968,6 +1995,20 @@ impl Store {
                     "last_activity_at IS NULL DESC, last_activity_at ASC, s.id ASC"
                 }
             };
+            let mut where_clauses = vec![
+                format!("(? IS NULL OR {last_activity} >= ?)"),
+                format!("(? IS NULL OR {last_activity} < ?)"),
+            ];
+            let after = opt_dt(options.after);
+            let before = opt_dt(options.before);
+            let mut values = vec![
+                opt_sql_text(after.clone()),
+                opt_sql_text(after),
+                opt_sql_text(before.clone()),
+                opt_sql_text(before),
+            ];
+            push_session_filter_sql(&mut where_clauses, &mut values, &options.filter);
+            let where_sql = where_clauses.join("\n                   AND ");
             let sql = format!(
                 "SELECT s.id,
                         s.source_id,
@@ -1986,58 +2027,42 @@ impl Store {
                         {last_activity} AS last_activity_at
                  FROM sessions s
                  LEFT JOIN session_activity a ON a.session_id = s.id
-                 WHERE (:after IS NULL OR {last_activity} >= :after)
-                   AND (:before IS NULL OR {last_activity} < :before)
-                   AND (:scope IS NULL OR {workspace_filter})
+                 WHERE {where_sql}
                  ORDER BY {order}
-                 LIMIT :limit"
+                 LIMIT ?"
             );
-            let after = options.after.map(|dt| dt.to_rfc3339());
-            let before = options.before.map(|dt| dt.to_rfc3339());
-            let scope = options
-                .workspace_scope
-                .as_deref()
-                .map(|scope| scope.trim_end_matches('/'))
-                .filter(|scope| !scope.is_empty());
+            values.push(SqlValue::Integer(options.limit as i64));
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                named_params! {
-                    ":after": after,
-                    ":before": before,
-                    ":scope": scope,
-                    ":limit": options.limit as i64,
-                },
-                |row| {
-                    let metadata_text: String = row.get(9)?;
-                    let metadata = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
-                    let session = SessionRecord {
-                        id: row.get(0)?,
-                        source_id: row.get(1)?,
-                        machine_id: row.get(2)?,
-                        source_kind: row.get(3)?,
-                        external_id: row.get(4)?,
-                        title: row.get(5)?,
-                        status: row.get(6)?,
-                        started_at: parse_opt_dt(row.get(7)?),
-                        updated_at: parse_opt_dt(row.get(8)?),
-                        metadata: metadata.clone(),
-                        hash: row.get(10)?,
-                    };
-                    let first_event_at = parse_opt_dt(row.get(12)?);
-                    let last_event_at = parse_opt_dt(row.get(13)?);
-                    let last_activity_at = parse_opt_dt(row.get(14)?);
-                    let workspace_values = session_workspace_values(&metadata);
-                    Ok(ThreadRow {
-                        session,
-                        event_count: row.get::<_, i64>(11)?.max(0) as u64,
-                        first_event_at,
-                        last_event_at,
-                        last_activity_at,
-                        workspace_path: primary_workspace_value(&metadata),
-                        workspace_values,
-                    })
-                },
-            )?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                let metadata_text: String = row.get(9)?;
+                let metadata = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
+                let session = SessionRecord {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    machine_id: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    external_id: row.get(4)?,
+                    title: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: parse_opt_dt(row.get(7)?),
+                    updated_at: parse_opt_dt(row.get(8)?),
+                    metadata: metadata.clone(),
+                    hash: row.get(10)?,
+                };
+                let first_event_at = parse_opt_dt(row.get(12)?);
+                let last_event_at = parse_opt_dt(row.get(13)?);
+                let last_activity_at = parse_opt_dt(row.get(14)?);
+                let workspace_values = session_workspace_values(&metadata);
+                Ok(ThreadRow {
+                    session,
+                    event_count: row.get::<_, i64>(11)?.max(0) as u64,
+                    first_event_at,
+                    last_event_at,
+                    last_activity_at,
+                    workspace_path: primary_workspace_value(&metadata),
+                    workspace_values,
+                })
+            })?;
 
             let mut out = Vec::new();
             for row in rows {
@@ -2604,19 +2629,28 @@ fn with_immediate_write_tx<T>(
 }
 
 fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<String>> {
-    let sources = normalized_string_set(&filter.sources);
+    let sources = normalized_string_set(&filter.session_filter.sources);
     let sessions = normalized_string_set(&filter.sessions);
     let workspace_scope = filter
+        .session_filter
         .workspace_scope
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let workspace_basename = filter
+        .session_filter
+        .workspace_basename
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let machine_id = filter
+        .session_filter
         .machine_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let machine_id_prefix = filter
+        .session_filter
         .machine_id_prefix
         .as_deref()
         .map(str::trim)
@@ -2653,6 +2687,7 @@ fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<Stri
             &sources,
             &sessions,
             workspace_scope,
+            workspace_basename,
             machine_id,
             machine_id_prefix,
             filter.after,
@@ -3321,6 +3356,18 @@ fn normalized_string_set(values: &[String]) -> HashSet<String> {
         .collect()
 }
 
+fn normalized_strings(values: &[String]) -> Vec<String> {
+    let mut values = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
 fn session_matches_export_filter(
     row: &SessionFilterRow,
     sources: &HashSet<String>,
@@ -3360,6 +3407,7 @@ fn prune_session_matches(
     sources: &HashSet<String>,
     sessions: &HashSet<String>,
     workspace_scope: Option<&str>,
+    workspace_basename: Option<&str>,
     machine_id: Option<&str>,
     machine_id_prefix: Option<&str>,
     after: Option<DateTime<Utc>>,
@@ -3385,6 +3433,14 @@ fn prune_session_matches(
         if !session_workspace_values(&row.metadata)
             .iter()
             .any(|value| path_matches_scope(value, workspace_scope))
+        {
+            return false;
+        }
+    }
+    if let Some(workspace_basename) = workspace_basename {
+        if !session_workspace_values(&row.metadata)
+            .iter()
+            .any(|value| path_basename_matches(value, workspace_basename))
         {
             return false;
         }
@@ -3448,7 +3504,58 @@ fn thread_last_activity_sql() -> &'static str {
     "NULLIF(MAX(COALESCE(a.last_event_at, ''), COALESCE(s.updated_at, ''), COALESCE(s.started_at, '')), '')"
 }
 
-fn thread_workspace_scope_sql() -> String {
+fn push_session_filter_sql(
+    where_clauses: &mut Vec<String>,
+    values: &mut Vec<SqlValue>,
+    filter: &SessionFilter,
+) {
+    let sources = normalized_strings(&filter.sources);
+    if !sources.is_empty() {
+        where_clauses.push(format!(
+            "s.source_kind IN ({})",
+            placeholders(sources.len())
+        ));
+        values.extend(sources.into_iter().map(SqlValue::Text));
+    }
+    if let Some(machine_id) = filter
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        where_clauses.push("s.machine_id = ?".to_string());
+        values.push(SqlValue::Text(machine_id.to_string()));
+    }
+    if let Some(machine_id_prefix) = filter
+        .machine_id_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        where_clauses.push("substr(s.machine_id, 1, length(?)) = ?".to_string());
+        values.push(SqlValue::Text(machine_id_prefix.to_string()));
+        values.push(SqlValue::Text(machine_id_prefix.to_string()));
+    }
+    if filter
+        .workspace_scope
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        where_clauses.push(format!("({})", positional_workspace_scope_sql()));
+        push_workspace_scope_match_params(values, filter.workspace_scope.as_deref());
+    }
+    if let Some(basename) = filter
+        .workspace_basename
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        where_clauses.push(format!("({})", workspace_basename_sql()));
+        push_workspace_basename_match_params(values, basename);
+    }
+}
+
+fn workspace_value_exprs() -> [&'static str; 6] {
     [
         "json_extract(s.metadata_json, '$.workspace_path')",
         "json_extract(s.metadata_json, '$.workspace_root')",
@@ -3457,32 +3564,56 @@ fn thread_workspace_scope_sql() -> String {
         "json_extract(s.metadata_json, '$.workspace.root')",
         "json_extract(s.metadata_json, '$.workspace.cwd')",
     ]
-    .into_iter()
-    .map(thread_workspace_value_matches_scope_sql)
-    .collect::<Vec<_>>()
-    .join(" OR ")
 }
 
-fn thread_workspace_value_matches_scope_sql(value_expr: &str) -> String {
+fn workspace_basename_sql() -> String {
+    workspace_value_exprs()
+        .into_iter()
+        .map(workspace_value_matches_basename_sql)
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn workspace_value_matches_basename_sql(value_expr: &str) -> String {
     format!(
-        "(rtrim(COALESCE({value_expr}, ''), '/') = :scope
-          OR substr(rtrim(COALESCE({value_expr}, ''), '/'), 1, length(:scope) + 1) = :scope || '/')"
+        "(rtrim(COALESCE({value_expr}, ''), '/') = ?
+          OR rtrim(COALESCE({value_expr}, ''), '/') LIKE ? ESCAPE '\\')"
     )
 }
 
+fn push_workspace_scope_match_params(values: &mut Vec<SqlValue>, scope: Option<&str>) {
+    for _ in 0..workspace_value_exprs().len() {
+        values.push(opt_sql_text(scope.map(str::to_string)));
+        values.push(opt_sql_text(scope.map(str::to_string)));
+        values.push(opt_sql_text(scope.map(str::to_string)));
+    }
+}
+
+fn push_workspace_basename_match_params(values: &mut Vec<SqlValue>, basename: &str) {
+    let like_pattern = format!("%/{}", escape_sql_like(basename));
+    for _ in 0..workspace_value_exprs().len() {
+        values.push(SqlValue::Text(basename.to_string()));
+        values.push(SqlValue::Text(like_pattern.clone()));
+    }
+}
+
+fn escape_sql_like(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn positional_workspace_scope_sql() -> String {
-    [
-        "json_extract(s.metadata_json, '$.workspace_path')",
-        "json_extract(s.metadata_json, '$.workspace_root')",
-        "json_extract(s.metadata_json, '$.cwd')",
-        "json_extract(s.metadata_json, '$.workspace.path')",
-        "json_extract(s.metadata_json, '$.workspace.root')",
-        "json_extract(s.metadata_json, '$.workspace.cwd')",
-    ]
-    .into_iter()
-    .map(positional_workspace_value_matches_scope_sql)
-    .collect::<Vec<_>>()
-    .join(" OR ")
+    workspace_value_exprs()
+        .into_iter()
+        .map(positional_workspace_value_matches_scope_sql)
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn positional_workspace_value_matches_scope_sql(value_expr: &str) -> String {
@@ -3508,6 +3639,15 @@ fn path_matches_scope(value: &str, scope: &str) -> bool {
         || value
             .strip_prefix(scope)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_basename_matches(value: &str, basename: &str) -> bool {
+    let value = value.trim_end_matches('/');
+    value == basename
+        || value
+            .rsplit('/')
+            .next()
+            .is_some_and(|part| part == basename)
 }
 
 fn placeholders(count: usize) -> String {
@@ -5588,7 +5728,10 @@ mod tests {
                 sort: ThreadSortMode::Newest,
                 after: Some(dt("2026-06-06T00:00:00Z")),
                 before: Some(dt("2026-06-07T00:00:00Z")),
-                workspace_scope: Some("/tmp/repo".to_string()),
+                filter: SessionFilter {
+                    workspace_scope: Some("/tmp/repo".to_string()),
+                    ..SessionFilter::default()
+                },
             })
             .expect("list threads");
 
@@ -5602,6 +5745,113 @@ mod tests {
         assert_eq!(rows[1].event_count, 2);
         assert_eq!(rows[1].first_event_at, Some(dt("2026-06-06T03:00:00Z")));
         assert_eq!(rows[1].last_event_at, Some(dt("2026-06-06T04:00:00Z")));
+    }
+
+    #[test]
+    fn list_threads_applies_shared_session_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let codex_source = fixture_source("source_threads_codex");
+        let mut treechat_source = fixture_source("source_threads_treechat");
+        treechat_source.kind = "treechat".to_string();
+
+        let mut codex = fixture_session("session_threads_codex", &codex_source.id);
+        codex.machine_id = "machine_b".to_string();
+        codex.metadata = json!({"workspace_path": "/tmp/projects/super-cass"});
+        let mut treechat = fixture_session("session_threads_treechat", &treechat_source.id);
+        treechat.source_kind = "treechat".to_string();
+        treechat.machine_id = "machine_b".to_string();
+        treechat.metadata = json!({"workspace_path": "/tmp/projects/treechat"});
+        let mut other_machine = fixture_session("session_threads_other_machine", &codex_source.id);
+        other_machine.machine_id = "machine_c".to_string();
+        other_machine.metadata = json!({"workspace_path": "/tmp/projects/super-cass"});
+
+        let mut codex_event = fixture_event(
+            "event_threads_codex",
+            &codex.id,
+            &codex_source.id,
+            1,
+            None,
+            "event_hash_threads_codex",
+        );
+        codex_event.machine_id = codex.machine_id.clone();
+        codex_event.occurred_at = Some(dt("2026-06-06T06:00:00Z"));
+        let mut treechat_event = fixture_event(
+            "event_threads_treechat",
+            &treechat.id,
+            &treechat_source.id,
+            1,
+            None,
+            "event_hash_threads_treechat",
+        );
+        treechat_event.machine_id = treechat.machine_id.clone();
+        treechat_event.source_kind = treechat.source_kind.clone();
+        treechat_event.occurred_at = Some(dt("2026-06-06T07:00:00Z"));
+        let mut other_machine_event = fixture_event(
+            "event_threads_other_machine",
+            &other_machine.id,
+            &codex_source.id,
+            1,
+            None,
+            "event_hash_threads_other_machine",
+        );
+        other_machine_event.machine_id = other_machine.machine_id.clone();
+        other_machine_event.occurred_at = Some(dt("2026-06-06T08:00:00Z"));
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(codex_source),
+                ArchiveRecord::Source(treechat_source),
+                ArchiveRecord::Session(codex),
+                ArchiveRecord::Session(treechat),
+                ArchiveRecord::Session(other_machine),
+                ArchiveRecord::Event(codex_event),
+                ArchiveRecord::Event(treechat_event),
+                ArchiveRecord::Event(other_machine_event),
+            ])
+            .expect("import thread records");
+
+        let source_rows = store
+            .list_threads(&ThreadListOptions {
+                limit: 10,
+                sort: ThreadSortMode::Newest,
+                after: None,
+                before: None,
+                filter: SessionFilter {
+                    sources: vec!["treechat".to_string()],
+                    ..SessionFilter::default()
+                },
+            })
+            .expect("list source threads");
+        assert_eq!(
+            source_rows
+                .iter()
+                .map(|row| row.session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session_threads_treechat"]
+        );
+
+        let combined_rows = store
+            .list_threads(&ThreadListOptions {
+                limit: 10,
+                sort: ThreadSortMode::Newest,
+                after: None,
+                before: None,
+                filter: SessionFilter {
+                    sources: vec!["codex".to_string()],
+                    machine_id: Some("machine_b".to_string()),
+                    workspace_basename: Some("super-cass".to_string()),
+                    ..SessionFilter::default()
+                },
+            })
+            .expect("list filtered threads");
+        assert_eq!(
+            combined_rows
+                .iter()
+                .map(|row| row.session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session_threads_codex"]
+        );
     }
 
     #[test]
