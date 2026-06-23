@@ -214,18 +214,18 @@ histo tui --server-url http://<remote-ip>:7391
 
 ### Embedding Mode
 
-Historious can run with embeddings enabled or disabled. Embeddings are enabled by default.
+Historious can run with embeddings enabled or disabled. Embeddings are disabled by default so first indexing stays lightweight and predictable.
 
-Persistently disable embeddings for this data directory:
-
-```bash
-histo config embeddings off
-```
-
-Re-enable them:
+Persistently enable embeddings for this data directory:
 
 ```bash
 histo config embeddings on
+```
+
+Turn them back off:
+
+```bash
+histo config embeddings off
 ```
 
 Inspect the current setting and config file path:
