@@ -39,7 +39,7 @@ jobs:
             asset_name: histo-macos-x86_64
             binary_suffix: ""
             build_with_zig: false
-            cargo_args: ""
+            cargo_args: "--no-default-features"
           - os: macos-14
             target: aarch64-apple-darwin
             asset_name: histo-macos-aarch64
@@ -83,6 +83,8 @@ jobs:
 
       - name: Build release binary with Zig
         if: matrix.build_with_zig
+        env:
+          CFLAGS: "-D_GNU_SOURCE"
         run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Build release binary
