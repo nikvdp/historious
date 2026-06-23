@@ -36,8 +36,8 @@ Pick the asset for your machine:
 | Platform | Asset |
 | --- | --- |
 | macOS Apple Silicon | `histo-macos-aarch64` |
-| Linux x86_64 | `histo-linux-x86_64-gnu` |
-| Linux ARM64 | `histo-linux-aarch64-gnu` |
+| Linux x86_64 static | `histo-linux-x86_64-musl` |
+| Linux ARM64 static | `histo-linux-aarch64-musl` |
 | Windows x86_64 | `histo-windows-x86_64.exe` |
 
 Or build from source:
@@ -243,6 +243,10 @@ histo config show
 
 Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`,
 `daemon`, or `serve` for a one-off lexical-only run.
+
+Linux musl release binaries are built without FastEmbed so they stay static and
+portable. If you want Linux semantic embeddings in the binary itself, build from
+source with Cargo and then run `histo config embeddings on`.
 
 ## Serve Mode
 

@@ -23,29 +23,25 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.31
-            asset_name: histo-linux-x86_64-gnu
+            target: x86_64-unknown-linux-musl
+            asset_name: histo-linux-x86_64-musl
             binary_suffix: ""
             build_with_zig: true
-            cargo_args: ""
+            cargo_args: "--no-default-features"
           - os: ubuntu-latest
-            rust_target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.31
-            asset_name: histo-linux-aarch64-gnu
+            target: aarch64-unknown-linux-musl
+            asset_name: histo-linux-aarch64-musl
             binary_suffix: ""
             build_with_zig: true
-            cargo_args: ""
+            cargo_args: "--no-default-features"
           - os: macos-14
-            rust_target: aarch64-apple-darwin
-            zig_target: ""
+            target: aarch64-apple-darwin
             asset_name: histo-macos-aarch64
             binary_suffix: ""
             build_with_zig: false
             cargo_args: ""
           - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            zig_target: ""
+            target: x86_64-pc-windows-msvc
             asset_name: histo-windows-x86_64.exe
             binary_suffix: ".exe"
             build_with_zig: false
@@ -60,12 +56,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust_target }}
+          targets: ${{ matrix.target }}
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.rust_target }}
+          key: ${{ matrix.target }}
 
       - name: Install Zig
         if: matrix.build_with_zig
@@ -81,24 +77,26 @@ jobs:
 
       - name: Build release binary with Zig
         if: matrix.build_with_zig
-        run: cargo zigbuild --release --target ${{ matrix.zig_target }} ${{ matrix.cargo_args }}
+        env:
+          CFLAGS: "-D_GNU_SOURCE"
+        run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Build release binary
         if: ${{ !matrix.build_with_zig }}
-        run: cargo build --release --target ${{ matrix.rust_target }} ${{ matrix.cargo_args }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Stage release artifact
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.rust_target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
+          cp "target/${{ matrix.target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
 
       - name: Stage release artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.rust_target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
+          Copy-Item "target/${{ matrix.target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
