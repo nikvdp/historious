@@ -2,6 +2,10 @@
 name = "historious"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/nikvdp/historious"
+license = "AGPL-3.0-only"
+description = "Searchable memory for your coding agents — index local transcripts and search them with `histo`."
+authors = ["Nik V"]
 
 [workspace]
 members = [".", "xtask"]

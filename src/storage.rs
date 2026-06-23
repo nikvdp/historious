@@ -5757,14 +5757,14 @@ mod tests {
 
         let mut codex = fixture_session("session_threads_codex", &codex_source.id);
         codex.machine_id = "machine_b".to_string();
-        codex.metadata = json!({"workspace_path": "/tmp/projects/super-cass"});
+        codex.metadata = json!({"workspace_path": "/tmp/projects/example-project"});
         let mut treechat = fixture_session("session_threads_treechat", &treechat_source.id);
         treechat.source_kind = "treechat".to_string();
         treechat.machine_id = "machine_b".to_string();
         treechat.metadata = json!({"workspace_path": "/tmp/projects/treechat"});
         let mut other_machine = fixture_session("session_threads_other_machine", &codex_source.id);
         other_machine.machine_id = "machine_c".to_string();
-        other_machine.metadata = json!({"workspace_path": "/tmp/projects/super-cass"});
+        other_machine.metadata = json!({"workspace_path": "/tmp/projects/example-project"});
 
         let mut codex_event = fixture_event(
             "event_threads_codex",
@@ -5840,7 +5840,7 @@ mod tests {
                 filter: SessionFilter {
                     sources: vec!["codex".to_string()],
                     machine_id: Some("machine_b".to_string()),
-                    workspace_basename: Some("super-cass".to_string()),
+                    workspace_basename: Some("example-project".to_string()),
                     ..SessionFilter::default()
                 },
             })

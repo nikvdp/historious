@@ -1,16 +1,4 @@
 target/
 .DS_Store
-
-# Local prior-art clones used for research; not part of this repo.
-cass_memory_system/
-coding_agent_session_search/
-frankensearch/
-oracle/
-
-# Runtime data when experimenting inside the repo.
-.super-cass/
-
-# lb runtime cache; tracked state is .lb/config.jsonc and .lb/issues.jsonl.
-.lb/cache.db*
-.lb/sync.log
-.lb/backups/
+.env*
+*.envrc
