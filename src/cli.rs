@@ -31,7 +31,7 @@ static TAIL_CANCELLED: AtomicBool = AtomicBool::new(false);
 static TAIL_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
-#[command(name = "histo")]
+#[command(name = "histo", version)]
 #[command(about = "Search and sync local coding-agent transcripts")]
 pub struct Cli {
     #[arg(
