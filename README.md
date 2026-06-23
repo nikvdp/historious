@@ -1,17 +1,17 @@
 # Historious
 
-Historious is a local search engine for old coding-agent conversations.
+Your coding agents have a past. Historious makes it searchable.
 
 If you use Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, or similar tools,
-you already have a pile of useful work sitting in transcript files: commands
-that worked, fixes that failed, decisions you made, error messages you chased,
-and half-finished ideas that are annoying to find later. Historious indexes that
-history and gives you one command, `histo`, for searching it again.
+your machine already has a quiet archive of useful work: commands that worked,
+fixes that failed, decisions you made, error messages you chased, and threads you
+would absolutely reuse if you could find them. Historious indexes those local
+transcripts and gives you one command, `histo`, for searching them again.
 
-The main use case is agent memory. You can search across projects, machines, and
-sessions; recover the exact thread where something happened; and give your next
-agent enough context to avoid solving the same problem from scratch. It is not a
-hosted memory service. It is a local archive your agents can query.
+The point is agent memory without a hosted memory service. Search across
+projects, machines, and sessions; recover the exact thread where something
+happened; then hand that context to your next agent so it does not have to learn
+the same lesson twice.
 
 Short version for the impatient:
 
@@ -58,6 +58,9 @@ Index your local history:
 ```bash
 histo update
 ```
+
+The first run can take a little while, especially if you have a lot of old agent
+chat sessions. Later updates only need to catch up with new history.
 
 Check what Historious found:
 
