@@ -15,11 +15,9 @@ the same lesson twice.
 
 Short version for the impatient:
 
-```text
-Install Historious from nikvdp/historious, put `histo` on PATH, run
-`histo update`, then run `histo onboard --agents-md` or install the packaged
-Historious skill for this agent. Use `histo --robot` for agent searches.
-```
+> Install Historious from `nikvdp/historious`, put `histo` on `PATH`, run
+> `histo update`, then run `histo onboard --agents-md` or install the packaged
+> Historious skill for this agent. Use `histo --robot` for agent searches.
 
 ## Install
 
@@ -108,9 +106,10 @@ Good agent behavior is simple: start broad, use `--robot`, group hits by
 `session_id`, then inspect promising refs with `show` or `transcript`. Use full
 transcripts when exact commands, file paths, or decisions matter.
 
-## Useful Searches
+## Browse Recent Threads
 
-Find recent threads:
+Use `threads` when you remember roughly when work happened, or which repo it
+was in, but not the exact words from the conversation:
 
 ```bash
 histo threads --all --today
@@ -118,7 +117,10 @@ histo threads --all --after "3 days ago"
 histo threads --project /absolute/repo/path
 ```
 
-Search with filters:
+## Search History
+
+Use `search` when you remember a phrase, error, command, file path, branch name,
+or other clue:
 
 ```bash
 histo search "migration rollback sqlite" --project /absolute/repo/path
@@ -144,7 +146,8 @@ histo tail <session_id>
 
 ## Local TUI
 
-`histo tui` is a local terminal UI built on `fzf`. Install `fzf` first:
+`histo tui` is a local terminal UI built on `fzf`. If you already have `fzf` on
+your `PATH`, you are set. If not, install it first:
 
 ```bash
 brew install fzf
@@ -256,22 +259,3 @@ histo tui --server-url http://<remote-ip>:7391
 ```
 
 Do not expose the Historious HTTP server directly on a public interface.
-
-## Release Flow
-
-Maintainers can prepare a release locally:
-
-```bash
-make release-dry-run
-make release VERSION=0.1.1
-```
-
-Without `VERSION`, the release task bumps the patch version. It updates
-`Cargo.toml` and `Cargo.lock`, creates a release commit, and creates an
-annotated `vX.Y.Z` tag. Pushing the tag to `nikvdp/historious` triggers GitHub
-Actions to build release artifacts and create or update the GitHub release:
-
-```bash
-git push origin HEAD
-git push origin v0.1.1
-```
