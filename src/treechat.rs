@@ -639,14 +639,9 @@ impl SearchPart {
 
 fn built_in_profile(profile: &str) -> ResolvedTreechatConfig {
     let (backend_url, app_host) = match profile {
-        "staging" => (
-            "https://knov-staging-jajw.onrender.com",
-            Some("https://staging-frontend-vi5w.onrender.com"),
-        ),
-        "prod" => (
-            "https://knov-prod.onrender.com",
-            Some("https://prod-frontend-kitu.onrender.com"),
-        ),
+        // Staging and prod profiles default to localhost; set real URLs via
+        // config or the TREECHAT_BACKEND_URL / TREECHAT_APP_HOST env vars.
+        "staging" | "prod" => ("http://localhost:5001", Some("http://localhost:5173")),
         _ => ("http://localhost:5001", Some("http://localhost:5173")),
     };
     ResolvedTreechatConfig {
