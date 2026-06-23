@@ -66,10 +66,10 @@ Check what Historious found:
 histo status
 ```
 
-Search for something you half remember:
+Search for a concrete clue you remember:
 
 ```bash
-histo search "that weird auth retry bug"
+histo search "429 reqwest retry"
 histo show <ref> --before 5 --after 8
 histo transcript <session_id> --at <ref>
 ```
@@ -78,7 +78,7 @@ For scripts and agents, use `--robot` so output is stable JSON:
 
 ```bash
 histo --robot status
-histo --robot search "distinctive query terms" --limit 20
+histo --robot search "Cargo.lock toml_edit" --limit 20
 histo --robot show <ref> --before 5 --after 8
 ```
 
@@ -119,20 +119,15 @@ histo threads --project /absolute/repo/path
 
 ## Search History
 
-Use `search` when you remember a phrase, error, command, file path, branch name,
-or other clue:
+By default, `search` is mainly lexical. Use words and symbols that actually
+appeared in the transcript: error codes, command names, file paths, function
+names, branch names, package names, ports, hosts, or log text.
 
 ```bash
 histo search "migration rollback sqlite" --project /absolute/repo/path
 histo search "rate limit 429" --all --after 2026-06-01
 histo search "cargo zigbuild release" --include-tools
 histo search "exact_function_name" --mode lexical
-```
-
-After enabling embeddings, semantic search is available too:
-
-```bash
-histo search "why did the sync loop repeat" --mode semantic
 ```
 
 Inspect results:
@@ -209,6 +204,15 @@ Turn embeddings on for this data directory:
 
 ```bash
 histo config embeddings on
+```
+
+Then run `histo update` so Historious can index embedding vectors into its
+database. After that, semantic search can help with fuzzy, concept-shaped
+queries:
+
+```bash
+histo update
+histo search "why did the sync loop repeat" --mode semantic
 ```
 
 Turn them back off:
