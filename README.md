@@ -1,31 +1,29 @@
 # Historious
 
-Your coding agents have a past. Historious makes it searchable.
+Historious is a local search engine for old coding-agent conversations.
 
-It indexes local agent transcripts from tools like Codex, Claude Code, pi,
-OpenClaw, Hermes, OpenCode, and optional Treechat sources, then gives you one
-fast `histo` command for finding old decisions, fixes, commands, failures, and
-half-remembered threads. Instead of asking "where did we solve this already?",
-you can search the actual history and hand the useful parts back to your next
-agent.
+If you use Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, or similar tools,
+you already have a pile of useful work sitting in transcript files: commands
+that worked, fixes that failed, decisions you made, error messages you chased,
+and half-finished ideas that are annoying to find later. Historious indexes that
+history and gives you one command, `histo`, for searching it again.
 
-Install it if you use coding agents across more than one repo, machine, model,
-or session. Historious helps with agent memory: recovering old threads, avoiding
-repeated mistakes, reusing working commands, syncing history between devices,
-and giving agents a reliable way to learn from prior work without you becoming
-the human clipboard.
+The main use case is agent memory. You can search across projects, machines, and
+sessions; recover the exact thread where something happened; and give your next
+agent enough context to avoid solving the same problem from scratch. It is not a
+hosted memory service. It is a local archive your agents can query.
 
-In a hurry? Point your agent at this README and say:
+Short version for the impatient:
 
 ```text
 Install Historious from nikvdp/historious, put `histo` on PATH, run
 `histo update`, then run `histo onboard --agents-md` or install the packaged
-Historious skill for this agent. Use `histo --robot` for searches.
+Historious skill for this agent. Use `histo --robot` for agent searches.
 ```
 
-## Quick Start
+## Install
 
-Install a release binary:
+Download a release binary:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -35,7 +33,7 @@ curl -L "https://github.com/nikvdp/historious/releases/latest/download/$asset" \
 chmod +x ~/.local/bin/histo
 ```
 
-Use the asset that matches your machine:
+Pick the asset for your machine:
 
 | Platform | Asset |
 | --- | --- |
@@ -45,22 +43,37 @@ Use the asset that matches your machine:
 | Linux ARM64 static | `histo-linux-aarch64-musl` |
 | Windows x86_64 | `histo-windows-x86_64.exe` |
 
-Or build from source with Rust:
+Or build from source:
 
 ```bash
 cargo install --git https://github.com/nikvdp/historious historious --locked
 ```
 
-Then index your local history and search it:
+Make sure `~/.local/bin` is on your `PATH` if you used the binary install.
+
+## First Run
+
+Index your local history:
 
 ```bash
 histo update
+```
+
+Check what Historious found:
+
+```bash
+histo status
+```
+
+Search for something you half remember:
+
+```bash
 histo search "that weird auth retry bug"
 histo show <ref> --before 5 --after 8
 histo transcript <session_id> --at <ref>
 ```
 
-For agents and scripts, use robot mode:
+For scripts and agents, use `--robot` so output is stable JSON:
 
 ```bash
 histo --robot status
@@ -68,31 +81,17 @@ histo --robot search "distinctive query terms" --limit 20
 histo --robot show <ref> --before 5 --after 8
 ```
 
-## What You Get
+## Agent Setup
 
-- One local archive for many agent histories.
-- Search by words, paths, errors, branch names, commands, or fuzzy concepts.
-- Timeline discovery with `threads` when you remember when work happened.
-- Exact transcript recovery with stable refs for follow-up commands.
-- Machine-friendly JSON envelopes for agents.
-- A local TUI with `histo tui`.
-- JSONL import/export so machines can exchange history over SSH.
-- Packaged agent instructions and skills so your agent knows how to use it.
-
-Historious is local-first. It scans local logs into a SQLite-backed archive in
-your Historious data directory, and it does not need a hosted service for normal
-use.
-
-## Teach An Agent To Use Historious
-
-The simplest path is to let Historious print the instructions:
+Historious can print instructions that you can paste into `AGENTS.md`,
+`CLAUDE.md`, or the equivalent file for your agent:
 
 ```bash
 histo onboard
 histo onboard --agents-md
 ```
 
-For agents with skill systems, use the packaged skill:
+It also ships a packaged skill:
 
 ```bash
 histo skill list
@@ -102,24 +101,11 @@ histo skill install search-agent-history-historious --claude
 histo skill install search-agent-history-historious --pi
 ```
 
-Agent rule of thumb: prefer `histo --robot`, search broadly first, group hits by
+Good agent behavior is simple: start broad, use `--robot`, group hits by
 `session_id`, then inspect promising refs with `show` or `transcript`. Use full
-transcripts when exact commands, file paths, or final decisions matter.
+transcripts when exact commands, file paths, or decisions matter.
 
-## Daily Commands
-
-Refresh the archive:
-
-```bash
-histo update
-```
-
-Check health:
-
-```bash
-histo status
-histo --robot status
-```
+## Useful Searches
 
 Find recent threads:
 
@@ -129,13 +115,18 @@ histo threads --all --after "3 days ago"
 histo threads --project /absolute/repo/path
 ```
 
-Search with useful filters:
+Search with filters:
 
 ```bash
 histo search "migration rollback sqlite" --project /absolute/repo/path
 histo search "rate limit 429" --all --after 2026-06-01
 histo search "cargo zigbuild release" --include-tools
 histo search "exact_function_name" --mode lexical
+```
+
+After enabling embeddings, semantic search is available too:
+
+```bash
 histo search "why did the sync loop repeat" --mode semantic
 ```
 
@@ -148,16 +139,34 @@ histo transcript <session_id> --at <ref>
 histo tail <session_id>
 ```
 
-Open the terminal UI:
+## Local TUI
+
+`histo tui` is a local terminal UI built on `fzf`. Install `fzf` first:
+
+```bash
+brew install fzf
+# or, on Debian/Ubuntu:
+sudo apt install fzf
+```
+
+Then run:
 
 ```bash
 histo tui
 ```
 
-## Sync Between Machines
+The TUI starts a local Historious server for itself when needed. You usually do
+not need to run `histo serve` by hand.
 
-Historious sync is plain JSONL over stdin/stdout. Both machines need `histo` on
-`PATH`.
+For a fixed result set instead of live search, use:
+
+```bash
+histo search "query terms" --fzf
+```
+
+## Sync Machines
+
+Sync is plain JSONL over stdin/stdout. Both machines need `histo` on `PATH`.
 
 Pull remote history into the local machine:
 
@@ -183,68 +192,67 @@ histo export --jsonl --since 2026-06-01
 ```
 
 Do not add `histo update` to these exchange flows. `update` scans local agent log
-files; export/import exchanges records already stored in Historious.
+files; export/import moves records already stored in Historious.
 
 ## Embeddings
 
-Historious can use embeddings for semantic search. Embeddings are enabled by
-default when the binary was built with FastEmbed support.
+Embeddings are off by default. That keeps first indexing quick and avoids model
+downloads unless you ask for them.
 
-Persistently turn embeddings off for this data directory:
-
-```bash
-histo config embeddings off
-```
-
-Turn them back on:
+Turn embeddings on for this data directory:
 
 ```bash
 histo config embeddings on
 ```
 
-Inspect the current setting and config path:
+Turn them back off:
+
+```bash
+histo config embeddings off
+```
+
+Check the current setting and config path:
 
 ```bash
 histo config show
 ```
 
 Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`,
-`daemon`, or `serve` when you want a one-off lexical-only run.
+`daemon`, or `serve` for a one-off lexical-only run.
 
-Release note: Linux musl release binaries are built without FastEmbed so they
-stay static and portable. Build from source with Cargo when you want Linux
-semantic embedding support in the binary itself.
+Linux musl release binaries are built without FastEmbed so they stay static and
+portable. If you want Linux semantic embeddings in the binary itself, build from
+source with Cargo and then run `histo config embeddings on`.
 
-## Remote TUI
+## Serve Mode
 
-Local TUI starts and uses the default local server automatically:
+Most people can ignore this section.
 
-```bash
-histo tui
-```
-
-To run the server yourself:
+Historious has a small unauthenticated HTTP server because the TUI talks to the
+search engine through that API. `histo tui` starts a local server automatically,
+but you can run one yourself:
 
 ```bash
 histo serve
 histo tui --server-url http://127.0.0.1:7391
 ```
 
-For another machine, keep the server bound to loopback and reach it through SSH:
+Because the TUI accepts `--server-url`, you can also query a Historious server
+running on another machine. Prefer an SSH tunnel:
 
 ```bash
 ssh -L 7391:127.0.0.1:7391 <remote> 'histo serve'
 histo tui --server-url http://127.0.0.1:7391
 ```
 
-Direct LAN exposure is explicit because the HTTP server is unauthenticated:
+Direct LAN exposure is explicit because the server is unauthenticated:
 
 ```bash
 ssh <remote> 'histo serve --bind 0.0.0.0:7391 --allow-network-bind'
 histo tui --server-url http://<remote-ip>:7391
 ```
 
-Do not expose the unauthenticated HTTP server directly on a public interface.
+Do not expose the Historious HTTP server directly on a public interface.
 
 ## Release Flow
 
