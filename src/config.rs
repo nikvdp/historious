@@ -60,18 +60,14 @@ impl Default for SearchConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EmbeddingsConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     enabled: bool,
 }
 
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: false }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
