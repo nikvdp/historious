@@ -173,14 +173,29 @@ Pull remote history into the local machine:
 
 ```bash
 ssh <remote> 'histo export --jsonl' \
-  | histo import --jsonl -
+  | histo import --jsonl --json -
 ```
 
 Push local history to a remote machine:
 
 ```bash
 histo export --jsonl \
-  | ssh <remote> 'histo import --jsonl -'
+  | ssh <remote> 'histo import --jsonl --json -'
+```
+
+Omit embeddings when bandwidth or storage is constrained:
+
+```bash
+histo export --jsonl --embeddings omit \
+  | ssh <remote> 'histo import --jsonl --json -'
+```
+
+Control raw artifact transfer with `--raw-artifacts inline|metadata|omit`
+(or the alias `--no-raw-artifacts`):
+
+```bash
+histo export --jsonl --raw-artifacts metadata
+histo export --jsonl --no-raw-artifacts
 ```
 
 Useful export filters:
