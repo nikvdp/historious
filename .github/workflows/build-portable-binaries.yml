@@ -1,0 +1,135 @@
+name: build-portable-binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: histo-linux-x86_64-musl
+            binary_suffix: ""
+            build_with_zig: true
+            cargo_args: "--no-default-features"
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset_name: histo-linux-aarch64-musl
+            binary_suffix: ""
+            build_with_zig: true
+            cargo_args: "--no-default-features"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_name: histo-macos-x86_64
+            binary_suffix: ""
+            build_with_zig: false
+            cargo_args: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_name: histo-macos-aarch64
+            binary_suffix: ""
+            build_with_zig: false
+            cargo_args: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: histo-windows-x86_64.exe
+            binary_suffix: ".exe"
+            build_with_zig: false
+            cargo_args: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: matrix.build_with_zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_with_zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release binary with Zig
+        if: matrix.build_with_zig
+        run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+
+      - name: Build release binary
+        if: ${{ !matrix.build_with_zig }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+
+      - name: Stage release artifact
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Stage release artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/histo${{ matrix.binary_suffix }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" release-assets/* --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

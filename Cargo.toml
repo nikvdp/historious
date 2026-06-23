@@ -3,6 +3,10 @@ name = "historious"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
 [[bin]]
 name = "histo"
 path = "src/main.rs"
@@ -41,3 +45,9 @@ walkdir = "2.5"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
