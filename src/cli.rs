@@ -5503,7 +5503,7 @@ fn tui_reload_command(
 fn ensure_fzf_available() -> Result<()> {
     if !command_exists("fzf") {
         bail!(
-            "fzf is not installed. Use `histo search <query>` and then `histo show <ref>` or `histo transcript <ref>`."
+            "fzf is required for `histo tui` and `histo search --fzf`, but it was not found on PATH.\nInstall it with `brew install fzf` on macOS or `sudo apt install fzf` on Debian/Ubuntu.\nWithout fzf, use `histo search <query>` and then `histo show <ref>` or `histo transcript <session_id> --at <ref>`."
         );
     }
     Ok(())
