@@ -23,23 +23,24 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            asset_name: histo-linux-x86_64-musl
+            target: x86_64-unknown-linux-gnu
+            asset_name: histo-linux-x86_64-gnu
             binary_suffix: ""
-            build_with_zig: true
-            cargo_args: "--no-default-features"
+            build_with_zig: false
+            cargo_args: ""
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            asset_name: histo-linux-aarch64-musl
+            target: aarch64-unknown-linux-gnu
+            asset_name: histo-linux-aarch64-gnu
             binary_suffix: ""
             build_with_zig: true
-            cargo_args: "--no-default-features"
+            cargo_args: ""
           - os: macos-15-intel
             target: x86_64-apple-darwin
             asset_name: histo-macos-x86_64
             binary_suffix: ""
             build_with_zig: false
-            cargo_args: "--no-default-features"
+            cargo_args: ""
+            needs_ort_lib: true
           - os: macos-14
             target: aarch64-apple-darwin
             asset_name: histo-macos-aarch64
@@ -81,14 +82,45 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      - name: Download and cache ONNX Runtime for macOS Intel
+        if: matrix.needs_ort_lib
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ort-lib
+          key: ort-1.24.2-x86_64-apple-darwin
+
+      - name: Fetch ONNX Runtime prebuilt for macOS Intel
+        if: matrix.needs_ort_lib && steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/ort-lib
+          cd ~/ort-lib
+          # Try pyke.io CDN first (may host x86_64-apple-darwin even though
+          # it's not listed in ort-sys's dist.txt)
+          curl -fsSL -o ort.tar.lzma2 \
+            "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-apple-darwin.tar.lzma2" \
+            || true
+          if [ -f ort.tar.lzma2 ] && [ -s ort.tar.lzma2 ]; then
+            tar --lzma -xf ort.tar.lzma2
+            rm ort.tar.lzma2
+          else
+            # Fall back to Microsoft's GitHub releases (dylib only)
+            curl -fsSL -o ort.tgz \
+              "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-osx-x86_64-1.24.2.tgz"
+            tar -xzf ort.tgz
+            cp -r onnxruntime-osx-x86_64-1.24.2/lib/* .
+            rm -rf ort.tgz onnxruntime-osx-x86_64-1.24.2
+          fi
+          ls -la ~/ort-lib
+
       - name: Build release binary with Zig
         if: matrix.build_with_zig
-        env:
-          CFLAGS: "-D_GNU_SOURCE"
         run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Build release binary
         if: ${{ !matrix.build_with_zig }}
+        env:
+          ORT_LIB_LOCATION: ${{ matrix.needs_ort_lib && '/Users/runner/ort-lib' || '' }}
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Stage release artifact
