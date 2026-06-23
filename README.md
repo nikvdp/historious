@@ -36,7 +36,6 @@ Pick the asset for your machine:
 | Platform | Asset |
 | --- | --- |
 | macOS Apple Silicon | `histo-macos-aarch64` |
-| macOS Intel | `histo-macos-x86_64` |
 | Linux x86_64 | `histo-linux-x86_64-gnu` |
 | Linux ARM64 | `histo-linux-aarch64-gnu` |
 | Windows x86_64 | `histo-windows-x86_64.exe` |
