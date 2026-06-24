@@ -1447,7 +1447,24 @@ fn session_title(
 ) -> Option<String> {
     native_titles
         .get(kind, external_session_id)
+        .or_else(|| inline_session_title(kind, lines))
         .or_else(|| fallback_session_title(lines))
+}
+
+fn inline_session_title(kind: &str, lines: &[ParsedLine]) -> Option<String> {
+    match kind {
+        "pi_agent" => pi_session_info_title(lines),
+        _ => None,
+    }
+}
+
+fn pi_session_info_title(lines: &[ParsedLine]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.event_type == "session_info")
+        .and_then(|line| string_at(&line.value, &["name"]))
+        .and_then(|name| normalized_nonempty_title(&name))
 }
 
 fn fallback_session_title(lines: &[ParsedLine]) -> Option<String> {
@@ -1470,6 +1487,10 @@ fn title_candidate(content: &str) -> Option<String> {
     if is_bootstrap_content(content) {
         return None;
     }
+    normalized_nonempty_title(content)
+}
+
+fn normalized_nonempty_title(content: &str) -> Option<String> {
     let title = normalize_title(content);
     if title.is_empty() {
         None
@@ -1489,7 +1510,7 @@ fn normalize_title(content: &str) -> String {
 
 fn is_bootstrap_content(content: &str) -> bool {
     let content = content.trim_start();
-    content.starts_with("# AGENTS.md instructions for ")
+    content.starts_with("# AGENTS.md instructions")
         || content.starts_with("<INSTRUCTIONS>")
         || content.starts_with("<environment_context>")
 }
