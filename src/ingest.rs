@@ -137,6 +137,7 @@ struct ParsedLine {
     byte_offset: usize,
     byte_len: usize,
     content: String,
+    content_compacted: bool,
     search: SearchSegment,
     role: Option<String>,
     event_type: String,
@@ -1155,6 +1156,16 @@ fn prepare_file_import(
             "capture_fidelity".to_string(),
             Value::String("exact_local_log".to_string()),
         );
+        if line.content_compacted {
+            metadata.insert("content_compacted".to_string(), Value::Bool(true));
+            metadata.insert(
+                "content_compaction".to_string(),
+                json!({
+                    "strategy": "skipped_event_summary_v1",
+                    "raw_payload_preserved": use_raw_manifest || legacy_raw_hash.is_some()
+                }),
+            );
+        }
         line.search.apply_compat_metadata(&mut metadata);
         records.push(ArchiveRecord::Event(EventRecord {
             id: event_id,
@@ -2038,8 +2049,9 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
     let event_type = string_at(&value, &["type"])
         .or_else(|| string_at(&value, &["payload", "type"]))
         .unwrap_or_else(|| role.clone().unwrap_or_else(|| "event".to_string()));
-    let content = extract_text(&value).unwrap_or_else(|| value.to_string());
     let search = derive_search_segment(&value, role.as_deref(), &event_type);
+    let (content, content_compacted) =
+        event_content_for_search(&value, role.as_deref(), &event_type, &search);
     let occurred_at = string_at(&value, &["timestamp"])
         .or_else(|| string_at(&value, &["created_at"]))
         .or_else(|| string_at(&value, &["message", "created_at"]))
@@ -2053,6 +2065,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         byte_offset,
         byte_len,
         content,
+        content_compacted,
         search,
         role,
         event_type,
@@ -2111,6 +2124,48 @@ fn projection_from_parts(parts: Vec<String>, kind: &str, empty_reason: &str) -> 
         SearchSegment::indexed("conversation", kind, text, SemanticPolicy::Required)
             .with_provenance("message_text")
     }
+}
+
+fn event_content_for_search(
+    value: &Value,
+    role: Option<&str>,
+    event_type: &str,
+    search: &SearchSegment,
+) -> (String, bool) {
+    if search.is_searchable() {
+        return (search.text.clone(), false);
+    }
+    (compact_event_summary(value, role, event_type, search), true)
+}
+
+fn compact_event_summary(
+    value: &Value,
+    role: Option<&str>,
+    event_type: &str,
+    search: &SearchSegment,
+) -> String {
+    let label = if is_instruction_role(role) {
+        "instruction"
+    } else if looks_like_thinking_event(value, event_type) {
+        "thinking"
+    } else if looks_like_compaction_event(value, event_type) {
+        "compaction"
+    } else if looks_like_tool_event(value, event_type) {
+        "tool"
+    } else {
+        event_type.trim()
+    };
+    let label = if label.is_empty() {
+        "non-message"
+    } else {
+        label
+    };
+    let reason = search
+        .skip_reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("not indexed");
+    format!("[{label} event omitted from projection: {reason}; raw payload preserved]")
 }
 
 fn collect_conversation_text(value: &Value, parts: &mut Vec<String>) {
@@ -2180,6 +2235,23 @@ fn looks_like_tool_event(value: &Value, event_type: &str) -> bool {
         || is_toolish_object(value)
 }
 
+fn looks_like_thinking_event(value: &Value, event_type: &str) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    event_type.contains("thinking")
+        || event_type.contains("reasoning")
+        || value_contains_kind(value, &["thinking", "reasoning"])
+}
+
+fn looks_like_compaction_event(value: &Value, event_type: &str) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    event_type.contains("compact") || value_contains_kind(value, &["compact", "compaction"])
+}
+
+fn is_instruction_role(role: Option<&str>) -> bool {
+    role.map(str::to_ascii_lowercase)
+        .is_some_and(|role| role == "system" || role == "developer")
+}
+
 fn is_toolish_object(value: &Value) -> bool {
     let Some(map) = value.as_object() else {
         return false;
@@ -2193,11 +2265,33 @@ fn is_toolish_object(value: &Value) -> bool {
     kind.contains("tool")
         || kind.contains("function_call")
         || kind.contains("tool_result")
+        || kind.contains("thinking")
+        || kind.contains("reasoning")
+        || kind.contains("compact")
         || kind == "bash"
         || map.contains_key("tool_use_id")
         || map.contains_key("toolUseResult")
         || map.contains_key("stdout")
         || map.contains_key("stderr")
+}
+
+fn value_contains_kind(value: &Value, needles: &[&str]) -> bool {
+    match value {
+        Value::Object(map) => {
+            let kind_matches = ["type", "name", "kind"].iter().any(|key| {
+                map.get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|kind| needles.iter().any(|needle| kind.contains(needle)))
+            });
+            kind_matches
+                || map
+                    .values()
+                    .any(|child| value_contains_kind(child, needles))
+        }
+        Value::Array(items) => items.iter().any(|item| value_contains_kind(item, needles)),
+        _ => false,
+    }
 }
 
 fn normalize_parts(parts: Vec<String>) -> String {
@@ -2213,48 +2307,6 @@ fn push_text(parts: &mut Vec<String>, text: &str) {
     let text = text.trim();
     if !text.is_empty() {
         parts.push(text.to_string());
-    }
-}
-
-fn extract_text(value: &Value) -> Option<String> {
-    let mut parts = Vec::new();
-    collect_text(value, &mut parts);
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
-}
-
-fn collect_text(value: &Value, parts: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for key in [
-                "text", "content", "output", "input", "command", "stdout", "stderr",
-            ] {
-                if let Some(child) = map.get(key) {
-                    collect_text(child, parts);
-                }
-            }
-            if let Some(message) = map.get("message") {
-                collect_text(message, parts);
-            }
-            if let Some(payload) = map.get("payload") {
-                collect_text(payload, parts);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_text(item, parts);
-            }
-        }
-        Value::String(text) => {
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(text.to_string());
-            }
-        }
-        _ => {}
     }
 }
 
