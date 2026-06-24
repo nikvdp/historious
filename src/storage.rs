@@ -4358,7 +4358,11 @@ fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact, blob_dir: &Path) ->
     Ok(changed > 0)
 }
 
-fn insert_raw_object(conn: &Connection, object: &RawObjectRecord, blob_dir: &Path) -> Result<bool> {
+fn insert_raw_object(
+    conn: &Connection,
+    object: &RawObjectRecord,
+    _blob_dir: &Path,
+) -> Result<bool> {
     if object.size != object.content.len() as u64 && !object.content.is_empty() {
         bail!(
             "raw object size mismatch for {}: metadata says {}, content has {} bytes",
@@ -4382,24 +4386,24 @@ fn insert_raw_object(conn: &Connection, object: &RawObjectRecord, blob_dir: &Pat
         if existing.size != object.size || existing.media_type != object.media_type {
             bail!("raw object metadata mismatch for {}", object.hash);
         }
-        if !object.content.is_empty() {
-            write_verified_blob(blob_dir, &object.hash, &object.content)?;
+        if !object.content.is_empty() && existing.content.is_empty() {
+            conn.execute(
+                "UPDATE raw_objects SET content = ?2 WHERE hash = ?1 AND length(content) = 0",
+                params![object.hash.as_str(), object.content.as_slice()],
+            )?;
         }
         return Ok(false);
     }
 
-    if !object.content.is_empty() {
-        write_verified_blob(blob_dir, &object.hash, &object.content)?;
-    }
     let changed = conn.execute(
         "INSERT OR IGNORE INTO raw_objects
          (hash, media_type, size, content, first_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            object.hash,
-            object.media_type,
+            object.hash.as_str(),
+            object.media_type.as_str(),
             object.size,
-            Vec::<u8>::new(),
+            object.content.as_slice(),
             object.first_seen_at.to_rfc3339()
         ],
     )?;
@@ -4498,19 +4502,6 @@ fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
             .with_context(|| format!("creating blob shard {}", parent.display()))?;
     }
     std::fs::write(&path, content).with_context(|| format!("writing blob {}", path.display()))
-}
-
-fn write_verified_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
-    let path = blob_path(blob_dir, hash);
-    if path.exists() {
-        let existing =
-            std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))?;
-        if existing != content {
-            bail!("content-addressed blob collision for {hash}");
-        }
-        return Ok(());
-    }
-    write_blob(blob_dir, hash, content)
 }
 
 fn read_blob(blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
@@ -5638,7 +5629,7 @@ fn reconstruct_raw_manifest(conn: &Connection, blob_dir: &Path, hash: &str) -> R
     let entries = raw_manifest_entries(conn, hash)?;
     let mut out = Vec::with_capacity(manifest.full_size as usize);
     for entry in entries {
-        let bytes = read_blob(blob_dir, &entry.object_hash)?;
+        let bytes = raw_object_bytes(conn, blob_dir, &entry.object_hash)?;
         if bytes.len() as u64 != entry.byte_len {
             bail!(
                 "raw object length mismatch for {}: manifest says {}, blob has {} bytes",
@@ -5680,7 +5671,7 @@ fn raw_manifest_entry_for_event(
 
 fn raw_event_bytes(conn: &Connection, blob_dir: &Path, event_id: &str) -> Result<Option<Vec<u8>>> {
     if let Some(entry) = raw_manifest_entry_for_event(conn, event_id)? {
-        let bytes = read_blob(blob_dir, &entry.object_hash)?;
+        let bytes = raw_object_bytes(conn, blob_dir, &entry.object_hash)?;
         if bytes.len() as u64 != entry.byte_len {
             bail!(
                 "raw object length mismatch for {}: manifest says {}, blob has {} bytes",
@@ -5717,6 +5708,23 @@ fn raw_event_bytes(conn: &Connection, blob_dir: &Path, event_id: &str) -> Result
         );
     }
     Ok(Some(bytes[start..end].to_vec()))
+}
+
+fn raw_object_bytes(conn: &Connection, blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
+    let object = raw_object_by_hash(conn, hash)?
+        .ok_or_else(|| anyhow::anyhow!("raw object metadata not found: {hash}"))?;
+    if !object.content.is_empty() {
+        if object.content.len() as u64 != object.size {
+            bail!(
+                "raw object length mismatch for {}: metadata says {}, SQLite blob has {} bytes",
+                object.hash,
+                object.size,
+                object.content.len()
+            );
+        }
+        return Ok(object.content);
+    }
+    read_blob(blob_dir, hash)
 }
 
 fn metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
@@ -7432,7 +7440,8 @@ mod tests {
         assert_eq!(stored.hash, object.hash);
         assert_eq!(stored.media_type, "application/jsonl-record");
         assert_eq!(stored.size, line.len() as u64);
-        assert!(stored.content.is_empty());
+        assert_eq!(stored.content, line);
+        assert!(!blob_path(&store.blob_dir, &object.hash).exists());
 
         let mut mismatched = object.clone();
         mismatched.media_type = "text/plain".to_string();
@@ -7440,6 +7449,93 @@ mod tests {
             .insert_raw_object(&mismatched)
             .expect_err("metadata mismatch");
         assert!(err.to_string().contains("raw object metadata mismatch"));
+    }
+
+    #[test]
+    fn raw_manifest_backfills_empty_sqlite_object_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let object = fixture_raw_object(br#"{"event":"backfill"}"#);
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO raw_objects
+                     (hash, media_type, size, content, first_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        object.hash.as_str(),
+                        object.media_type.as_str(),
+                        object.size,
+                        Vec::<u8>::new(),
+                        object.first_seen_at.to_rfc3339()
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed empty object");
+
+        assert!(!store.insert_raw_object(&object).expect("backfill insert"));
+
+        let stored = store
+            .raw_object_by_hash(&object.hash)
+            .expect("object lookup")
+            .expect("object exists");
+        assert_eq!(stored.content, object.content);
+        assert!(!blob_path(&store.blob_dir, &object.hash).exists());
+    }
+
+    #[test]
+    fn raw_manifest_reconstructs_legacy_loose_raw_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let object = fixture_raw_object(br#"{"event":"legacy"}"#);
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO raw_objects
+                     (hash, media_type, size, content, first_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        object.hash.as_str(),
+                        object.media_type.as_str(),
+                        object.size,
+                        Vec::<u8>::new(),
+                        object.first_seen_at.to_rfc3339()
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed legacy object");
+        write_blob(&store.blob_dir, &object.hash, &object.content).expect("loose object");
+
+        let manifest = fixture_raw_manifest(
+            "manifest_legacy_loose",
+            "source_legacy_loose",
+            "/tmp/legacy.jsonl",
+            object.size,
+            1,
+            dt("2026-06-24T01:00:00Z"),
+        );
+        store
+            .insert_raw_manifest(
+                &manifest,
+                &fixture_manifest_entries(&manifest.hash, &[(&object, Some("event_legacy"))]),
+            )
+            .expect("legacy manifest");
+
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&manifest.hash)
+                .expect("reconstruct legacy"),
+            object.content
+        );
+        assert_eq!(
+            store
+                .raw_event_bytes("event_legacy")
+                .expect("raw event")
+                .expect("event bytes"),
+            object.content
+        );
     }
 
     #[test]
