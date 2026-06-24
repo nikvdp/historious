@@ -5274,24 +5274,28 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
         )?);
     }
 
-    if let Some((kind, text)) = tool_history_text(event) {
-        items.push(build_history_item(
-            event,
-            10,
-            "tool",
-            &kind,
-            &text,
-            true,
-            "opportunistic",
-            serde_json::json!({
-                "derived_from": "event.content",
-                "projector": "history_items_v2"
-            }),
-        )?);
+    let content_compacted = event_content_compacted(event);
+
+    if !content_compacted {
+        if let Some((kind, text)) = tool_history_text(event) {
+            items.push(build_history_item(
+                event,
+                10,
+                "tool",
+                &kind,
+                &text,
+                true,
+                "opportunistic",
+                serde_json::json!({
+                    "derived_from": "event.content",
+                    "projector": "history_items_v2"
+                }),
+            )?);
+        }
     }
 
     let raw_text = event.content.trim();
-    if !raw_text.is_empty() {
+    if !content_compacted && !raw_text.is_empty() {
         items.push(build_history_item(
             event,
             100,
@@ -5308,6 +5312,14 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
     }
 
     Ok(items)
+}
+
+fn event_content_compacted(event: &EventRecord) -> bool {
+    event
+        .metadata
+        .get("content_compacted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn conversation_history_text(event: &EventRecord) -> Option<(String, &str)> {
