@@ -198,6 +198,90 @@ fn raw_blobs_migrate_objects_skips_invalid_loose_objects() {
     assert_eq!(raw_object_content_len(&data_dir, &object_hash), 0);
 }
 
+#[test]
+fn raw_blobs_clean_manifest_artifacts_deletes_verified_legacy_artifact() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let raw_path = temp.path().join("manifest-session.jsonl");
+    let first = b"{\"event\":\"first\"}\n";
+    let second = b"{\"event\":\"second\"}\n";
+    let full = [first.as_slice(), second.as_slice()].concat();
+    let raw_hash = blake3_hex(&full);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+    seed_manifest_covered_raw_artifact(&data_dir, &raw_path.to_string_lossy(), &full, &[first, second]);
+
+    let preview = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-manifest-artifacts",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["data"]["cleanup"]["raw_artifacts_inspected"], 1);
+    assert_eq!(preview["data"]["cleanup"]["raw_artifacts_verified"], 1);
+    assert_eq!(preview["data"]["cleanup"]["raw_artifacts_deleted"], 0);
+    assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 1);
+    assert!(loose_blob_path(&data_dir, &raw_hash).exists());
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-manifest-artifacts",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_verified"], 1);
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_deleted"], 1);
+    assert_eq!(applied["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 0);
+    assert!(!loose_blob_path(&data_dir, &raw_hash).exists());
+}
+
+#[test]
+fn raw_blobs_clean_manifest_artifacts_keeps_mismatched_legacy_artifact() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let raw_path = temp.path().join("manifest-mismatch.jsonl");
+    let manifest_line = b"{\"event\":\"manifest\"}\n";
+    let legacy_bytes = b"{\"event\":\"legacy\"}\n";
+    let raw_hash = blake3_hex(legacy_bytes);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+    seed_manifest_covered_raw_artifact_with_legacy_bytes(
+        &data_dir,
+        &raw_path.to_string_lossy(),
+        &[manifest_line],
+        legacy_bytes,
+    );
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-manifest-artifacts",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_verified"], 0);
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_deleted"], 0);
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_skipped_mismatch"], 1);
+    assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 1);
+    assert!(loose_blob_path(&data_dir, &raw_hash).exists());
+}
+
 fn histo() -> Command {
     Command::cargo_bin("histo").expect("histo binary")
 }
@@ -237,6 +321,92 @@ fn raw_object_content_len(data_dir: &Path, hash: &str) -> usize {
         |row| row.get::<_, i64>(0),
     )
     .expect("content length") as usize
+}
+
+fn seed_manifest_covered_raw_artifact(
+    data_dir: &Path,
+    raw_path: &str,
+    manifest_bytes: &[u8],
+    entries: &[&[u8]],
+) {
+    seed_manifest_covered_raw_artifact_with_legacy_bytes(
+        data_dir,
+        raw_path,
+        entries,
+        manifest_bytes,
+    );
+}
+
+fn seed_manifest_covered_raw_artifact_with_legacy_bytes(
+    data_dir: &Path,
+    raw_path: &str,
+    entries: &[&[u8]],
+    legacy_bytes: &[u8],
+) {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    let raw_hash = blake3_hex(legacy_bytes);
+    conn.execute(
+        "INSERT INTO sources (id, kind, identity, path, first_seen_at, updated_at, hash)
+         VALUES ('source_manifest_cleanup', 'codex', ?1, ?1, '2026-06-24T00:00:00Z', '2026-06-24T00:00:00Z', 'source_hash')",
+        params![raw_path],
+    )
+    .expect("insert source");
+    conn.execute(
+        "INSERT INTO raw_artifacts
+         (hash, source_id, path, size, mtime_ms, media_type, content, first_seen_at)
+         VALUES (?1, 'source_manifest_cleanup', ?2, ?3, 1, 'application/jsonl', ?4, '2026-06-24T00:00:01Z')",
+        params![raw_hash.as_str(), raw_path, legacy_bytes.len() as i64, Vec::<u8>::new()],
+    )
+    .expect("insert raw artifact");
+    write_loose_blob(data_dir, &raw_hash, legacy_bytes);
+
+    let manifest_hash = format!("manifest:{}", blake3_hex(raw_path.as_bytes()));
+    let full_size = entries.iter().map(|entry| entry.len()).sum::<usize>() as i64;
+    conn.execute(
+        "INSERT INTO raw_manifests
+         (hash, source_id, source_kind, source_identity, path, external_session_id, full_size,
+          mtime_ms, media_type, entry_count, created_at, metadata_json)
+         VALUES (?1, 'source_manifest_cleanup', 'codex', ?2, ?2, 'session_manifest_cleanup',
+                 ?3, 1, 'application/jsonl', ?4, '2026-06-24T00:00:02Z', '{}')",
+        params![manifest_hash.as_str(), raw_path, full_size, entries.len() as i64],
+    )
+    .expect("insert manifest");
+
+    let mut byte_offset = 0i64;
+    for (idx, entry) in entries.iter().enumerate() {
+        let object_hash = blake3_hex(entry);
+        conn.execute(
+            "INSERT INTO raw_objects (hash, media_type, size, content, first_seen_at)
+             VALUES (?1, 'application/jsonl-record', ?2, ?3, '2026-06-24T00:00:02Z')",
+            params![object_hash.as_str(), entry.len() as i64, entry],
+        )
+        .expect("insert raw object");
+        conn.execute(
+            "INSERT INTO raw_manifest_entries
+             (manifest_hash, ordinal, object_hash, byte_offset, byte_len, raw_line_hash,
+              parsed_event_hash, event_id, external_event_id, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?3, NULL, NULL, NULL, '{}')",
+            params![
+                manifest_hash.as_str(),
+                idx as i64,
+                object_hash.as_str(),
+                byte_offset,
+                entry.len() as i64
+            ],
+        )
+        .expect("insert manifest entry");
+        byte_offset += entry.len() as i64;
+    }
+}
+
+fn raw_artifact_count(data_dir: &Path, hash: &str) -> usize {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM raw_artifacts WHERE hash = ?1",
+        params![hash],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("raw artifact count") as usize
 }
 
 fn archive_jsonl(

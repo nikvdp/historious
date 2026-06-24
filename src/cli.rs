@@ -726,6 +726,23 @@ pub enum RawBlobCommand {
         )]
         confirm: bool,
     },
+    /// Remove legacy raw artifacts that are exactly covered by manifests.
+    CleanManifestArtifacts {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview manifest-covered raw artifacts without deleting anything"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Delete raw artifacts only after byte-for-byte manifest verification"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -1591,6 +1608,31 @@ impl Cli {
                         print_raw_object_migration_output(&output);
                     }
                 }
+                RawBlobCommand::CleanManifestArtifacts {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let cleanup = if confirm {
+                        store.cleanup_manifest_raw_artifacts()?
+                    } else {
+                        store.preview_manifest_raw_artifact_cleanup()?
+                    };
+                    let output = ManifestRawArtifactCleanupOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        cleanup,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs clean-manifest-artifacts",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_manifest_raw_artifact_cleanup_output(&output);
+                    }
+                }
             },
             Command::Daemon {
                 interval_secs,
@@ -1724,7 +1766,8 @@ impl Command {
                     command: RawBlobCommand::Missing { json: true, .. }
                         | RawBlobCommand::Import { json: true, .. }
                         | RawBlobCommand::Compact { json: true, .. }
-                        | RawBlobCommand::MigrateObjects { json: true, .. },
+                        | RawBlobCommand::MigrateObjects { json: true, .. }
+                        | RawBlobCommand::CleanManifestArtifacts { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
         )
@@ -1942,6 +1985,13 @@ struct RawObjectMigrationOutput {
     dry_run: bool,
     confirmed: bool,
     migration: crate::storage::RawObjectMigrationOutcome,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestRawArtifactCleanupOutput {
+    dry_run: bool,
+    confirmed: bool,
+    cleanup: crate::storage::ManifestRawArtifactCleanupOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -3083,6 +3133,71 @@ fn print_raw_object_migration_output(output: &RawObjectMigrationOutput) {
         println!("Run again with --confirm to migrate these raw objects.");
     } else if output.migration.raw_objects_migrated == 0 {
         println!("No loose raw objects found for SQLite migration.");
+    }
+}
+
+fn print_manifest_raw_artifact_cleanup_output(output: &ManifestRawArtifactCleanupOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Manifest raw artifact cleanup preview"
+    } else {
+        "Manifest raw artifact cleanup complete"
+    };
+    println!("{title}");
+    print_section(
+        "Manifest-covered raw artifacts",
+        &[
+            (
+                "Raw artifacts inspected",
+                format_count(output.cleanup.raw_artifacts_inspected),
+            ),
+            (
+                "Raw artifacts verified",
+                format_count(output.cleanup.raw_artifacts_verified),
+            ),
+            (
+                "Raw artifacts deleted",
+                format_count(output.cleanup.raw_artifacts_deleted),
+            ),
+            (
+                "Raw artifact bytes verified",
+                format_bytes(output.cleanup.raw_artifact_bytes_verified),
+            ),
+            (
+                "Raw artifact bytes deleted",
+                format_bytes(output.cleanup.raw_artifact_bytes_deleted),
+            ),
+            (
+                "Missing legacy blobs",
+                format_count(output.cleanup.raw_artifacts_skipped_missing_blob),
+            ),
+            (
+                "Mismatches",
+                format_count(output.cleanup.raw_artifacts_skipped_mismatch),
+            ),
+            (
+                "Reconstruction failures",
+                format_count(output.cleanup.raw_artifacts_skipped_reconstruction_failed),
+            ),
+            (
+                "Raw blobs deleted",
+                format_count(output.cleanup.raw_blobs_deleted),
+            ),
+            (
+                "Raw blob bytes deleted",
+                format_bytes(output.cleanup.raw_blob_bytes_deleted),
+            ),
+            (
+                "Raw blobs retained for raw objects",
+                format_count(output.cleanup.raw_blobs_retained_for_raw_objects),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run && output.cleanup.raw_artifacts_verified > 0 {
+        println!("Run again with --confirm to delete verified raw artifacts.");
+    } else if output.cleanup.raw_artifacts_verified == 0 {
+        println!("No manifest-covered raw artifacts verified for cleanup.");
     }
 }
 

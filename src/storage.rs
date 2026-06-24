@@ -168,6 +168,21 @@ pub struct RawObjectMigrationOutcome {
     pub raw_blobs_retained_for_raw_artifacts: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ManifestRawArtifactCleanupOutcome {
+    pub raw_artifacts_inspected: usize,
+    pub raw_artifacts_verified: usize,
+    pub raw_artifacts_deleted: usize,
+    pub raw_artifact_bytes_verified: u64,
+    pub raw_artifact_bytes_deleted: u64,
+    pub raw_artifacts_skipped_missing_blob: usize,
+    pub raw_artifacts_skipped_mismatch: usize,
+    pub raw_artifacts_skipped_reconstruction_failed: usize,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+    pub raw_blobs_retained_for_raw_objects: usize,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RawObjectRecord {
@@ -1104,6 +1119,16 @@ impl Store {
 
     pub fn migrate_loose_raw_objects_to_sqlite(&self) -> Result<RawObjectMigrationOutcome> {
         self.with_conn(|conn| migrate_loose_raw_objects_to_sqlite(conn, &self.blob_dir, true))
+    }
+
+    pub fn preview_manifest_raw_artifact_cleanup(
+        &self,
+    ) -> Result<ManifestRawArtifactCleanupOutcome> {
+        self.with_conn(|conn| cleanup_manifest_raw_artifacts(conn, &self.blob_dir, false))
+    }
+
+    pub fn cleanup_manifest_raw_artifacts(&self) -> Result<ManifestRawArtifactCleanupOutcome> {
+        self.with_conn(|conn| cleanup_manifest_raw_artifacts(conn, &self.blob_dir, true))
     }
 
     pub fn vacuum(&self) -> Result<()> {
@@ -3320,6 +3345,159 @@ fn raw_artifact_hash_exists(conn: &Connection, hash: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+#[derive(Debug, Clone)]
+struct ManifestRawArtifactCleanupRow {
+    raw_hash: String,
+    raw_size: u64,
+    manifest_hash: String,
+}
+
+fn cleanup_manifest_raw_artifacts(
+    conn: &Connection,
+    blob_dir: &Path,
+    apply: bool,
+) -> Result<ManifestRawArtifactCleanupOutcome> {
+    let rows = manifest_raw_artifact_cleanup_rows(conn)?;
+    let mut outcome = ManifestRawArtifactCleanupOutcome {
+        raw_artifacts_inspected: rows.len(),
+        ..ManifestRawArtifactCleanupOutcome::default()
+    };
+
+    for row in rows {
+        let manifest_bytes = match reconstruct_raw_manifest(conn, blob_dir, &row.manifest_hash) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                outcome.raw_artifacts_skipped_reconstruction_failed += 1;
+                continue;
+            }
+        };
+        let raw_bytes = match raw_artifact_bytes(conn, blob_dir, &row.raw_hash) {
+            Ok(bytes) => bytes,
+            Err(err) if is_missing_blob_error(&err) => {
+                outcome.raw_artifacts_skipped_missing_blob += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if manifest_bytes != raw_bytes || raw_bytes.len() as u64 != row.raw_size {
+            outcome.raw_artifacts_skipped_mismatch += 1;
+            continue;
+        }
+
+        outcome.raw_artifacts_verified += 1;
+        outcome.raw_artifact_bytes_verified += row.raw_size;
+        if !apply {
+            continue;
+        }
+
+        let changed = conn.execute(
+            "DELETE FROM raw_artifacts WHERE hash = ?1",
+            params![row.raw_hash.as_str()],
+        )?;
+        if changed == 0 {
+            continue;
+        }
+        outcome.raw_artifacts_deleted += 1;
+        outcome.raw_artifact_bytes_deleted += row.raw_size;
+
+        let path = blob_path(blob_dir, &row.raw_hash);
+        if !path.exists() {
+            continue;
+        }
+        if raw_object_needs_loose_blob(conn, &row.raw_hash)? {
+            outcome.raw_blobs_retained_for_raw_objects += 1;
+            continue;
+        }
+        let deleted_bytes = std::fs::metadata(&path)
+            .with_context(|| format!("reading blob metadata {}", path.display()))?
+            .len();
+        std::fs::remove_file(&path).with_context(|| {
+            format!(
+                "removing manifest-covered raw artifact blob {}",
+                path.display()
+            )
+        })?;
+        outcome.raw_blobs_deleted += 1;
+        outcome.raw_blob_bytes_deleted += deleted_bytes;
+    }
+
+    Ok(outcome)
+}
+
+fn manifest_raw_artifact_cleanup_rows(
+    conn: &Connection,
+) -> Result<Vec<ManifestRawArtifactCleanupRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT raw.hash, raw.size, manifest.hash
+         FROM raw_artifacts raw
+         JOIN sources source ON source.id = raw.source_id
+         JOIN raw_manifests manifest
+           ON manifest.source_kind = source.kind
+          AND manifest.path = raw.path
+         WHERE manifest.created_at = (
+           SELECT MAX(latest.created_at)
+           FROM raw_manifests latest
+           WHERE latest.source_kind = source.kind
+             AND latest.path = raw.path
+         )
+         ORDER BY raw.path, raw.first_seen_at, raw.hash",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ManifestRawArtifactCleanupRow {
+            raw_hash: row.get(0)?,
+            raw_size: row.get::<_, i64>(1)? as u64,
+            manifest_hash: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_bytes(conn: &Connection, blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
+    let (size, content): (u64, Vec<u8>) = conn
+        .query_row(
+            "SELECT size, content FROM raw_artifacts WHERE hash = ?1",
+            params![hash],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("raw artifact metadata not found: {hash}"))?;
+    let bytes = if content.is_empty() {
+        read_blob(blob_dir, hash)?
+    } else {
+        content
+    };
+    if bytes.len() as u64 != size {
+        bail!(
+            "raw artifact length mismatch for {}: metadata says {}, content has {} bytes",
+            hash,
+            size,
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+fn raw_object_needs_loose_blob(conn: &Connection, hash: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM raw_objects WHERE hash = ?1 AND length(content) = 0)",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn is_missing_blob_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn collect_text_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
