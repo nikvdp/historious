@@ -2769,16 +2769,16 @@ mod tests {
     fn local_transcript_adapter_uses_cached_source_file_status() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
-        let identity = temp.path().join("cached-status.jsonl");
+        let identity = temp.path().join("cached-status.json");
         let identity = identity.to_string_lossy().to_string();
         let adapter = LocalTranscriptAdapter {
-            kind: "codex",
+            kind: "hermes",
             roots: Vec::new(),
             native_titles: NativeTitleIndex::default(),
         };
         let candidate = SourceCandidate {
-            adapter_kind: "codex",
-            kind: "codex".to_string(),
+            adapter_kind: "hermes",
+            kind: "hermes".to_string(),
             identity: identity.clone(),
             path: Some(PathBuf::from(&identity)),
             modified: 0,
@@ -2844,14 +2844,16 @@ mod tests {
         .expect("first ingest");
         let metadata = fs::metadata(&log_path).expect("first metadata");
         let current = store
-            .raw_artifact_is_current(
+            .raw_manifest_file_status(
+                "codex",
                 &log_path.to_string_lossy(),
                 metadata.len(),
                 file_mtime_ms(&metadata),
             )
-            .expect("freshness check");
+            .expect("freshness check")
+            .raw_current;
 
-        assert_eq!(first.inserted, 3);
+        assert_eq!(first.inserted, 2);
         assert_eq!(first.duplicates, 0);
         assert_eq!(first.delta.inserted_events.len(), 1);
         assert_eq!(first.delta.touched_sessions.len(), 1);
@@ -2883,38 +2885,58 @@ mod tests {
         let session_id = stable_id(&["session", "codex", &path_text, "session-1"]);
         let events = store.events_for_session(&session_id).expect("events");
 
-        assert_eq!(second.inserted, 2);
+        assert_eq!(second.inserted, 1);
         assert_eq!(second.duplicates, 1);
         assert_eq!(second.delta.inserted_events.len(), 1);
         assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
-        assert_eq!(second.delta.touched_paths.len(), 1);
-        assert_eq!(stats.raw_artifacts, 1);
+        assert!(second.delta.touched_paths.is_empty());
+        assert_eq!(stats.raw_artifacts, 0);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
-        assert!(!store.raw_artifact_blob_exists(&first_hash));
-        assert!(store.raw_artifact_blob_exists(&full_hash));
+        assert!(store
+            .raw_object_by_hash(&first_hash)
+            .expect("raw object")
+            .is_some());
         assert_eq!(events.len(), 2);
-        assert!(events
-            .iter()
-            .all(|event| event.raw_artifact_hash.as_deref() == Some(full_hash.as_str())));
+        assert!(events.iter().all(|event| event.raw_artifact_hash.is_none()));
         assert_eq!(
-            events[0].metadata["raw_artifact_hash"].as_str(),
+            events[0].metadata["raw_manifest_hash"].as_str(),
+            Some(first_hash.as_str())
+        );
+        assert_eq!(
+            events[1].metadata["raw_manifest_hash"].as_str(),
             Some(full_hash.as_str())
+        );
+        assert_eq!(
+            events[0].metadata["raw_object_hash"].as_str(),
+            Some(first_hash.as_str())
         );
         assert_eq!(events[0].metadata["byte_offset"].as_u64(), Some(0));
         assert_eq!(
             events[0].metadata["byte_len"].as_u64(),
             Some(first_log.len() as u64)
         );
-        let kept_raw = store
-            .read_raw_artifact_blob(&full_hash)
-            .expect("read kept raw");
-        assert_eq!(&kept_raw[..first_log.len()], first_log.as_bytes());
+        let manifest = store
+            .latest_raw_manifest_for_path("codex", &path_text)
+            .expect("latest manifest")
+            .expect("manifest exists");
+        let entries = store
+            .raw_manifest_entries(&manifest.hash)
+            .expect("manifest entries");
+        assert_eq!(manifest.hash, full_hash);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(raw_object_count(&store), 2);
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&manifest.hash)
+                .expect("reconstruct manifest"),
+            full_log
+        );
     }
 
     #[test]
-    fn non_prefix_rewrite_keeps_prior_raw_artifact() {
+    fn non_prefix_rewrite_keeps_prior_manifest_objects() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
         let log_path = temp.path().join("session.jsonl");
@@ -2952,12 +2974,87 @@ mod tests {
         .and_then(|prepared| prepared.commit(&store))
         .expect("second ingest");
         let stats = store.stats().expect("stats");
+        let path_text = log_path.to_string_lossy().to_string();
+        let manifest = store
+            .latest_raw_manifest_for_path("codex", &path_text)
+            .expect("latest manifest")
+            .expect("manifest exists");
 
-        assert_eq!(stats.raw_artifacts, 2);
+        assert_eq!(stats.raw_artifacts, 0);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
-        assert!(store.raw_artifact_blob_exists(&first_hash));
-        assert!(store.raw_artifact_blob_exists(&rewritten_hash));
+        assert!(store
+            .raw_object_by_hash(&first_hash)
+            .expect("old object")
+            .is_some());
+        assert_eq!(raw_object_count(&store), 3);
+        assert_eq!(manifest.hash, rewritten_hash);
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&manifest.hash)
+                .expect("reconstruct rewritten manifest"),
+            rewritten_log.as_bytes()
+        );
+    }
+
+    #[test]
+    fn forked_jsonl_copy_reuses_prefix_raw_object() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let first_path = temp.path().join("first.jsonl");
+        let fork_path = temp.path().join("fork.jsonl");
+        let shared = fixture_line("session-1", "shared question");
+        let first_log = format!("{}{}", shared, fixture_line("session-1", "first tail"));
+        let fork_log = format!("{}{}", shared, fixture_line("session-1", "fork tail"));
+        fs::write(&first_path, &first_log).expect("write first log");
+        fs::write(&fork_path, &fork_log).expect("write fork log");
+
+        let native_titles = NativeTitleIndex::default();
+        let context = SourceSyncContext::new(&store);
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &first_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("first ingest");
+        let context = SourceSyncContext::new(&store);
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &fork_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("fork ingest");
+
+        let first_manifest = store
+            .latest_raw_manifest_for_path("codex", &first_path.to_string_lossy())
+            .expect("first manifest")
+            .expect("first exists");
+        let fork_manifest = store
+            .latest_raw_manifest_for_path("codex", &fork_path.to_string_lossy())
+            .expect("fork manifest")
+            .expect("fork exists");
+        let first_entries = store
+            .raw_manifest_entries(&first_manifest.hash)
+            .expect("first entries");
+        let fork_entries = store
+            .raw_manifest_entries(&fork_manifest.hash)
+            .expect("fork entries");
+
+        assert_eq!(raw_object_count(&store), 3);
+        assert_eq!(first_entries[0].object_hash, fork_entries[0].object_hash);
+        assert_ne!(first_manifest.hash, fork_manifest.hash);
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&fork_manifest.hash)
+                .expect("reconstruct fork"),
+            fork_log.as_bytes()
+        );
     }
 
     #[test]
@@ -3081,5 +3178,14 @@ mod tests {
                 "timestamp": "2026-06-03T00:00:00Z"
             })
         )
+    }
+
+    fn raw_object_count(store: &Store) -> i64 {
+        store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM raw_objects", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .expect("raw object count")
     }
 }
