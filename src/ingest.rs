@@ -2911,15 +2911,9 @@ mod tests {
         assert_eq!(first.delta.touched_sessions.len(), 1);
         assert!(current);
 
-        fs::write(
-            &log_path,
-            format!(
-                "{}{}",
-                first_log,
-                fixture_line("session-1", "second question")
-            ),
-        )
-        .expect("append second log line");
+        let second_log = fixture_line("session-1", "second question");
+        fs::write(&log_path, format!("{}{}", first_log, second_log))
+            .expect("append second log line");
         let full_log = fs::read(&log_path).expect("read full log");
         let full_hash = blake3_hex(&full_log);
         let context = SourceSyncContext::new(&store);
@@ -2953,6 +2947,20 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.raw_artifact_hash.is_none()));
         assert_eq!(
+            store
+                .raw_event_bytes(&events[0].id)
+                .expect("first raw event")
+                .expect("first raw event exists"),
+            first_log.as_bytes()
+        );
+        assert_eq!(
+            store
+                .raw_event_bytes(&events[1].id)
+                .expect("second raw event")
+                .expect("second raw event exists"),
+            second_log.as_bytes()
+        );
+        assert_eq!(
             events[0].metadata["raw_manifest_hash"].as_str(),
             Some(first_hash.as_str())
         );
@@ -2985,6 +2993,25 @@ mod tests {
                 .expect("reconstruct manifest"),
             full_log
         );
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&first_hash)
+                .expect("reconstruct previous manifest"),
+            first_log.as_bytes()
+        );
+        let session = store
+            .session_by_id(&session_id)
+            .expect("session lookup")
+            .expect("session exists");
+        let rendered = crate::transcript::render_session(
+            &session,
+            &events,
+            None,
+            &crate::transcript::ViewMetadata::default(),
+            false,
+        );
+        assert!(rendered.contains("first question"));
+        assert!(rendered.contains("second question"));
     }
 
     #[test]
@@ -3101,6 +3128,18 @@ mod tests {
         assert_eq!(raw_object_count(&store), 3);
         assert_eq!(first_entries[0].object_hash, fork_entries[0].object_hash);
         assert_ne!(first_manifest.hash, fork_manifest.hash);
+        let fork_path_text = fork_path.to_string_lossy().to_string();
+        let fork_session_id = stable_id(&["session", "codex", &fork_path_text, "session-1"]);
+        let fork_events = store
+            .events_for_session(&fork_session_id)
+            .expect("fork events");
+        assert_eq!(
+            store
+                .raw_event_bytes(&fork_events[0].id)
+                .expect("fork raw event")
+                .expect("fork raw event exists"),
+            shared.as_bytes()
+        );
         assert_eq!(
             store
                 .reconstruct_raw_manifest(&fork_manifest.hash)
@@ -3146,6 +3185,16 @@ mod tests {
             store
                 .read_raw_artifact_blob(&raw_hash)
                 .expect("read raw artifact"),
+            raw_json.as_bytes()
+        );
+        let path_text = log_path.to_string_lossy().to_string();
+        let session_id = stable_id(&["session", "hermes", &path_text, "session-json"]);
+        let events = store.events_for_session(&session_id).expect("events");
+        assert_eq!(
+            store
+                .raw_event_bytes(&events[0].id)
+                .expect("raw event bytes")
+                .expect("raw event exists"),
             raw_json.as_bytes()
         );
 
