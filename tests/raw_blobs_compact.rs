@@ -1,7 +1,9 @@
 use assert_cmd::Command;
 use base64::Engine;
-use serde_json::{json, Value};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn raw_blobs_compact_previews_and_applies_append_snapshot_cleanup() {
@@ -105,6 +107,97 @@ fn raw_blobs_compact_previews_and_applies_append_snapshot_cleanup() {
     assert_eq!(status["data"]["stats"]["events"], 1);
 }
 
+#[test]
+fn raw_blobs_migrate_objects_moves_loose_objects_into_sqlite() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let object_bytes = br#"{"event":"old loose object"}"#;
+    let object_hash = blake3_hex(object_bytes);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+
+    seed_empty_raw_object(&data_dir, &object_hash, object_bytes);
+    write_loose_blob(&data_dir, &object_hash, object_bytes);
+
+    let preview = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "migrate-objects",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["data"]["dry_run"], true);
+    assert_eq!(preview["data"]["migration"]["raw_objects_inspected"], 1);
+    assert_eq!(preview["data"]["migration"]["raw_objects_migrated"], 1);
+    assert_eq!(preview["data"]["migration"]["raw_blobs_deleted"], 0);
+    assert!(loose_blob_path(&data_dir, &object_hash).exists());
+    assert_eq!(raw_object_content_len(&data_dir, &object_hash), 0);
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "migrate-objects",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["dry_run"], false);
+    assert_eq!(applied["data"]["confirmed"], true);
+    assert_eq!(applied["data"]["migration"]["raw_objects_migrated"], 1);
+    assert_eq!(applied["data"]["migration"]["raw_blobs_deleted"], 1);
+    assert_eq!(
+        applied["data"]["migration"]["raw_blob_bytes_deleted"],
+        object_bytes.len()
+    );
+    assert!(!loose_blob_path(&data_dir, &object_hash).exists());
+    assert_eq!(
+        raw_object_content_len(&data_dir, &object_hash),
+        object_bytes.len()
+    );
+}
+
+#[test]
+fn raw_blobs_migrate_objects_skips_invalid_loose_objects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let object_bytes = br#"{"event":"valid object"}"#;
+    let invalid_bytes = br#"{"event":"tampered object"}"#;
+    let object_hash = blake3_hex(object_bytes);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+
+    seed_empty_raw_object(&data_dir, &object_hash, object_bytes);
+    write_loose_blob(&data_dir, &object_hash, invalid_bytes);
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "migrate-objects",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["migration"]["raw_objects_migrated"], 0);
+    assert_eq!(
+        applied["data"]["migration"]["raw_objects_skipped_invalid_blob"],
+        1
+    );
+    assert_eq!(applied["data"]["migration"]["raw_blobs_deleted"], 0);
+    assert!(loose_blob_path(&data_dir, &object_hash).exists());
+    assert_eq!(raw_object_content_len(&data_dir, &object_hash), 0);
+}
+
 fn histo() -> Command {
     Command::cargo_bin("histo").expect("histo binary")
 }
@@ -112,6 +205,38 @@ fn histo() -> Command {
 fn command_json(command: &mut Command) -> Value {
     let output = command.assert().success().get_output().stdout.clone();
     serde_json::from_slice(&output).expect("json output")
+}
+
+fn seed_empty_raw_object(data_dir: &Path, hash: &str, bytes: &[u8]) {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    conn.execute(
+        "INSERT INTO raw_objects (hash, media_type, size, content, first_seen_at)
+         VALUES (?1, 'application/jsonl-record', ?2, ?3, '2026-06-24T00:00:00Z')",
+        params![hash, bytes.len() as i64, Vec::<u8>::new()],
+    )
+    .expect("insert raw object");
+}
+
+fn write_loose_blob(data_dir: &Path, hash: &str, bytes: &[u8]) {
+    let path = loose_blob_path(data_dir, hash);
+    fs::create_dir_all(path.parent().expect("blob parent")).expect("blob dir");
+    fs::write(path, bytes).expect("write loose blob");
+}
+
+fn loose_blob_path(data_dir: &Path, hash: &str) -> PathBuf {
+    let clean = hash.strip_prefix("blake3:").unwrap_or(hash);
+    let shard = clean.get(0..2).unwrap_or("xx");
+    data_dir.join("blobs").join(shard).join(clean)
+}
+
+fn raw_object_content_len(data_dir: &Path, hash: &str) -> usize {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    conn.query_row(
+        "SELECT length(content) FROM raw_objects WHERE hash = ?1",
+        params![hash],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("content length") as usize
 }
 
 fn archive_jsonl(
