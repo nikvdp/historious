@@ -159,6 +159,7 @@ impl SourceAdapter for TreechatAdapter {
 
     fn prepare_import(
         &self,
+        _context: &SourceSyncContext<'_>,
         machine_id: &str,
         candidate: &SourceCandidate,
     ) -> Result<PreparedImport> {
