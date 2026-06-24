@@ -3173,6 +3173,103 @@ mod tests {
     }
 
     #[test]
+    fn pi_tool_heavy_events_store_compact_summaries_and_project_conversation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("pi-session.jsonl");
+        let lines = [
+            json!({
+                "session_id": "session-pi",
+                "type": "message",
+                "role": "user",
+                "content": "please inspect the failing deploy",
+                "timestamp": "2026-06-03T00:00:00Z"
+            }),
+            json!({
+                "session_id": "session-pi",
+                "type": "message",
+                "role": "assistant",
+                "content": "I will check the deploy logs.",
+                "timestamp": "2026-06-03T00:00:01Z"
+            }),
+            json!({
+                "session_id": "session-pi",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "thinking", "text": "large private reasoning payload"}],
+                "timestamp": "2026-06-03T00:00:02Z"
+            }),
+            json!({
+                "session_id": "session-pi",
+                "type": "toolResult",
+                "content": "very large tool output that should stay out of projection",
+                "timestamp": "2026-06-03T00:00:03Z"
+            }),
+            json!({
+                "session_id": "session-pi",
+                "type": "compaction",
+                "content": "large compaction payload that should stay out of projection",
+                "timestamp": "2026-06-03T00:00:04Z"
+            }),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        fs::write(&log_path, lines).expect("write pi fixture");
+        let native_titles = NativeTitleIndex::default();
+        let context = SourceSyncContext::new(&store);
+
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "pi_agent",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("ingest pi fixture");
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
+
+        let path_text = log_path.to_string_lossy().to_string();
+        let session_id = stable_id(&["session", "pi_agent", &path_text, "session-pi"]);
+        let events = store.events_for_session(&session_id).expect("events");
+
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].content, "please inspect the failing deploy");
+        assert_eq!(events[1].content, "I will check the deploy logs.");
+        assert!(events[2].content.contains("thinking event omitted"));
+        assert!(events[3].content.contains("tool event omitted"));
+        assert!(events[4].content.contains("compaction event omitted"));
+        for event in &events[2..] {
+            assert_eq!(event.metadata["content_compacted"].as_bool(), Some(true));
+            assert!(event.metadata["raw_object_hash"].as_str().is_some());
+            assert!(store
+                .history_items_for_event(&event.id)
+                .expect("history items")
+                .is_empty());
+        }
+
+        assert_eq!(
+            tier_kinds(
+                &store
+                    .history_items_for_event(&events[0].id)
+                    .expect("user history")
+            ),
+            vec![("conversation", "user"), ("raw", "user")]
+        );
+        assert_eq!(
+            tier_kinds(
+                &store
+                    .history_items_for_event(&events[1].id)
+                    .expect("assistant history")
+            ),
+            vec![("conversation", "assistant"), ("raw", "assistant")]
+        );
+    }
+
+    #[test]
     fn source_summaries_track_found_and_selected_files_by_kind() {
         let mut summaries = Vec::new();
         push_found_source_file(&mut summaries, "codex");
@@ -3302,5 +3399,12 @@ mod tests {
                     .map_err(Into::into)
             })
             .expect("raw object count")
+    }
+
+    fn tier_kinds(items: &[crate::storage::HistoryItemRecord]) -> Vec<(&str, &str)> {
+        items
+            .iter()
+            .map(|item| (item.tier.as_str(), item.kind.as_str()))
+            .collect()
     }
 }
