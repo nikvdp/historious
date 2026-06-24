@@ -709,6 +709,23 @@ pub enum RawBlobCommand {
         )]
         confirm: bool,
     },
+    /// Move legacy loose raw object blobs into SQLite storage.
+    MigrateObjects {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview loose raw objects that can move into SQLite"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Store loose raw objects in SQLite and remove migrated loose blobs"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -1549,6 +1566,31 @@ impl Cli {
                         print_raw_blob_compact_output(&output);
                     }
                 }
+                RawBlobCommand::MigrateObjects {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let migration = if confirm {
+                        store.migrate_loose_raw_objects_to_sqlite()?
+                    } else {
+                        store.preview_loose_raw_object_migration()?
+                    };
+                    let output = RawObjectMigrationOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        migration,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs migrate-objects",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_raw_object_migration_output(&output);
+                    }
+                }
             },
             Command::Daemon {
                 interval_secs,
@@ -1681,7 +1723,8 @@ impl Command {
                 | Command::RawBlobs {
                     command: RawBlobCommand::Missing { json: true, .. }
                         | RawBlobCommand::Import { json: true, .. }
-                        | RawBlobCommand::Compact { json: true, .. },
+                        | RawBlobCommand::Compact { json: true, .. }
+                        | RawBlobCommand::MigrateObjects { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
         )
@@ -1892,6 +1935,13 @@ struct RawBlobCompactOutput {
     dry_run: bool,
     confirmed: bool,
     compaction: crate::storage::RawArtifactCompactionOutcome,
+}
+
+#[derive(Debug, Serialize)]
+struct RawObjectMigrationOutput {
+    dry_run: bool,
+    confirmed: bool,
+    migration: crate::storage::RawObjectMigrationOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -2980,6 +3030,59 @@ fn print_raw_blob_compact_output(output: &RawBlobCompactOutput) {
         println!("Run again with --confirm to apply this compaction.");
     } else if output.compaction.raw_artifacts_compacted == 0 {
         println!("No append-covered raw artifacts found.");
+    }
+}
+
+fn print_raw_object_migration_output(output: &RawObjectMigrationOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Raw object migration preview"
+    } else {
+        "Raw object migration complete"
+    };
+    println!("{title}");
+    print_section(
+        "Loose raw objects",
+        &[
+            (
+                "Objects inspected",
+                format_count(output.migration.raw_objects_inspected),
+            ),
+            (
+                "Objects migratable",
+                format_count(output.migration.raw_objects_migrated),
+            ),
+            (
+                "Object bytes migratable",
+                format_bytes(output.migration.raw_object_bytes_migrated),
+            ),
+            (
+                "Missing loose blobs",
+                format_count(output.migration.raw_objects_skipped_missing_blob),
+            ),
+            (
+                "Invalid loose blobs",
+                format_count(output.migration.raw_objects_skipped_invalid_blob),
+            ),
+            (
+                "Loose blobs deleted",
+                format_count(output.migration.raw_blobs_deleted),
+            ),
+            (
+                "Loose blob bytes deleted",
+                format_bytes(output.migration.raw_blob_bytes_deleted),
+            ),
+            (
+                "Loose blobs retained for raw artifacts",
+                format_count(output.migration.raw_blobs_retained_for_raw_artifacts),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run && output.migration.raw_objects_migrated > 0 {
+        println!("Run again with --confirm to migrate these raw objects.");
+    } else if output.migration.raw_objects_migrated == 0 {
+        println!("No loose raw objects found for SQLite migration.");
     }
 }
 

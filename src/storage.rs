@@ -156,6 +156,18 @@ pub struct RawArtifactCompactionOutcome {
     pub raw_blob_bytes_deleted: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RawObjectMigrationOutcome {
+    pub raw_objects_inspected: usize,
+    pub raw_objects_migrated: usize,
+    pub raw_object_bytes_migrated: u64,
+    pub raw_objects_skipped_missing_blob: usize,
+    pub raw_objects_skipped_invalid_blob: usize,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+    pub raw_blobs_retained_for_raw_artifacts: usize,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RawObjectRecord {
@@ -1084,6 +1096,14 @@ impl Store {
         outcome.raw_blobs_deleted = raw_blobs_deleted;
         outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
         Ok(outcome)
+    }
+
+    pub fn preview_loose_raw_object_migration(&self) -> Result<RawObjectMigrationOutcome> {
+        self.with_conn(|conn| migrate_loose_raw_objects_to_sqlite(conn, &self.blob_dir, false))
+    }
+
+    pub fn migrate_loose_raw_objects_to_sqlite(&self) -> Result<RawObjectMigrationOutcome> {
+        self.with_conn(|conn| migrate_loose_raw_objects_to_sqlite(conn, &self.blob_dir, true))
     }
 
     pub fn vacuum(&self) -> Result<()> {
@@ -3195,6 +3215,111 @@ fn remove_raw_artifact_blobs(blob_dir: &Path, hashes: &[String]) -> Result<(usiz
         bytes += size;
     }
     Ok((deleted, bytes))
+}
+
+#[derive(Debug, Clone)]
+struct RawObjectMigrationRow {
+    hash: String,
+    size: u64,
+}
+
+fn migrate_loose_raw_objects_to_sqlite(
+    conn: &Connection,
+    blob_dir: &Path,
+    apply: bool,
+) -> Result<RawObjectMigrationOutcome> {
+    const PAGE_SIZE: usize = 1_000;
+
+    let mut outcome = RawObjectMigrationOutcome::default();
+    let mut last_hash = String::new();
+    loop {
+        let rows = raw_object_migration_rows(conn, &last_hash, PAGE_SIZE)?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_hash = row.hash.clone();
+            outcome.raw_objects_inspected += 1;
+            let path = blob_path(blob_dir, &row.hash);
+            if !path.exists() {
+                outcome.raw_objects_skipped_missing_blob += 1;
+                continue;
+            }
+
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading raw object blob {}", path.display()))?;
+            if bytes.len() as u64 != row.size || crate::archive::blake3_hex(&bytes) != row.hash {
+                outcome.raw_objects_skipped_invalid_blob += 1;
+                continue;
+            }
+
+            outcome.raw_objects_migrated += 1;
+            outcome.raw_object_bytes_migrated += row.size;
+            if !apply {
+                continue;
+            }
+
+            let changed = conn.execute(
+                "UPDATE raw_objects
+                 SET content = ?2
+                 WHERE hash = ?1 AND length(content) = 0",
+                params![row.hash.as_str(), bytes.as_slice()],
+            )?;
+            if changed == 0 {
+                continue;
+            }
+
+            if raw_artifact_hash_exists(conn, &row.hash)? {
+                outcome.raw_blobs_retained_for_raw_artifacts += 1;
+                continue;
+            }
+
+            let deleted_bytes = std::fs::metadata(&path)
+                .with_context(|| format!("reading blob metadata {}", path.display()))?
+                .len();
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing migrated raw object blob {}", path.display()))?;
+            outcome.raw_blobs_deleted += 1;
+            outcome.raw_blob_bytes_deleted += deleted_bytes;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn raw_object_migration_rows(
+    conn: &Connection,
+    after_hash: &str,
+    limit: usize,
+) -> Result<Vec<RawObjectMigrationRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT hash, size
+         FROM raw_objects
+         WHERE length(content) = 0 AND hash > ?1
+         ORDER BY hash
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after_hash, limit as i64], |row| {
+        Ok(RawObjectMigrationRow {
+            hash: row.get(0)?,
+            size: row.get::<_, i64>(1)? as u64,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn raw_artifact_hash_exists(conn: &Connection, hash: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM raw_artifacts WHERE hash = ?1)",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn collect_text_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
