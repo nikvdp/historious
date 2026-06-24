@@ -588,6 +588,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Run explicit cold-path maintenance tasks.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
     /// Output agent instructions for Historious.
     Onboard {
         #[arg(long, help = "Emit only the AGENTS.md-ready block")]
@@ -642,6 +647,27 @@ pub enum ConfigCommand {
     Treechat {
         #[arg(value_enum, default_value_t = ConfigSourceState::Status)]
         state: ConfigSourceState,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceCommand {
+    /// Optimize FTS indexes and vacuum the SQLite database.
+    Compact {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview database size without running maintenance"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Run FTS optimize and SQLite VACUUM"
+        )]
+        confirm: bool,
     },
 }
 
@@ -1634,6 +1660,33 @@ impl Cli {
                     }
                 }
             },
+            Command::Maintenance { command } => match command {
+                MaintenanceCommand::Compact {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let maintenance = if confirm {
+                        store.compact_sqlite()?
+                    } else {
+                        store.preview_sqlite_compaction()?
+                    };
+                    let output = MaintenanceCompactOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        maintenance,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "maintenance compact",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_maintenance_compact_output(&output);
+                    }
+                }
+            },
             Command::Daemon {
                 interval_secs,
                 max_files,
@@ -1745,6 +1798,7 @@ impl Command {
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
             Command::Config { .. } => "config",
+            Command::Maintenance { .. } => "maintenance",
             Command::Onboard { .. } => "onboard",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
@@ -1768,6 +1822,9 @@ impl Command {
                         | RawBlobCommand::Compact { json: true, .. }
                         | RawBlobCommand::MigrateObjects { json: true, .. }
                         | RawBlobCommand::CleanManifestArtifacts { json: true, .. },
+                }
+                | Command::Maintenance {
+                    command: MaintenanceCommand::Compact { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
         )
@@ -1992,6 +2049,13 @@ struct ManifestRawArtifactCleanupOutput {
     dry_run: bool,
     confirmed: bool,
     cleanup: crate::storage::ManifestRawArtifactCleanupOutcome,
+}
+
+#[derive(Debug, Serialize)]
+struct MaintenanceCompactOutput {
+    dry_run: bool,
+    confirmed: bool,
+    maintenance: crate::storage::SqliteMaintenanceOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -3198,6 +3262,42 @@ fn print_manifest_raw_artifact_cleanup_output(output: &ManifestRawArtifactCleanu
         println!("Run again with --confirm to delete verified raw artifacts.");
     } else if output.cleanup.raw_artifacts_verified == 0 {
         println!("No manifest-covered raw artifacts verified for cleanup.");
+    }
+}
+
+fn print_maintenance_compact_output(output: &MaintenanceCompactOutput) {
+    println!();
+    let title = if output.dry_run {
+        "SQLite maintenance preview"
+    } else {
+        "SQLite maintenance complete"
+    };
+    println!("{title}");
+    print_section(
+        "Database",
+        &[
+            (
+                "Before",
+                format_bytes(output.maintenance.database_bytes_before),
+            ),
+            (
+                "After",
+                format_bytes(output.maintenance.database_bytes_after),
+            ),
+            (
+                "Reclaimed",
+                format_bytes(output.maintenance.database_bytes_reclaimed),
+            ),
+            (
+                "FTS optimized",
+                output.maintenance.fts_optimized.to_string(),
+            ),
+            ("Vacuumed", output.maintenance.vacuumed.to_string()),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run {
+        println!("Run again with --confirm to optimize FTS indexes and vacuum the database.");
     }
 }
 

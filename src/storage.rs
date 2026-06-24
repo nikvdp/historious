@@ -183,6 +183,15 @@ pub struct ManifestRawArtifactCleanupOutcome {
     pub raw_blobs_retained_for_raw_objects: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SqliteMaintenanceOutcome {
+    pub database_bytes_before: u64,
+    pub database_bytes_after: u64,
+    pub database_bytes_reclaimed: u64,
+    pub fts_optimized: bool,
+    pub vacuumed: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RawObjectRecord {
@@ -1131,12 +1140,45 @@ impl Store {
         self.with_conn(|conn| cleanup_manifest_raw_artifacts(conn, &self.blob_dir, true))
     }
 
+    pub fn preview_sqlite_compaction(&self) -> Result<SqliteMaintenanceOutcome> {
+        Ok(SqliteMaintenanceOutcome {
+            database_bytes_before: self.database_bytes()?,
+            database_bytes_after: self.database_bytes()?,
+            ..SqliteMaintenanceOutcome::default()
+        })
+    }
+
+    pub fn compact_sqlite(&self) -> Result<SqliteMaintenanceOutcome> {
+        let before = self.database_bytes()?;
+        self.with_conn(|conn| {
+            optimize_fts(conn)?;
+            conn.execute_batch("VACUUM")
+                .context("compacting Historious SQLite database")?;
+            Ok(())
+        })?;
+        let after = self.database_bytes()?;
+        Ok(SqliteMaintenanceOutcome {
+            database_bytes_before: before,
+            database_bytes_after: after,
+            database_bytes_reclaimed: before.saturating_sub(after),
+            fts_optimized: true,
+            vacuumed: true,
+        })
+    }
+
     pub fn vacuum(&self) -> Result<()> {
         self.with_conn(|conn| {
+            optimize_fts(conn)?;
             conn.execute_batch("VACUUM")
                 .context("compacting Historious SQLite database")?;
             Ok(())
         })
+    }
+
+    fn database_bytes(&self) -> Result<u64> {
+        Ok(std::fs::metadata(&self.db_path)
+            .with_context(|| format!("reading database metadata {}", self.db_path.display()))?
+            .len())
     }
 
     pub fn refresh_history_items(&self) -> Result<usize> {
@@ -3498,6 +3540,18 @@ fn is_missing_blob_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+fn optimize_fts(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        INSERT INTO events_fts(events_fts) VALUES('optimize');
+        INSERT INTO history_items_fts(history_items_fts) VALUES('optimize');
+        INSERT INTO history_items_conversation_fts(history_items_conversation_fts) VALUES('optimize');
+        ",
+    )
+    .context("optimizing Historious full-text indexes")?;
+    Ok(())
 }
 
 fn collect_text_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
