@@ -282,6 +282,57 @@ fn raw_blobs_clean_manifest_artifacts_keeps_mismatched_legacy_artifact() {
     assert!(loose_blob_path(&data_dir, &raw_hash).exists());
 }
 
+#[test]
+fn maintenance_compact_previews_and_runs_sqlite_maintenance() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+
+    let preview = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "maintenance",
+        "compact",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["data"]["dry_run"], true);
+    assert_eq!(preview["data"]["confirmed"], false);
+    assert_eq!(preview["data"]["maintenance"]["fts_optimized"], false);
+    assert_eq!(preview["data"]["maintenance"]["vacuumed"], false);
+    assert!(
+        preview["data"]["maintenance"]["database_bytes_before"]
+            .as_u64()
+            .expect("database bytes")
+            > 0
+    );
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "maintenance",
+        "compact",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["dry_run"], false);
+    assert_eq!(applied["data"]["confirmed"], true);
+    assert_eq!(applied["data"]["maintenance"]["fts_optimized"], true);
+    assert_eq!(applied["data"]["maintenance"]["vacuumed"], true);
+    assert!(
+        applied["data"]["maintenance"]["database_bytes_after"]
+            .as_u64()
+            .expect("database bytes")
+            > 0
+    );
+}
+
 fn histo() -> Command {
     Command::cargo_bin("histo").expect("histo binary")
 }
