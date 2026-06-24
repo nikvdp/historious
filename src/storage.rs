@@ -1950,15 +1950,46 @@ impl Store {
                  FROM raw_artifacts
                  WHERE hash = ?1",
                 params![hash],
-                |row| {
-                    Ok(RawArtifactSummary {
-                        hash: row.get(0)?,
-                        path: row.get(1)?,
-                        size: row.get::<_, u64>(2)?,
-                        media_type: row.get(3)?,
-                        first_seen_at: parse_dt(row.get(4)?),
-                    })
-                },
+                row_raw_artifact_summary,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn latest_raw_artifact_summary_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<RawArtifactSummary>> {
+        self.with_conn(|conn| latest_raw_artifact_summary_for_path(conn, path))
+    }
+
+    pub fn max_event_ordinal_for_session(&self, session_id: &str) -> Result<Option<i64>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT MAX(ordinal) FROM events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn latest_session_external_id_for_source_path(
+        &self,
+        source_kind: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT external_id
+                 FROM sessions
+                 WHERE source_kind = ?1
+                   AND json_extract(metadata_json, '$.path') = ?2
+                 ORDER BY COALESCE(updated_at, started_at, '') DESC, rowid DESC
+                 LIMIT 1",
+                params![source_kind, path],
+                |row| row.get(0),
             )
             .optional()
             .map_err(Into::into)
@@ -5125,6 +5156,33 @@ fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
         media_type: row.get(5)?,
         content: row.get(6)?,
         first_seen_at: parse_dt(row.get::<_, String>(7)?),
+    })
+}
+
+fn latest_raw_artifact_summary_for_path(
+    conn: &Connection,
+    path: &str,
+) -> Result<Option<RawArtifactSummary>> {
+    conn.query_row(
+        "SELECT hash, path, size, media_type, first_seen_at
+         FROM raw_artifacts
+         WHERE path = ?1
+         ORDER BY first_seen_at DESC, rowid DESC
+         LIMIT 1",
+        params![path],
+        row_raw_artifact_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn row_raw_artifact_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifactSummary> {
+    Ok(RawArtifactSummary {
+        hash: row.get(0)?,
+        path: row.get(1)?,
+        size: row.get::<_, u64>(2)?,
+        media_type: row.get(3)?,
+        first_seen_at: parse_dt(row.get(4)?),
     })
 }
 

@@ -321,6 +321,7 @@ pub trait SourceAdapter: Send + Sync {
     ) -> Result<bool>;
     fn prepare_import(
         &self,
+        context: &SourceSyncContext<'_>,
         machine_id: &str,
         candidate: &SourceCandidate,
     ) -> Result<PreparedImport>;
@@ -384,6 +385,7 @@ mod tests {
 
         fn prepare_import(
             &self,
+            _context: &SourceSyncContext<'_>,
             _machine_id: &str,
             _candidate: &SourceCandidate,
         ) -> Result<PreparedImport> {
@@ -454,6 +456,7 @@ mod tests {
 
             fn prepare_import(
                 &self,
+                _context: &SourceSyncContext<'_>,
                 _machine_id: &str,
                 _candidate: &SourceCandidate,
             ) -> Result<PreparedImport> {

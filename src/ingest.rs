@@ -157,6 +157,13 @@ struct WorkspaceIdentity {
     confidence: String,
 }
 
+#[derive(Debug, Clone)]
+struct AppendImportPlan {
+    previous_size: usize,
+    external_session_id: String,
+    next_ordinal: i64,
+}
+
 pub fn update_local_with_progress(
     store: &Store,
     machine_id: &str,
@@ -302,8 +309,13 @@ pub fn update_local_with_progress_and_cancel(
         });
     }
 
-    let prepared_imports =
-        prepare_pending_imports(&registry, machine_id, pending_imports, &should_cancel)?;
+    let prepared_imports = prepare_pending_imports(
+        &registry,
+        &context,
+        machine_id,
+        pending_imports,
+        &should_cancel,
+    )?;
     for prepared in prepared_imports {
         if should_cancel() {
             return Ok(stats);
@@ -436,6 +448,7 @@ struct PreparedPendingImport {
 
 fn prepare_pending_imports(
     registry: &SourceAdapterRegistry,
+    context: &SourceSyncContext<'_>,
     machine_id: &str,
     pending_imports: Vec<PendingImport>,
     should_cancel: &impl Fn() -> bool,
@@ -488,6 +501,7 @@ fn prepare_pending_imports(
             }
             prepared.extend(prepare_pending_import_batch(
                 adapter,
+                context,
                 machine_id,
                 batch.to_vec(),
                 should_cancel,
@@ -500,6 +514,7 @@ fn prepare_pending_imports(
 
 fn prepare_pending_import_batch(
     adapter: &dyn SourceAdapter,
+    context: &SourceSyncContext<'_>,
     machine_id: &str,
     pending_imports: Vec<PendingImport>,
     should_cancel: &impl Fn() -> bool,
@@ -512,7 +527,8 @@ fn prepare_pending_import_batch(
                 (
                     fallback,
                     scope.spawn(move || {
-                        let result = adapter.prepare_import(machine_id, &pending.candidate);
+                        let result =
+                            adapter.prepare_import(&context, machine_id, &pending.candidate);
                         PreparedPendingImport {
                             order: pending.order,
                             adapter_kind: pending.adapter_kind,
@@ -612,7 +628,8 @@ pub fn update_source_path_with_progress_and_cancel(
     if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
         stats.skipped_unchanged += 1;
     } else {
-        match prepare_file_import(machine_id, kind, &path, &native_titles)
+        let context = SourceSyncContext::new(store);
+        match prepare_file_import(&context, machine_id, kind, &path, &native_titles)
             .and_then(|prepared| prepared.commit(store))
         {
             Ok(delta) => {
@@ -823,6 +840,7 @@ impl SourceAdapter for LocalTranscriptAdapter {
 
     fn prepare_import(
         &self,
+        context: &SourceSyncContext<'_>,
         machine_id: &str,
         candidate: &SourceCandidate,
     ) -> Result<PreparedImport> {
@@ -830,7 +848,8 @@ impl SourceAdapter for LocalTranscriptAdapter {
             .path
             .as_deref()
             .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
-        let prepared = prepare_file_import(machine_id, self.kind(), path, &self.native_titles)?;
+        let prepared =
+            prepare_file_import(context, machine_id, self.kind(), path, &self.native_titles)?;
         if self.kind() == "opencode" {
             return Ok(prepared.with_checkpoint(SourceCheckpointUpsert {
                 source_kind: self.kind().to_string(),
@@ -938,6 +957,7 @@ fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
 }
 
 fn prepare_file_import(
+    context: &SourceSyncContext<'_>,
     machine_id: &str,
     kind: &str,
     path: &Path,
@@ -981,16 +1001,26 @@ fn prepare_file_import(
         );
     }
 
-    let text = String::from_utf8_lossy(&bytes);
-    let lines = if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+    let append_plan = append_import_plan(context, kind, path, &path_text, &bytes)?;
+    let lines = if let Some(plan) = &append_plan {
+        let suffix = String::from_utf8_lossy(&bytes[plan.previous_size..]);
+        parse_jsonl_with_start(suffix.as_ref(), plan.next_ordinal, plan.previous_size)
+    } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+        let text = String::from_utf8_lossy(&bytes);
         parse_jsonl(&text)
     } else {
+        let text = String::from_utf8_lossy(&bytes);
         parse_json_file(&text)
     };
     let lines = lines.with_context(|| format!("parsing {}", path.display()))?;
-    let external_session_id = lines
-        .iter()
-        .find_map(|line| line.external_session_id.clone())
+    let external_session_id = append_plan
+        .as_ref()
+        .map(|plan| plan.external_session_id.clone())
+        .or_else(|| {
+            lines
+                .iter()
+                .find_map(|line| line.external_session_id.clone())
+        })
         .unwrap_or_else(|| file_stem(path));
     let session_id = stable_id(&["session", kind, &path_text, &external_session_id]);
     let title = session_title(kind, &external_session_id, &lines, native_titles);
@@ -1051,6 +1081,54 @@ fn prepare_file_import(
         }));
     }
     Ok(PreparedImport::archive(vec![source_upsert], records))
+}
+
+fn append_import_plan(
+    context: &SourceSyncContext<'_>,
+    kind: &str,
+    path: &Path,
+    path_text: &str,
+    bytes: &[u8],
+) -> Result<Option<AppendImportPlan>> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") || kind == "opencode" {
+        return Ok(None);
+    }
+
+    let Some(previous) = context
+        .store
+        .latest_raw_artifact_summary_for_path(path_text)?
+    else {
+        return Ok(None);
+    };
+    let Ok(previous_size) = usize::try_from(previous.size) else {
+        return Ok(None);
+    };
+    if previous_size == 0 || previous_size >= bytes.len() {
+        return Ok(None);
+    }
+    if bytes.get(previous_size.saturating_sub(1)) != Some(&b'\n') {
+        return Ok(None);
+    }
+    if blake3_hex(&bytes[..previous_size]) != previous.hash {
+        return Ok(None);
+    }
+
+    let Some(external_session_id) = context
+        .store
+        .latest_session_external_id_for_source_path(kind, path_text)?
+    else {
+        return Ok(None);
+    };
+    let session_id = stable_id(&["session", kind, path_text, &external_session_id]);
+    let Some(max_ordinal) = context.store.max_event_ordinal_for_session(&session_id)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(AppendImportPlan {
+        previous_size,
+        external_session_id,
+        next_ordinal: max_ordinal.saturating_add(1),
+    }))
 }
 
 fn prepare_opencode_db_import(
@@ -1633,8 +1711,16 @@ fn looks_like_path(text: &str) -> bool {
 }
 
 fn parse_jsonl(text: &str) -> Result<Vec<ParsedLine>> {
+    parse_jsonl_with_start(text, 0, 0)
+}
+
+fn parse_jsonl_with_start(
+    text: &str,
+    starting_ordinal: i64,
+    starting_byte_offset: usize,
+) -> Result<Vec<ParsedLine>> {
     let mut out = Vec::new();
-    let mut offset = 0usize;
+    let mut offset = starting_byte_offset;
     for (idx, raw_line) in text.split_inclusive('\n').enumerate() {
         let byte_len = raw_line.len();
         let raw_line = raw_line.trim();
@@ -1644,7 +1730,12 @@ fn parse_jsonl(text: &str) -> Result<Vec<ParsedLine>> {
         }
         let value: Value = serde_json::from_str(raw_line)
             .with_context(|| format!("parsing JSONL line {}", idx + 1))?;
-        out.push(parsed_line(idx as i64, value, offset, byte_len));
+        out.push(parsed_line(
+            starting_ordinal.saturating_add(idx as i64),
+            value,
+            offset,
+            byte_len,
+        ));
         offset += byte_len;
     }
     Ok(out)
@@ -2243,9 +2334,16 @@ mod tests {
         drop(conn);
 
         let native_titles = NativeTitleIndex::default();
-        let imported = prepare_file_import("machine_fixture", "opencode", &db_path, &native_titles)
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("ingest opencode");
+        let context = SourceSyncContext::new(&store);
+        let imported = prepare_file_import(
+            &context,
+            "machine_fixture",
+            "opencode",
+            &db_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("ingest opencode");
         let path_text = db_path.to_string_lossy().to_string();
         let session_id = stable_id(&["session", "opencode", &path_text, "ses_fixture"]);
         let session = store
@@ -2373,9 +2471,16 @@ mod tests {
         fs::write(&log_path, &first_log).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
-        let first = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("first ingest");
+        let context = SourceSyncContext::new(&store);
+        let first = prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("first ingest");
         let metadata = fs::metadata(&log_path).expect("first metadata");
         let current = store
             .raw_artifact_is_current(
@@ -2402,16 +2507,23 @@ mod tests {
         .expect("append second log line");
         let full_log = fs::read(&log_path).expect("read full log");
         let full_hash = blake3_hex(&full_log);
-        let second = prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("second ingest");
+        let context = SourceSyncContext::new(&store);
+        let second = prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("second ingest");
         let stats = store.stats().expect("stats");
         let path_text = log_path.to_string_lossy().to_string();
         let session_id = stable_id(&["session", "codex", &path_text, "session-1"]);
         let events = store.events_for_session(&session_id).expect("events");
 
         assert_eq!(second.inserted, 2);
-        assert_eq!(second.duplicates, 2);
+        assert_eq!(second.duplicates, 1);
         assert_eq!(second.delta.inserted_events.len(), 1);
         assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
@@ -2450,9 +2562,16 @@ mod tests {
         fs::write(&log_path, &first_log).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
-        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("first ingest");
+        let context = SourceSyncContext::new(&store);
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("first ingest");
 
         let rewritten_log = format!(
             "{}{}",
@@ -2461,9 +2580,16 @@ mod tests {
         );
         let rewritten_hash = blake3_hex(rewritten_log.as_bytes());
         fs::write(&log_path, &rewritten_log).expect("rewrite log");
-        prepare_file_import("machine_fixture", "codex", &log_path, &native_titles)
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("second ingest");
+        let context = SourceSyncContext::new(&store);
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "codex",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("second ingest");
         let stats = store.stats().expect("stats");
 
         assert_eq!(stats.raw_artifacts, 2);
