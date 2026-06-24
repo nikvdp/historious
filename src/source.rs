@@ -1,5 +1,8 @@
 use crate::archive::ArchiveRecord;
-use crate::storage::{ImportStats, SourceFileStatus, Store};
+use crate::storage::{
+    ImportStats, RawManifestEntryRecord, RawManifestRecord, RawObjectRecord, SourceFileStatus,
+    Store,
+};
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -103,6 +106,13 @@ pub struct SourceCheckpointUpsert {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedRawManifest {
+    pub objects: Vec<RawObjectRecord>,
+    pub manifest: RawManifestRecord,
+    pub entries: Vec<RawManifestEntryRecord>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PreparedImportMode {
     Archive,
@@ -113,6 +123,7 @@ pub enum PreparedImportMode {
 pub struct PreparedImport {
     pub source_upserts: Vec<SourceUpsert>,
     pub records: Vec<ArchiveRecord>,
+    pub raw_manifests: Vec<PreparedRawManifest>,
     pub checkpoints: Vec<SourceCheckpointUpsert>,
     pub mode: PreparedImportMode,
 }
@@ -122,6 +133,7 @@ impl PreparedImport {
         Self {
             source_upserts,
             records,
+            raw_manifests: Vec::new(),
             checkpoints: Vec::new(),
             mode: PreparedImportMode::Archive,
         }
@@ -131,9 +143,15 @@ impl PreparedImport {
         Self {
             source_upserts,
             records,
+            raw_manifests: Vec::new(),
             checkpoints: Vec::new(),
             mode: PreparedImportMode::Full,
         }
+    }
+
+    pub fn with_raw_manifest(mut self, raw_manifest: PreparedRawManifest) -> Self {
+        self.raw_manifests.push(raw_manifest);
+        self
     }
 
     pub fn with_checkpoint(mut self, checkpoint: SourceCheckpointUpsert) -> Self {
@@ -154,6 +172,12 @@ impl PreparedImport {
             PreparedImportMode::Archive => store.import_archive_records(&self.records)?,
             PreparedImportMode::Full => store.import_records(&self.records)?,
         };
+        for raw_manifest in &self.raw_manifests {
+            for object in &raw_manifest.objects {
+                store.insert_raw_object(object)?;
+            }
+            store.insert_raw_manifest(&raw_manifest.manifest, &raw_manifest.entries)?;
+        }
         for checkpoint in &self.checkpoints {
             store.upsert_source_checkpoint(
                 &checkpoint.source_kind,

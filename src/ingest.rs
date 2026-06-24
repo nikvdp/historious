@@ -3,11 +3,14 @@ use crate::archive::{
 };
 use crate::config::SourceConfigs;
 use crate::source::{
-    AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
-    SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
-    SourceUpsert,
+    AdapterConcurrency, PreparedImport, PreparedRawManifest, SearchSegment, SemanticPolicy,
+    SourceAdapter, SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert,
+    SourceSyncContext, SourceUpsert,
 };
-use crate::storage::{ImportDelta, SourceFileFingerprint, SourceFileStatus, Store};
+use crate::storage::{
+    ImportDelta, RawManifestEntryRecord, RawManifestRecord, RawObjectRecord, SourceFileFingerprint,
+    SourceFileStatus, Store,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -162,6 +165,22 @@ struct AppendImportPlan {
     previous_size: usize,
     external_session_id: String,
     next_ordinal: i64,
+    previous_entries: Vec<RawManifestEntryRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct RawJsonlSegment {
+    ordinal: i64,
+    byte_offset: usize,
+    byte_len: usize,
+    object_hash: String,
+    content: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestEventLink {
+    parsed_event_hash: String,
+    event_id: String,
 }
 
 pub fn update_local_with_progress(
@@ -834,6 +853,19 @@ impl SourceAdapter for LocalTranscriptAdapter {
                 .is_some_and(|stored| stored == cursor));
         }
         let size = candidate.size.unwrap_or(0);
+        if candidate
+            .path
+            .as_deref()
+            .is_some_and(|path| uses_raw_manifest_for_jsonl(self.kind(), path))
+        {
+            let status = context.store.raw_manifest_file_status(
+                self.kind(),
+                &candidate.identity,
+                size,
+                candidate.mtime_ms,
+            )?;
+            return Ok(status.raw_current && !status.needs_workspace_refresh);
+        }
         let status = context.source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
         Ok(status.raw_current && !status.needs_workspace_refresh)
     }
@@ -956,6 +988,10 @@ fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn uses_raw_manifest_for_jsonl(kind: &str, path: &Path) -> bool {
+    kind != "opencode" && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+}
+
 fn prepare_file_import(
     context: &SourceSyncContext<'_>,
     machine_id: &str,
@@ -978,6 +1014,7 @@ fn prepare_file_import(
         fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
     let mtime_ms = file_mtime_ms(&metadata);
     let mut records = Vec::new();
+    let use_raw_manifest = uses_raw_manifest_for_jsonl(kind, path);
     let raw_artifact = RawArtifact {
         hash: raw_hash.clone(),
         source_id: source_id.clone(),
@@ -988,7 +1025,12 @@ fn prepare_file_import(
         content: bytes.clone(),
         first_seen_at: Utc::now(),
     };
-    records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
+    let raw_artifact = if use_raw_manifest {
+        None
+    } else {
+        records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
+        Some(raw_artifact)
+    };
 
     if kind == "opencode" {
         return prepare_opencode_db_import(
@@ -997,11 +1039,15 @@ fn prepare_file_import(
             &path_text,
             &source_id,
             source_upsert,
-            raw_artifact,
+            raw_artifact.expect("OpenCode imports keep raw artifacts"),
         );
     }
 
-    let append_plan = append_import_plan(context, kind, path, &path_text, &bytes)?;
+    let append_plan = if use_raw_manifest {
+        manifest_append_import_plan(context, kind, path, &path_text, &bytes)?
+    } else {
+        append_import_plan(context, kind, path, &path_text, &bytes)?
+    };
     let lines = if let Some(plan) = &append_plan {
         let suffix = String::from_utf8_lossy(&bytes[plan.previous_size..]);
         parse_jsonl_with_start(suffix.as_ref(), plan.next_ordinal, plan.previous_size)
@@ -1013,6 +1059,23 @@ fn prepare_file_import(
         parse_json_file(&text)
     };
     let lines = lines.with_context(|| format!("parsing {}", path.display()))?;
+    let raw_segments = if use_raw_manifest {
+        if let Some(plan) = &append_plan {
+            jsonl_segments_with_start(
+                &bytes[plan.previous_size..],
+                plan.next_ordinal,
+                plan.previous_size,
+            )
+        } else {
+            jsonl_segments_with_start(&bytes, 0, 0)
+        }
+    } else {
+        Vec::new()
+    };
+    let raw_object_hashes_by_offset = raw_segments
+        .iter()
+        .map(|segment| (segment.byte_offset, segment.object_hash.clone()))
+        .collect::<HashMap<_, _>>();
     let external_session_id = append_plan
         .as_ref()
         .map(|plan| plan.external_session_id.clone())
@@ -1040,6 +1103,8 @@ fn prepare_file_import(
         hash: session_hash,
     }));
 
+    let legacy_raw_hash = raw_artifact.as_ref().map(|raw| raw.hash.clone());
+    let mut manifest_event_links = HashMap::new();
     for line in lines {
         if line.content.trim().is_empty() {
             continue;
@@ -1054,15 +1119,42 @@ fn prepare_file_import(
         ]);
         let byte_offset = line.byte_offset;
         let byte_len = line.byte_len;
-        let mut metadata = json!({
-            "raw_artifact_hash": raw_hash.clone(),
-            "byte_offset": byte_offset,
-            "byte_len": byte_len,
-            "capture_fidelity": "exact_local_log",
-        })
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+        let mut metadata = Map::new();
+        if let Some(raw_hash) = &legacy_raw_hash {
+            metadata.insert(
+                "raw_artifact_hash".to_string(),
+                Value::String(raw_hash.clone()),
+            );
+        }
+        if use_raw_manifest {
+            metadata.insert(
+                "raw_manifest_hash".to_string(),
+                Value::String(raw_hash.clone()),
+            );
+            if let Some(object_hash) = raw_object_hashes_by_offset.get(&byte_offset) {
+                metadata.insert(
+                    "raw_object_hash".to_string(),
+                    Value::String(object_hash.clone()),
+                );
+                metadata.insert(
+                    "raw_line_hash".to_string(),
+                    Value::String(object_hash.clone()),
+                );
+            }
+            manifest_event_links.insert(
+                byte_offset,
+                ManifestEventLink {
+                    parsed_event_hash: line_hash.clone(),
+                    event_id: event_id.clone(),
+                },
+            );
+        }
+        metadata.insert("byte_offset".to_string(), json!(byte_offset));
+        metadata.insert("byte_len".to_string(), json!(byte_len));
+        metadata.insert(
+            "capture_fidelity".to_string(),
+            Value::String("exact_local_log".to_string()),
+        );
         line.search.apply_compat_metadata(&mut metadata);
         records.push(ArchiveRecord::Event(EventRecord {
             id: event_id,
@@ -1074,13 +1166,28 @@ fn prepare_file_import(
             event_type: line.event_type,
             role: line.role,
             content: line.content,
-            raw_artifact_hash: Some(raw_hash.clone()),
+            raw_artifact_hash: legacy_raw_hash.clone(),
             occurred_at: line.occurred_at,
             metadata: Value::Object(metadata),
             hash: line_hash,
         }));
     }
-    Ok(PreparedImport::archive(vec![source_upsert], records))
+    let mut prepared = PreparedImport::archive(vec![source_upsert], records);
+    if use_raw_manifest {
+        prepared = prepared.with_raw_manifest(prepared_jsonl_raw_manifest(
+            &source_id,
+            kind,
+            &path_text,
+            &external_session_id,
+            &raw_hash,
+            bytes.len() as u64,
+            mtime_ms,
+            append_plan.as_ref(),
+            &raw_segments,
+            &manifest_event_links,
+        ));
+    }
+    Ok(prepared)
 }
 
 fn append_import_plan(
@@ -1128,7 +1235,155 @@ fn append_import_plan(
         previous_size,
         external_session_id,
         next_ordinal: max_ordinal.saturating_add(1),
+        previous_entries: Vec::new(),
     }))
+}
+
+fn manifest_append_import_plan(
+    context: &SourceSyncContext<'_>,
+    kind: &str,
+    path: &Path,
+    path_text: &str,
+    bytes: &[u8],
+) -> Result<Option<AppendImportPlan>> {
+    if !uses_raw_manifest_for_jsonl(kind, path) {
+        return Ok(None);
+    }
+
+    let Some(previous) = context
+        .store
+        .latest_raw_manifest_for_path(kind, path_text)?
+    else {
+        return Ok(None);
+    };
+    let Ok(previous_size) = usize::try_from(previous.full_size) else {
+        return Ok(None);
+    };
+    if previous_size == 0 || previous_size >= bytes.len() {
+        return Ok(None);
+    }
+    if bytes.get(previous_size.saturating_sub(1)) != Some(&b'\n') {
+        return Ok(None);
+    }
+    let previous_bytes = context.store.reconstruct_raw_manifest(&previous.hash)?;
+    if previous_bytes.as_slice() != &bytes[..previous_size] {
+        return Ok(None);
+    }
+    let previous_entries = context.store.raw_manifest_entries(&previous.hash)?;
+    let Some(max_ordinal) = previous_entries.iter().map(|entry| entry.ordinal).max() else {
+        return Ok(None);
+    };
+    let external_session_id = previous
+        .external_session_id
+        .or_else(|| {
+            context
+                .store
+                .latest_session_external_id_for_source_path(kind, path_text)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| file_stem(path));
+
+    Ok(Some(AppendImportPlan {
+        previous_size,
+        external_session_id,
+        next_ordinal: max_ordinal.saturating_add(1),
+        previous_entries,
+    }))
+}
+
+fn jsonl_segments_with_start(
+    bytes: &[u8],
+    starting_ordinal: i64,
+    starting_byte_offset: usize,
+) -> Vec<RawJsonlSegment> {
+    let mut segments = Vec::new();
+    let mut offset = starting_byte_offset;
+    for (idx, segment) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let byte_len = segment.len();
+        segments.push(RawJsonlSegment {
+            ordinal: starting_ordinal.saturating_add(idx as i64),
+            byte_offset: offset,
+            byte_len,
+            object_hash: blake3_hex(segment),
+            content: segment.to_vec(),
+        });
+        offset += byte_len;
+    }
+    segments
+}
+
+fn prepared_jsonl_raw_manifest(
+    source_id: &str,
+    kind: &str,
+    path_text: &str,
+    external_session_id: &str,
+    raw_hash: &str,
+    full_size: u64,
+    mtime_ms: Option<i64>,
+    append_plan: Option<&AppendImportPlan>,
+    raw_segments: &[RawJsonlSegment],
+    event_links: &HashMap<usize, ManifestEventLink>,
+) -> PreparedRawManifest {
+    let mut entries = append_plan
+        .map(|plan| {
+            plan.previous_entries
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    entry.manifest_hash = raw_hash.to_string();
+                    entry
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    entries.extend(raw_segments.iter().map(|segment| {
+        let link = event_links.get(&segment.byte_offset);
+        RawManifestEntryRecord {
+            manifest_hash: raw_hash.to_string(),
+            ordinal: segment.ordinal,
+            object_hash: segment.object_hash.clone(),
+            byte_offset: segment.byte_offset as u64,
+            byte_len: segment.byte_len as u64,
+            raw_line_hash: segment.object_hash.clone(),
+            parsed_event_hash: link.map(|link| link.parsed_event_hash.clone()),
+            event_id: link.map(|link| link.event_id.clone()),
+            external_event_id: None,
+            metadata: json!({"strategy": "event_cas_manifest_v1"}),
+        }
+    }));
+    let objects = raw_segments
+        .iter()
+        .map(|segment| RawObjectRecord {
+            hash: segment.object_hash.clone(),
+            media_type: "application/jsonl-record".to_string(),
+            size: segment.byte_len as u64,
+            content: segment.content.clone(),
+            first_seen_at: Utc::now(),
+        })
+        .collect::<Vec<_>>();
+    let manifest = RawManifestRecord {
+        hash: raw_hash.to_string(),
+        source_id: source_id.to_string(),
+        source_kind: kind.to_string(),
+        source_identity: path_text.to_string(),
+        path: Some(path_text.to_string()),
+        external_session_id: Some(external_session_id.to_string()),
+        full_size,
+        mtime_ms,
+        media_type: "application/jsonl".to_string(),
+        entry_count: entries.len() as u64,
+        created_at: Utc::now(),
+        metadata: json!({
+            "strategy": "event_cas_manifest_v1",
+            "full_hash": raw_hash,
+        }),
+    };
+    PreparedRawManifest {
+        objects,
+        manifest,
+        entries,
+    }
 }
 
 fn prepare_opencode_db_import(

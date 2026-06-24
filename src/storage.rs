@@ -1286,6 +1286,24 @@ impl Store {
         })
     }
 
+    pub fn raw_manifest_file_status(
+        &self,
+        source_kind: &str,
+        path: &str,
+        size: u64,
+        mtime_ms: Option<i64>,
+    ) -> Result<SourceFileStatus> {
+        self.with_conn(|conn| {
+            let raw_current = raw_manifest_is_current(conn, source_kind, path, size, mtime_ms)?;
+            let needs_workspace_refresh =
+                raw_current && session_workspace_metadata_missing_for_path(conn, path)?;
+            Ok(SourceFileStatus {
+                raw_current,
+                needs_workspace_refresh,
+            })
+        })
+    }
+
     pub fn source_file_statuses(
         &self,
         files: &[SourceFileFingerprint],
@@ -5109,6 +5127,29 @@ fn raw_artifact_is_current(
              ORDER BY first_seen_at DESC
              LIMIT 1",
             params![path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(existing
+        .map(|(stored_size, stored_mtime)| stored_size == size as i64 && stored_mtime == mtime_ms)
+        .unwrap_or(false))
+}
+
+fn raw_manifest_is_current(
+    conn: &Connection,
+    source_kind: &str,
+    path: &str,
+    size: u64,
+    mtime_ms: Option<i64>,
+) -> Result<bool> {
+    let existing: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT full_size, mtime_ms
+             FROM raw_manifests
+             WHERE source_kind = ?1 AND path = ?2
+             ORDER BY created_at DESC, hash DESC
+             LIMIT 1",
+            params![source_kind, path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
