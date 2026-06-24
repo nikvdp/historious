@@ -28,24 +28,42 @@ jobs:
             binary_suffix: ""
             cargo_args: ""
             cross_packages: ""
+            build_with_zig: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             asset_name: histo-linux-aarch64-gnu
             binary_suffix: ""
             cargo_args: ""
             cross_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu"
+            build_with_zig: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: histo-linux-x86_64-musl
+            binary_suffix: ""
+            cargo_args: "--no-default-features"
+            cross_packages: ""
+            build_with_zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset_name: histo-linux-aarch64-musl
+            binary_suffix: ""
+            cargo_args: "--no-default-features"
+            cross_packages: ""
+            build_with_zig: true
           - os: macos-14
             target: aarch64-apple-darwin
             asset_name: histo-macos-aarch64
             binary_suffix: ""
             cargo_args: ""
             cross_packages: ""
+            build_with_zig: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: histo-windows-x86_64.exe
             binary_suffix: ".exe"
             cargo_args: ""
             cross_packages: ""
+            build_with_zig: false
 
     runs-on: ${{ matrix.os }}
 
@@ -69,7 +87,26 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install Zig
+        if: matrix.build_with_zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_with_zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release binary with Zig
+        if: matrix.build_with_zig
+        env:
+          CFLAGS: "-D_GNU_SOURCE"
+        run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+
       - name: Build release binary
+        if: ${{ !matrix.build_with_zig }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
