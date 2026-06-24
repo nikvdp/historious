@@ -2216,7 +2216,7 @@ mod tests {
                 json!({
                     "session_id": "session-1",
                     "type": "user",
-                    "content": "# AGENTS.md instructions for /tmp/repo\n<INSTRUCTIONS>..."
+                    "content": "# AGENTS.md instructions\n<INSTRUCTIONS>..."
                 }),
                 0,
                 1,
@@ -2236,6 +2236,91 @@ mod tests {
         assert_eq!(
             session_title("codex", "session-1", &lines, &native_titles).as_deref(),
             Some("Make thread titles recognizable")
+        );
+    }
+
+    #[test]
+    fn pi_session_title_prefers_latest_session_info_name() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "type": "session",
+                    "id": "pi-session-1",
+                    "cwd": "/tmp/repo"
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "type": "session_info",
+                    "name": "Old Pi Name"
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                2,
+                json!({
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "fallback user request"}]
+                    }
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                3,
+                json!({
+                    "type": "session_info",
+                    "name": "Renamed Pi Session"
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("pi_agent", "pi-session-1", &lines, &native_titles).as_deref(),
+            Some("Renamed Pi Session")
+        );
+    }
+
+    #[test]
+    fn pi_session_title_falls_back_after_cleared_session_info_name() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "type": "session_info",
+                    "name": ""
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first real pi prompt"}]
+                    }
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("pi_agent", "pi-session-1", &lines, &native_titles).as_deref(),
+            Some("first real pi prompt")
         );
     }
 
