@@ -598,6 +598,11 @@ impl Store {
         self.with_conn(|conn| raw_manifest_entry_for_event(conn, event_id))
     }
 
+    #[allow(dead_code)]
+    pub fn raw_event_bytes(&self, event_id: &str) -> Result<Option<Vec<u8>>> {
+        self.with_conn(|conn| raw_event_bytes(conn, &self.blob_dir, event_id))
+    }
+
     pub fn upsert_source(
         &self,
         id: &str,
@@ -5671,6 +5676,51 @@ fn raw_manifest_entry_for_event(
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn raw_event_bytes(conn: &Connection, blob_dir: &Path, event_id: &str) -> Result<Option<Vec<u8>>> {
+    if let Some(entry) = raw_manifest_entry_for_event(conn, event_id)? {
+        let bytes = read_blob(blob_dir, &entry.object_hash)?;
+        if bytes.len() as u64 != entry.byte_len {
+            bail!(
+                "raw object length mismatch for {}: manifest says {}, blob has {} bytes",
+                entry.object_hash,
+                entry.byte_len,
+                bytes.len()
+            );
+        }
+        return Ok(Some(bytes));
+    }
+
+    let Some(event) = event_by_id(conn, event_id)? else {
+        return Ok(None);
+    };
+    let Some(raw_hash) = event.raw_artifact_hash.as_deref() else {
+        return Ok(None);
+    };
+    let bytes = read_blob(blob_dir, raw_hash)?;
+    let Some(byte_offset) = metadata_u64(&event.metadata, "byte_offset") else {
+        return Ok(Some(bytes));
+    };
+    let Some(byte_len) = metadata_u64(&event.metadata, "byte_len") else {
+        return Ok(Some(bytes));
+    };
+    let start = usize::try_from(byte_offset).context("raw event byte offset is too large")?;
+    let len = usize::try_from(byte_len).context("raw event byte length is too large")?;
+    let end = start
+        .checked_add(len)
+        .context("raw event byte range overflowed")?;
+    if end > bytes.len() {
+        bail!(
+            "raw artifact range mismatch for {raw_hash}: event range {start}..{end}, blob has {} bytes",
+            bytes.len()
+        );
+    }
+    Ok(Some(bytes[start..end].to_vec()))
+}
+
+fn metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
+    metadata.get(key).and_then(Value::as_u64)
 }
 
 fn latest_raw_artifact_summary_for_path(
