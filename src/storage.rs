@@ -156,6 +156,48 @@ pub struct RawArtifactCompactionOutcome {
     pub raw_blob_bytes_deleted: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RawObjectRecord {
+    pub hash: String,
+    pub media_type: String,
+    pub size: u64,
+    pub content: Vec<u8>,
+    pub first_seen_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RawManifestRecord {
+    pub hash: String,
+    pub source_id: String,
+    pub source_kind: String,
+    pub source_identity: String,
+    pub path: Option<String>,
+    pub external_session_id: Option<String>,
+    pub full_size: u64,
+    pub mtime_ms: Option<i64>,
+    pub media_type: String,
+    pub entry_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub metadata: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RawManifestEntryRecord {
+    pub manifest_hash: String,
+    pub ordinal: i64,
+    pub object_hash: String,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+    pub raw_line_hash: String,
+    pub parsed_event_hash: Option<String>,
+    pub event_id: Option<String>,
+    pub external_event_id: Option<String>,
+    pub metadata: Value,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceFileStatus {
     pub raw_current: bool,
@@ -487,6 +529,73 @@ impl Store {
             }
             Ok(!already_present)
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn insert_raw_object(&self, object: &RawObjectRecord) -> Result<bool> {
+        self.with_conn(|conn| insert_raw_object(conn, object, &self.blob_dir))
+    }
+
+    #[allow(dead_code)]
+    pub fn raw_object_by_hash(&self, hash: &str) -> Result<Option<RawObjectRecord>> {
+        self.with_conn(|conn| raw_object_by_hash(conn, hash))
+    }
+
+    #[allow(dead_code)]
+    pub fn insert_raw_manifest(
+        &self,
+        manifest: &RawManifestRecord,
+        entries: &[RawManifestEntryRecord],
+    ) -> Result<bool> {
+        load_sqlite_vec();
+        let mut conn = Connection::open(&self.db_path)
+            .with_context(|| format!("opening database {}", self.db_path.display()))?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = insert_raw_manifest(&tx, manifest, entries)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    #[allow(dead_code)]
+    pub fn raw_manifest_by_hash(&self, hash: &str) -> Result<Option<RawManifestRecord>> {
+        self.with_conn(|conn| raw_manifest_by_hash(conn, hash))
+    }
+
+    #[allow(dead_code)]
+    pub fn raw_manifest_entries(&self, hash: &str) -> Result<Vec<RawManifestEntryRecord>> {
+        self.with_conn(|conn| raw_manifest_entries(conn, hash))
+    }
+
+    #[allow(dead_code)]
+    pub fn latest_raw_manifest_for_source(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+    ) -> Result<Option<RawManifestRecord>> {
+        self.with_conn(|conn| latest_raw_manifest_for_source(conn, source_kind, source_identity))
+    }
+
+    #[allow(dead_code)]
+    pub fn latest_raw_manifest_for_path(
+        &self,
+        source_kind: &str,
+        path: &str,
+    ) -> Result<Option<RawManifestRecord>> {
+        self.with_conn(|conn| latest_raw_manifest_for_path(conn, source_kind, path))
+    }
+
+    #[allow(dead_code)]
+    pub fn reconstruct_raw_manifest(&self, hash: &str) -> Result<Vec<u8>> {
+        self.with_conn(|conn| reconstruct_raw_manifest(conn, &self.blob_dir, hash))
+    }
+
+    #[allow(dead_code)]
+    pub fn raw_manifest_entry_for_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<RawManifestEntryRecord>> {
+        self.with_conn(|conn| raw_manifest_entry_for_event(conn, event_id))
     }
 
     pub fn upsert_source(
@@ -3814,6 +3923,59 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_artifacts_path_first_seen
           ON raw_artifacts(path, first_seen_at DESC);
 
+        CREATE TABLE IF NOT EXISTS raw_objects (
+          hash TEXT PRIMARY KEY,
+          media_type TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          content BLOB NOT NULL,
+          first_seen_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_raw_objects_first_seen
+          ON raw_objects(first_seen_at);
+
+        CREATE TABLE IF NOT EXISTS raw_manifests (
+          hash TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          source_identity TEXT NOT NULL,
+          path TEXT,
+          external_session_id TEXT,
+          full_size INTEGER NOT NULL,
+          mtime_ms INTEGER,
+          media_type TEXT NOT NULL,
+          entry_count INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          metadata_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_raw_manifests_source
+          ON raw_manifests(source_kind, source_identity, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_raw_manifests_path
+          ON raw_manifests(source_kind, path, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS raw_manifest_entries (
+          manifest_hash TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          object_hash TEXT NOT NULL,
+          byte_offset INTEGER NOT NULL,
+          byte_len INTEGER NOT NULL,
+          raw_line_hash TEXT NOT NULL,
+          parsed_event_hash TEXT,
+          event_id TEXT,
+          external_event_id TEXT,
+          metadata_json TEXT NOT NULL,
+          PRIMARY KEY (manifest_hash, ordinal)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_raw_manifest_entries_object
+          ON raw_manifest_entries(object_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_raw_manifest_entries_event
+          ON raw_manifest_entries(event_id)
+          WHERE event_id IS NOT NULL;
+
         CREATE TABLE IF NOT EXISTS sessions (
           id TEXT PRIMARY KEY,
           source_id TEXT NOT NULL,
@@ -4172,6 +4334,136 @@ fn insert_raw_artifact(conn: &Connection, raw: &RawArtifact, blob_dir: &Path) ->
     Ok(changed > 0)
 }
 
+fn insert_raw_object(conn: &Connection, object: &RawObjectRecord, blob_dir: &Path) -> Result<bool> {
+    if object.size != object.content.len() as u64 && !object.content.is_empty() {
+        bail!(
+            "raw object size mismatch for {}: metadata says {}, content has {} bytes",
+            object.hash,
+            object.size,
+            object.content.len()
+        );
+    }
+    if !object.content.is_empty() {
+        let actual = crate::archive::blake3_hex(&object.content);
+        if actual != object.hash {
+            bail!(
+                "raw object blob hash mismatch: expected {}, got {}",
+                object.hash,
+                actual
+            );
+        }
+    }
+
+    if let Some(existing) = raw_object_by_hash(conn, &object.hash)? {
+        if existing.size != object.size || existing.media_type != object.media_type {
+            bail!("raw object metadata mismatch for {}", object.hash);
+        }
+        if !object.content.is_empty() {
+            write_verified_blob(blob_dir, &object.hash, &object.content)?;
+        }
+        return Ok(false);
+    }
+
+    if !object.content.is_empty() {
+        write_verified_blob(blob_dir, &object.hash, &object.content)?;
+    }
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO raw_objects
+         (hash, media_type, size, content, first_seen_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            object.hash,
+            object.media_type,
+            object.size,
+            Vec::<u8>::new(),
+            object.first_seen_at.to_rfc3339()
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+fn raw_object_by_hash(conn: &Connection, hash: &str) -> Result<Option<RawObjectRecord>> {
+    conn.query_row(
+        "SELECT hash, media_type, size, content, first_seen_at
+         FROM raw_objects
+         WHERE hash = ?1",
+        params![hash],
+        row_raw_object,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn insert_raw_manifest(
+    conn: &Connection,
+    manifest: &RawManifestRecord,
+    entries: &[RawManifestEntryRecord],
+) -> Result<bool> {
+    if manifest.entry_count != entries.len() as u64 {
+        bail!(
+            "raw manifest entry count mismatch for {}: metadata says {}, entries has {}",
+            manifest.hash,
+            manifest.entry_count,
+            entries.len()
+        );
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.manifest_hash != manifest.hash)
+    {
+        bail!("raw manifest entries include a different manifest hash");
+    }
+    if let Some(existing) = raw_manifest_by_hash(conn, &manifest.hash)? {
+        if existing.entry_count != manifest.entry_count || existing.full_size != manifest.full_size
+        {
+            bail!("raw manifest metadata mismatch for {}", manifest.hash);
+        }
+        return Ok(false);
+    }
+
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO raw_manifests
+         (hash, source_id, source_kind, source_identity, path, external_session_id,
+          full_size, mtime_ms, media_type, entry_count, created_at, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            manifest.hash,
+            manifest.source_id,
+            manifest.source_kind,
+            manifest.source_identity,
+            manifest.path,
+            manifest.external_session_id,
+            manifest.full_size,
+            manifest.mtime_ms,
+            manifest.media_type,
+            manifest.entry_count,
+            manifest.created_at.to_rfc3339(),
+            manifest.metadata.to_string()
+        ],
+    )?;
+    for entry in entries {
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_manifest_entries
+             (manifest_hash, ordinal, object_hash, byte_offset, byte_len, raw_line_hash,
+              parsed_event_hash, event_id, external_event_id, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                entry.manifest_hash,
+                entry.ordinal,
+                entry.object_hash,
+                entry.byte_offset,
+                entry.byte_len,
+                entry.raw_line_hash,
+                entry.parsed_event_hash,
+                entry.event_id,
+                entry.external_event_id,
+                entry.metadata.to_string()
+            ],
+        )?;
+    }
+    Ok(changed > 0)
+}
+
 fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
     let path = blob_path(blob_dir, hash);
     if path.exists() {
@@ -4182,6 +4474,19 @@ fn write_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
             .with_context(|| format!("creating blob shard {}", parent.display()))?;
     }
     std::fs::write(&path, content).with_context(|| format!("writing blob {}", path.display()))
+}
+
+fn write_verified_blob(blob_dir: &Path, hash: &str, content: &[u8]) -> Result<()> {
+    let path = blob_path(blob_dir, hash);
+    if path.exists() {
+        let existing =
+            std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))?;
+        if existing != content {
+            bail!("content-addressed blob collision for {hash}");
+        }
+        return Ok(());
+    }
+    write_blob(blob_dir, hash, content)
 }
 
 fn read_blob(blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
@@ -5157,6 +5462,161 @@ fn row_raw_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifact> {
         content: row.get(6)?,
         first_seen_at: parse_dt(row.get::<_, String>(7)?),
     })
+}
+
+fn row_raw_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawObjectRecord> {
+    Ok(RawObjectRecord {
+        hash: row.get(0)?,
+        media_type: row.get(1)?,
+        size: row.get::<_, u64>(2)?,
+        content: row.get(3)?,
+        first_seen_at: parse_dt(row.get(4)?),
+    })
+}
+
+fn row_raw_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawManifestRecord> {
+    Ok(RawManifestRecord {
+        hash: row.get(0)?,
+        source_id: row.get(1)?,
+        source_kind: row.get(2)?,
+        source_identity: row.get(3)?,
+        path: row.get(4)?,
+        external_session_id: row.get(5)?,
+        full_size: row.get::<_, u64>(6)?,
+        mtime_ms: row.get(7)?,
+        media_type: row.get(8)?,
+        entry_count: row.get::<_, u64>(9)?,
+        created_at: parse_dt(row.get(10)?),
+        metadata: parse_metadata_json(row.get(11)?),
+    })
+}
+
+fn row_raw_manifest_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawManifestEntryRecord> {
+    Ok(RawManifestEntryRecord {
+        manifest_hash: row.get(0)?,
+        ordinal: row.get(1)?,
+        object_hash: row.get(2)?,
+        byte_offset: row.get::<_, u64>(3)?,
+        byte_len: row.get::<_, u64>(4)?,
+        raw_line_hash: row.get(5)?,
+        parsed_event_hash: row.get(6)?,
+        event_id: row.get(7)?,
+        external_event_id: row.get(8)?,
+        metadata: parse_metadata_json(row.get(9)?),
+    })
+}
+
+fn raw_manifest_by_hash(conn: &Connection, hash: &str) -> Result<Option<RawManifestRecord>> {
+    conn.query_row(
+        "SELECT hash, source_id, source_kind, source_identity, path, external_session_id,
+                full_size, mtime_ms, media_type, entry_count, created_at, metadata_json
+         FROM raw_manifests
+         WHERE hash = ?1",
+        params![hash],
+        row_raw_manifest,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn raw_manifest_entries(conn: &Connection, hash: &str) -> Result<Vec<RawManifestEntryRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT manifest_hash, ordinal, object_hash, byte_offset, byte_len, raw_line_hash,
+                parsed_event_hash, event_id, external_event_id, metadata_json
+         FROM raw_manifest_entries
+         WHERE manifest_hash = ?1
+         ORDER BY ordinal",
+    )?;
+    let rows = stmt.query_map(params![hash], row_raw_manifest_entry)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn latest_raw_manifest_for_source(
+    conn: &Connection,
+    source_kind: &str,
+    source_identity: &str,
+) -> Result<Option<RawManifestRecord>> {
+    conn.query_row(
+        "SELECT hash, source_id, source_kind, source_identity, path, external_session_id,
+                full_size, mtime_ms, media_type, entry_count, created_at, metadata_json
+         FROM raw_manifests
+         WHERE source_kind = ?1 AND source_identity = ?2
+         ORDER BY created_at DESC, hash DESC
+         LIMIT 1",
+        params![source_kind, source_identity],
+        row_raw_manifest,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn latest_raw_manifest_for_path(
+    conn: &Connection,
+    source_kind: &str,
+    path: &str,
+) -> Result<Option<RawManifestRecord>> {
+    conn.query_row(
+        "SELECT hash, source_id, source_kind, source_identity, path, external_session_id,
+                full_size, mtime_ms, media_type, entry_count, created_at, metadata_json
+         FROM raw_manifests
+         WHERE source_kind = ?1 AND path = ?2
+         ORDER BY created_at DESC, hash DESC
+         LIMIT 1",
+        params![source_kind, path],
+        row_raw_manifest,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn reconstruct_raw_manifest(conn: &Connection, blob_dir: &Path, hash: &str) -> Result<Vec<u8>> {
+    let manifest = raw_manifest_by_hash(conn, hash)?
+        .ok_or_else(|| anyhow::anyhow!("raw manifest not found: {hash}"))?;
+    let entries = raw_manifest_entries(conn, hash)?;
+    let mut out = Vec::with_capacity(manifest.full_size as usize);
+    for entry in entries {
+        let bytes = read_blob(blob_dir, &entry.object_hash)?;
+        if bytes.len() as u64 != entry.byte_len {
+            bail!(
+                "raw object length mismatch for {}: manifest says {}, blob has {} bytes",
+                entry.object_hash,
+                entry.byte_len,
+                bytes.len()
+            );
+        }
+        out.extend_from_slice(&bytes);
+    }
+    if out.len() as u64 != manifest.full_size {
+        bail!(
+            "raw manifest reconstruction size mismatch for {}: manifest says {}, built {} bytes",
+            manifest.hash,
+            manifest.full_size,
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+fn raw_manifest_entry_for_event(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<RawManifestEntryRecord>> {
+    conn.query_row(
+        "SELECT manifest_hash, ordinal, object_hash, byte_offset, byte_len, raw_line_hash,
+                parsed_event_hash, event_id, external_event_id, metadata_json
+         FROM raw_manifest_entries
+         WHERE event_id = ?1
+         ORDER BY manifest_hash, ordinal
+         LIMIT 1",
+        params![event_id],
+        row_raw_manifest_entry,
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn latest_raw_artifact_summary_for_path(
