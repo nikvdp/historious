@@ -7311,6 +7311,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_manifest_raw_object_insert_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let line = br#"{"type":"message","role":"user"}"#;
+        let object = fixture_raw_object(line);
+
+        assert!(store.insert_raw_object(&object).expect("first insert"));
+        assert!(!store.insert_raw_object(&object).expect("second insert"));
+
+        let stored = store
+            .raw_object_by_hash(&object.hash)
+            .expect("object lookup")
+            .expect("object exists");
+        assert_eq!(stored.hash, object.hash);
+        assert_eq!(stored.media_type, "application/jsonl-record");
+        assert_eq!(stored.size, line.len() as u64);
+        assert!(stored.content.is_empty());
+
+        let mut mismatched = object.clone();
+        mismatched.media_type = "text/plain".to_string();
+        let err = store
+            .insert_raw_object(&mismatched)
+            .expect_err("metadata mismatch");
+        assert!(err.to_string().contains("raw object metadata mismatch"));
+    }
+
+    #[test]
+    fn raw_manifest_reconstructs_shared_prefix_manifests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let prefix = fixture_raw_object(br#"{"event":"shared"}"#);
+        let first_tail = fixture_raw_object(br#"{"event":"first"}"#);
+        let second_tail = fixture_raw_object(br#"{"event":"second"}"#);
+        store.insert_raw_object(&prefix).expect("prefix");
+        store.insert_raw_object(&first_tail).expect("first tail");
+        assert!(!store.insert_raw_object(&prefix).expect("shared prefix"));
+        store.insert_raw_object(&second_tail).expect("second tail");
+
+        let first_bytes = [prefix.content.as_slice(), first_tail.content.as_slice()].concat();
+        let first_manifest = fixture_raw_manifest(
+            "manifest_first",
+            "source_manifest",
+            "/tmp/session.jsonl",
+            first_bytes.len() as u64,
+            2,
+            dt("2026-06-24T01:00:00Z"),
+        );
+        let first_entries = fixture_manifest_entries(
+            &first_manifest.hash,
+            &[(&prefix, None), (&first_tail, Some("event_first"))],
+        );
+        store
+            .insert_raw_manifest(&first_manifest, &first_entries)
+            .expect("first manifest");
+
+        let second_bytes = [prefix.content.as_slice(), second_tail.content.as_slice()].concat();
+        let second_manifest = fixture_raw_manifest(
+            "manifest_second",
+            "source_manifest",
+            "/tmp/session.jsonl",
+            second_bytes.len() as u64,
+            2,
+            dt("2026-06-24T02:00:00Z"),
+        );
+        let second_entries = fixture_manifest_entries(
+            &second_manifest.hash,
+            &[(&prefix, None), (&second_tail, Some("event_second"))],
+        );
+        store
+            .insert_raw_manifest(&second_manifest, &second_entries)
+            .expect("second manifest");
+
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&first_manifest.hash)
+                .expect("first reconstruction"),
+            first_bytes
+        );
+        assert_eq!(
+            store
+                .reconstruct_raw_manifest(&second_manifest.hash)
+                .expect("second reconstruction"),
+            second_bytes
+        );
+        assert_eq!(
+            store
+                .raw_manifest_entry_for_event("event_second")
+                .expect("event entry")
+                .expect("entry exists")
+                .object_hash,
+            second_tail.hash
+        );
+    }
+
+    #[test]
+    fn raw_manifest_latest_lookup_uses_created_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let line = fixture_raw_object(br#"{"event":"latest"}"#);
+        store.insert_raw_object(&line).expect("object");
+
+        let older = fixture_raw_manifest(
+            "manifest_older",
+            "source_latest",
+            "/tmp/latest.jsonl",
+            line.content.len() as u64,
+            1,
+            dt("2026-06-24T01:00:00Z"),
+        );
+        store
+            .insert_raw_manifest(
+                &older,
+                &fixture_manifest_entries(&older.hash, &[(&line, Some("event_older"))]),
+            )
+            .expect("older manifest");
+        let newer = fixture_raw_manifest(
+            "manifest_newer",
+            "source_latest",
+            "/tmp/latest.jsonl",
+            line.content.len() as u64,
+            1,
+            dt("2026-06-24T03:00:00Z"),
+        );
+        store
+            .insert_raw_manifest(
+                &newer,
+                &fixture_manifest_entries(&newer.hash, &[(&line, Some("event_newer"))]),
+            )
+            .expect("newer manifest");
+
+        assert_eq!(
+            store
+                .latest_raw_manifest_for_source("pi_agent", "source_latest")
+                .expect("latest source")
+                .expect("manifest exists")
+                .hash,
+            newer.hash
+        );
+        assert_eq!(
+            store
+                .latest_raw_manifest_for_path("pi_agent", "/tmp/latest.jsonl")
+                .expect("latest path")
+                .expect("manifest exists")
+                .hash,
+            newer.hash
+        );
+        assert_eq!(
+            store
+                .raw_manifest_entries(&newer.hash)
+                .expect("entries")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .raw_manifest_by_hash(&older.hash)
+                .expect("manifest lookup")
+                .expect("older exists")
+                .hash,
+            older.hash
+        );
+    }
+
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
         records.iter().any(|record| record.id() == id)
     }
@@ -7326,6 +7490,64 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .expect("fixture datetime")
             .with_timezone(&Utc)
+    }
+
+    fn fixture_raw_object(content: &[u8]) -> RawObjectRecord {
+        RawObjectRecord {
+            hash: crate::archive::blake3_hex(content),
+            media_type: "application/jsonl-record".to_string(),
+            size: content.len() as u64,
+            content: content.to_vec(),
+            first_seen_at: Utc::now(),
+        }
+    }
+
+    fn fixture_raw_manifest(
+        hash: &str,
+        source_identity: &str,
+        path: &str,
+        full_size: u64,
+        entry_count: u64,
+        created_at: DateTime<Utc>,
+    ) -> RawManifestRecord {
+        RawManifestRecord {
+            hash: hash.to_string(),
+            source_id: format!("source_{source_identity}"),
+            source_kind: "pi_agent".to_string(),
+            source_identity: source_identity.to_string(),
+            path: Some(path.to_string()),
+            external_session_id: Some(format!("session_{source_identity}")),
+            full_size,
+            mtime_ms: Some(1),
+            media_type: "application/jsonl".to_string(),
+            entry_count,
+            created_at,
+            metadata: json!({"fixture": true}),
+        }
+    }
+
+    fn fixture_manifest_entries(
+        manifest_hash: &str,
+        objects: &[(&RawObjectRecord, Option<&str>)],
+    ) -> Vec<RawManifestEntryRecord> {
+        let mut byte_offset = 0;
+        let mut entries = Vec::new();
+        for (idx, (object, event_id)) in objects.iter().enumerate() {
+            entries.push(RawManifestEntryRecord {
+                manifest_hash: manifest_hash.to_string(),
+                ordinal: idx as i64,
+                object_hash: object.hash.clone(),
+                byte_offset,
+                byte_len: object.size,
+                raw_line_hash: object.hash.clone(),
+                parsed_event_hash: event_id.map(|id| stable_hash(&("event", id)).expect("hash")),
+                event_id: event_id.map(ToOwned::to_owned),
+                external_event_id: event_id.map(|id| format!("external_{id}")),
+                metadata: json!({"fixture": true}),
+            });
+            byte_offset += object.size;
+        }
+        entries
     }
 
     fn fixture_archive_records() -> Vec<ArchiveRecord> {
