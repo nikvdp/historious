@@ -1260,6 +1260,7 @@ impl Store {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn raw_artifact_is_current(
         &self,
         path: &str,

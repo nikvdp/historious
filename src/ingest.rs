@@ -3058,6 +3058,69 @@ mod tests {
     }
 
     #[test]
+    fn non_jsonl_import_export_preserves_raw_artifact_content() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("session.json");
+        let raw_json = json!({
+            "session_id": "session-json",
+            "type": "message",
+            "role": "user",
+            "content": "json array fallback stays whole-file",
+            "timestamp": "2026-06-03T00:00:00Z"
+        })
+        .to_string();
+        fs::write(&log_path, &raw_json).expect("write json log");
+        let raw_hash = blake3_hex(raw_json.as_bytes());
+        let native_titles = NativeTitleIndex::default();
+        let context = SourceSyncContext::new(&store);
+
+        prepare_file_import(
+            &context,
+            "machine_fixture",
+            "hermes",
+            &log_path,
+            &native_titles,
+        )
+        .and_then(|prepared| prepared.commit(&store))
+        .expect("ingest json");
+
+        assert_eq!(store.stats().expect("stats").raw_artifacts, 1);
+        assert!(store
+            .latest_raw_manifest_for_path("hermes", &log_path.to_string_lossy())
+            .expect("manifest lookup")
+            .is_none());
+        assert_eq!(
+            store
+                .read_raw_artifact_blob(&raw_hash)
+                .expect("read raw artifact"),
+            raw_json.as_bytes()
+        );
+
+        let exported = store.export_records().expect("export records");
+        let exported_raw = exported
+            .iter()
+            .find_map(|record| match record {
+                ArchiveRecord::RawArtifact(raw) if raw.hash == raw_hash => Some(raw),
+                _ => None,
+            })
+            .expect("exported raw artifact");
+        assert_eq!(exported_raw.content, raw_json.as_bytes());
+
+        let imported_dir = tempfile::tempdir().expect("import temp dir");
+        let imported = Store::open(imported_dir.path()).expect("open import store");
+        imported
+            .import_records(&exported)
+            .expect("import exported records");
+        assert_eq!(
+            imported
+                .read_raw_artifact_blob(&raw_hash)
+                .expect("read imported raw artifact"),
+            raw_json.as_bytes()
+        );
+    }
+
+    #[test]
     fn source_summaries_track_found_and_selected_files_by_kind() {
         let mut summaries = Vec::new();
         push_found_source_file(&mut summaries, "codex");
