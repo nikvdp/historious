@@ -36,9 +36,15 @@ Pick the asset for your machine:
 | Platform | Asset |
 | --- | --- |
 | macOS Apple Silicon | `histo-macos-aarch64` |
-| Linux x86_64 | `histo-linux-x86_64-gnu` |
-| Linux ARM64 | `histo-linux-aarch64-gnu` |
+| Linux x86_64, modern glibc with embeddings | `histo-linux-x86_64-gnu` |
+| Linux ARM64, modern glibc with embeddings | `histo-linux-aarch64-gnu` |
+| Linux x86_64, portable fallback | `histo-linux-x86_64-musl` |
+| Linux ARM64, portable fallback | `histo-linux-aarch64-musl` |
 | Windows x86_64 | `histo-windows-x86_64.exe` |
+
+Use the `gnu` Linux builds on modern glibc distros such as Ubuntu 24.04 or
+newer; those builds include FastEmbed support. Use the `musl` builds on older
+Linux distros or Alpine; those portable builds do not include FastEmbed yet.
 
 Or build from source:
 
