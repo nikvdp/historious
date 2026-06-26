@@ -332,6 +332,7 @@ fn raw_blobs_clean_source_archives_removes_legacy_archives_only() {
     assert_eq!(preview["data"]["cleanup"]["raw_objects_deleted"], 2);
     assert_eq!(preview["data"]["cleanup"]["events_unlinked"], 1);
     assert_eq!(preview["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(preview["data"]["maintenance"], Value::Null);
     assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 1);
     assert!(loose_blob_path(&data_dir, &raw_hash).exists());
 
@@ -347,6 +348,14 @@ fn raw_blobs_clean_source_archives_removes_legacy_archives_only() {
     assert_eq!(applied["data"]["confirmed"], true);
     assert_eq!(applied["data"]["cleanup"]["raw_artifacts_deleted"], 1);
     assert_eq!(applied["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(applied["data"]["maintenance"]["fts_optimized"], true);
+    assert_eq!(applied["data"]["maintenance"]["vacuumed"], true);
+    assert!(
+        applied["data"]["maintenance"]["database_bytes_after"]
+            .as_u64()
+            .expect("database bytes")
+            > 0
+    );
     assert_eq!(raw_archive_table_count(&data_dir, "raw_artifacts"), 0);
     assert_eq!(raw_archive_table_count(&data_dir, "raw_manifests"), 0);
     assert_eq!(
