@@ -1,16 +1,13 @@
 use crate::archive::{
-    blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, RawArtifact, SessionRecord,
+    blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, SessionRecord,
 };
 use crate::config::SourceConfigs;
 use crate::source::{
-    AdapterConcurrency, PreparedImport, PreparedRawManifest, SearchSegment, SemanticPolicy,
-    SourceAdapter, SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert,
-    SourceSyncContext, SourceUpsert,
+    AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
+    SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
+    SourceUpsert,
 };
-use crate::storage::{
-    ImportDelta, RawManifestEntryRecord, RawManifestRecord, RawObjectRecord, SourceFileFingerprint,
-    SourceFileStatus, Store,
-};
+use crate::storage::{ImportDelta, SourceCheckpointFingerprint, SourceFileStatus, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -159,29 +156,6 @@ struct WorkspaceIdentity {
     git_branch: Option<String>,
     source: String,
     confidence: String,
-}
-
-#[derive(Debug, Clone)]
-struct AppendImportPlan {
-    previous_size: usize,
-    external_session_id: String,
-    next_ordinal: i64,
-    previous_entries: Vec<RawManifestEntryRecord>,
-}
-
-#[derive(Debug, Clone)]
-struct RawJsonlSegment {
-    ordinal: i64,
-    byte_offset: usize,
-    byte_len: usize,
-    object_hash: String,
-    content: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct ManifestEventLink {
-    parsed_event_hash: String,
-    event_id: String,
 }
 
 pub fn update_local_with_progress(
@@ -377,18 +351,17 @@ fn precompute_local_source_file_statuses(
 ) -> Result<HashMap<String, SourceFileStatus>> {
     let fingerprints = candidates
         .iter()
-        .filter(|candidate| {
-            is_local_transcript_kind(&candidate.kind) && candidate.kind.as_str() != "opencode"
-        })
+        .filter(|candidate| is_local_transcript_kind(&candidate.kind))
         .filter_map(|candidate| {
-            Some(SourceFileFingerprint {
-                path: candidate.identity.clone(),
-                size: candidate.size?,
-                mtime_ms: candidate.mtime_ms,
+            let cursor = local_transcript_checkpoint_cursor_for_candidate(candidate).ok()?;
+            Some(SourceCheckpointFingerprint {
+                source_kind: candidate.kind.clone(),
+                source_identity: candidate.identity.clone(),
+                cursor,
             })
         })
         .collect::<Vec<_>>();
-    store.source_file_statuses(&fingerprints)
+    store.source_checkpoint_statuses(&fingerprints)
 }
 
 struct AdapterDiscovery {
@@ -840,34 +813,8 @@ impl SourceAdapter for LocalTranscriptAdapter {
         context: &SourceSyncContext<'_>,
         candidate: &SourceCandidate,
     ) -> Result<bool> {
-        if self.kind() == "opencode" {
-            let path = candidate
-                .path
-                .as_deref()
-                .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
-            let cursor = opencode_checkpoint_cursor(path)?;
-            let checkpoint = context
-                .store
-                .source_checkpoint(self.kind(), &candidate.identity)?;
-            return Ok(checkpoint
-                .and_then(|checkpoint| checkpoint.cursor)
-                .is_some_and(|stored| stored == cursor));
-        }
-        let size = candidate.size.unwrap_or(0);
-        if candidate
-            .path
-            .as_deref()
-            .is_some_and(|path| uses_raw_manifest_for_jsonl(self.kind(), path))
-        {
-            let status = context.store.raw_manifest_file_status(
-                self.kind(),
-                &candidate.identity,
-                size,
-                candidate.mtime_ms,
-            )?;
-            return Ok(status.raw_current && !status.needs_workspace_refresh);
-        }
-        let status = context.source_file_status(&candidate.identity, size, candidate.mtime_ms)?;
+        let cursor = local_transcript_checkpoint_cursor_for_candidate(candidate)?;
+        let status = context.source_checkpoint_status(self.kind(), &candidate.identity, &cursor)?;
         Ok(status.raw_current && !status.needs_workspace_refresh)
     }
 
@@ -883,18 +830,7 @@ impl SourceAdapter for LocalTranscriptAdapter {
             .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
         let prepared =
             prepare_file_import(context, machine_id, self.kind(), path, &self.native_titles)?;
-        if self.kind() == "opencode" {
-            return Ok(prepared.with_checkpoint(SourceCheckpointUpsert {
-                source_kind: self.kind().to_string(),
-                source_identity: candidate.identity.clone(),
-                cursor: Some(opencode_checkpoint_cursor(path)?),
-                metadata: json!({
-                    "strategy": "sqlite_file_trio_metadata_v1",
-                    "path": candidate.identity,
-                }),
-            }));
-        }
-        Ok(prepared)
+        Ok(prepared.with_checkpoint(local_transcript_checkpoint_upsert(self.kind(), candidate)?))
     }
 }
 
@@ -989,12 +925,63 @@ fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn uses_raw_manifest_for_jsonl(kind: &str, path: &Path) -> bool {
-    kind != "opencode" && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+fn local_transcript_checkpoint_cursor_for_candidate(candidate: &SourceCandidate) -> Result<String> {
+    let path = candidate
+        .path
+        .as_deref()
+        .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+    local_transcript_checkpoint_cursor(&candidate.kind, path, candidate.size, candidate.mtime_ms)
+}
+
+fn local_transcript_checkpoint_cursor(
+    kind: &str,
+    path: &Path,
+    size: Option<u64>,
+    mtime_ms: Option<i64>,
+) -> Result<String> {
+    if kind == "opencode" {
+        return opencode_checkpoint_cursor(path);
+    }
+    Ok(format!(
+        "file_metadata_v1:{}:{}",
+        size.map(|size| size.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        mtime_ms
+            .map(|mtime| mtime.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+fn local_transcript_checkpoint_upsert(
+    kind: &str,
+    candidate: &SourceCandidate,
+) -> Result<SourceCheckpointUpsert> {
+    let path = candidate
+        .path
+        .as_deref()
+        .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
+    let cursor =
+        local_transcript_checkpoint_cursor(kind, path, candidate.size, candidate.mtime_ms)?;
+    let strategy = if kind == "opencode" {
+        "sqlite_file_trio_metadata_v1"
+    } else {
+        "file_metadata_v1"
+    };
+    Ok(SourceCheckpointUpsert {
+        source_kind: kind.to_string(),
+        source_identity: candidate.identity.clone(),
+        cursor: Some(cursor),
+        metadata: json!({
+            "strategy": strategy,
+            "path": candidate.identity,
+            "size": candidate.size,
+            "mtime_ms": candidate.mtime_ms,
+        }),
+    })
 }
 
 fn prepare_file_import(
-    context: &SourceSyncContext<'_>,
+    _context: &SourceSyncContext<'_>,
     machine_id: &str,
     kind: &str,
     path: &Path,
@@ -1011,48 +998,13 @@ fn prepare_file_import(
         path: Some(path_text.clone()),
     };
 
-    let metadata =
-        fs::metadata(path).with_context(|| format!("reading metadata {}", path.display()))?;
-    let mtime_ms = file_mtime_ms(&metadata);
     let mut records = Vec::new();
-    let use_raw_manifest = uses_raw_manifest_for_jsonl(kind, path);
-    let raw_artifact = RawArtifact {
-        hash: raw_hash.clone(),
-        source_id: source_id.clone(),
-        path: path_text.clone(),
-        size: bytes.len() as u64,
-        mtime_ms,
-        media_type: media_type(path),
-        content: bytes.clone(),
-        first_seen_at: Utc::now(),
-    };
-    let raw_artifact = if use_raw_manifest {
-        None
-    } else {
-        records.push(ArchiveRecord::RawArtifact(raw_artifact.clone()));
-        Some(raw_artifact)
-    };
 
     if kind == "opencode" {
-        return prepare_opencode_db_import(
-            machine_id,
-            path,
-            &path_text,
-            &source_id,
-            source_upsert,
-            raw_artifact.expect("OpenCode imports keep raw artifacts"),
-        );
+        return prepare_opencode_db_import(machine_id, path, &path_text, &source_id, source_upsert);
     }
 
-    let append_plan = if use_raw_manifest {
-        manifest_append_import_plan(context, kind, path, &path_text, &bytes)?
-    } else {
-        append_import_plan(context, kind, path, &path_text, &bytes)?
-    };
-    let lines = if let Some(plan) = &append_plan {
-        let suffix = String::from_utf8_lossy(&bytes[plan.previous_size..]);
-        parse_jsonl_with_start(suffix.as_ref(), plan.next_ordinal, plan.previous_size)
-    } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+    let lines = if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         let text = String::from_utf8_lossy(&bytes);
         parse_jsonl(&text)
     } else {
@@ -1060,31 +1012,9 @@ fn prepare_file_import(
         parse_json_file(&text)
     };
     let lines = lines.with_context(|| format!("parsing {}", path.display()))?;
-    let raw_segments = if use_raw_manifest {
-        if let Some(plan) = &append_plan {
-            jsonl_segments_with_start(
-                &bytes[plan.previous_size..],
-                plan.next_ordinal,
-                plan.previous_size,
-            )
-        } else {
-            jsonl_segments_with_start(&bytes, 0, 0)
-        }
-    } else {
-        Vec::new()
-    };
-    let raw_object_hashes_by_offset = raw_segments
+    let external_session_id = lines
         .iter()
-        .map(|segment| (segment.byte_offset, segment.object_hash.clone()))
-        .collect::<HashMap<_, _>>();
-    let external_session_id = append_plan
-        .as_ref()
-        .map(|plan| plan.external_session_id.clone())
-        .or_else(|| {
-            lines
-                .iter()
-                .find_map(|line| line.external_session_id.clone())
-        })
+        .find_map(|line| line.external_session_id.clone())
         .unwrap_or_else(|| file_stem(path));
     let session_id = stable_id(&["session", kind, &path_text, &external_session_id]);
     let title = session_title(kind, &external_session_id, &lines, native_titles);
@@ -1104,8 +1034,6 @@ fn prepare_file_import(
         hash: session_hash,
     }));
 
-    let legacy_raw_hash = raw_artifact.as_ref().map(|raw| raw.hash.clone());
-    let mut manifest_event_links = HashMap::new();
     for line in lines {
         if line.content.trim().is_empty() {
             continue;
@@ -1121,40 +1049,12 @@ fn prepare_file_import(
         let byte_offset = line.byte_offset;
         let byte_len = line.byte_len;
         let mut metadata = Map::new();
-        if let Some(raw_hash) = &legacy_raw_hash {
-            metadata.insert(
-                "raw_artifact_hash".to_string(),
-                Value::String(raw_hash.clone()),
-            );
-        }
-        if use_raw_manifest {
-            metadata.insert(
-                "raw_manifest_hash".to_string(),
-                Value::String(raw_hash.clone()),
-            );
-            if let Some(object_hash) = raw_object_hashes_by_offset.get(&byte_offset) {
-                metadata.insert(
-                    "raw_object_hash".to_string(),
-                    Value::String(object_hash.clone()),
-                );
-                metadata.insert(
-                    "raw_line_hash".to_string(),
-                    Value::String(object_hash.clone()),
-                );
-            }
-            manifest_event_links.insert(
-                byte_offset,
-                ManifestEventLink {
-                    parsed_event_hash: line_hash.clone(),
-                    event_id: event_id.clone(),
-                },
-            );
-        }
         metadata.insert("byte_offset".to_string(), json!(byte_offset));
         metadata.insert("byte_len".to_string(), json!(byte_len));
+        metadata.insert("source_file_hash".to_string(), json!(raw_hash.clone()));
         metadata.insert(
             "capture_fidelity".to_string(),
-            Value::String("exact_local_log".to_string()),
+            Value::String("normalized_local_log".to_string()),
         );
         if line.content_compacted {
             metadata.insert("content_compacted".to_string(), Value::Bool(true));
@@ -1162,7 +1062,7 @@ fn prepare_file_import(
                 "content_compaction".to_string(),
                 json!({
                     "strategy": "skipped_event_summary_v1",
-                    "raw_payload_preserved": use_raw_manifest || legacy_raw_hash.is_some()
+                    "raw_payload_preserved": false
                 }),
             );
         }
@@ -1177,224 +1077,13 @@ fn prepare_file_import(
             event_type: line.event_type,
             role: line.role,
             content: line.content,
-            raw_artifact_hash: legacy_raw_hash.clone(),
+            raw_artifact_hash: None,
             occurred_at: line.occurred_at,
             metadata: Value::Object(metadata),
             hash: line_hash,
         }));
     }
-    let mut prepared = PreparedImport::archive(vec![source_upsert], records);
-    if use_raw_manifest {
-        prepared = prepared.with_raw_manifest(prepared_jsonl_raw_manifest(
-            &source_id,
-            kind,
-            &path_text,
-            &external_session_id,
-            &raw_hash,
-            bytes.len() as u64,
-            mtime_ms,
-            append_plan.as_ref(),
-            &raw_segments,
-            &manifest_event_links,
-        ));
-    }
-    Ok(prepared)
-}
-
-fn append_import_plan(
-    context: &SourceSyncContext<'_>,
-    kind: &str,
-    path: &Path,
-    path_text: &str,
-    bytes: &[u8],
-) -> Result<Option<AppendImportPlan>> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") || kind == "opencode" {
-        return Ok(None);
-    }
-
-    let Some(previous) = context
-        .store
-        .latest_raw_artifact_summary_for_path(path_text)?
-    else {
-        return Ok(None);
-    };
-    let Ok(previous_size) = usize::try_from(previous.size) else {
-        return Ok(None);
-    };
-    if previous_size == 0 || previous_size >= bytes.len() {
-        return Ok(None);
-    }
-    if bytes.get(previous_size.saturating_sub(1)) != Some(&b'\n') {
-        return Ok(None);
-    }
-    if blake3_hex(&bytes[..previous_size]) != previous.hash {
-        return Ok(None);
-    }
-
-    let Some(external_session_id) = context
-        .store
-        .latest_session_external_id_for_source_path(kind, path_text)?
-    else {
-        return Ok(None);
-    };
-    let session_id = stable_id(&["session", kind, path_text, &external_session_id]);
-    let Some(max_ordinal) = context.store.max_event_ordinal_for_session(&session_id)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(AppendImportPlan {
-        previous_size,
-        external_session_id,
-        next_ordinal: max_ordinal.saturating_add(1),
-        previous_entries: Vec::new(),
-    }))
-}
-
-fn manifest_append_import_plan(
-    context: &SourceSyncContext<'_>,
-    kind: &str,
-    path: &Path,
-    path_text: &str,
-    bytes: &[u8],
-) -> Result<Option<AppendImportPlan>> {
-    if !uses_raw_manifest_for_jsonl(kind, path) {
-        return Ok(None);
-    }
-
-    let Some(previous) = context
-        .store
-        .latest_raw_manifest_for_path(kind, path_text)?
-    else {
-        return Ok(None);
-    };
-    let Ok(previous_size) = usize::try_from(previous.full_size) else {
-        return Ok(None);
-    };
-    if previous_size == 0 || previous_size >= bytes.len() {
-        return Ok(None);
-    }
-    if bytes.get(previous_size.saturating_sub(1)) != Some(&b'\n') {
-        return Ok(None);
-    }
-    let previous_bytes = context.store.reconstruct_raw_manifest(&previous.hash)?;
-    if previous_bytes.as_slice() != &bytes[..previous_size] {
-        return Ok(None);
-    }
-    let previous_entries = context.store.raw_manifest_entries(&previous.hash)?;
-    let Some(max_ordinal) = previous_entries.iter().map(|entry| entry.ordinal).max() else {
-        return Ok(None);
-    };
-    let external_session_id = previous
-        .external_session_id
-        .or_else(|| {
-            context
-                .store
-                .latest_session_external_id_for_source_path(kind, path_text)
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(|| file_stem(path));
-
-    Ok(Some(AppendImportPlan {
-        previous_size,
-        external_session_id,
-        next_ordinal: max_ordinal.saturating_add(1),
-        previous_entries,
-    }))
-}
-
-fn jsonl_segments_with_start(
-    bytes: &[u8],
-    starting_ordinal: i64,
-    starting_byte_offset: usize,
-) -> Vec<RawJsonlSegment> {
-    let mut segments = Vec::new();
-    let mut offset = starting_byte_offset;
-    for (idx, segment) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
-        let byte_len = segment.len();
-        segments.push(RawJsonlSegment {
-            ordinal: starting_ordinal.saturating_add(idx as i64),
-            byte_offset: offset,
-            byte_len,
-            object_hash: blake3_hex(segment),
-            content: segment.to_vec(),
-        });
-        offset += byte_len;
-    }
-    segments
-}
-
-fn prepared_jsonl_raw_manifest(
-    source_id: &str,
-    kind: &str,
-    path_text: &str,
-    external_session_id: &str,
-    raw_hash: &str,
-    full_size: u64,
-    mtime_ms: Option<i64>,
-    append_plan: Option<&AppendImportPlan>,
-    raw_segments: &[RawJsonlSegment],
-    event_links: &HashMap<usize, ManifestEventLink>,
-) -> PreparedRawManifest {
-    let mut entries = append_plan
-        .map(|plan| {
-            plan.previous_entries
-                .iter()
-                .cloned()
-                .map(|mut entry| {
-                    entry.manifest_hash = raw_hash.to_string();
-                    entry
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    entries.extend(raw_segments.iter().map(|segment| {
-        let link = event_links.get(&segment.byte_offset);
-        RawManifestEntryRecord {
-            manifest_hash: raw_hash.to_string(),
-            ordinal: segment.ordinal,
-            object_hash: segment.object_hash.clone(),
-            byte_offset: segment.byte_offset as u64,
-            byte_len: segment.byte_len as u64,
-            raw_line_hash: segment.object_hash.clone(),
-            parsed_event_hash: link.map(|link| link.parsed_event_hash.clone()),
-            event_id: link.map(|link| link.event_id.clone()),
-            external_event_id: None,
-            metadata: json!({"strategy": "event_cas_manifest_v1"}),
-        }
-    }));
-    let objects = raw_segments
-        .iter()
-        .map(|segment| RawObjectRecord {
-            hash: segment.object_hash.clone(),
-            media_type: "application/jsonl-record".to_string(),
-            size: segment.byte_len as u64,
-            content: segment.content.clone(),
-            first_seen_at: Utc::now(),
-        })
-        .collect::<Vec<_>>();
-    let manifest = RawManifestRecord {
-        hash: raw_hash.to_string(),
-        source_id: source_id.to_string(),
-        source_kind: kind.to_string(),
-        source_identity: path_text.to_string(),
-        path: Some(path_text.to_string()),
-        external_session_id: Some(external_session_id.to_string()),
-        full_size,
-        mtime_ms,
-        media_type: "application/jsonl".to_string(),
-        entry_count: entries.len() as u64,
-        created_at: Utc::now(),
-        metadata: json!({
-            "strategy": "event_cas_manifest_v1",
-            "full_hash": raw_hash,
-        }),
-    };
-    PreparedRawManifest {
-        objects,
-        manifest,
-        entries,
-    }
+    Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
 fn prepare_opencode_db_import(
@@ -1403,14 +1092,13 @@ fn prepare_opencode_db_import(
     path_text: &str,
     source_id: &str,
     source_upsert: SourceUpsert,
-    raw_artifact: RawArtifact,
 ) -> Result<PreparedImport> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("opening OpenCode database {}", path.display()))?;
-    let mut records = vec![ArchiveRecord::RawArtifact(raw_artifact.clone())];
+    let mut records = Vec::new();
 
     let mut sessions = conn.prepare(
         "SELECT id, project_id, parent_id, slug, directory, title, version,
@@ -1537,8 +1225,7 @@ fn prepare_opencode_db_import(
             .with_provenance("opencode_part_text")
             .with_stable_part(part_id.clone());
             let mut metadata = json!({
-                "raw_artifact_hash": raw_artifact.hash.clone(),
-                "capture_fidelity": "native_opencode_sqlite",
+                "capture_fidelity": "normalized_opencode_sqlite",
                 "parser": "opencode_sqlite_v1",
                 "opencode_session_id": external_session_id.clone(),
                 "opencode_message_id": message_id.clone(),
@@ -1559,7 +1246,7 @@ fn prepare_opencode_db_import(
                 event_type: part_type.clone(),
                 role: Some(role.clone()),
                 content: content.clone(),
-                raw_artifact_hash: Some(raw_artifact.hash.clone()),
+                raw_artifact_hash: None,
                 occurred_at: unix_millis_to_utc(part_time)
                     .or_else(|| unix_millis_to_utc(message_time)),
                 metadata: Value::Object(metadata),
@@ -1736,13 +1423,13 @@ fn pi_session_info_title(lines: &[ParsedLine]) -> Option<String> {
 fn fallback_session_title(lines: &[ParsedLine]) -> Option<String> {
     lines
         .iter()
-        .find(|line| is_human_line(line) && title_candidate(&line.content).is_some())
+        .find(|line| is_human_line(line) && line_title_candidate(line).is_some())
         .or_else(|| {
-            lines.iter().find(|line| {
-                !is_bootstrap_content(&line.content) && title_candidate(&line.content).is_some()
-            })
+            lines
+                .iter()
+                .find(|line| line_title_candidate(line).is_some())
         })
-        .and_then(|line| title_candidate(&line.content))
+        .and_then(line_title_candidate)
 }
 
 fn is_human_line(line: &ParsedLine) -> bool {
@@ -1756,6 +1443,15 @@ fn title_candidate(content: &str) -> Option<String> {
     normalized_nonempty_title(content)
 }
 
+fn line_title_candidate(line: &ParsedLine) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_conversation_text(&line.value, &mut parts);
+    parts
+        .iter()
+        .find_map(|part| title_candidate(part))
+        .or_else(|| title_candidate(&line.search.text))
+        .or_else(|| title_candidate(&line.content))
+}
 fn normalized_nonempty_title(content: &str) -> Option<String> {
     let title = normalize_title(content);
     if title.is_empty() {
@@ -2135,7 +1831,16 @@ fn event_content_for_search(
     if search.is_searchable() {
         return (search.text.clone(), false);
     }
-    (compact_event_summary(value, role, event_type, search), true)
+    let normalized = normalized_event_content(value)
+        .unwrap_or_else(|| compact_event_summary(value, role, event_type, search));
+    (normalized, false)
+}
+
+fn normalized_event_content(value: &Value) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn compact_event_summary(
@@ -2165,7 +1870,7 @@ fn compact_event_summary(
         .as_deref()
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or("not indexed");
-    format!("[{label} event omitted from projection: {reason}; raw payload preserved]")
+    format!("[{label} event omitted from projection: {reason}; raw payload unavailable]")
 }
 
 fn collect_conversation_text(value: &Value, parts: &mut Vec<String>) {
@@ -2322,14 +2027,6 @@ fn parse_time(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
-}
-
-fn media_type(path: &Path) -> String {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("json") => "application/json".to_string(),
-        Some("jsonl") => "application/jsonl".to_string(),
-        _ => "application/octet-stream".to_string(),
-    }
 }
 
 fn file_stem(path: &Path) -> String {
@@ -2765,7 +2462,7 @@ mod tests {
             .expect("session");
         let events = store.events_for_session(&session_id).expect("load events");
 
-        assert_eq!(imported.inserted, 4);
+        assert_eq!(imported.inserted, 3);
         assert_eq!(session.title.as_deref(), Some("Native OpenCode Title"));
         assert_eq!(session.source_kind, "opencode");
         assert_eq!(session.metadata["parser"], "opencode_sqlite_v1");
@@ -2894,28 +2591,15 @@ mod tests {
         )
         .and_then(|prepared| prepared.commit(&store))
         .expect("first ingest");
-        let metadata = fs::metadata(&log_path).expect("first metadata");
-        let current = store
-            .raw_manifest_file_status(
-                "codex",
-                &log_path.to_string_lossy(),
-                metadata.len(),
-                file_mtime_ms(&metadata),
-            )
-            .expect("freshness check")
-            .raw_current;
 
         assert_eq!(first.inserted, 2);
         assert_eq!(first.duplicates, 0);
         assert_eq!(first.delta.inserted_events.len(), 1);
         assert_eq!(first.delta.touched_sessions.len(), 1);
-        assert!(current);
 
         let second_log = fixture_line("session-1", "second question");
         fs::write(&log_path, format!("{}{}", first_log, second_log))
             .expect("append second log line");
-        let full_log = fs::read(&log_path).expect("read full log");
-        let full_hash = blake3_hex(&full_log);
         let context = SourceSyncContext::new(&store);
         let second = prepare_file_import(
             &context,
@@ -2932,7 +2616,7 @@ mod tests {
         let events = store.events_for_session(&session_id).expect("events");
 
         assert_eq!(second.inserted, 1);
-        assert_eq!(second.duplicates, 1);
+        assert_eq!(second.duplicates, 2);
         assert_eq!(second.delta.inserted_events.len(), 1);
         assert_eq!(second.delta.touched_events.len(), 1);
         assert_eq!(second.delta.touched_sessions.len(), 1);
@@ -2940,64 +2624,19 @@ mod tests {
         assert_eq!(stats.raw_artifacts, 0);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
-        assert!(store
-            .raw_object_by_hash(&first_hash)
-            .expect("raw object")
-            .is_some());
+        assert_eq!(raw_object_count(&store), 0);
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.raw_artifact_hash.is_none()));
         assert_eq!(
-            store
-                .raw_event_bytes(&events[0].id)
-                .expect("first raw event")
-                .expect("first raw event exists"),
-            first_log.as_bytes()
-        );
-        assert_eq!(
-            store
-                .raw_event_bytes(&events[1].id)
-                .expect("second raw event")
-                .expect("second raw event exists"),
-            second_log.as_bytes()
-        );
-        assert_eq!(
-            events[0].metadata["raw_manifest_hash"].as_str(),
+            events[0].metadata["source_file_hash"].as_str(),
             Some(first_hash.as_str())
         );
-        assert_eq!(
-            events[1].metadata["raw_manifest_hash"].as_str(),
-            Some(full_hash.as_str())
-        );
-        assert_eq!(
-            events[0].metadata["raw_object_hash"].as_str(),
-            Some(first_hash.as_str())
-        );
+        assert!(events[0].metadata["raw_manifest_hash"].is_null());
+        assert!(events[0].metadata["raw_object_hash"].is_null());
         assert_eq!(events[0].metadata["byte_offset"].as_u64(), Some(0));
         assert_eq!(
             events[0].metadata["byte_len"].as_u64(),
             Some(first_log.len() as u64)
-        );
-        let manifest = store
-            .latest_raw_manifest_for_path("codex", &path_text)
-            .expect("latest manifest")
-            .expect("manifest exists");
-        let entries = store
-            .raw_manifest_entries(&manifest.hash)
-            .expect("manifest entries");
-        assert_eq!(manifest.hash, full_hash);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(raw_object_count(&store), 2);
-        assert_eq!(
-            store
-                .reconstruct_raw_manifest(&manifest.hash)
-                .expect("reconstruct manifest"),
-            full_log
-        );
-        assert_eq!(
-            store
-                .reconstruct_raw_manifest(&first_hash)
-                .expect("reconstruct previous manifest"),
-            first_log.as_bytes()
         );
         let session = store
             .session_by_id(&session_id)
@@ -3020,7 +2659,6 @@ mod tests {
         let store = Store::open(temp.path()).expect("open store");
         let log_path = temp.path().join("session.jsonl");
         let first_log = fixture_line("session-1", "first question");
-        let first_hash = blake3_hex(first_log.as_bytes());
         fs::write(&log_path, &first_log).expect("write first log");
 
         let native_titles = NativeTitleIndex::default();
@@ -3040,7 +2678,6 @@ mod tests {
             fixture_line("session-1", "rewritten first question"),
             fixture_line("session-1", "second question")
         );
-        let rewritten_hash = blake3_hex(rewritten_log.as_bytes());
         fs::write(&log_path, &rewritten_log).expect("rewrite log");
         let context = SourceSyncContext::new(&store);
         prepare_file_import(
@@ -3054,26 +2691,19 @@ mod tests {
         .expect("second ingest");
         let stats = store.stats().expect("stats");
         let path_text = log_path.to_string_lossy().to_string();
-        let manifest = store
-            .latest_raw_manifest_for_path("codex", &path_text)
-            .expect("latest manifest")
-            .expect("manifest exists");
+        let session_id = stable_id(&["session", "codex", &path_text, "session-1"]);
+        let events = store.events_for_session(&session_id).expect("events");
 
         assert_eq!(stats.raw_artifacts, 0);
         assert_eq!(stats.sessions, 1);
         assert_eq!(stats.events, 2);
-        assert!(store
-            .raw_object_by_hash(&first_hash)
-            .expect("old object")
-            .is_some());
-        assert_eq!(raw_object_count(&store), 3);
-        assert_eq!(manifest.hash, rewritten_hash);
-        assert_eq!(
-            store
-                .reconstruct_raw_manifest(&manifest.hash)
-                .expect("reconstruct rewritten manifest"),
-            rewritten_log.as_bytes()
-        );
+        assert_eq!(raw_object_count(&store), 0);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.raw_artifact_hash.is_none()));
+        assert!(events.iter().any(|event| event.content == "first question"));
+        assert!(events
+            .iter()
+            .any(|event| event.content == "second question"));
     }
 
     #[test]
@@ -3110,46 +2740,36 @@ mod tests {
         .and_then(|prepared| prepared.commit(&store))
         .expect("fork ingest");
 
-        let first_manifest = store
-            .latest_raw_manifest_for_path("codex", &first_path.to_string_lossy())
-            .expect("first manifest")
-            .expect("first exists");
-        let fork_manifest = store
-            .latest_raw_manifest_for_path("codex", &fork_path.to_string_lossy())
-            .expect("fork manifest")
-            .expect("fork exists");
-        let first_entries = store
-            .raw_manifest_entries(&first_manifest.hash)
-            .expect("first entries");
-        let fork_entries = store
-            .raw_manifest_entries(&fork_manifest.hash)
-            .expect("fork entries");
-
-        assert_eq!(raw_object_count(&store), 3);
-        assert_eq!(first_entries[0].object_hash, fork_entries[0].object_hash);
-        assert_ne!(first_manifest.hash, fork_manifest.hash);
+        let stats = store.stats().expect("stats");
+        let first_path_text = first_path.to_string_lossy().to_string();
         let fork_path_text = fork_path.to_string_lossy().to_string();
+        let first_session_id = stable_id(&["session", "codex", &first_path_text, "session-1"]);
         let fork_session_id = stable_id(&["session", "codex", &fork_path_text, "session-1"]);
+        let first_events = store
+            .events_for_session(&first_session_id)
+            .expect("first events");
         let fork_events = store
             .events_for_session(&fork_session_id)
             .expect("fork events");
-        assert_eq!(
-            store
-                .raw_event_bytes(&fork_events[0].id)
-                .expect("fork raw event")
-                .expect("fork raw event exists"),
-            shared.as_bytes()
-        );
-        assert_eq!(
-            store
-                .reconstruct_raw_manifest(&fork_manifest.hash)
-                .expect("reconstruct fork"),
-            fork_log.as_bytes()
-        );
+
+        assert_eq!(stats.raw_artifacts, 0);
+        assert_eq!(raw_object_count(&store), 0);
+        assert_eq!(first_events.len(), 2);
+        assert_eq!(fork_events.len(), 2);
+        assert!(first_events
+            .iter()
+            .all(|event| event.raw_artifact_hash.is_none()));
+        assert!(fork_events
+            .iter()
+            .all(|event| event.raw_artifact_hash.is_none()));
+        assert!(fork_events
+            .iter()
+            .any(|event| event.content == "shared question"));
+        assert!(fork_events.iter().any(|event| event.content == "fork tail"));
     }
 
     #[test]
-    fn non_jsonl_import_export_preserves_raw_artifact_content() {
+    fn non_jsonl_import_export_preserves_normalized_event_content() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
         let log_path = temp.path().join("session.json");
@@ -3162,7 +2782,6 @@ mod tests {
         })
         .to_string();
         fs::write(&log_path, &raw_json).expect("write json log");
-        let raw_hash = blake3_hex(raw_json.as_bytes());
         let native_titles = NativeTitleIndex::default();
         let context = SourceSyncContext::new(&store);
 
@@ -3176,48 +2795,35 @@ mod tests {
         .and_then(|prepared| prepared.commit(&store))
         .expect("ingest json");
 
-        assert_eq!(store.stats().expect("stats").raw_artifacts, 1);
+        assert_eq!(store.stats().expect("stats").raw_artifacts, 0);
         assert!(store
             .latest_raw_manifest_for_path("hermes", &log_path.to_string_lossy())
             .expect("manifest lookup")
             .is_none());
-        assert_eq!(
-            store
-                .read_raw_artifact_blob(&raw_hash)
-                .expect("read raw artifact"),
-            raw_json.as_bytes()
-        );
         let path_text = log_path.to_string_lossy().to_string();
         let session_id = stable_id(&["session", "hermes", &path_text, "session-json"]);
         let events = store.events_for_session(&session_id).expect("events");
-        assert_eq!(
-            store
-                .raw_event_bytes(&events[0].id)
-                .expect("raw event bytes")
-                .expect("raw event exists"),
-            raw_json.as_bytes()
-        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "json array fallback stays whole-file");
+        assert!(events[0].raw_artifact_hash.is_none());
 
         let exported = store.export_records().expect("export records");
-        let exported_raw = exported
+        assert!(!exported
             .iter()
-            .find_map(|record| match record {
-                ArchiveRecord::RawArtifact(raw) if raw.hash == raw_hash => Some(raw),
-                _ => None,
-            })
-            .expect("exported raw artifact");
-        assert_eq!(exported_raw.content, raw_json.as_bytes());
+            .any(|record| matches!(record, ArchiveRecord::RawArtifact(_))));
 
         let imported_dir = tempfile::tempdir().expect("import temp dir");
         let imported = Store::open(imported_dir.path()).expect("open import store");
         imported
             .import_records(&exported)
             .expect("import exported records");
+        let imported_events = imported
+            .events_for_session(&session_id)
+            .expect("imported events");
+        assert_eq!(imported_events.len(), 1);
         assert_eq!(
-            imported
-                .read_raw_artifact_blob(&raw_hash)
-                .expect("read imported raw artifact"),
-            raw_json.as_bytes()
+            imported_events[0].content,
+            "json array fallback stays whole-file"
         );
     }
 
@@ -3288,17 +2894,24 @@ mod tests {
         assert_eq!(events.len(), 5);
         assert_eq!(events[0].content, "please inspect the failing deploy");
         assert_eq!(events[1].content, "I will check the deploy logs.");
-        assert!(events[2].content.contains("thinking event omitted"));
-        assert!(events[3].content.contains("tool event omitted"));
-        assert!(events[4].content.contains("compaction event omitted"));
+        assert!(events[2]
+            .content
+            .contains("large private reasoning payload"));
+        assert!(events[3].content.contains("very large tool output"));
+        assert!(events[4].content.contains("large compaction payload"));
         for event in &events[2..] {
-            assert_eq!(event.metadata["content_compacted"].as_bool(), Some(true));
-            assert!(event.metadata["raw_object_hash"].as_str().is_some());
-            assert!(store
+            assert!(event.metadata["content_compacted"].is_null());
+            assert!(event.metadata["raw_object_hash"].is_null());
+            let items = store
                 .history_items_for_event(&event.id)
-                .expect("history items")
-                .is_empty());
+                .expect("history items");
+            assert!(items.iter().any(|item| item.tier == "raw"));
         }
+        assert!(store
+            .history_items_for_event(&events[3].id)
+            .expect("tool result history")
+            .iter()
+            .any(|item| item.tier == "tool" && item.kind == "tool_result"));
 
         assert_eq!(
             tier_kinds(
