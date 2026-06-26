@@ -8284,6 +8284,118 @@ mod tests {
         assert!(value.get("items").is_none());
     }
 
+    #[test]
+    fn transcript_grep_context_flags_require_grep() {
+        assert!(resolve_transcript_grep(None, Some(1), None, None).is_err());
+        assert!(resolve_transcript_grep(Some("   ".to_string()), None, None, None).is_err());
+
+        let grep = resolve_transcript_grep(Some(" Basis ".to_string()), None, Some(3), Some(2))
+            .expect("resolve grep")
+            .expect("grep");
+
+        assert_eq!(grep.pattern, "Basis");
+        assert_eq!(grep.before_context, 2);
+        assert_eq!(grep.after_context, 3);
+    }
+
+    #[test]
+    fn transcript_grep_windows_collapse_overlapping_context() {
+        let selected = grep_window_indices(6, |idx| idx == 1 || idx == 3, 1, 1);
+
+        assert_eq!(selected, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn transcript_grep_filters_clean_context_and_preserves_target_index() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let event = store
+            .event_by_id("event_view")
+            .expect("event lookup")
+            .expect("event exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: Some(event),
+            items: vec![
+                fixture_history_item("history_before", "event_before", 6, "user", "before text"),
+                fixture_history_item(
+                    "history_view",
+                    "event_view",
+                    7,
+                    "assistant",
+                    "Basis article text",
+                ),
+                fixture_history_item("history_after", "event_after", 8, "assistant", "after text"),
+            ],
+            target_index: Some(1),
+            omitted_target: false,
+        };
+        let grep = TranscriptGrep {
+            pattern: "basis".to_string(),
+            before_context: 1,
+            after_context: 1,
+        };
+
+        let filtered = grep_history_context(context, &grep);
+        let output = history_transcript_output(&store, &filtered, Some(&grep))
+            .expect("history transcript output");
+        let value = serde_json::to_value(output).expect("serialize");
+
+        assert_eq!(value["target_index"], 1);
+        assert_eq!(value["omitted_target"], false);
+        assert_eq!(value["grep"]["pattern"], "basis");
+        assert_eq!(value["grep"]["before_context"], 1);
+        assert_eq!(value["grep"]["after_context"], 1);
+        assert_eq!(value["grep"]["match_count"], 1);
+        assert_eq!(value["items"][0]["history_item_id"], "history_before");
+        assert_eq!(value["items"][1]["history_item_id"], "history_view");
+        assert_eq!(value["items"][2]["history_item_id"], "history_after");
+    }
+
+    #[test]
+    fn transcript_grep_marks_target_omitted_when_slice_excludes_it() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let event = store
+            .event_by_id("event_view")
+            .expect("event lookup")
+            .expect("event exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: Some(event),
+            items: vec![
+                fixture_history_item("history_view", "event_view", 7, "assistant", "target text"),
+                fixture_history_item(
+                    "history_after",
+                    "event_after",
+                    8,
+                    "assistant",
+                    "Basis article text",
+                ),
+            ],
+            target_index: Some(0),
+            omitted_target: false,
+        };
+        let grep = TranscriptGrep {
+            pattern: "basis".to_string(),
+            before_context: 0,
+            after_context: 0,
+        };
+
+        let filtered = grep_history_context(context, &grep);
+
+        assert_eq!(filtered.target_index, None);
+        assert!(filtered.omitted_target);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].id, "history_after");
+    }
+
     fn fixture_store_with_viewer_ref() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
