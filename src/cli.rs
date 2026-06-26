@@ -72,8 +72,11 @@ pub enum Command {
     },
     /// Search indexed transcripts.
     Search {
-        #[arg(help = "Words, paths, errors, or other details to search for")]
-        query: Option<String>,
+        #[arg(
+            value_name = "QUERY",
+            help = "Words, paths, errors, or other details to search for"
+        )]
+        query: Vec<String>,
         #[arg(
             short,
             long,
@@ -100,6 +103,12 @@ pub enum Command {
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
         mode: Option<SearchModeArg>,
+        #[arg(
+            long = "match",
+            value_enum,
+            help = "How to combine multiple query terms: all or any"
+        )]
+        match_mode: Option<SearchMatchArg>,
         #[arg(long, help = "Skip embedding-backed semantic search for this run")]
         no_embeddings: bool,
         #[arg(
@@ -862,6 +871,12 @@ pub enum SearchModeArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SearchMatchArg {
+    All,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ColorArg {
     Auto,
     Always,
@@ -903,6 +918,15 @@ impl From<SearchModeArg> for search::SearchMode {
             SearchModeArg::Hybrid => search::SearchMode::Hybrid,
             SearchModeArg::Lexical => search::SearchMode::Lexical,
             SearchModeArg::Semantic => search::SearchMode::Semantic,
+        }
+    }
+}
+
+impl From<SearchMatchArg> for search::SearchTermMatch {
+    fn from(value: SearchMatchArg) -> Self {
+        match value {
+            SearchMatchArg::All => search::SearchTermMatch::All,
+            SearchMatchArg::Any => search::SearchTermMatch::Any,
         }
     }
 }
@@ -988,6 +1012,7 @@ impl Cli {
                 exclude,
                 sort,
                 mode,
+                match_mode,
                 no_embeddings,
                 corpus,
                 include_tools,
@@ -1009,7 +1034,8 @@ impl Cli {
                     bail!("--robot cannot be combined with --fzf");
                 }
                 let limit = search_limit(limit, fzf);
-                let query = query.unwrap_or_default();
+                let resolved_query = resolve_search_query(query, match_mode)?;
+                let query = resolved_query.query;
                 if query.trim().is_empty() && fzf {
                     bail!("search --fzf requires a query; use `histo tui` for live interactive search");
                 }
@@ -1034,7 +1060,8 @@ impl Cli {
                     .with_show_duplicates(show_duplicates)
                     .with_time_window(after_bound, before_bound)
                     .with_machine_filter(machine.clone(), hostname.clone())
-                    .with_workspace_scope(workspace_scope.clone());
+                    .with_workspace_scope(workspace_scope.clone())
+                    .with_term_match(resolved_query.term_match, resolved_query.terms.clone());
                 let response = search::search(
                     &store,
                     &query,
@@ -1067,6 +1094,8 @@ impl Cli {
                         workspace_scope.clone(),
                         machine.clone(),
                         hostname.clone(),
+                        resolved_query.term_match,
+                        &resolved_query.terms,
                         &response,
                         &refs,
                     );
@@ -2173,6 +2202,8 @@ struct SearchOptionsOutput {
     limit: usize,
     sort: &'static str,
     mode: &'static str,
+    match_mode: Option<&'static str>,
+    match_terms: Vec<String>,
     corpus: String,
     recency_bias: f64,
     after: Option<DateTime<Utc>>,
@@ -2181,6 +2212,12 @@ struct SearchOptionsOutput {
     machine: Option<String>,
     hostname: Option<String>,
     show_duplicates: bool,
+}
+
+struct ResolvedSearchQuery {
+    query: String,
+    term_match: Option<search::SearchTermMatch>,
+    terms: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5301,6 +5338,8 @@ fn search_output(
     project: Option<String>,
     machine: Option<String>,
     hostname: Option<String>,
+    term_match: Option<search::SearchTermMatch>,
+    match_terms: &[String],
     response: &search::SearchResponse,
     refs: &[String],
 ) -> SearchOutput {
@@ -5310,6 +5349,8 @@ fn search_output(
             limit,
             sort: sort.as_str(),
             mode: mode.as_str(),
+            match_mode: term_match.map(search::SearchTermMatch::as_str),
+            match_terms: match_terms.to_vec(),
             corpus: corpus.as_csv(),
             recency_bias,
             after,
@@ -5554,6 +5595,27 @@ fn resolve_search_corpus(
         return Ok(search::SearchCorpus::raw());
     }
     Ok(search::SearchCorpus::default())
+}
+
+fn resolve_search_query(
+    query_terms: Vec<String>,
+    match_mode: Option<SearchMatchArg>,
+) -> Result<ResolvedSearchQuery> {
+    let terms = query_terms
+        .into_iter()
+        .map(|term| term.trim().to_string())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.len() > 1 && match_mode.is_none() {
+        bail!("search received multiple query terms; quote a single query or pass --match=all/any");
+    }
+    let term_match = match_mode.map(search::SearchTermMatch::from);
+    let query = terms.join(" ");
+    Ok(ResolvedSearchQuery {
+        query,
+        term_match,
+        terms,
+    })
 }
 
 fn resolve_context_event_id(
@@ -7552,6 +7614,8 @@ mod tests {
             None,
             Some("machine_devbox_123".to_string()),
             Some("devbox".to_string()),
+            None,
+            &[],
             &response,
             &["ab3f".to_string()],
         );
@@ -7561,6 +7625,8 @@ mod tests {
         assert_eq!(value["options"]["limit"], 20);
         assert_eq!(value["options"]["sort"], "relevance");
         assert_eq!(value["options"]["mode"], "semantic");
+        assert_eq!(value["options"]["match_mode"], serde_json::Value::Null);
+        assert_eq!(value["options"]["match_terms"], serde_json::json!([]));
         assert_eq!(value["options"]["corpus"], "conversation,tool");
         assert_eq!(value["options"]["show_duplicates"], false);
         assert_eq!(value["options"]["after"], serde_json::Value::Null);

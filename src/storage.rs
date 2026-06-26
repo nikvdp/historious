@@ -329,6 +329,12 @@ pub struct SearchRow {
     pub rank: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FtsMatchMode {
+    All,
+    Any,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoryItemForEmbedding {
     pub id: String,
@@ -2113,6 +2119,54 @@ impl Store {
         workspace_scope: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query(query);
+        self.search_fts_query(
+            fts_query,
+            tiers,
+            limit,
+            after,
+            before,
+            machine_id,
+            machine_id_prefix,
+            workspace_scope,
+        )
+    }
+
+    pub fn search_fts_terms(
+        &self,
+        terms: &[String],
+        match_mode: FtsMatchMode,
+        tiers: &[&str],
+        limit: usize,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
+        machine_id: Option<&str>,
+        machine_id_prefix: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<Vec<SearchRow>> {
+        let fts_query = fts_query_terms(terms.iter().map(String::as_str), match_mode);
+        self.search_fts_query(
+            fts_query,
+            tiers,
+            limit,
+            after,
+            before,
+            machine_id,
+            machine_id_prefix,
+            workspace_scope,
+        )
+    }
+
+    fn search_fts_query(
+        &self,
+        fts_query: String,
+        tiers: &[&str],
+        limit: usize,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
+        machine_id: Option<&str>,
+        machine_id_prefix: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<Vec<SearchRow>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -4975,23 +5029,37 @@ pub fn f32_vector_from_blob(bytes: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn fts_query(input: &str) -> String {
-    input
-        .split_whitespace()
-        .filter_map(|term| {
-            let cleaned: String = term
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-                .collect();
-            if cleaned.is_empty() {
-                None
-            } else if cleaned.chars().count() >= 4 {
-                Some(format!("\"{}\"*", cleaned.replace('"', "\"\"")))
-            } else {
-                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
-            }
-        })
+    fts_query_terms(input.split_whitespace(), FtsMatchMode::All)
+}
+
+fn fts_query_terms<'a>(
+    terms: impl IntoIterator<Item = &'a str>,
+    match_mode: FtsMatchMode,
+) -> String {
+    let joiner = match match_mode {
+        FtsMatchMode::All => " ",
+        FtsMatchMode::Any => " OR ",
+    };
+    terms
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter_map(fts_query_term)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(joiner)
+}
+
+fn fts_query_term(term: &str) -> Option<String> {
+    let cleaned: String = term
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else if cleaned.chars().count() >= 4 {
+        Some(format!("\"{}\"*", cleaned.replace('"', "\"\"")))
+    } else {
+        Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
+    }
 }
 
 fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
