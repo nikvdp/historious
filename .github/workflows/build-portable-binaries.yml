@@ -102,7 +102,7 @@ jobs:
       - name: Build release binary with Zig
         if: matrix.build_with_zig
         env:
-          CFLAGS: "-D_GNU_SOURCE"
+          CFLAGS: "-D_GNU_SOURCE -Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t"
         run: cargo zigbuild --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
       - name: Build release binary
