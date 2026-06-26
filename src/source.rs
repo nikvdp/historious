@@ -48,6 +48,7 @@ impl<'a> SourceSyncContext<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn source_file_status(
         &self,
         path: &str,
@@ -62,6 +63,23 @@ impl<'a> SourceSyncContext<'a> {
             return Ok(status);
         }
         self.store.source_file_status(path, size, mtime_ms)
+    }
+
+    pub fn source_checkpoint_status(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+        cursor: &str,
+    ) -> Result<SourceFileStatus> {
+        if let Some(status) = self
+            .source_file_statuses
+            .and_then(|statuses| statuses.get(source_identity))
+            .copied()
+        {
+            return Ok(status);
+        }
+        self.store
+            .source_checkpoint_status(source_kind, source_identity, cursor)
     }
 }
 
@@ -149,6 +167,7 @@ impl PreparedImport {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_raw_manifest(mut self, raw_manifest: PreparedRawManifest) -> Self {
         self.raw_manifests.push(raw_manifest);
         self

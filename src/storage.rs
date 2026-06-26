@@ -240,11 +240,19 @@ pub struct SourceFileStatus {
     pub needs_workspace_refresh: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SourceFileFingerprint {
     pub path: String,
     pub size: u64,
     pub mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceCheckpointFingerprint {
+    pub source_kind: String,
+    pub source_identity: String,
+    pub cursor: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1379,6 +1387,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn raw_manifest_file_status(
         &self,
         source_kind: &str,
@@ -1397,6 +1406,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn source_file_statuses(
         &self,
         files: &[SourceFileFingerprint],
@@ -1454,6 +1464,39 @@ impl Store {
             for row in rows {
                 let (path, status) = row?;
                 out.insert(path, status);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn source_checkpoint_status(
+        &self,
+        source_kind: &str,
+        source_identity: &str,
+        cursor: &str,
+    ) -> Result<SourceFileStatus> {
+        self.with_conn(|conn| source_checkpoint_status(conn, source_kind, source_identity, cursor))
+    }
+
+    pub fn source_checkpoint_statuses(
+        &self,
+        files: &[SourceCheckpointFingerprint],
+    ) -> Result<HashMap<String, SourceFileStatus>> {
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_conn(|conn| {
+            let mut out = HashMap::with_capacity(files.len());
+            for file in files {
+                out.insert(
+                    file.source_identity.clone(),
+                    source_checkpoint_status(
+                        conn,
+                        &file.source_kind,
+                        &file.source_identity,
+                        &file.cursor,
+                    )?,
+                );
             }
             Ok(out)
         })
@@ -2177,6 +2220,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn latest_raw_artifact_summary_for_path(
         &self,
         path: &str,
@@ -2184,6 +2228,7 @@ impl Store {
         self.with_conn(|conn| latest_raw_artifact_summary_for_path(conn, path))
     }
 
+    #[allow(dead_code)]
     pub fn max_event_ordinal_for_session(&self, session_id: &str) -> Result<Option<i64>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -2195,6 +2240,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn latest_session_external_id_for_source_path(
         &self,
         source_kind: &str,
@@ -4209,6 +4255,7 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
     Ok(())
 }
 
+#[allow(dead_code)]
 fn prepare_temp_source_file_status_scope(
     conn: &Connection,
     files: &[SourceFileFingerprint],
@@ -5489,6 +5536,7 @@ fn raw_artifact_is_current(
         .unwrap_or(false))
 }
 
+#[allow(dead_code)]
 fn raw_manifest_is_current(
     conn: &Connection,
     source_kind: &str,
@@ -5510,6 +5558,32 @@ fn raw_manifest_is_current(
     Ok(existing
         .map(|(stored_size, stored_mtime)| stored_size == size as i64 && stored_mtime == mtime_ms)
         .unwrap_or(false))
+}
+
+fn source_checkpoint_status(
+    conn: &Connection,
+    source_kind: &str,
+    source_identity: &str,
+    cursor: &str,
+) -> Result<SourceFileStatus> {
+    let current: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM source_checkpoints
+           WHERE source_kind = ?1
+             AND source_identity = ?2
+             AND cursor = ?3
+         )",
+        params![source_kind, source_identity, cursor],
+        |row| row.get(0),
+    )?;
+    let raw_current = current != 0;
+    let needs_workspace_refresh =
+        raw_current && session_workspace_metadata_missing_for_path(conn, source_identity)?;
+    Ok(SourceFileStatus {
+        raw_current,
+        needs_workspace_refresh,
+    })
 }
 
 fn session_workspace_metadata_missing_for_path(conn: &Connection, path: &str) -> Result<bool> {
@@ -5718,9 +5792,14 @@ fn tool_history_text(event: &EventRecord) -> Option<(String, String)> {
     if text.is_empty() || is_encrypted_payload_text(text) {
         return None;
     }
+    let event_can_have_tool_history = event_can_have_tool_history(event);
     if let Some(value) = parse_json_value(text) {
-        if let Some((kind, text)) = tool_history_text_from_json(&value) {
-            return Some((kind, text));
+        if event_can_have_tool_history || json_has_explicit_tool_history(&value) {
+            if let Some((kind, text)) =
+                tool_history_text_from_json(&value, event_can_have_tool_history)
+            {
+                return Some((kind, text));
+            }
         }
     }
     if text.starts_with("Chunk ID:") && text.contains("\nOutput:") {
@@ -5729,7 +5808,50 @@ fn tool_history_text(event: &EventRecord) -> Option<(String, String)> {
     None
 }
 
-fn tool_history_text_from_json(value: &Value) -> Option<(String, String)> {
+fn event_can_have_tool_history(event: &EventRecord) -> bool {
+    let event_type = event.event_type.to_ascii_lowercase();
+    let role = event
+        .role
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    role == "tool"
+        || event_type.contains("tool")
+        || event_type.contains("function_call")
+        || event_type.contains("exec")
+}
+
+fn json_has_explicit_tool_history(value: &Value) -> bool {
+    let payload = value.get("payload").unwrap_or(value);
+    let Some(map) = payload.as_object() else {
+        return false;
+    };
+    let kind = map
+        .get("type")
+        .or_else(|| map.get("name"))
+        .or_else(|| map.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    kind.contains("tool")
+        || kind.contains("function")
+        || kind.contains("exec")
+        || kind == "bash"
+        || map.contains_key("arguments")
+        || map.contains_key("input")
+        || map.contains_key("command")
+        || map.contains_key("stdout")
+        || map.contains_key("stderr")
+        || map.contains_key("output")
+        || map.contains_key("result")
+        || map.contains_key("tool_use_id")
+        || map.contains_key("toolUseResult")
+}
+
+fn tool_history_text_from_json(
+    value: &Value,
+    allow_content_result: bool,
+) -> Option<(String, String)> {
     let payload = value.get("payload").unwrap_or(value);
     let name = payload
         .get("name")
@@ -5758,6 +5880,18 @@ fn tool_history_text_from_json(value: &Value) -> Option<(String, String)> {
 
     for key in ["stdout", "stderr", "output", "result"] {
         if let Some(value) = payload.get(key) {
+            let text = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(("tool_result".to_string(), text.to_string()));
+            }
+        }
+    }
+    if allow_content_result {
+        if let Some(value) = payload.get("content") {
             let text = value
                 .as_str()
                 .map(ToOwned::to_owned)
@@ -6088,6 +6222,7 @@ fn metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
     metadata.get(key).and_then(Value::as_u64)
 }
 
+#[allow(dead_code)]
 fn latest_raw_artifact_summary_for_path(
     conn: &Connection,
     path: &str,
