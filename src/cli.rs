@@ -9,6 +9,7 @@ use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, U
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2505,8 +2506,7 @@ fn run_update_once_human(
     repair: bool,
 ) -> Result<UpdateOutput> {
     let source_selection = ingest::SourceSelection::parse(source)?;
-    let progress = ProgressUi::new();
-    let mut scan = progress.phase("Scanning local agent logs");
+    let mut progress = UpdateProgressView::new();
     let ingest = ingest::update_local_with_progress(
         store,
         &config.machine_id,
@@ -2515,52 +2515,40 @@ fn run_update_once_human(
             source_selection,
             sources: config.sources.clone(),
         },
-        |event| scan.update(update_progress_detail(event)),
+        |event| progress.ingest_event(event),
     )?;
-    scan.finish(format!(
-        "{} files, {} new events, {} unchanged, {} errors",
-        format_count(ingest.files_seen),
-        format_count(ingest.inserted),
-        format_count(ingest.skipped_unchanged),
-        format_count(ingest.errors)
-    ));
+    progress.finish_ingest();
 
-    let mut index = progress.phase(if repair {
-        "Repairing search index"
-    } else {
-        "Updating search index"
-    });
+    progress.start_search_data(repair, config.embedder.is_disabled());
     let projected = refresh_search_after_update_with_progress(
         store,
         &ingest.delta,
         repair,
         config.embedder.is_disabled(),
         |detail| {
-            index.update(detail);
+            progress.search_detail(detail);
         },
     )?;
-    index.finish(format!("{} events indexed", format_count(projected)));
+    progress.finish_search_index(projected);
 
     let embeddings = if config.embedder.is_disabled() {
-        search::EmbeddingRefresh::disabled()
+        let embeddings = search::EmbeddingRefresh::disabled();
+        progress.finish_embeddings(&embeddings);
+        embeddings
     } else {
-        let mut embed = progress.phase(if repair {
-            "Repairing embeddings"
-        } else {
-            "Updating embeddings"
-        });
         let embeddings = refresh_embeddings_after_update_with_progress(
             store,
             config,
             &ingest.delta,
             repair,
             |event| {
-                embed.update(embedding_progress_detail(event));
+                progress.embedding_event(event);
             },
         )?;
-        embed.finish(embedding_phase_detail(&embeddings));
+        progress.finish_embeddings(&embeddings);
         embeddings
     };
+    progress.finish_all(&ingest, projected, &embeddings);
 
     Ok(UpdateOutput {
         ingest,
@@ -3771,6 +3759,51 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.skipped_unchanged),
             format_count(stats.errors)
         ),
+        ingest::UpdateProgress::PreparingImports {
+            changed_files,
+            sources: _,
+            stats,
+        } => format!(
+            "preparing {} changed files; {} new, {} unchanged, {} errors",
+            format_count(*changed_files),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
+        ingest::UpdateProgress::ImportingFile {
+            adapter_kind: _,
+            kind,
+            path,
+            changed_file_index,
+            changed_file_count,
+            stats,
+        } => format!(
+            "importing changed {} {}/{} {}; {} new, {} unchanged, {} errors",
+            kind,
+            format_count(*changed_file_index),
+            format_count(*changed_file_count),
+            compact_path(path),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
+        ingest::UpdateProgress::ImportedFile {
+            adapter_kind: _,
+            kind,
+            path,
+            changed_file_index,
+            changed_file_count,
+            stats,
+        } => format!(
+            "imported changed {} {}/{} {}; {} new, {} unchanged, {} errors",
+            kind,
+            format_count(*changed_file_index),
+            format_count(*changed_file_count),
+            compact_path(path),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
         ingest::UpdateProgress::CompletedFile {
             adapter_kind: _,
             kind,
@@ -3831,6 +3864,53 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "source_file_count": source_file_count,
             "stats": stats,
         }),
+        ingest::UpdateProgress::PreparingImports {
+            changed_files,
+            sources,
+            stats,
+        } => serde_json::json!({
+            "status": "preparing_imports",
+            "changed_files": changed_files,
+            "sources": sources.iter().map(|source| {
+                serde_json::json!({
+                    "kind": source.kind,
+                    "changed_files": source.changed_files,
+                })
+            }).collect::<Vec<_>>(),
+            "stats": stats,
+        }),
+        ingest::UpdateProgress::ImportingFile {
+            adapter_kind,
+            kind,
+            path,
+            changed_file_index,
+            changed_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "importing_file",
+            "adapter_kind": adapter_kind,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "changed_file_index": changed_file_index,
+            "changed_file_count": changed_file_count,
+            "stats": stats,
+        }),
+        ingest::UpdateProgress::ImportedFile {
+            adapter_kind,
+            kind,
+            path,
+            changed_file_index,
+            changed_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "imported_file",
+            "adapter_kind": adapter_kind,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "changed_file_index": changed_file_index,
+            "changed_file_count": changed_file_count,
+            "stats": stats,
+        }),
         ingest::UpdateProgress::CompletedFile {
             adapter_kind,
             kind,
@@ -3852,6 +3932,523 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "stats": stats,
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateDisplayPhase {
+    LocalLogs,
+    ChangedLogs,
+    SearchData,
+    Complete,
+}
+
+#[derive(Debug, Default)]
+struct UpdateSourceProgress {
+    total_files: usize,
+    checked_files: usize,
+    changed_files: usize,
+    read_files: usize,
+    state: &'static str,
+    current_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpdateDataProgress {
+    state: &'static str,
+    current: Option<usize>,
+    total: Option<usize>,
+    detail: String,
+}
+
+struct UpdateProgressView {
+    interactive: bool,
+    phase: UpdateDisplayPhase,
+    sources: BTreeMap<String, UpdateSourceProgress>,
+    data_rows: BTreeMap<String, UpdateDataProgress>,
+    drawn_lines: usize,
+    last_emit: Instant,
+}
+
+impl UpdateProgressView {
+    fn new() -> Self {
+        Self {
+            interactive: std::io::stderr().is_terminal(),
+            phase: UpdateDisplayPhase::LocalLogs,
+            sources: BTreeMap::new(),
+            data_rows: BTreeMap::new(),
+            drawn_lines: 0,
+            last_emit: Instant::now(),
+        }
+    }
+
+    fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
+        match event {
+            ingest::UpdateProgress::Discovered { sources, .. } => {
+                self.phase = UpdateDisplayPhase::LocalLogs;
+                for source in sources {
+                    if source.selected_files == 0 {
+                        continue;
+                    }
+                    let row = self.sources.entry(source.kind.clone()).or_default();
+                    row.total_files = source.selected_files;
+                    row.state = "waiting";
+                }
+            }
+            ingest::UpdateProgress::Processing {
+                kind,
+                path,
+                source_file_index,
+                source_file_count,
+                ..
+            } => {
+                self.phase = UpdateDisplayPhase::LocalLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.total_files = *source_file_count;
+                row.checked_files = source_file_index.saturating_sub(1);
+                row.state = "checking";
+                row.current_path = Some(path.clone());
+            }
+            ingest::UpdateProgress::CompletedFile {
+                kind,
+                source_file_index,
+                source_file_count,
+                ..
+            } => {
+                self.phase = UpdateDisplayPhase::LocalLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.total_files = *source_file_count;
+                row.checked_files = *source_file_index;
+                row.state = if row.checked_files >= row.total_files {
+                    "checked"
+                } else {
+                    "checking"
+                };
+                row.current_path = None;
+            }
+            ingest::UpdateProgress::PreparingImports { sources, .. } => {
+                for source in sources {
+                    let row = self.sources.entry(source.kind.clone()).or_default();
+                    row.changed_files = source.changed_files;
+                    row.read_files = 0;
+                    row.state = "waiting";
+                    row.current_path = None;
+                }
+                for row in self.sources.values_mut() {
+                    if row.checked_files >= row.total_files {
+                        row.state = "checked";
+                    }
+                }
+                self.phase = UpdateDisplayPhase::ChangedLogs;
+            }
+            ingest::UpdateProgress::ImportingFile { kind, path, .. } => {
+                self.phase = UpdateDisplayPhase::ChangedLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.state = "reading";
+                row.current_path = Some(path.clone());
+            }
+            ingest::UpdateProgress::ImportedFile { kind, .. } => {
+                self.phase = UpdateDisplayPhase::ChangedLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.read_files = row
+                    .read_files
+                    .saturating_add(1)
+                    .min(row.changed_files.max(row.read_files.saturating_add(1)));
+                row.state = if row.changed_files > 0 && row.read_files >= row.changed_files {
+                    "read"
+                } else {
+                    "reading"
+                };
+                row.current_path = None;
+            }
+        }
+        self.render(false);
+    }
+
+    fn finish_ingest(&mut self) {
+        if self.sources.values().all(|row| row.changed_files == 0) {
+            self.phase = UpdateDisplayPhase::LocalLogs;
+            for row in self.sources.values_mut() {
+                if row.checked_files >= row.total_files {
+                    row.state = "checked";
+                }
+            }
+        } else {
+            self.phase = UpdateDisplayPhase::ChangedLogs;
+            for row in self.sources.values_mut() {
+                if row.changed_files > 0 && row.read_files >= row.changed_files {
+                    row.state = "read";
+                }
+            }
+        }
+        self.render(true);
+    }
+
+    fn start_search_data(&mut self, repair: bool, embeddings_disabled: bool) {
+        self.phase = UpdateDisplayPhase::SearchData;
+        self.data_rows.clear();
+        self.data_rows.insert(
+            "search".to_string(),
+            UpdateDataProgress {
+                state: if repair { "repairing" } else { "waiting" },
+                ..Default::default()
+            },
+        );
+        self.data_rows.insert(
+            "history".to_string(),
+            UpdateDataProgress {
+                state: "waiting",
+                ..Default::default()
+            },
+        );
+        self.data_rows.insert(
+            "vectors".to_string(),
+            UpdateDataProgress {
+                state: if embeddings_disabled {
+                    "skipped"
+                } else {
+                    "waiting"
+                },
+                detail: if embeddings_disabled {
+                    "embeddings disabled".to_string()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            },
+        );
+        self.render(true);
+    }
+
+    fn search_detail(&mut self, detail: String) {
+        self.phase = UpdateDisplayPhase::SearchData;
+        if detail.contains("project") {
+            let (current, total) = parse_progress_fraction(&detail).unwrap_or((0, 0));
+            let row = self.data_rows.entry("history".to_string()).or_default();
+            row.state = if detail.contains("projected") {
+                "projecting"
+            } else {
+                "projecting"
+            };
+            if total > 0 {
+                row.current = Some(current);
+                row.total = Some(total);
+            }
+            row.detail = detail;
+        } else {
+            let (current, total) = parse_progress_fraction(&detail).unwrap_or((0, 0));
+            let row = self.data_rows.entry("search".to_string()).or_default();
+            row.state = if detail.contains("repair") {
+                "repairing"
+            } else if detail.contains("checking") {
+                "checking"
+            } else {
+                "indexing"
+            };
+            if total > 0 {
+                row.current = Some(current);
+                row.total = Some(total);
+            }
+            row.detail = detail;
+        }
+        self.render(false);
+    }
+
+    fn finish_search_index(&mut self, projected: usize) {
+        let row = self.data_rows.entry("search".to_string()).or_default();
+        row.state = "indexed";
+        row.current = Some(projected);
+        row.total = Some(projected);
+        row.detail = format!("{} events indexed", format_count(projected));
+        self.render(true);
+    }
+
+    fn embedding_event(&mut self, event: &search::EmbeddingProgress) {
+        self.phase = UpdateDisplayPhase::SearchData;
+        let row = self.data_rows.entry("vectors".to_string()).or_default();
+        match event {
+            search::EmbeddingProgress::LoadingModel { model_id } => {
+                row.state = "loading";
+                row.detail = model_id.clone();
+            }
+            search::EmbeddingProgress::Batch {
+                embedded, pending, ..
+            } => {
+                row.state = "embedding";
+                row.current = Some(*embedded);
+                row.total = Some(embedded.saturating_add(*pending));
+                row.detail = format!(
+                    "{} embedded, {} pending",
+                    format_count(*embedded),
+                    format_count(*pending)
+                );
+            }
+            search::EmbeddingProgress::Deferred { pending, reason } => {
+                row.state = "deferred";
+                row.detail = format!("{} pending: {reason}", format_count(*pending));
+            }
+        }
+        self.render(false);
+    }
+
+    fn finish_embeddings(&mut self, embeddings: &search::EmbeddingRefresh) {
+        let row = self.data_rows.entry("vectors".to_string()).or_default();
+        if embeddings.disabled {
+            row.state = "skipped";
+            row.detail = "embeddings disabled".to_string();
+        } else if let Some(reason) = &embeddings.deferred_reason {
+            row.state = "deferred";
+            row.detail = reason.clone();
+        } else {
+            row.state = "embedded";
+            row.current = Some(embeddings.embedded);
+            row.total = Some(embeddings.embedded);
+            row.detail = format!(
+                "{} new embeddings, {} vectors indexed",
+                format_count(embeddings.embedded),
+                format_count(embeddings.vectors_indexed)
+            );
+        }
+        self.render(true);
+    }
+
+    fn finish_all(
+        &mut self,
+        ingest: &ingest::UpdateStats,
+        projected: usize,
+        embeddings: &search::EmbeddingRefresh,
+    ) {
+        self.phase = UpdateDisplayPhase::Complete;
+        let history = self.data_rows.get("history").cloned();
+        self.data_rows.clear();
+        self.data_rows.insert(
+            "logs".to_string(),
+            UpdateDataProgress {
+                state: "checked",
+                current: Some(ingest.files_seen),
+                total: Some(ingest.files_seen),
+                detail: format!(
+                    "{} files, {} changed",
+                    format_count(ingest.files_seen),
+                    format_count(self.sources.values().map(|row| row.changed_files).sum())
+                ),
+            },
+        );
+        self.data_rows.insert(
+            "events".to_string(),
+            UpdateDataProgress {
+                state: "read",
+                current: Some(ingest.inserted),
+                total: Some(ingest.inserted),
+                detail: format!("{} new events", format_count(ingest.inserted)),
+            },
+        );
+        self.data_rows.insert(
+            "search".to_string(),
+            UpdateDataProgress {
+                state: "indexed",
+                current: Some(projected),
+                total: Some(projected),
+                detail: format!("{} events indexed", format_count(projected)),
+            },
+        );
+        self.data_rows.insert(
+            "history".to_string(),
+            history.unwrap_or_else(|| UpdateDataProgress {
+                state: "projected",
+                detail: "history items refreshed".to_string(),
+                ..Default::default()
+            }),
+        );
+        self.data_rows.insert(
+            "vectors".to_string(),
+            UpdateDataProgress {
+                state: if embeddings.disabled {
+                    "skipped"
+                } else {
+                    "embedded"
+                },
+                detail: embedding_phase_detail(embeddings),
+                ..Default::default()
+            },
+        );
+        self.render(true);
+        self.finish_rendering();
+    }
+
+    fn finish_rendering(&mut self) {
+        if self.interactive && self.drawn_lines > 0 {
+            eprintln!();
+            self.drawn_lines = 0;
+        }
+    }
+
+    fn render(&mut self, force: bool) {
+        if !self.interactive && !force && self.last_emit.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let lines = self.lines();
+        if self.interactive {
+            if self.drawn_lines > 0 {
+                eprint!("\x1b[{}F", self.drawn_lines);
+            }
+            let clear_lines = self.drawn_lines.max(lines.len());
+            for idx in 0..clear_lines {
+                eprint!("\r\x1b[2K");
+                if let Some(line) = lines.get(idx) {
+                    eprint!("{line}");
+                }
+                eprintln!();
+            }
+            self.drawn_lines = clear_lines;
+        } else {
+            for line in lines {
+                eprintln!("{line}");
+            }
+            eprintln!();
+        }
+        let _ = std::io::stderr().flush();
+        self.last_emit = Instant::now();
+    }
+
+    fn lines(&self) -> Vec<String> {
+        match self.phase {
+            UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
+            UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
+            UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
+            UpdateDisplayPhase::Complete => self.data_lines("complete"),
+        }
+    }
+
+    fn source_lines(&self, heading: &str, checking: bool) -> Vec<String> {
+        let mut lines = vec![heading.to_string()];
+        let label_width = self.source_label_width();
+        for (kind, row) in &self.sources {
+            if !checking && row.changed_files == 0 {
+                continue;
+            }
+            let (current, total, suffix) = if checking {
+                (
+                    row.checked_files,
+                    row.total_files,
+                    format!(
+                        "{}/{} files, {} changed",
+                        format_count(row.checked_files),
+                        format_count(row.total_files),
+                        format_count(row.changed_files)
+                    ),
+                )
+            } else {
+                (
+                    row.read_files,
+                    row.changed_files,
+                    format!(
+                        "{}/{} files",
+                        format_count(row.read_files),
+                        format_count(row.changed_files)
+                    ),
+                )
+            };
+            lines.push(format!(
+                "  {kind:<label_width$}  {:<10} {}  {suffix}",
+                row.state,
+                progress_meter(current, total, 20)
+            ));
+            if !checking {
+                if let Some(path) = &row.current_path {
+                    lines.push(format!(
+                        "  {:<label_width$}  {:<10} {}  current {}",
+                        "",
+                        "",
+                        " ".repeat(20),
+                        compact_path(path)
+                    ));
+                }
+            }
+        }
+        lines
+    }
+
+    fn data_lines(&self, heading: &str) -> Vec<String> {
+        let mut lines = vec![heading.to_string()];
+        let label_width = self.data_label_width();
+        let keys: &[&str] = if self.phase == UpdateDisplayPhase::Complete {
+            &["logs", "events", "search", "history", "vectors"]
+        } else {
+            &["search", "history", "vectors"]
+        };
+        for key in keys {
+            if let Some(row) = self.data_rows.get(*key) {
+                let meter = match (row.current, row.total) {
+                    (Some(current), Some(total)) => progress_meter(current, total, 20),
+                    _ => " ".repeat(20),
+                };
+                lines.push(format!(
+                    "  {key:<label_width$}  {:<10} {meter}  {}",
+                    row.state, row.detail
+                ));
+            }
+        }
+        lines
+    }
+
+    fn source_label_width(&self) -> usize {
+        self.sources
+            .keys()
+            .map(|key| key.chars().count())
+            .max()
+            .unwrap_or(7)
+            .max(7)
+    }
+
+    fn data_label_width(&self) -> usize {
+        self.data_rows
+            .keys()
+            .map(|key| key.chars().count())
+            .max()
+            .unwrap_or(7)
+            .max(7)
+    }
+}
+
+fn progress_meter(current: usize, total: usize, width: usize) -> String {
+    if total == 0 || width == 0 {
+        return " ".repeat(width);
+    }
+    if current >= total {
+        return "█".repeat(width);
+    }
+    let units = current.saturating_mul(width).saturating_mul(8) / total;
+    let full = units / 8;
+    let partial = units % 8;
+    let partials = ["", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+    let mut meter = "█".repeat(full.min(width));
+    if full < width && partial > 0 {
+        meter.push_str(partials[partial]);
+    }
+    let meter_width = meter.chars().count();
+    if meter_width < width {
+        meter.push_str(&" ".repeat(width - meter_width));
+    }
+    meter
+}
+
+fn parse_progress_fraction(detail: &str) -> Option<(usize, usize)> {
+    let slash = detail.find('/')?;
+    let left = detail[..slash]
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == ',')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .replace(',', "");
+    let right = detail[slash + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == ',')
+        .collect::<String>()
+        .replace(',', "");
+    Some((left.parse().ok()?, right.parse().ok()?))
 }
 
 fn compact_path(path: &Path) -> String {

@@ -88,6 +88,12 @@ pub struct UpdateSourceSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateChangedSourceSummary {
+    pub kind: String,
+    pub changed_files: usize,
+}
+
+#[derive(Debug, Clone)]
 pub enum UpdateProgress {
     Discovered {
         sources: Vec<UpdateSourceSummary>,
@@ -101,6 +107,27 @@ pub enum UpdateProgress {
         total_files: usize,
         source_file_index: usize,
         source_file_count: usize,
+        stats: UpdateStats,
+    },
+    PreparingImports {
+        changed_files: usize,
+        sources: Vec<UpdateChangedSourceSummary>,
+        stats: UpdateStats,
+    },
+    ImportingFile {
+        adapter_kind: String,
+        kind: String,
+        path: PathBuf,
+        changed_file_index: usize,
+        changed_file_count: usize,
+        stats: UpdateStats,
+    },
+    ImportedFile {
+        adapter_kind: String,
+        kind: String,
+        path: PathBuf,
+        changed_file_index: usize,
+        changed_file_count: usize,
         stats: UpdateStats,
     },
     CompletedFile {
@@ -296,13 +323,17 @@ pub fn update_local_with_progress_and_cancel(
             candidate,
             kind,
             path,
-            file_index: idx + 1,
-            total_files,
-            source_file_index,
-            source_file_count,
         });
     }
 
+    if !pending_imports.is_empty() {
+        let changed_sources = changed_source_summaries(&pending_imports);
+        progress(&UpdateProgress::PreparingImports {
+            changed_files: pending_imports.len(),
+            sources: changed_sources,
+            stats: stats.clone(),
+        });
+    }
     let prepared_imports = prepare_pending_imports(
         &registry,
         &context,
@@ -310,10 +341,19 @@ pub fn update_local_with_progress_and_cancel(
         pending_imports,
         &should_cancel,
     )?;
-    for prepared in prepared_imports {
+    let changed_file_count = prepared_imports.len();
+    for (changed_idx, prepared) in prepared_imports.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
         }
+        progress(&UpdateProgress::ImportingFile {
+            adapter_kind: prepared.adapter_kind.to_string(),
+            kind: prepared.kind.clone(),
+            path: prepared.path.clone(),
+            changed_file_index: changed_idx + 1,
+            changed_file_count,
+            stats: stats.clone(),
+        });
         match prepared.result {
             Ok(import) => match import.commit(store) {
                 Ok(delta) => {
@@ -331,14 +371,12 @@ pub fn update_local_with_progress_and_cancel(
                 stats.errors += 1;
             }
         }
-        progress(&UpdateProgress::CompletedFile {
+        progress(&UpdateProgress::ImportedFile {
             adapter_kind: prepared.adapter_kind.to_string(),
             kind: prepared.kind,
             path: prepared.path,
-            file_index: prepared.file_index,
-            total_files: prepared.total_files,
-            source_file_index: prepared.source_file_index,
-            source_file_count: prepared.source_file_count,
+            changed_file_index: changed_idx + 1,
+            changed_file_count,
             stats: stats.clone(),
         });
     }
@@ -421,10 +459,6 @@ struct PendingImport {
     candidate: SourceCandidate,
     kind: String,
     path: PathBuf,
-    file_index: usize,
-    total_files: usize,
-    source_file_index: usize,
-    source_file_count: usize,
 }
 
 struct PreparedPendingImport {
@@ -432,10 +466,6 @@ struct PreparedPendingImport {
     adapter_kind: &'static str,
     kind: String,
     path: PathBuf,
-    file_index: usize,
-    total_files: usize,
-    source_file_index: usize,
-    source_file_count: usize,
     result: Result<PreparedImport>,
 }
 
@@ -476,10 +506,6 @@ fn prepare_pending_imports(
                 adapter_kind: pending.adapter_kind,
                 kind: pending.kind,
                 path: pending.path,
-                file_index: pending.file_index,
-                total_files: pending.total_files,
-                source_file_index: pending.source_file_index,
-                source_file_count: pending.source_file_count,
                 result: Err(anyhow::anyhow!(
                     "source adapter {} disappeared during import preparation",
                     pending.adapter_kind
@@ -527,10 +553,6 @@ fn prepare_pending_import_batch(
                             adapter_kind: pending.adapter_kind,
                             kind: pending.kind,
                             path: pending.path,
-                            file_index: pending.file_index,
-                            total_files: pending.total_files,
-                            source_file_index: pending.source_file_index,
-                            source_file_count: pending.source_file_count,
                             result,
                         }
                     }),
@@ -550,10 +572,6 @@ fn prepare_pending_import_batch(
                     adapter_kind: fallback.adapter_kind,
                     kind: fallback.kind,
                     path: fallback.path,
-                    file_index: fallback.file_index,
-                    total_files: fallback.total_files,
-                    source_file_index: fallback.source_file_index,
-                    source_file_count: fallback.source_file_count,
                     result: Err(anyhow::anyhow!("source import preparation worker panicked")),
                 }),
             }
@@ -697,6 +715,24 @@ fn increment_source_seen(seen: &mut Vec<MutableSourceSummary>, kind: &str) -> us
         });
         1
     }
+}
+
+fn changed_source_summaries(pending_imports: &[PendingImport]) -> Vec<UpdateChangedSourceSummary> {
+    let mut summaries: Vec<UpdateChangedSourceSummary> = Vec::new();
+    for pending in pending_imports {
+        if let Some(summary) = summaries
+            .iter_mut()
+            .find(|summary| summary.kind == pending.kind)
+        {
+            summary.changed_files += 1;
+        } else {
+            summaries.push(UpdateChangedSourceSummary {
+                kind: pending.kind.clone(),
+                changed_files: 1,
+            });
+        }
+    }
+    summaries
 }
 
 fn built_in_source_adapters(options: &UpdateOptions) -> Result<SourceAdapterRegistry> {
