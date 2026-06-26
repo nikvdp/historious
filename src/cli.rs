@@ -2539,7 +2539,7 @@ fn run_update_once_human(
         progress.finish_embeddings(&embeddings);
         embeddings
     };
-    progress.finish_all(&ingest, projected, &embeddings);
+    progress.finish_all();
 
     Ok(UpdateOutput {
         ingest,
@@ -3941,7 +3941,6 @@ enum UpdateDisplayPhase {
     LocalLogs,
     ChangedLogs,
     SearchData,
-    Complete,
 }
 
 #[derive(Debug, Default)]
@@ -4220,73 +4219,12 @@ impl UpdateProgressView {
         self.render(true);
     }
 
-    fn finish_all(
-        &mut self,
-        ingest: &ingest::UpdateStats,
-        projected: usize,
-        embeddings: &search::EmbeddingRefresh,
-    ) {
-        self.phase = UpdateDisplayPhase::Complete;
-        let history = self.data_rows.get("history").cloned();
-        self.data_rows.clear();
-        self.data_rows.insert(
-            "logs".to_string(),
-            UpdateDataProgress {
-                state: "checked",
-                current: Some(ingest.files_seen),
-                total: Some(ingest.files_seen),
-                detail: format!(
-                    "{} files, {} changed",
-                    format_count(ingest.files_seen),
-                    format_count(self.sources.values().map(|row| row.changed_files).sum())
-                ),
-            },
-        );
-        self.data_rows.insert(
-            "events".to_string(),
-            UpdateDataProgress {
-                state: "read",
-                current: Some(ingest.inserted),
-                total: Some(ingest.inserted),
-                detail: format!("{} new events", format_count(ingest.inserted)),
-            },
-        );
-        self.data_rows.insert(
-            "search".to_string(),
-            UpdateDataProgress {
-                state: "indexed",
-                current: Some(projected),
-                total: Some(projected),
-                detail: format!("{} events indexed", format_count(projected)),
-            },
-        );
-        self.data_rows.insert(
-            "history".to_string(),
-            history.unwrap_or_else(|| UpdateDataProgress {
-                state: "projected",
-                detail: "history items refreshed".to_string(),
-                ..Default::default()
-            }),
-        );
-        self.data_rows.insert(
-            "vectors".to_string(),
-            UpdateDataProgress {
-                state: if embeddings.disabled {
-                    "skipped"
-                } else {
-                    "embedded"
-                },
-                detail: embedding_phase_detail(embeddings),
-                ..Default::default()
-            },
-        );
-        self.render(true);
-        self.finish_rendering();
+    fn finish_all(&mut self) {
+        self.settle_rendering();
     }
 
-    fn finish_rendering(&mut self) {
+    fn settle_rendering(&mut self) {
         if self.interactive && self.drawn_lines > 0 {
-            eprintln!();
             self.drawn_lines = 0;
         }
     }
@@ -4324,7 +4262,6 @@ impl UpdateProgressView {
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
-            UpdateDisplayPhase::Complete => self.data_lines("complete"),
         }
     }
 
@@ -4380,11 +4317,7 @@ impl UpdateProgressView {
     fn data_lines(&self, heading: &str) -> Vec<String> {
         let mut lines = vec![heading.to_string()];
         let label_width = self.data_label_width();
-        let keys: &[&str] = if self.phase == UpdateDisplayPhase::Complete {
-            &["logs", "events", "search", "history", "vectors"]
-        } else {
-            &["search", "history", "vectors"]
-        };
+        let keys: &[&str] = &["search", "history", "vectors"];
         for key in keys {
             if let Some(row) = self.data_rows.get(*key) {
                 let meter = match (row.current, row.total) {
