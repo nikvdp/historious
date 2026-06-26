@@ -783,6 +783,23 @@ pub enum RawBlobCommand {
         )]
         confirm: bool,
     },
+    /// Remove unreferenced legacy loose raw blob files.
+    CleanOrphans {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview unreferenced loose raw blob cleanup without deleting anything"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Delete unreferenced loose raw blob files"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -1704,6 +1721,31 @@ impl Cli {
                         print_source_archive_cleanup_output(&output);
                     }
                 }
+                RawBlobCommand::CleanOrphans {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let cleanup = if confirm {
+                        store.cleanup_orphan_raw_blobs()?
+                    } else {
+                        store.preview_orphan_raw_blob_cleanup()?
+                    };
+                    let output = OrphanRawBlobCleanupOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        cleanup,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs clean-orphans",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_orphan_raw_blob_cleanup_output(&output);
+                    }
+                }
             },
             Command::Maintenance { command } => match command {
                 MaintenanceCommand::Compact {
@@ -1866,7 +1908,9 @@ impl Command {
                         | RawBlobCommand::Import { json: true, .. }
                         | RawBlobCommand::Compact { json: true, .. }
                         | RawBlobCommand::MigrateObjects { json: true, .. }
-                        | RawBlobCommand::CleanManifestArtifacts { json: true, .. },
+                        | RawBlobCommand::CleanManifestArtifacts { json: true, .. }
+                        | RawBlobCommand::CleanSourceArchives { json: true, .. }
+                        | RawBlobCommand::CleanOrphans { json: true, .. },
                 }
                 | Command::Maintenance {
                     command: MaintenanceCommand::Compact { json: true, .. },
@@ -2102,6 +2146,13 @@ struct SourceArchiveCleanupOutput {
     confirmed: bool,
     cleanup: crate::storage::SourceArchiveCleanupOutcome,
     maintenance: Option<crate::storage::SqliteMaintenanceOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct OrphanRawBlobCleanupOutput {
+    dry_run: bool,
+    confirmed: bool,
+    cleanup: crate::storage::OrphanRawBlobCleanupOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -3411,6 +3462,47 @@ fn source_archive_cleanup_removed_data(
         || cleanup.raw_objects_deleted > 0
         || cleanup.events_unlinked > 0
         || cleanup.raw_blobs_deleted > 0
+}
+
+fn print_orphan_raw_blob_cleanup_output(output: &OrphanRawBlobCleanupOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Orphan raw blob cleanup preview"
+    } else {
+        "Orphan raw blob cleanup complete"
+    };
+    println!("{title}");
+    print_section(
+        "Loose raw blobs",
+        &[
+            (
+                "Blobs inspected",
+                format_count(output.cleanup.raw_blobs_inspected),
+            ),
+            (
+                "Blobs retained",
+                format_count(output.cleanup.raw_blobs_retained),
+            ),
+            (
+                "Invalid paths skipped",
+                format_count(output.cleanup.raw_blobs_skipped_invalid_path),
+            ),
+            (
+                "Orphan blobs",
+                format_count(output.cleanup.raw_blobs_deleted),
+            ),
+            (
+                "Orphan blob bytes",
+                format_bytes(output.cleanup.raw_blob_bytes_deleted),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run && output.cleanup.raw_blobs_deleted > 0 {
+        println!("Run again with --confirm to delete these unreferenced loose raw blobs.");
+    } else if output.cleanup.raw_blobs_deleted == 0 {
+        println!("No unreferenced loose raw blobs found.");
+    }
 }
 
 fn print_maintenance_compact_output(output: &MaintenanceCompactOutput) {
