@@ -112,7 +112,11 @@ fn release(args: Vec<String>) -> Result<()> {
     run_git(&repo_root, &["add", "Cargo.toml", "Cargo.lock"])?;
     run_git(
         &repo_root,
-        &["commit", "-F", path_str(&message_path, "release message path")?],
+        &[
+            "commit",
+            "-F",
+            path_str(&message_path, "release message path")?,
+        ],
     )?;
     run_git(
         &repo_root,
@@ -159,7 +163,8 @@ fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
     }
     if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
         return Err(
-            "git has tracked changes; commit or stash them before running the release script".into(),
+            "git has tracked changes; commit or stash them before running the release script"
+                .into(),
         );
     }
     Ok(())
