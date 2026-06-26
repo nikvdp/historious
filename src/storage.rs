@@ -184,6 +184,19 @@ pub struct ManifestRawArtifactCleanupOutcome {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceArchiveCleanupOutcome {
+    pub raw_artifacts_deleted: usize,
+    pub raw_artifact_bytes_deleted: u64,
+    pub raw_manifests_deleted: usize,
+    pub raw_manifest_entries_deleted: usize,
+    pub raw_objects_deleted: usize,
+    pub raw_object_bytes_deleted: u64,
+    pub events_unlinked: usize,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SqliteMaintenanceOutcome {
     pub database_bytes_before: u64,
     pub database_bytes_after: u64,
@@ -1146,6 +1159,27 @@ impl Store {
 
     pub fn cleanup_manifest_raw_artifacts(&self) -> Result<ManifestRawArtifactCleanupOutcome> {
         self.with_conn(|conn| cleanup_manifest_raw_artifacts(conn, &self.blob_dir, true))
+    }
+
+    pub fn preview_source_archive_cleanup(&self) -> Result<SourceArchiveCleanupOutcome> {
+        self.with_conn(|conn| source_archive_cleanup_outcome(conn, &self.blob_dir))
+    }
+
+    pub fn cleanup_source_archives(&self) -> Result<SourceArchiveCleanupOutcome> {
+        let (mut outcome, hashes) = self.with_conn(|conn| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                .context("starting source archive cleanup transaction")?;
+            let outcome = source_archive_cleanup_outcome(&tx, &self.blob_dir)?;
+            let hashes = source_archive_blob_hashes(&tx)?;
+            apply_source_archive_cleanup(&tx)?;
+            tx.commit().context("committing source archive cleanup")?;
+            Ok((outcome, hashes))
+        })?;
+        let (raw_blobs_deleted, raw_blob_bytes_deleted) =
+            remove_raw_artifact_blobs(&self.blob_dir, &hashes)?;
+        outcome.raw_blobs_deleted = raw_blobs_deleted;
+        outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
+        Ok(outcome)
     }
 
     pub fn preview_sqlite_compaction(&self) -> Result<SqliteMaintenanceOutcome> {
@@ -3512,6 +3546,107 @@ fn cleanup_manifest_raw_artifacts(
     }
 
     Ok(outcome)
+}
+
+fn source_archive_cleanup_outcome(
+    conn: &Connection,
+    blob_dir: &Path,
+) -> Result<SourceArchiveCleanupOutcome> {
+    let (raw_artifacts_deleted, raw_artifact_bytes_deleted): (usize, u64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM raw_artifacts",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as u64)),
+    )?;
+    let raw_manifests_deleted: usize =
+        conn.query_row("SELECT COUNT(*) FROM raw_manifests", [], |row| {
+            Ok(row.get::<_, i64>(0)? as usize)
+        })?;
+    let raw_manifest_entries_deleted: usize =
+        conn.query_row("SELECT COUNT(*) FROM raw_manifest_entries", [], |row| {
+            Ok(row.get::<_, i64>(0)? as usize)
+        })?;
+    let (raw_objects_deleted, raw_object_bytes_deleted): (usize, u64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM raw_objects",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as u64)),
+    )?;
+    let events_unlinked: usize = conn.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE raw_artifact_hash IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_artifact_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_manifest_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_object_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_line_hash') IS NOT NULL",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? as usize),
+    )?;
+    let hashes = source_archive_blob_hashes(conn)?;
+    let (raw_blobs_deleted, raw_blob_bytes_deleted) = raw_blob_file_stats(blob_dir, &hashes)?;
+    Ok(SourceArchiveCleanupOutcome {
+        raw_artifacts_deleted,
+        raw_artifact_bytes_deleted,
+        raw_manifests_deleted,
+        raw_manifest_entries_deleted,
+        raw_objects_deleted,
+        raw_object_bytes_deleted,
+        events_unlinked,
+        raw_blobs_deleted,
+        raw_blob_bytes_deleted,
+    })
+}
+
+fn source_archive_blob_hashes(conn: &Connection) -> Result<Vec<String>> {
+    let mut hashes = collect_text_column(
+        conn,
+        "SELECT hash FROM raw_artifacts
+         UNION
+         SELECT hash FROM raw_objects
+         ORDER BY hash",
+    )?;
+    hashes.sort();
+    hashes.dedup();
+    Ok(hashes)
+}
+
+fn apply_source_archive_cleanup(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE events
+         SET raw_artifact_hash = NULL,
+             metadata_json = json_remove(
+               metadata_json,
+               '$.raw_artifact_hash',
+               '$.raw_manifest_hash',
+               '$.raw_object_hash',
+               '$.raw_line_hash'
+             )
+         WHERE raw_artifact_hash IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_artifact_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_manifest_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_object_hash') IS NOT NULL
+            OR json_extract(metadata_json, '$.raw_line_hash') IS NOT NULL",
+        [],
+    )?;
+    conn.execute("DELETE FROM raw_manifest_entries", [])?;
+    conn.execute("DELETE FROM raw_manifests", [])?;
+    conn.execute("DELETE FROM raw_objects", [])?;
+    conn.execute("DELETE FROM raw_artifacts", [])?;
+    Ok(())
+}
+
+fn raw_blob_file_stats(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64)> {
+    let mut count = 0;
+    let mut bytes = 0;
+    for hash in hashes {
+        let path = blob_path(blob_dir, hash);
+        if !path.exists() {
+            continue;
+        }
+        count += 1;
+        bytes += std::fs::metadata(&path)
+            .with_context(|| format!("reading blob metadata {}", path.display()))?
+            .len();
+    }
+    Ok((count, bytes))
 }
 
 fn manifest_raw_artifact_cleanup_rows(
