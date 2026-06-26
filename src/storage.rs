@@ -779,6 +779,7 @@ impl Store {
         Ok(stats)
     }
 
+    #[allow(dead_code)]
     pub fn export_records(&self) -> Result<Vec<ArchiveRecord>> {
         self.export_records_with_raw_content(true)
     }
@@ -862,6 +863,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn export_records_for_session_ids(
         &self,
         session_ids: &[String],

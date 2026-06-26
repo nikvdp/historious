@@ -14,8 +14,7 @@ const IMPORT_JSONL_BATCH_RECORDS: usize = 500;
 const IMPORT_STREAM_CHANNEL_BATCHES: usize = 8;
 
 pub fn export_jsonl(store: &Store, mut writer: impl Write) -> Result<usize> {
-    let records = store.export_records()?;
-    write_jsonl_records(records, &mut writer)
+    export_jsonl_with_options_and_progress(store, ExportOptions::default(), &mut writer, |_| {})
 }
 
 #[allow(dead_code)]
@@ -50,7 +49,13 @@ pub fn export_jsonl_filtered(
         return export_jsonl(store, writer);
     }
     let session_ids = store.session_ids_for_export_filter(filter)?;
-    let records = store.export_records_for_session_ids(&session_ids)?;
+    let records = filter_export_records(
+        store.export_records_for_session_ids_with_raw_content(
+            &session_ids,
+            ExportOptions::default().include_raw_artifact_content,
+        )?,
+        ExportOptions::default(),
+    );
     write_jsonl_records(records, &mut writer)
 }
 
@@ -95,8 +100,8 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             include_embeddings: true,
-            include_raw_artifact_records: true,
-            include_raw_artifact_content: true,
+            include_raw_artifact_records: false,
+            include_raw_artifact_content: false,
         }
     }
 }
@@ -705,7 +710,16 @@ mod tests {
             .expect("import records");
 
         let mut body = Vec::new();
-        export_jsonl(&store, &mut body).expect("export jsonl");
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: true,
+                include_raw_artifact_records: true,
+                include_raw_artifact_content: true,
+            },
+            &mut body,
+        )
+        .expect("export jsonl");
         let body_jsonl = String::from_utf8(body.clone()).expect("utf8 jsonl");
         let embedding_line = body_jsonl
             .lines()
@@ -1030,14 +1044,14 @@ mod tests {
         let imported_dir = tempfile::tempdir().expect("import tempdir");
         let imported = Store::open(imported_dir.path()).expect("open imported");
         let stats = import_jsonl_reader(&imported, body.as_slice()).expect("import filtered");
-        assert_eq!(stats.inserted, 4);
+        assert_eq!(stats.inserted, 3);
 
         let records = imported.export_records().expect("export imported");
         assert!(records
             .iter()
             .any(|record| record.id() == "session_selected"));
         assert!(records.iter().any(|record| record.id() == "event_selected"));
-        assert!(records.iter().any(|record| record.id() == "raw_selected"));
+        assert!(!records.iter().any(|record| record.id() == "raw_selected"));
         assert!(!records.iter().any(|record| record.id() == "session_other"));
     }
 
@@ -1053,7 +1067,16 @@ mod tests {
             .expect("import records");
 
         let mut body = Vec::new();
-        export_jsonl(&store, &mut body).expect("export jsonl");
+        export_jsonl_with_options(
+            &store,
+            ExportOptions {
+                include_embeddings: true,
+                include_raw_artifact_records: true,
+                include_raw_artifact_content: true,
+            },
+            &mut body,
+        )
+        .expect("export jsonl");
 
         let raw = jsonl_record_payload(&body, "raw_artifact").expect("raw artifact payload");
         let content = raw.get("content").expect("content field");
@@ -1152,6 +1175,37 @@ mod tests {
         assert_jsonl_contains_kind(&body, "session");
         assert_jsonl_contains_kind(&body, "event");
         assert_jsonl_contains_kind(&body, "search_unit");
+        assert!(!jsonl_contains_kind(&body, "raw_artifact"));
+    }
+
+    #[test]
+    fn default_jsonl_export_omits_legacy_raw_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source("source_raw")),
+                ArchiveRecord::Session(fixture_session(
+                    "session_raw",
+                    "source_raw",
+                    "/tmp/historious/repo",
+                )),
+                ArchiveRecord::Event(fixture_event(
+                    "event_raw",
+                    "session_raw",
+                    "source_raw",
+                    Some("raw_default"),
+                )),
+                ArchiveRecord::RawArtifact(fixture_raw("source_raw", "raw_default")),
+            ])
+            .expect("import records");
+
+        let mut body = Vec::new();
+        export_jsonl(&store, &mut body).expect("default export");
+
+        assert_jsonl_contains_kind(&body, "source");
+        assert_jsonl_contains_kind(&body, "session");
+        assert_jsonl_contains_kind(&body, "event");
         assert!(!jsonl_contains_kind(&body, "raw_artifact"));
     }
 
