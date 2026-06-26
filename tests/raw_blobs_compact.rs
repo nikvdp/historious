@@ -199,6 +199,60 @@ fn raw_blobs_migrate_objects_skips_invalid_loose_objects() {
 }
 
 #[test]
+fn raw_blobs_clean_orphans_removes_only_unreferenced_loose_blobs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let referenced_bytes = br#"{"message":"referenced"}"#;
+    let orphan_bytes = br#"{"message":"orphan"}"#;
+    let referenced_hash = blake3_hex(referenced_bytes);
+    let orphan_hash = blake3_hex(orphan_bytes);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+    seed_empty_raw_object(&data_dir, &referenced_hash, referenced_bytes);
+    write_loose_blob(&data_dir, &referenced_hash, referenced_bytes);
+    write_loose_blob(&data_dir, &orphan_hash, orphan_bytes);
+
+    let preview = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-orphans",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["data"]["dry_run"], true);
+    assert_eq!(preview["data"]["cleanup"]["raw_blobs_inspected"], 2);
+    assert_eq!(preview["data"]["cleanup"]["raw_blobs_retained"], 1);
+    assert_eq!(preview["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(
+        preview["data"]["cleanup"]["raw_blob_bytes_deleted"],
+        orphan_bytes.len() as u64
+    );
+    assert!(loose_blob_path(&data_dir, &referenced_hash).exists());
+    assert!(loose_blob_path(&data_dir, &orphan_hash).exists());
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-orphans",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["dry_run"], false);
+    assert_eq!(applied["data"]["confirmed"], true);
+    assert_eq!(applied["data"]["cleanup"]["raw_blobs_retained"], 1);
+    assert_eq!(applied["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert!(loose_blob_path(&data_dir, &referenced_hash).exists());
+    assert!(!loose_blob_path(&data_dir, &orphan_hash).exists());
+}
+
+#[test]
 fn raw_blobs_clean_manifest_artifacts_deletes_verified_legacy_artifact() {
     let temp = tempfile::tempdir().expect("temp dir");
     let data_dir = temp.path().join("histo-data");
