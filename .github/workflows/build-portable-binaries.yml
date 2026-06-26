@@ -3,9 +3,6 @@ name: build-portable-binaries
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*"
   pull_request:
