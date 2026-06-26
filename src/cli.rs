@@ -4072,7 +4072,7 @@ struct UpdateProgressView {
     phase: UpdateDisplayPhase,
     sources: BTreeMap<String, UpdateSourceProgress>,
     data_rows: BTreeMap<String, UpdateDataProgress>,
-    drawn_lines: usize,
+    drawn_rows: usize,
     last_emit: Instant,
 }
 
@@ -4083,7 +4083,7 @@ impl UpdateProgressView {
             phase: UpdateDisplayPhase::LocalLogs,
             sources: BTreeMap::new(),
             data_rows: BTreeMap::new(),
-            drawn_lines: 0,
+            drawn_rows: 0,
             last_emit: Instant::now(),
         }
     }
@@ -4330,8 +4330,8 @@ impl UpdateProgressView {
     }
 
     fn settle_rendering(&mut self) {
-        if self.interactive && self.drawn_lines > 0 {
-            self.drawn_lines = 0;
+        if self.interactive && self.drawn_rows > 0 {
+            self.drawn_rows = 0;
         }
     }
 
@@ -4339,22 +4339,17 @@ impl UpdateProgressView {
         if !self.interactive && !force && self.last_emit.elapsed() < Duration::from_secs(2) {
             return;
         }
-        let lines = self.lines();
         if self.interactive {
-            if self.drawn_lines > 0 {
-                eprint!("\x1b[{}F", self.drawn_lines);
-            }
-            let clear_lines = self.drawn_lines.max(lines.len());
-            for idx in 0..clear_lines {
-                eprint!("\r\x1b[2K");
-                if let Some(line) = lines.get(idx) {
-                    eprint!("{line}");
-                }
+            let columns = terminal_columns();
+            let lines = self.lines_for_terminal(columns);
+            self.clear_rendered_block();
+            for line in &lines {
+                eprint!("\r\x1b[2K{line}");
                 eprintln!();
             }
-            self.drawn_lines = clear_lines;
+            self.drawn_rows = terminal_rows_for_lines(&lines, columns);
         } else {
-            for line in lines {
+            for line in self.lines() {
                 eprintln!("{line}");
             }
             eprintln!();
@@ -4363,12 +4358,35 @@ impl UpdateProgressView {
         self.last_emit = Instant::now();
     }
 
+    fn clear_rendered_block(&mut self) {
+        if self.drawn_rows == 0 {
+            return;
+        }
+        eprint!("\x1b[{}F", self.drawn_rows);
+        for idx in 0..self.drawn_rows {
+            eprint!("\r\x1b[2K");
+            if idx + 1 < self.drawn_rows {
+                eprint!("\x1b[1E");
+            }
+        }
+        if self.drawn_rows > 1 {
+            eprint!("\x1b[{}F", self.drawn_rows - 1);
+        }
+    }
+
     fn lines(&self) -> Vec<String> {
         match self.phase {
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
         }
+    }
+
+    fn lines_for_terminal(&self, columns: usize) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .map(|line| fit_terminal_line(&line, columns))
+            .collect()
     }
 
     fn source_lines(&self, heading: &str, checking: bool) -> Vec<String> {
@@ -4517,6 +4535,23 @@ fn compact_path(path: &Path) -> String {
             .collect::<String>();
         format!("...{tail}")
     }
+}
+
+fn fit_terminal_line(line: &str, columns: usize) -> String {
+    let budget = terminal_line_budget(columns);
+    ellipsize_middle(line, budget)
+}
+
+fn terminal_rows_for_lines(lines: &[String], columns: usize) -> usize {
+    let columns = terminal_line_budget(columns);
+    lines
+        .iter()
+        .map(|line| line.chars().count().max(1).div_ceil(columns))
+        .sum()
+}
+
+fn terminal_line_budget(columns: usize) -> usize {
+    columns.saturating_sub(1).max(1)
 }
 
 fn format_count(value: usize) -> String {
