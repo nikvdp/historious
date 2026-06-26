@@ -396,6 +396,33 @@ pub enum Command {
             help = "Search unit id to jump to"
         )]
         search_unit: Option<String>,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Only show transcript items matching text plus context"
+        )]
+        grep: Option<String>,
+        #[arg(
+            short = 'A',
+            long = "after-context",
+            value_name = "COUNT",
+            help = "Number of transcript items to show after each --grep match"
+        )]
+        after_context: Option<usize>,
+        #[arg(
+            short = 'B',
+            long = "before-context",
+            value_name = "COUNT",
+            help = "Number of transcript items to show before each --grep match"
+        )]
+        before_context: Option<usize>,
+        #[arg(
+            short = 'C',
+            long = "context",
+            value_name = "COUNT",
+            help = "Number of transcript items to show before and after each --grep match"
+        )]
+        context: Option<usize>,
         #[arg(long, help = "Print directly instead of opening a pager")]
         no_pager: bool,
         #[arg(long, value_enum, help = "When to use colored output")]
@@ -1330,6 +1357,10 @@ impl Cli {
                 target,
                 at,
                 search_unit,
+                grep,
+                after_context,
+                before_context,
+                context,
                 no_pager,
                 color,
                 no_color,
@@ -1350,9 +1381,15 @@ impl Cli {
                             .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))
                     })
                     .transpose()?;
+                let grep = resolve_transcript_grep(grep, before_context, after_context, context)?;
                 if json || robot {
                     if full {
                         let events = store.events_for_session(&session)?;
+                        let events = if let Some(grep) = &grep {
+                            grep_events(&events, grep)
+                        } else {
+                            events
+                        };
                         crate::output::write_success(
                             "transcript",
                             transcript_output(
@@ -1360,11 +1397,12 @@ impl Cli {
                                 &session_record,
                                 &events,
                                 target_event_id.as_deref(),
+                                grep.as_ref(),
                             )?,
                             Default::default(),
                         )?;
                     } else {
-                        let context = if let Some(event_id) = target_event_id.as_deref() {
+                        let mut context = if let Some(event_id) = target_event_id.as_deref() {
                             store
                                 .history_items_around_event(
                                     event_id,
@@ -1377,14 +1415,22 @@ impl Cli {
                                 .history_items_for_transcript_session(&session)?
                                 .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?
                         };
+                        if let Some(grep) = &grep {
+                            context = grep_history_context(context, grep);
+                        }
                         crate::output::write_success(
                             "transcript",
-                            history_transcript_output(&store, &context)?,
+                            history_transcript_output(&store, &context, grep.as_ref())?,
                             Default::default(),
                         )?;
                     }
                 } else if full {
                     let events = store.events_for_session(&session)?;
+                    let events = if let Some(grep) = &grep {
+                        grep_events(&events, grep)
+                    } else {
+                        events
+                    };
                     let metadata = view_metadata_for_session(
                         &store,
                         &session_record,
@@ -1408,7 +1454,7 @@ impl Cli {
                         verbose,
                     )?;
                     let color = should_color(no_color, color, robot);
-                    let context = if let Some(event_id) = target_event_id.as_deref() {
+                    let mut context = if let Some(event_id) = target_event_id.as_deref() {
                         store
                             .history_items_around_event(event_id, usize::MAX / 4, usize::MAX / 4)?
                             .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?
@@ -1417,6 +1463,9 @@ impl Cli {
                             .history_items_for_transcript_session(&session)?
                             .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?
                     };
+                    if let Some(grep) = &grep {
+                        context = grep_history_context(context, grep);
+                    }
                     let rendered =
                         crate::transcript::render_history_session(&context, &metadata, color);
                     page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
@@ -2319,6 +2368,8 @@ struct TranscriptOutput {
     target_event_id: Option<String>,
     target_ref: Option<String>,
     target_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grep: Option<TranscriptGrepOutput>,
     events: Vec<EventOutput>,
 }
 
@@ -2329,7 +2380,24 @@ struct HistoryTranscriptOutput {
     target_ref: Option<String>,
     target_index: Option<usize>,
     omitted_target: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grep: Option<TranscriptGrepOutput>,
     items: Vec<HistoryItemOutput>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptGrep {
+    pattern: String,
+    before_context: usize,
+    after_context: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TranscriptGrepOutput {
+    pattern: String,
+    before_context: usize,
+    after_context: usize,
+    match_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -5236,6 +5304,7 @@ fn transcript_output(
     session: &crate::archive::SessionRecord,
     events: &[crate::archive::EventRecord],
     target_event_id: Option<&str>,
+    grep: Option<&TranscriptGrep>,
 ) -> Result<TranscriptOutput> {
     let target_index =
         target_event_id.and_then(|event_id| events.iter().position(|event| event.id == event_id));
@@ -5252,6 +5321,15 @@ fn transcript_output(
         target_event_id: target_event_id.map(str::to_string),
         target_ref,
         target_index,
+        grep: grep.map(|grep| TranscriptGrepOutput {
+            pattern: grep.pattern.clone(),
+            before_context: grep.before_context,
+            after_context: grep.after_context,
+            match_count: transcript_match_count(
+                events.iter().map(|event| event.content.as_str()),
+                grep,
+            ),
+        }),
         events,
     })
 }
@@ -5259,6 +5337,7 @@ fn transcript_output(
 fn history_transcript_output(
     store: &Store,
     context: &crate::storage::HistoryTranscriptContext,
+    grep: Option<&TranscriptGrep>,
 ) -> Result<HistoryTranscriptOutput> {
     let target_event_id = context.target_event.as_ref().map(|event| event.id.clone());
     let target_ref = target_event_id
@@ -5277,6 +5356,15 @@ fn history_transcript_output(
         target_ref,
         target_index: context.target_index,
         omitted_target: context.omitted_target,
+        grep: grep.map(|grep| TranscriptGrepOutput {
+            pattern: grep.pattern.clone(),
+            before_context: grep.before_context,
+            after_context: grep.after_context,
+            match_count: transcript_match_count(
+                context.items.iter().map(|item| item.text.as_str()),
+                grep,
+            ),
+        }),
         items,
     })
 }
@@ -5668,6 +5756,114 @@ fn resolve_transcript_target(
         .event_by_id(&event_id)?
         .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
     Ok((event.session_id, Some(event.id)))
+}
+
+fn resolve_transcript_grep(
+    pattern: Option<String>,
+    before_context: Option<usize>,
+    after_context: Option<usize>,
+    context: Option<usize>,
+) -> Result<Option<TranscriptGrep>> {
+    if pattern.is_none()
+        && (before_context.is_some() || after_context.is_some() || context.is_some())
+    {
+        bail!("transcript context flags require --grep");
+    }
+
+    let Some(pattern) = pattern.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if pattern.is_empty() {
+        bail!("transcript --grep requires non-empty text");
+    }
+
+    let shared_context = context.unwrap_or(0);
+    Ok(Some(TranscriptGrep {
+        pattern,
+        before_context: before_context.unwrap_or(shared_context),
+        after_context: after_context.unwrap_or(shared_context),
+    }))
+}
+
+fn grep_history_context(
+    mut context: crate::storage::HistoryTranscriptContext,
+    grep: &TranscriptGrep,
+) -> crate::storage::HistoryTranscriptContext {
+    let selected = grep_window_indices(
+        context.items.len(),
+        |idx| transcript_text_matches(&context.items[idx].text, grep),
+        grep.before_context,
+        grep.after_context,
+    );
+    let original_items = context.items;
+    let target_event_id = context.target_event.as_ref().map(|event| event.id.as_str());
+    let mut target_index = None;
+    context.items = selected
+        .into_iter()
+        .enumerate()
+        .map(|(new_idx, old_idx)| {
+            let item = original_items[old_idx].clone();
+            if target_event_id == Some(item.event_id.as_str()) {
+                target_index = Some(new_idx);
+            }
+            item
+        })
+        .collect();
+    context.target_index = target_index;
+    context.omitted_target = target_event_id.is_some() && target_index.is_none();
+    context
+}
+
+fn grep_events(
+    events: &[crate::archive::EventRecord],
+    grep: &TranscriptGrep,
+) -> Vec<crate::archive::EventRecord> {
+    grep_window_indices(
+        events.len(),
+        |idx| transcript_text_matches(&events[idx].content, grep),
+        grep.before_context,
+        grep.after_context,
+    )
+    .into_iter()
+    .map(|idx| events[idx].clone())
+    .collect()
+}
+
+fn grep_window_indices(
+    len: usize,
+    mut is_match: impl FnMut(usize) -> bool,
+    before_context: usize,
+    after_context: usize,
+) -> Vec<usize> {
+    let mut selected = Vec::new();
+    let mut next_allowed = 0usize;
+
+    for idx in 0..len {
+        if !is_match(idx) {
+            continue;
+        }
+        let start = idx.saturating_sub(before_context).max(next_allowed);
+        let end = idx.saturating_add(after_context).saturating_add(1).min(len);
+        selected.extend(start..end);
+        next_allowed = end;
+    }
+
+    selected
+}
+
+fn transcript_text_matches(text: &str, grep: &TranscriptGrep) -> bool {
+    text.to_ascii_lowercase()
+        .contains(&grep.pattern.to_ascii_lowercase())
+}
+
+fn transcript_match_count<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    grep: &TranscriptGrep,
+) -> usize {
+    texts
+        .into_iter()
+        .filter(|text| transcript_text_matches(text, grep))
+        .count()
 }
 
 fn resolve_session_filter_targets(store: &Store, targets: Vec<String>) -> Result<Vec<String>> {
@@ -8012,7 +8208,7 @@ mod tests {
             omitted_target: false,
         };
 
-        let output = history_transcript_output(&store, &context).expect("history output");
+        let output = history_transcript_output(&store, &context, None).expect("history output");
         let value = serde_json::to_value(output).expect("serialize");
         let ref_id = store
             .recent_ref_for_event_id("event_view")
@@ -8075,8 +8271,8 @@ mod tests {
             .events_for_session("session_view")
             .expect("events lookup");
 
-        let output =
-            transcript_output(&store, &session, &events, Some("event_view")).expect("raw output");
+        let output = transcript_output(&store, &session, &events, Some("event_view"), None)
+            .expect("raw output");
         let value = serde_json::to_value(output).expect("serialize");
         let ref_id = store
             .recent_ref_for_event_id("event_view")
