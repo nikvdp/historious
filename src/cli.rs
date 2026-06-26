@@ -769,6 +769,23 @@ pub enum RawBlobCommand {
         )]
         confirm: bool,
     },
+    /// Remove legacy source-native raw archives after normalized records exist.
+    CleanSourceArchives {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+        #[arg(
+            long,
+            conflicts_with = "confirm",
+            help = "Preview legacy source archive cleanup without deleting anything"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Delete legacy source archive rows and loose blobs"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -1659,6 +1676,31 @@ impl Cli {
                         print_manifest_raw_artifact_cleanup_output(&output);
                     }
                 }
+                RawBlobCommand::CleanSourceArchives {
+                    json,
+                    dry_run: _,
+                    confirm,
+                } => {
+                    let cleanup = if confirm {
+                        store.cleanup_source_archives()?
+                    } else {
+                        store.preview_source_archive_cleanup()?
+                    };
+                    let output = SourceArchiveCleanupOutput {
+                        dry_run: !confirm,
+                        confirmed: confirm,
+                        cleanup,
+                    };
+                    if json || robot {
+                        crate::output::write_success(
+                            "raw-blobs clean-source-archives",
+                            output,
+                            Default::default(),
+                        )?;
+                    } else {
+                        print_source_archive_cleanup_output(&output);
+                    }
+                }
             },
             Command::Maintenance { command } => match command {
                 MaintenanceCommand::Compact {
@@ -2049,6 +2091,13 @@ struct ManifestRawArtifactCleanupOutput {
     dry_run: bool,
     confirmed: bool,
     cleanup: crate::storage::ManifestRawArtifactCleanupOutcome,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceArchiveCleanupOutput {
+    dry_run: bool,
+    confirmed: bool,
+    cleanup: crate::storage::SourceArchiveCleanupOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -3262,6 +3311,72 @@ fn print_manifest_raw_artifact_cleanup_output(output: &ManifestRawArtifactCleanu
         println!("Run again with --confirm to delete verified raw artifacts.");
     } else if output.cleanup.raw_artifacts_verified == 0 {
         println!("No manifest-covered raw artifacts verified for cleanup.");
+    }
+}
+
+fn print_source_archive_cleanup_output(output: &SourceArchiveCleanupOutput) {
+    println!();
+    let title = if output.dry_run {
+        "Source archive cleanup preview"
+    } else {
+        "Source archive cleanup complete"
+    };
+    println!("{title}");
+    print_section(
+        "Legacy source archives",
+        &[
+            (
+                "Raw artifacts",
+                format_count(output.cleanup.raw_artifacts_deleted),
+            ),
+            (
+                "Raw artifact bytes",
+                format_bytes(output.cleanup.raw_artifact_bytes_deleted),
+            ),
+            (
+                "Raw manifests",
+                format_count(output.cleanup.raw_manifests_deleted),
+            ),
+            (
+                "Raw manifest entries",
+                format_count(output.cleanup.raw_manifest_entries_deleted),
+            ),
+            (
+                "Raw objects",
+                format_count(output.cleanup.raw_objects_deleted),
+            ),
+            (
+                "Raw object bytes",
+                format_bytes(output.cleanup.raw_object_bytes_deleted),
+            ),
+            (
+                "Events unlinked",
+                format_count(output.cleanup.events_unlinked),
+            ),
+            (
+                "Loose blobs",
+                format_count(output.cleanup.raw_blobs_deleted),
+            ),
+            (
+                "Loose blob bytes",
+                format_bytes(output.cleanup.raw_blob_bytes_deleted),
+            ),
+        ],
+        std::io::stdout().is_terminal(),
+    );
+    if output.dry_run
+        && (output.cleanup.raw_artifacts_deleted > 0
+            || output.cleanup.raw_manifests_deleted > 0
+            || output.cleanup.raw_objects_deleted > 0
+            || output.cleanup.raw_blobs_deleted > 0)
+    {
+        println!("Run again with --confirm to delete these legacy source archives.");
+    } else if output.cleanup.raw_artifacts_deleted == 0
+        && output.cleanup.raw_manifests_deleted == 0
+        && output.cleanup.raw_objects_deleted == 0
+        && output.cleanup.raw_blobs_deleted == 0
+    {
+        println!("No legacy source archives found.");
     }
 }
 
