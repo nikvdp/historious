@@ -2440,6 +2440,67 @@ mod tests {
     }
 
     #[test]
+    fn lexical_search_match_all_requires_every_term() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let target_id = import_event_at(&store, "needle red shared", None).0;
+        import_event_at(&store, "needle blue shared", None);
+        import_event_at(&store, "green red shared", None);
+        refresh(&store).expect("refresh search");
+
+        let response = search(
+            &store,
+            "needle red",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Lexical)
+                .with_term_match(
+                    Some(SearchTermMatch::All),
+                    vec!["needle".to_string(), "red".to_string()],
+                ),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].event_id, target_id);
+    }
+
+    #[test]
+    fn lexical_search_match_any_accepts_either_term() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let needle_id = import_event_at(&store, "needle blue shared", None).0;
+        let red_id = import_event_at(&store, "green red shared", None).0;
+        import_event_at(&store, "plain blue shared", None);
+        refresh(&store).expect("refresh search");
+
+        let response = search(
+            &store,
+            "needle red",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Lexical)
+                .with_term_match(
+                    Some(SearchTermMatch::Any),
+                    vec!["needle".to_string(), "red".to_string()],
+                ),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert_eq!(response.results.len(), 2);
+        assert!(response
+            .results
+            .iter()
+            .any(|result| result.event_id == needle_id));
+        assert!(response
+            .results
+            .iter()
+            .any(|result| result.event_id == red_id));
+    }
+
+    #[test]
     fn lexical_search_uses_composable_history_item_tiers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");

@@ -2214,6 +2214,7 @@ struct SearchOptionsOutput {
     show_duplicates: bool,
 }
 
+#[derive(Debug)]
 struct ResolvedSearchQuery {
     query: String,
     term_match: Option<search::SearchTermMatch>,
@@ -7652,6 +7653,36 @@ mod tests {
             value["next_commands"][1],
             "histo transcript session_1 --at ab3f --json"
         );
+    }
+
+    #[test]
+    fn search_query_resolver_requires_match_for_multiple_terms() {
+        let error = resolve_search_query(vec!["needle".to_string(), "red".to_string()], None)
+            .expect_err("missing match mode should fail");
+
+        assert!(error.to_string().contains("--match=all/any"));
+    }
+
+    #[test]
+    fn search_query_resolver_keeps_single_query_compatible() {
+        let resolved = resolve_search_query(vec!["needle red".to_string()], None).expect("query");
+
+        assert_eq!(resolved.query, "needle red");
+        assert_eq!(resolved.term_match, None);
+        assert_eq!(resolved.terms, vec!["needle red"]);
+    }
+
+    #[test]
+    fn search_query_resolver_accepts_multiple_terms_with_match() {
+        let resolved = resolve_search_query(
+            vec!["needle".to_string(), "red".to_string()],
+            Some(SearchMatchArg::All),
+        )
+        .expect("query");
+
+        assert_eq!(resolved.query, "needle red");
+        assert_eq!(resolved.term_match, Some(search::SearchTermMatch::All));
+        assert_eq!(resolved.terms, vec!["needle", "red"]);
     }
 
     #[test]
