@@ -1,8 +1,8 @@
 use crate::embed::{Embedder, EmbedderConfig};
 use crate::memory::MemorySample;
 use crate::storage::{
-    HistoryItemEmbeddingCursor, HistoryItemForEmbedding, ImportDelta, SearchRow, Store,
-    VectorSearchRow,
+    FtsMatchMode, HistoryItemEmbeddingCursor, HistoryItemForEmbedding, ImportDelta, SearchRow,
+    Store, VectorSearchRow,
 };
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
@@ -209,6 +209,8 @@ pub struct SearchOptions {
     pub workspace_scope: Option<String>,
     pub corpus: SearchCorpus,
     pub show_duplicates: bool,
+    pub term_match: Option<SearchTermMatch>,
+    pub match_terms: Vec<String>,
 }
 
 impl SearchOptions {
@@ -225,6 +227,8 @@ impl SearchOptions {
             workspace_scope: None,
             corpus: SearchCorpus::default(),
             show_duplicates: false,
+            term_match: None,
+            match_terms: Vec::new(),
         }
     }
 
@@ -269,6 +273,20 @@ impl SearchOptions {
         self.show_duplicates = show_duplicates;
         self
     }
+
+    pub fn with_term_match(
+        mut self,
+        term_match: Option<SearchTermMatch>,
+        terms: Vec<String>,
+    ) -> Self {
+        self.term_match = term_match;
+        self.match_terms = terms
+            .into_iter()
+            .map(|term| term.trim().to_string())
+            .filter(|term| !term.is_empty())
+            .collect();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,6 +326,21 @@ pub struct DuplicateSearchMember {
     pub session_title: Option<String>,
     pub workspace_values: Vec<String>,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum SearchTermMatch {
+    All,
+    Any,
+}
+
+impl SearchTermMatch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchTermMatch::All => "all",
+            SearchTermMatch::Any => "any",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -963,20 +996,34 @@ pub fn search(
     let semantic_limit = backend_limit.min(SQLITE_VEC_MAX_K);
     let tier_names = options.corpus.tier_names();
     let lexical = if options.mode.includes_lexical() {
-        store.search_fts(
-            query,
-            &tier_names,
-            backend_limit,
-            options.after,
-            options.before,
-            options.machine_id.as_deref(),
-            options.machine_id_prefix.as_deref(),
-            options.workspace_scope.as_deref(),
-        )?
+        if let Some(term_match) = options.term_match {
+            store.search_fts_terms(
+                &options.match_terms,
+                fts_match_mode(term_match),
+                &tier_names,
+                backend_limit,
+                options.after,
+                options.before,
+                options.machine_id.as_deref(),
+                options.machine_id_prefix.as_deref(),
+                options.workspace_scope.as_deref(),
+            )?
+        } else {
+            store.search_fts(
+                query,
+                &tier_names,
+                backend_limit,
+                options.after,
+                options.before,
+                options.machine_id.as_deref(),
+                options.machine_id_prefix.as_deref(),
+                options.workspace_scope.as_deref(),
+            )?
+        }
     } else {
         Vec::new()
     };
-    let (semantic, degraded_reason) = if options.mode.includes_semantic() {
+    let (mut semantic, degraded_reason) = if options.mode.includes_semantic() {
         semantic_search(
             store,
             query,
@@ -993,10 +1040,35 @@ pub fn search(
     } else {
         (Vec::new(), None)
     };
+    if let Some(term_match) = options.term_match {
+        semantic.retain(|row| text_matches_terms(&row.content, &options.match_terms, term_match));
+    }
     Ok(SearchResponse {
         degraded_reason,
         results: fuse(lexical, semantic, options),
     })
+}
+
+fn fts_match_mode(term_match: SearchTermMatch) -> FtsMatchMode {
+    match term_match {
+        SearchTermMatch::All => FtsMatchMode::All,
+        SearchTermMatch::Any => FtsMatchMode::Any,
+    }
+}
+
+fn text_matches_terms(text: &str, terms: &[String], term_match: SearchTermMatch) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    match term_match {
+        SearchTermMatch::All => terms
+            .iter()
+            .all(|term| lower.contains(&term.to_ascii_lowercase())),
+        SearchTermMatch::Any => terms
+            .iter()
+            .any(|term| lower.contains(&term.to_ascii_lowercase())),
+    }
 }
 
 fn semantic_search(
