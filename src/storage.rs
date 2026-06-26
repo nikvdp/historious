@@ -197,6 +197,15 @@ pub struct SourceArchiveCleanupOutcome {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct OrphanRawBlobCleanupOutcome {
+    pub raw_blobs_inspected: usize,
+    pub raw_blobs_retained: usize,
+    pub raw_blobs_skipped_invalid_path: usize,
+    pub raw_blobs_deleted: usize,
+    pub raw_blob_bytes_deleted: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SqliteMaintenanceOutcome {
     pub database_bytes_before: u64,
     pub database_bytes_after: u64,
@@ -1182,6 +1191,14 @@ impl Store {
         outcome.raw_blobs_deleted = raw_blobs_deleted;
         outcome.raw_blob_bytes_deleted = raw_blob_bytes_deleted;
         Ok(outcome)
+    }
+
+    pub fn preview_orphan_raw_blob_cleanup(&self) -> Result<OrphanRawBlobCleanupOutcome> {
+        self.with_conn(|conn| cleanup_orphan_raw_blobs(conn, &self.blob_dir, false))
+    }
+
+    pub fn cleanup_orphan_raw_blobs(&self) -> Result<OrphanRawBlobCleanupOutcome> {
+        self.with_conn(|conn| cleanup_orphan_raw_blobs(conn, &self.blob_dir, true))
     }
 
     pub fn preview_sqlite_compaction(&self) -> Result<SqliteMaintenanceOutcome> {
@@ -3649,6 +3666,126 @@ fn raw_blob_file_stats(blob_dir: &Path, hashes: &[String]) -> Result<(usize, u64
             .len();
     }
     Ok((count, bytes))
+}
+
+#[derive(Debug, Clone)]
+struct LooseRawBlobFile {
+    hash: String,
+    path: PathBuf,
+    size: u64,
+}
+
+fn cleanup_orphan_raw_blobs(
+    conn: &Connection,
+    blob_dir: &Path,
+    apply: bool,
+) -> Result<OrphanRawBlobCleanupOutcome> {
+    let referenced = referenced_loose_raw_blob_hashes(conn)?;
+    let (files, invalid_paths) = loose_raw_blob_files(blob_dir)?;
+    let mut outcome = OrphanRawBlobCleanupOutcome {
+        raw_blobs_inspected: files.len() + invalid_paths,
+        raw_blobs_skipped_invalid_path: invalid_paths,
+        ..OrphanRawBlobCleanupOutcome::default()
+    };
+
+    for file in files {
+        if referenced.contains(&file.hash) {
+            outcome.raw_blobs_retained += 1;
+            continue;
+        }
+
+        outcome.raw_blobs_deleted += 1;
+        outcome.raw_blob_bytes_deleted += file.size;
+        if apply {
+            std::fs::remove_file(&file.path)
+                .with_context(|| format!("removing orphan raw blob {}", file.path.display()))?;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn loose_raw_blob_files(blob_dir: &Path) -> Result<(Vec<LooseRawBlobFile>, usize)> {
+    let mut files = Vec::new();
+    let mut invalid_paths = 0;
+    if !blob_dir.exists() {
+        return Ok((files, invalid_paths));
+    }
+
+    for shard_entry in std::fs::read_dir(blob_dir)
+        .with_context(|| format!("reading blob dir {}", blob_dir.display()))?
+    {
+        let shard_entry = shard_entry?;
+        let shard_path = shard_entry.path();
+        if !shard_path.is_dir() {
+            invalid_paths += 1;
+            continue;
+        }
+        let Some(shard) = shard_path.file_name().and_then(|name| name.to_str()) else {
+            invalid_paths += 1;
+            continue;
+        };
+
+        for blob_entry in std::fs::read_dir(&shard_path)
+            .with_context(|| format!("reading blob shard {}", shard_path.display()))?
+        {
+            let blob_entry = blob_entry?;
+            let path = blob_entry.path();
+            if !path.is_file() {
+                invalid_paths += 1;
+                continue;
+            }
+            let Some(hash) = path.file_name().and_then(|name| name.to_str()) else {
+                invalid_paths += 1;
+                continue;
+            };
+            if !is_clean_blob_hash(hash) || hash.get(0..2) != Some(shard) {
+                invalid_paths += 1;
+                continue;
+            }
+            let size = std::fs::metadata(&path)
+                .with_context(|| format!("reading blob metadata {}", path.display()))?
+                .len();
+            files.push(LooseRawBlobFile {
+                hash: hash.to_string(),
+                path,
+                size,
+            });
+        }
+    }
+
+    Ok((files, invalid_paths))
+}
+
+fn is_clean_blob_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn referenced_loose_raw_blob_hashes(conn: &Connection) -> Result<HashSet<String>> {
+    let hashes = collect_text_column(
+        conn,
+        "SELECT hash FROM raw_artifacts
+         UNION
+         SELECT hash FROM raw_objects WHERE length(content) = 0
+         UNION
+         SELECT raw_artifact_hash FROM events WHERE raw_artifact_hash IS NOT NULL
+         UNION
+         SELECT json_extract(metadata_json, '$.raw_artifact_hash')
+           FROM events
+          WHERE json_extract(metadata_json, '$.raw_artifact_hash') IS NOT NULL
+         UNION
+         SELECT json_extract(metadata_json, '$.raw_object_hash')
+           FROM events
+          WHERE json_extract(metadata_json, '$.raw_object_hash') IS NOT NULL
+         UNION
+         SELECT json_extract(metadata_json, '$.raw_line_hash')
+           FROM events
+          WHERE json_extract(metadata_json, '$.raw_line_hash') IS NOT NULL",
+    )?;
+    Ok(hashes
+        .into_iter()
+        .map(|hash| hash.strip_prefix("blake3:").unwrap_or(&hash).to_string())
+        .collect())
 }
 
 fn manifest_raw_artifact_cleanup_rows(
