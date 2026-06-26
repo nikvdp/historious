@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use base64::Engine;
-use rusqlite::{Connection, params};
-use serde_json::{Value, json};
+use rusqlite::{params, Connection};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -214,7 +214,12 @@ fn raw_blobs_clean_manifest_artifacts_deletes_verified_legacy_artifact() {
         "--robot",
         "status",
     ]));
-    seed_manifest_covered_raw_artifact(&data_dir, &raw_path.to_string_lossy(), &full, &[first, second]);
+    seed_manifest_covered_raw_artifact(
+        &data_dir,
+        &raw_path.to_string_lossy(),
+        &full,
+        &[first, second],
+    );
 
     let preview = command_json(histo().args([
         "--data-dir",
@@ -277,9 +282,80 @@ fn raw_blobs_clean_manifest_artifacts_keeps_mismatched_legacy_artifact() {
     ]));
     assert_eq!(applied["data"]["cleanup"]["raw_artifacts_verified"], 0);
     assert_eq!(applied["data"]["cleanup"]["raw_artifacts_deleted"], 0);
-    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_skipped_mismatch"], 1);
+    assert_eq!(
+        applied["data"]["cleanup"]["raw_artifacts_skipped_mismatch"],
+        1
+    );
     assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 1);
     assert!(loose_blob_path(&data_dir, &raw_hash).exists());
+}
+
+#[test]
+fn raw_blobs_clean_source_archives_removes_legacy_archives_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("histo-data");
+    let raw_path = temp.path().join("session.jsonl");
+    let first = br#"{"message":"first"}"#;
+    let second = br#"{"message":"second"}"#;
+    let full = [first.as_slice(), b"\n", second.as_slice(), b"\n"].concat();
+    let raw_hash = blake3_hex(&full);
+
+    command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "status",
+    ]));
+    seed_manifest_covered_raw_artifact(
+        &data_dir,
+        &raw_path.to_string_lossy(),
+        &full,
+        &[first, second],
+    );
+    seed_normalized_event_with_raw_refs(&data_dir, &raw_path.to_string_lossy(), &raw_hash);
+
+    let preview = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-source-archives",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["data"]["dry_run"], true);
+    assert_eq!(preview["data"]["cleanup"]["raw_artifacts_deleted"], 1);
+    assert_eq!(preview["data"]["cleanup"]["raw_manifests_deleted"], 1);
+    assert_eq!(
+        preview["data"]["cleanup"]["raw_manifest_entries_deleted"],
+        2
+    );
+    assert_eq!(preview["data"]["cleanup"]["raw_objects_deleted"], 2);
+    assert_eq!(preview["data"]["cleanup"]["events_unlinked"], 1);
+    assert_eq!(preview["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(raw_artifact_count(&data_dir, &raw_hash), 1);
+    assert!(loose_blob_path(&data_dir, &raw_hash).exists());
+
+    let applied = command_json(histo().args([
+        "--data-dir",
+        data_dir.to_str().expect("data dir"),
+        "--robot",
+        "raw-blobs",
+        "clean-source-archives",
+        "--confirm",
+    ]));
+    assert_eq!(applied["data"]["dry_run"], false);
+    assert_eq!(applied["data"]["confirmed"], true);
+    assert_eq!(applied["data"]["cleanup"]["raw_artifacts_deleted"], 1);
+    assert_eq!(applied["data"]["cleanup"]["raw_blobs_deleted"], 1);
+    assert_eq!(raw_archive_table_count(&data_dir, "raw_artifacts"), 0);
+    assert_eq!(raw_archive_table_count(&data_dir, "raw_manifests"), 0);
+    assert_eq!(
+        raw_archive_table_count(&data_dir, "raw_manifest_entries"),
+        0
+    );
+    assert_eq!(raw_archive_table_count(&data_dir, "raw_objects"), 0);
+    assert!(!loose_blob_path(&data_dir, &raw_hash).exists());
+    assert_normalized_event_survived_source_archive_cleanup(&data_dir);
 }
 
 #[test]
@@ -419,7 +495,12 @@ fn seed_manifest_covered_raw_artifact_with_legacy_bytes(
           mtime_ms, media_type, entry_count, created_at, metadata_json)
          VALUES (?1, 'source_manifest_cleanup', 'codex', ?2, ?2, 'session_manifest_cleanup',
                  ?3, 1, 'application/jsonl', ?4, '2026-06-24T00:00:02Z', '{}')",
-        params![manifest_hash.as_str(), raw_path, full_size, entries.len() as i64],
+        params![
+            manifest_hash.as_str(),
+            raw_path,
+            full_size,
+            entries.len() as i64
+        ],
     )
     .expect("insert manifest");
 
@@ -458,6 +539,70 @@ fn raw_artifact_count(data_dir: &Path, hash: &str) -> usize {
         |row| row.get::<_, i64>(0),
     )
     .expect("raw artifact count") as usize
+}
+
+fn raw_archive_table_count(data_dir: &Path, table: &str) -> usize {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .expect("raw archive table count") as usize
+}
+
+fn seed_normalized_event_with_raw_refs(data_dir: &Path, raw_path: &str, raw_hash: &str) {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    conn.execute(
+        "INSERT INTO sessions
+         (id, source_id, machine_id, source_kind, external_id, title, status,
+          started_at, updated_at, metadata_json, hash)
+         VALUES ('session_source_archive_cleanup', 'source_manifest_cleanup', 'machine_fixture',
+                 'codex', 'session_source_archive_cleanup', 'cleanup fixture', 'open',
+                 '2026-06-24T00:00:03Z', '2026-06-24T00:00:03Z', ?1, 'session_hash_cleanup')",
+        params![json!({"path": raw_path, "workspace_path": "/tmp/histo-cleanup"}).to_string()],
+    )
+    .expect("insert session");
+    conn.execute(
+        "INSERT INTO events
+         (id, session_id, source_id, machine_id, source_kind, ordinal, event_type, role,
+          content, raw_artifact_hash, occurred_at, metadata_json, hash)
+         VALUES ('event_source_archive_cleanup', 'session_source_archive_cleanup',
+                 'source_manifest_cleanup', 'machine_fixture', 'codex', 0, 'message', 'user',
+                 'normalized user request survives cleanup', ?1, '2026-06-24T00:00:03Z',
+                 ?2, 'event_hash_cleanup')",
+        params![
+            raw_hash,
+            json!({
+                "raw_artifact_hash": raw_hash,
+                "raw_manifest_hash": "manifest-cleanup",
+                "raw_object_hash": "object-cleanup",
+                "raw_line_hash": "line-cleanup",
+                "byte_offset": 0,
+                "byte_len": 1
+            })
+            .to_string()
+        ],
+    )
+    .expect("insert event");
+}
+
+fn assert_normalized_event_survived_source_archive_cleanup(data_dir: &Path) {
+    let conn = Connection::open(data_dir.join("historious.db")).expect("open db");
+    let (content, raw_artifact_hash, raw_ref_count): (String, Option<String>, i64) = conn
+        .query_row(
+            "SELECT content,
+                    raw_artifact_hash,
+                    (CASE WHEN json_extract(metadata_json, '$.raw_artifact_hash') IS NULL THEN 0 ELSE 1 END) +
+                    (CASE WHEN json_extract(metadata_json, '$.raw_manifest_hash') IS NULL THEN 0 ELSE 1 END) +
+                    (CASE WHEN json_extract(metadata_json, '$.raw_object_hash') IS NULL THEN 0 ELSE 1 END) +
+                    (CASE WHEN json_extract(metadata_json, '$.raw_line_hash') IS NULL THEN 0 ELSE 1 END)
+             FROM events
+             WHERE id = 'event_source_archive_cleanup'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("event after cleanup");
+    assert_eq!(content, "normalized user request survives cleanup");
+    assert!(raw_artifact_hash.is_none());
+    assert_eq!(raw_ref_count, 0);
 }
 
 fn archive_jsonl(
