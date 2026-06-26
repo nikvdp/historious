@@ -447,14 +447,11 @@ pub enum Command {
         #[arg(
             long,
             value_enum,
-            default_value_t = RawArtifactExportMode::Inline,
-            help = "How to include raw artifacts in JSONL exports: inline content, metadata only, or omit for search-only/incomplete sync"
+            default_value_t = RawArtifactExportMode::Omit,
+            help = "How to include legacy raw artifacts in JSONL exports: omit by default, metadata only, or inline content"
         )]
         raw_artifacts: RawArtifactExportMode,
-        #[arg(
-            long,
-            help = "Alias for --raw-artifacts omit; export is search-only/incomplete"
-        )]
+        #[arg(long, help = "Alias for --raw-artifacts omit")]
         no_raw_artifacts: bool,
         #[arg(
             long,
@@ -4194,7 +4191,10 @@ fn print_status_indexed_history(stats: &crate::storage::ArchiveStats, color: boo
             ("History items", format_count_u64(stats.history_items)),
             ("Events", format_count_u64(stats.events)),
             ("Sources", format_count_u64(stats.sources)),
-            ("Raw artifacts", format_count_u64(stats.raw_artifacts)),
+            (
+                "Legacy raw artifacts",
+                format_count_u64(stats.raw_artifacts),
+            ),
             ("Search units", format_count_u64(stats.search_units)),
             ("Embeddings", format_count_u64(stats.embeddings)),
         ],
@@ -4211,7 +4211,7 @@ fn print_status_disk_usage(disk_usage: &StatusDiskUsageOutput, color: bool) {
                 "Database + indexes",
                 format_bytes(disk_usage.database_bytes),
             ),
-            ("Raw blobs", format_bytes(disk_usage.raw_blobs_bytes)),
+            ("Legacy raw blobs", format_bytes(disk_usage.raw_blobs_bytes)),
             ("Models", format_bytes(disk_usage.models_bytes)),
             ("Other app files", format_bytes(disk_usage.other_bytes)),
         ],
