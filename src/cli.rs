@@ -959,16 +959,7 @@ impl Cli {
         }
 
         let mut config = AppConfig::load(data_dir)?;
-        let human_update = matches!(&command, Command::Update { json: false, .. }) && !robot;
-        let store = if human_update {
-            let progress = ProgressUi::new();
-            let opening = progress.phase("Opening history database");
-            let store = Store::open(&config.data_dir)?;
-            opening.finish("ready".to_string());
-            store
-        } else {
-            Store::open(&config.data_dir)?
-        };
+        let store = Store::open(&config.data_dir)?;
         match command {
             Command::Update {
                 max_files,
@@ -3707,6 +3698,13 @@ fn embedding_progress_payload(event: &search::EmbeddingProgress) -> serde_json::
 
 fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
     match event {
+        ingest::UpdateProgress::Discovering { sources } => {
+            if sources.is_empty() {
+                "looking for enabled sources".to_string()
+            } else {
+                format!("discovering sources {}", sources.join(", "))
+            }
+        }
         ingest::UpdateProgress::Discovered {
             sources,
             selected_files,
@@ -3830,6 +3828,10 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
 
 fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value {
     match event {
+        ingest::UpdateProgress::Discovering { sources } => serde_json::json!({
+            "status": "discovering",
+            "sources": sources,
+        }),
         ingest::UpdateProgress::Discovered {
             sources,
             selected_files,
@@ -3983,6 +3985,13 @@ impl UpdateProgressView {
 
     fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
         match event {
+            ingest::UpdateProgress::Discovering { sources } => {
+                self.phase = UpdateDisplayPhase::LocalLogs;
+                for source in sources {
+                    let row = self.sources.entry(source.clone()).or_default();
+                    row.state = "discovering";
+                }
+            }
             ingest::UpdateProgress::Discovered { sources, .. } => {
                 self.phase = UpdateDisplayPhase::LocalLogs;
                 for source in sources {
@@ -3991,7 +4000,7 @@ impl UpdateProgressView {
                     }
                     let row = self.sources.entry(source.kind.clone()).or_default();
                     row.total_files = source.selected_files;
-                    row.state = "waiting";
+                    row.state = "checking";
                 }
             }
             ingest::UpdateProgress::Processing {
@@ -4030,7 +4039,7 @@ impl UpdateProgressView {
                     let row = self.sources.entry(source.kind.clone()).or_default();
                     row.changed_files = source.changed_files;
                     row.read_files = 0;
-                    row.state = "waiting";
+                    row.state = "preparing";
                     row.current_path = None;
                 }
                 for row in self.sources.values_mut() {

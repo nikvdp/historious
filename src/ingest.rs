@@ -95,6 +95,9 @@ pub struct UpdateChangedSourceSummary {
 
 #[derive(Debug, Clone)]
 pub enum UpdateProgress {
+    Discovering {
+        sources: Vec<String>,
+    },
     Discovered {
         sources: Vec<UpdateSourceSummary>,
         selected_files: usize,
@@ -205,6 +208,12 @@ pub fn update_local_with_progress_and_cancel(
     let mut candidates = Vec::new();
     let mut source_summaries = Vec::new();
     let registry = built_in_source_adapters(&options)?;
+    progress(&UpdateProgress::Discovering {
+        sources: registry
+            .iter()
+            .map(|adapter| adapter.kind().to_string())
+            .collect(),
+    });
     let discoveries = discover_selected_sources(&registry, &options, &should_cancel)?;
     for discovery in discoveries {
         match discovery.result {
