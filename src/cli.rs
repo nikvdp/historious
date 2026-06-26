@@ -1683,10 +1683,16 @@ impl Cli {
                     } else {
                         store.preview_source_archive_cleanup()?
                     };
+                    let maintenance = if confirm && source_archive_cleanup_removed_data(&cleanup) {
+                        Some(store.compact_sqlite()?)
+                    } else {
+                        None
+                    };
                     let output = SourceArchiveCleanupOutput {
                         dry_run: !confirm,
                         confirmed: confirm,
                         cleanup,
+                        maintenance,
                     };
                     if json || robot {
                         crate::output::write_success(
@@ -2095,6 +2101,7 @@ struct SourceArchiveCleanupOutput {
     dry_run: bool,
     confirmed: bool,
     cleanup: crate::storage::SourceArchiveCleanupOutcome,
+    maintenance: Option<crate::storage::SqliteMaintenanceOutcome>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3361,13 +3368,31 @@ fn print_source_archive_cleanup_output(output: &SourceArchiveCleanupOutput) {
         ],
         std::io::stdout().is_terminal(),
     );
+    if let Some(maintenance) = &output.maintenance {
+        print_section(
+            "SQLite maintenance",
+            &[
+                ("Before", format_bytes(maintenance.database_bytes_before)),
+                ("After", format_bytes(maintenance.database_bytes_after)),
+                (
+                    "Reclaimed",
+                    format_bytes(maintenance.database_bytes_reclaimed),
+                ),
+                ("FTS optimized", maintenance.fts_optimized.to_string()),
+                ("Vacuumed", maintenance.vacuumed.to_string()),
+            ],
+            std::io::stdout().is_terminal(),
+        );
+    }
     if output.dry_run
         && (output.cleanup.raw_artifacts_deleted > 0
             || output.cleanup.raw_manifests_deleted > 0
             || output.cleanup.raw_objects_deleted > 0
             || output.cleanup.raw_blobs_deleted > 0)
     {
-        println!("Run again with --confirm to delete these legacy source archives.");
+        println!(
+            "Run again with --confirm to delete these legacy source archives and compact SQLite."
+        );
     } else if output.cleanup.raw_artifacts_deleted == 0
         && output.cleanup.raw_manifests_deleted == 0
         && output.cleanup.raw_objects_deleted == 0
@@ -3375,6 +3400,17 @@ fn print_source_archive_cleanup_output(output: &SourceArchiveCleanupOutput) {
     {
         println!("No legacy source archives found.");
     }
+}
+
+fn source_archive_cleanup_removed_data(
+    cleanup: &crate::storage::SourceArchiveCleanupOutcome,
+) -> bool {
+    cleanup.raw_artifacts_deleted > 0
+        || cleanup.raw_manifests_deleted > 0
+        || cleanup.raw_manifest_entries_deleted > 0
+        || cleanup.raw_objects_deleted > 0
+        || cleanup.events_unlinked > 0
+        || cleanup.raw_blobs_deleted > 0
 }
 
 fn print_maintenance_compact_output(output: &MaintenanceCompactOutput) {
