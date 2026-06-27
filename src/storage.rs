@@ -20,6 +20,8 @@ const RECENT_RESULT_REF_LIMIT: usize = 10_000;
 const SQLITE_BIND_CHUNK_SIZE: usize = 500;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
+const HISTORY_ITEMS_PROJECTION: &str = "history_items_v2";
+const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v2";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -101,6 +103,12 @@ pub struct ArchiveStats {
     pub history_items: u64,
     pub search_units: u64,
     pub embeddings: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HistoryItemsProjectionHealth {
+    pub ready: bool,
+    pub missing_conversation_items: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1286,8 +1294,8 @@ impl Store {
                 }
                 drop(stmt);
                 let count = count(tx, "history_items")? as usize;
-                update_projection_status(tx, "history_items_v1", count)?;
-                update_projection_status(tx, "history_items_conversation_fts_v1", count)?;
+                update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
+                update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
                 Ok(count)
             })
         })
@@ -1306,7 +1314,7 @@ impl Store {
         let event_ids = normalized_ids(event_ids);
         if event_ids.is_empty() {
             return self.with_conn(|conn| {
-                if let Some(count) = projection_status_count(conn, "history_items_v1")? {
+                if let Some(count) = projection_status_count(conn, HISTORY_ITEMS_PROJECTION)? {
                     Ok(count)
                 } else {
                     Ok(count(conn, "history_items")? as usize)
@@ -1376,26 +1384,29 @@ impl Store {
                     progress(processed_events, total_events);
                 }
                 drop(stmt);
-                let count =
-                    if let Some(current_count) = projection_status_count(tx, "history_items_v1")? {
-                        current_count
-                            .saturating_sub(replaced_count)
-                            .saturating_add(inserted_count)
-                    } else {
-                        count(tx, "history_items")? as usize
-                    };
-                update_projection_status(tx, "history_items_v1", count)?;
-                update_projection_status(tx, "history_items_conversation_fts_v1", count)?;
+                let count = if let Some(current_count) =
+                    projection_status_count(tx, HISTORY_ITEMS_PROJECTION)?
+                {
+                    current_count
+                        .saturating_sub(replaced_count)
+                        .saturating_add(inserted_count)
+                } else {
+                    count(tx, "history_items")? as usize
+                };
+                update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
+                update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
                 Ok(count)
             })
         })
     }
 
     pub fn history_items_projection_ready(&self) -> Result<bool> {
-        self.with_conn(|conn| {
-            Ok(projection_status_ready(conn, "history_items_v1")?
-                && projection_status_ready(conn, "history_items_conversation_fts_v1")?)
-        })
+        self.history_items_projection_health()
+            .map(|health| health.ready)
+    }
+
+    pub fn history_items_projection_health(&self) -> Result<HistoryItemsProjectionHealth> {
+        self.with_conn(history_items_projection_health)
     }
 
     #[cfg(test)]
@@ -3269,8 +3280,12 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
         [],
     )?;
     let history_count = count(conn, "history_items")? as usize;
-    update_projection_status(conn, "history_items_v1", history_count)?;
-    update_projection_status(conn, "history_items_conversation_fts_v1", history_count)?;
+    update_projection_status(conn, HISTORY_ITEMS_PROJECTION, history_count)?;
+    update_projection_status(
+        conn,
+        HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION,
+        history_count,
+    )?;
     update_projection_status(conn, "search_rrf_v1", count(conn, "search_units")? as usize)?;
     Ok(())
 }
@@ -5995,6 +6010,52 @@ fn projection_status_ready(conn: &Connection, name: &str) -> Result<bool> {
     Ok(ready != 0)
 }
 
+fn history_items_projection_health(conn: &Connection) -> Result<HistoryItemsProjectionHealth> {
+    let statuses_ready = projection_status_ready(conn, HISTORY_ITEMS_PROJECTION)?
+        && projection_status_ready(conn, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION)?;
+    if !statuses_ready {
+        return Ok(HistoryItemsProjectionHealth {
+            ready: false,
+            missing_conversation_items: 0,
+        });
+    }
+    let missing_conversation_items = history_items_missing_conversation_count(conn)?;
+    Ok(HistoryItemsProjectionHealth {
+        ready: missing_conversation_items == 0,
+        missing_conversation_items,
+    })
+}
+
+fn history_items_missing_conversation_count(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "WITH conversation_events AS (
+           SELECT e.id,
+                  lower(coalesce(json_extract(e.metadata_json, '$.search_kind'), e.role, 'unknown')) AS search_kind,
+                  lower(coalesce(e.role, '')) AS role,
+                  lower(ltrim(coalesce(json_extract(e.metadata_json, '$.search_text'), ''))) AS trimmed_text,
+                  lower(coalesce(json_extract(e.metadata_json, '$.search_text'), '')) AS search_text
+           FROM events e
+           WHERE json_extract(e.metadata_json, '$.search_indexable') = 1
+             AND length(trim(coalesce(json_extract(e.metadata_json, '$.search_text'), ''))) > 0
+         )
+         SELECT COUNT(*)
+         FROM conversation_events e
+         LEFT JOIN history_items hi
+           ON hi.event_id = e.id
+          AND hi.tier = 'conversation'
+         WHERE hi.id IS NULL
+           AND e.search_kind IN ('user', 'assistant', 'conversation', 'thinking', 'reasoning')
+           AND e.role NOT IN ('system', 'developer')
+           AND e.trimmed_text NOT LIKE '# agents.md instructions%'
+           AND e.trimmed_text NOT LIKE '<instructions>%'
+           AND e.trimmed_text NOT LIKE '<permissions instructions>%'
+           AND instr(e.search_text, '<instructions>') = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
 fn projection_status_count(conn: &Connection, name: &str) -> Result<Option<usize>> {
     let count = conn
         .query_row(
@@ -7428,6 +7489,102 @@ mod tests {
             .find(|item| item.tier == "conversation")
             .expect("repaired conversation user item");
         assert_eq!(repaired_conversation_user.id, stable_id);
+    }
+
+    #[test]
+    fn history_items_projection_health_detects_missing_conversation_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_missing_history_projection");
+        let session = fixture_session("session_missing_history_projection", &source.id);
+        let mut user = fixture_event(
+            "event_missing_history_projection",
+            &session.id,
+            &source.id,
+            1,
+            Some("user"),
+            "event_hash_missing_history_projection",
+        );
+        user.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_tier": "conversation",
+            "search_text": "bsv projection regression"
+        });
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(user),
+            ])
+            .expect("import records");
+        store
+            .with_conn(|conn| {
+                update_projection_status(conn, HISTORY_ITEMS_PROJECTION, 0)?;
+                update_projection_status(conn, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, 0)
+            })
+            .expect("mark projection ready");
+
+        let health = store
+            .history_items_projection_health()
+            .expect("projection health");
+        assert!(!health.ready);
+        assert_eq!(health.missing_conversation_items, 1);
+        assert!(!store
+            .history_items_projection_ready()
+            .expect("projection ready"));
+
+        store
+            .refresh_history_items()
+            .expect("refresh history items");
+        let health = store
+            .history_items_projection_health()
+            .expect("repaired projection health");
+        assert!(health.ready);
+        assert_eq!(health.missing_conversation_items, 0);
+    }
+
+    #[test]
+    fn history_items_projection_health_ignores_instruction_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_instruction_projection");
+        let session = fixture_session("session_instruction_projection", &source.id);
+        let mut event = fixture_event(
+            "event_instruction_projection",
+            &session.id,
+            &source.id,
+            1,
+            Some("user"),
+            "event_hash_instruction_projection",
+        );
+        event.metadata = json!({
+            "search_indexable": true,
+            "search_kind": "user",
+            "search_tier": "conversation",
+            "search_text": "# AGENTS.md instructions\n<INSTRUCTIONS>\nUse lb tickets."
+        });
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event),
+            ])
+            .expect("import records");
+        store
+            .with_conn(|conn| {
+                update_projection_status(conn, HISTORY_ITEMS_PROJECTION, 0)?;
+                update_projection_status(conn, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, 0)
+            })
+            .expect("mark projection ready");
+
+        let health = store
+            .history_items_projection_health()
+            .expect("projection health");
+        assert!(health.ready);
+        assert_eq!(health.missing_conversation_items, 0);
     }
 
     #[test]

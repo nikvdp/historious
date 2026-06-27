@@ -2536,6 +2536,7 @@ struct StatusOutput {
     config: StatusConfigOutput,
     disk_usage: StatusDiskUsageOutput,
     stats: crate::storage::ArchiveStats,
+    history_items_projection: crate::storage::HistoryItemsProjectionHealth,
     query_embedder: crate::embed::EmbedderStatus,
     query_embedder_probe: Option<EmbedderProbeOutput>,
 }
@@ -3195,6 +3196,7 @@ fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
         config: status_config_output(config),
         disk_usage,
         stats: store.stats()?,
+        history_items_projection: store.history_items_projection_health()?,
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
     })
@@ -4955,7 +4957,7 @@ fn print_status_output(output: &StatusOutput) {
     print_status_search(&output.config, &output.query_embedder, color);
     print_status_attention(&output.query_embedder, color);
     print_status_probe(output.query_embedder_probe.as_ref(), color);
-    print_status_indexed_history(&output.stats, color);
+    print_status_indexed_history(&output.stats, &output.history_items_projection, color);
     print_status_disk_usage(&output.disk_usage, color);
     print_status_config(&output.config, color);
     print_status_storage(&output.data_dir, &output.db_path, color);
@@ -4981,7 +4983,11 @@ fn print_status_output_live(store: &Store, config: &AppConfig) -> Result<()> {
     let stats = status_phase("Reading indexed counts", spinner, || store.stats())?;
     println!();
     println!("  {}", status_summary(&stats));
-    print_status_indexed_history(&stats, color);
+    let history_items_projection =
+        status_phase("Checking history item projection", spinner, || {
+            store.history_items_projection_health()
+        })?;
+    print_status_indexed_history(&stats, &history_items_projection, color);
     flush_stdout()?;
 
     let disk_usage = status_phase("Measuring disk usage", spinner, || {
@@ -5078,12 +5084,20 @@ fn print_status_probe(probe: Option<&EmbedderProbeOutput>, color: bool) {
     }
 }
 
-fn print_status_indexed_history(stats: &crate::storage::ArchiveStats, color: bool) {
+fn print_status_indexed_history(
+    stats: &crate::storage::ArchiveStats,
+    history_items_projection: &crate::storage::HistoryItemsProjectionHealth,
+    color: bool,
+) {
     print_section(
         "Indexed history",
         &[
             ("Sessions", format_count_u64(stats.sessions)),
             ("History items", format_count_u64(stats.history_items)),
+            (
+                "History item projection",
+                history_items_projection_status(history_items_projection),
+            ),
             ("Events", format_count_u64(stats.events)),
             ("Sources", format_count_u64(stats.sources)),
             (
@@ -5095,6 +5109,21 @@ fn print_status_indexed_history(stats: &crate::storage::ArchiveStats, color: boo
         ],
         color,
     );
+}
+
+fn history_items_projection_status(
+    health: &crate::storage::HistoryItemsProjectionHealth,
+) -> String {
+    if health.ready {
+        "healthy".to_string()
+    } else if health.missing_conversation_items > 0 {
+        format!(
+            "stale, {} conversation events missing",
+            format_count_u64(health.missing_conversation_items)
+        )
+    } else {
+        "not ready".to_string()
+    }
 }
 
 fn print_status_disk_usage(disk_usage: &StatusDiskUsageOutput, color: bool) {
