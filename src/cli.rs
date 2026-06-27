@@ -65,7 +65,19 @@ pub enum Command {
         source: Vec<String>,
         #[arg(long, help = "Fully reconcile derived search and vector indexes")]
         repair: bool,
-        #[arg(long, help = "Skip embedding work for this run")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Use embedding-backed semantic indexing for this run"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip embedding work for this run"
+        )]
         no_embeddings: bool,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
@@ -109,7 +121,19 @@ pub enum Command {
             help = "How to combine multiple query terms: 'and' or 'or'"
         )]
         match_mode: Option<SearchMatchArg>,
-        #[arg(long, help = "Skip embedding-backed semantic search for this run")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Use embedding-backed semantic search for this run"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip embedding-backed semantic search for this run"
+        )]
         no_embeddings: bool,
         #[arg(
             long,
@@ -197,7 +221,19 @@ pub enum Command {
         sort: SearchSort,
         #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
         mode: Option<SearchModeArg>,
-        #[arg(long, help = "Skip embedding-backed semantic search for this run")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Use embedding-backed semantic search for this run"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip embedding-backed semantic search for this run"
+        )]
         no_embeddings: bool,
         #[arg(
             long,
@@ -511,7 +547,19 @@ pub enum Command {
         jsonl: bool,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
-        #[arg(long, help = "Skip importing embedding records for this run")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Import embedding records for this run"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip importing embedding records for this run"
+        )]
         no_embeddings: bool,
         #[arg(default_value = "-", help = "Input file, or '-' for stdin")]
         input: String,
@@ -568,7 +616,19 @@ pub enum Command {
             help = "Scan these source kinds each pass; may be repeated or comma-separated"
         )]
         source: Vec<String>,
-        #[arg(long, help = "Skip embedding work while this daemon runs")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Use embedding-backed semantic indexing while this daemon runs"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip embedding work while this daemon runs"
+        )]
         no_embeddings: bool,
     },
     /// Serve already-indexed local history over HTTP.
@@ -609,7 +669,19 @@ pub enum Command {
             help = "Scan these source kinds when watching; may be repeated or comma-separated"
         )]
         source: Vec<String>,
-        #[arg(long, help = "Skip embedding work for this server process")]
+        #[arg(
+            short = 'e',
+            long,
+            conflicts_with = "no_embeddings",
+            help = "Use embedding-backed semantic indexing and search for this server process"
+        )]
+        embeddings: bool,
+        #[arg(
+            short = 'E',
+            long,
+            conflicts_with = "embeddings",
+            help = "Skip embedding work for this server process"
+        )]
         no_embeddings: bool,
     },
     /// Show local history and search health.
@@ -1018,10 +1090,11 @@ impl Cli {
                 max_files,
                 source,
                 repair,
+                embeddings,
                 no_embeddings,
                 json,
             } => {
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 if json || robot {
                     let output =
                         run_update_once_machine(&store, &config, max_files, source, repair)?;
@@ -1042,6 +1115,7 @@ impl Cli {
                 sort,
                 mode,
                 match_mode,
+                embeddings,
                 no_embeddings,
                 corpus,
                 include_tools,
@@ -1074,7 +1148,7 @@ impl Cli {
                 if fzf_rows && query.trim().is_empty() {
                     return Ok(());
                 }
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 let (after_bound, before_bound) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let workspace_scope = search_workspace_scope(project.as_deref(), all);
@@ -1159,6 +1233,7 @@ impl Cli {
                 server_url,
                 sort,
                 mode,
+                embeddings,
                 no_embeddings,
                 corpus,
                 include_tools,
@@ -1177,7 +1252,7 @@ impl Cli {
                 if robot {
                     bail!("--robot cannot be combined with tui");
                 }
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 let (after_bound, before_bound) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let workspace_scope = search_workspace_scope(project.as_deref(), all);
@@ -1559,10 +1634,11 @@ impl Cli {
             Command::Import {
                 jsonl,
                 json,
+                embeddings,
                 no_embeddings,
                 input,
             } => {
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 if jsonl {
                     if json || robot {
                         let output = run_import_once(&store, &config, &input)?;
@@ -1850,9 +1926,10 @@ impl Cli {
                 interval_secs,
                 max_files,
                 source,
+                embeddings,
                 no_embeddings,
             } => {
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 run_daemon(
                     &store,
                     &config.machine_id,
@@ -1871,9 +1948,10 @@ impl Cli {
                 interval_secs,
                 max_files,
                 source,
+                embeddings,
                 no_embeddings,
             } => {
-                apply_no_embeddings_override(&mut config, no_embeddings);
+                apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 let addr = parse_server_bind_addr(&bind, allow_network_bind)?;
                 if watch {
                     let server_store = store.clone();
@@ -1997,7 +2075,10 @@ fn print_completion(shell: Shell) {
     clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
 }
 
-fn apply_no_embeddings_override(config: &mut AppConfig, no_embeddings: bool) {
+fn apply_embeddings_override(config: &mut AppConfig, embeddings: bool, no_embeddings: bool) {
+    if embeddings {
+        config.embedder = crate::embed::EmbedderConfig::from_config_and_env(&config.data_dir, true);
+    }
     if no_embeddings {
         config.embedder.disable();
     }
@@ -7891,9 +7972,8 @@ mod tests {
 
     #[test]
     fn search_query_resolver_defaults_multiple_terms_to_and() {
-        let resolved =
-            resolve_search_query(vec!["needle".to_string(), "red".to_string()], None)
-                .expect("query");
+        let resolved = resolve_search_query(vec!["needle".to_string(), "red".to_string()], None)
+            .expect("query");
 
         assert_eq!(resolved.query, "needle red");
         assert_eq!(resolved.term_match, Some(search::SearchTermMatch::All));
@@ -8062,6 +8142,63 @@ mod tests {
         assert!(!should_color(false, Some(ColorArg::Never), false));
         assert!(!should_color(true, Some(ColorArg::Always), false));
         assert!(!should_color(false, Some(ColorArg::Always), true));
+    }
+
+    #[test]
+    fn embedding_override_short_flags_parse_for_search() {
+        let cli = Cli::try_parse_from(["histo", "search", "-e", "needle"])
+            .expect("parse embeddings override");
+        match cli.command {
+            Command::Search {
+                embeddings,
+                no_embeddings,
+                ..
+            } => {
+                assert!(embeddings);
+                assert!(!no_embeddings);
+            }
+            _ => panic!("expected search command"),
+        }
+
+        let cli = Cli::try_parse_from(["histo", "search", "-E", "needle"])
+            .expect("parse no embeddings override");
+        match cli.command {
+            Command::Search {
+                embeddings,
+                no_embeddings,
+                ..
+            } => {
+                assert!(!embeddings);
+                assert!(no_embeddings);
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn embedding_override_flags_conflict_for_search() {
+        let error = Cli::try_parse_from([
+            "histo",
+            "search",
+            "--embeddings",
+            "--no-embeddings",
+            "needle",
+        ])
+        .expect_err("embedding override flags should conflict");
+
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn embedding_override_can_force_config_disabled_embedder_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert!(config.embedder.is_disabled());
+        apply_embeddings_override(&mut config, true, false);
+        assert!(!config.embedder.is_disabled());
+        apply_embeddings_override(&mut config, false, true);
+        assert!(config.embedder.is_disabled());
     }
 
     #[test]
