@@ -130,10 +130,16 @@ names, branch names, package names, ports, hosts, or log text.
 
 ```bash
 histo search "migration rollback sqlite" --project /absolute/repo/path
+histo search dog parade
+histo search --match or dog parade
 histo search "rate limit 429" --all --after 2026-06-01
 histo search "cargo zigbuild release" --include-tools
 histo search "exact_function_name" --mode lexical
 ```
+
+Multiple unquoted query terms match with AND behavior by default. Use
+`--match or` when any term may match. The older `--match all` and `--match any`
+spellings still work as aliases.
 
 Inspect results:
 
@@ -247,8 +253,10 @@ Check the current setting and config path:
 histo config show
 ```
 
-Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`,
-`daemon`, or `serve` for a one-off lexical-only run.
+Use `--embeddings` or `-e` on commands such as `update`, `import`, `search`,
+`tui`, `daemon`, or `serve` to force embeddings on for a single run even when
+config has them off. Use `--no-embeddings` or `-E` for a one-off lexical-only
+run.
 
 ## Serve Mode
 
