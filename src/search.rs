@@ -337,8 +337,8 @@ pub enum SearchTermMatch {
 impl SearchTermMatch {
     pub fn as_str(self) -> &'static str {
         match self {
-            SearchTermMatch::All => "all",
-            SearchTermMatch::Any => "any",
+            SearchTermMatch::All => "and",
+            SearchTermMatch::Any => "or",
         }
     }
 }
