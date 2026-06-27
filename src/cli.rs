@@ -779,14 +779,18 @@ pub enum MaintenanceCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigEmbeddingState {
+    #[value(alias("true"))]
     On,
+    #[value(alias("false"))]
     Off,
     Status,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigSourceState {
+    #[value(alias("true"))]
     On,
+    #[value(alias("false"))]
     Off,
     Status,
 }
@@ -8040,6 +8044,38 @@ mod tests {
         assert!(cli.robot);
         assert_eq!(cli.command_name(), "search");
         assert!(cli.wants_structured_errors());
+    }
+
+    #[test]
+    fn config_boolean_subcommands_accept_true_false_aliases() {
+        for (subcommand, true_value, false_value) in [
+            ("embeddings", "true", "false"),
+            ("treechat", "true", "false"),
+        ] {
+            let cli = Cli::try_parse_from(["histo", "config", subcommand, true_value])
+                .expect("parse true alias");
+            match cli.command {
+                Command::Config {
+                    command: ConfigCommand::Embeddings { state },
+                } => assert!(matches!(state, ConfigEmbeddingState::On)),
+                Command::Config {
+                    command: ConfigCommand::Treechat { state },
+                } => assert!(matches!(state, ConfigSourceState::On)),
+                _ => panic!("expected config command"),
+            }
+
+            let cli = Cli::try_parse_from(["histo", "config", subcommand, false_value])
+                .expect("parse false alias");
+            match cli.command {
+                Command::Config {
+                    command: ConfigCommand::Embeddings { state },
+                } => assert!(matches!(state, ConfigEmbeddingState::Off)),
+                Command::Config {
+                    command: ConfigCommand::Treechat { state },
+                } => assert!(matches!(state, ConfigSourceState::Off)),
+                _ => panic!("expected config command"),
+            }
+        }
     }
 
     #[test]
