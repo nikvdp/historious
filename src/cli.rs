@@ -106,7 +106,7 @@ pub enum Command {
         #[arg(
             long = "match",
             value_enum,
-            help = "How to combine multiple query terms: all or any"
+            help = "How to combine multiple query terms: 'and' or 'or'"
         )]
         match_mode: Option<SearchMatchArg>,
         #[arg(long, help = "Skip embedding-backed semantic search for this run")]
@@ -899,8 +899,10 @@ pub enum SearchModeArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SearchMatchArg {
-    All,
-    Any,
+    #[value(alias = "all")]
+    And,
+    #[value(alias = "any")]
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -952,8 +954,8 @@ impl From<SearchModeArg> for search::SearchMode {
 impl From<SearchMatchArg> for search::SearchTermMatch {
     fn from(value: SearchMatchArg) -> Self {
         match value {
-            SearchMatchArg::All => search::SearchTermMatch::All,
-            SearchMatchArg::Any => search::SearchTermMatch::Any,
+            SearchMatchArg::And => search::SearchTermMatch::All,
+            SearchMatchArg::Or => search::SearchTermMatch::Any,
         }
     }
 }
@@ -5730,10 +5732,11 @@ fn resolve_search_query(
         .map(|term| term.trim().to_string())
         .filter(|term| !term.is_empty())
         .collect::<Vec<_>>();
-    if terms.len() > 1 && match_mode.is_none() {
-        bail!("search received multiple query terms; quote a single query or pass --match=all/any");
-    }
-    let term_match = match_mode.map(search::SearchTermMatch::from);
+    let term_match = match match_mode {
+        Some(match_mode) => Some(search::SearchTermMatch::from(match_mode)),
+        None if terms.len() > 1 => Some(search::SearchTermMatch::All),
+        None => None,
+    };
     let query = terms.join(" ");
     Ok(ResolvedSearchQuery {
         query,
@@ -7887,11 +7890,14 @@ mod tests {
     }
 
     #[test]
-    fn search_query_resolver_requires_match_for_multiple_terms() {
-        let error = resolve_search_query(vec!["needle".to_string(), "red".to_string()], None)
-            .expect_err("missing match mode should fail");
+    fn search_query_resolver_defaults_multiple_terms_to_and() {
+        let resolved =
+            resolve_search_query(vec!["needle".to_string(), "red".to_string()], None)
+                .expect("query");
 
-        assert!(error.to_string().contains("--match=all/any"));
+        assert_eq!(resolved.query, "needle red");
+        assert_eq!(resolved.term_match, Some(search::SearchTermMatch::All));
+        assert_eq!(resolved.terms, vec!["needle", "red"]);
     }
 
     #[test]
@@ -7907,13 +7913,38 @@ mod tests {
     fn search_query_resolver_accepts_multiple_terms_with_match() {
         let resolved = resolve_search_query(
             vec!["needle".to_string(), "red".to_string()],
-            Some(SearchMatchArg::All),
+            Some(SearchMatchArg::Or),
         )
         .expect("query");
 
         assert_eq!(resolved.query, "needle red");
-        assert_eq!(resolved.term_match, Some(search::SearchTermMatch::All));
+        assert_eq!(resolved.term_match, Some(search::SearchTermMatch::Any));
         assert_eq!(resolved.terms, vec!["needle", "red"]);
+    }
+
+    #[test]
+    fn search_match_mode_accepts_and_or_with_all_any_aliases() {
+        for value in ["and", "all"] {
+            let cli = Cli::try_parse_from(["histo", "search", "--match", value, "needle"])
+                .expect("parse and match mode");
+            match cli.command {
+                Command::Search { match_mode, .. } => {
+                    assert!(matches!(match_mode, Some(SearchMatchArg::And)));
+                }
+                _ => panic!("expected search command"),
+            }
+        }
+
+        for value in ["or", "any"] {
+            let cli = Cli::try_parse_from(["histo", "search", "--match", value, "needle"])
+                .expect("parse or match mode");
+            match cli.command {
+                Command::Search { match_mode, .. } => {
+                    assert!(matches!(match_mode, Some(SearchMatchArg::Or)));
+                }
+                _ => panic!("expected search command"),
+            }
+        }
     }
 
     #[test]
