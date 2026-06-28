@@ -54,6 +54,14 @@ cargo install --git https://github.com/nikvdp/historious historious --locked
 
 Make sure `~/.local/bin` is on your `PATH` if you used the binary install.
 
+Update an installed release binary later with:
+
+```bash
+histo self-update
+```
+
+Use `histo self-update --check` to only check for a newer GitHub release.
+
 ## First Run
 
 Index your local history:
