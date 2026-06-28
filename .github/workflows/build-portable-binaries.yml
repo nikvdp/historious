@@ -54,13 +54,6 @@ jobs:
             cargo_args: ""
             cross_packages: ""
             build_with_zig: false
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset_name: histo-windows-x86_64.exe
-            binary_suffix: ".exe"
-            cargo_args: ""
-            cross_packages: ""
-            build_with_zig: false
 
     runs-on: ${{ matrix.os }}
 
