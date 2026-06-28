@@ -82,6 +82,28 @@ pub enum Command {
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
+    /// Update the installed histo binary from GitHub releases.
+    SelfUpdate {
+        #[arg(long, help = "Only check whether an update is available")]
+        check: bool,
+        #[arg(
+            long,
+            help = "Reinstall even when the selected release matches this version"
+        )]
+        force: bool,
+        #[arg(long, value_name = "TAG", help = "Install a specific release tag")]
+        tag: Option<String>,
+        #[arg(
+            long,
+            value_name = "BINARY",
+            help = "Path to the histo executable to replace"
+        )]
+        path: Option<PathBuf>,
+        #[arg(long, help = "On Linux, install the musl portable build")]
+        portable: bool,
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+    },
     /// Search indexed transcripts.
     Search {
         #[arg(
@@ -1082,6 +1104,51 @@ impl Cli {
             print_completion(shell);
             return Ok(());
         }
+        if let Command::SelfUpdate {
+            check,
+            force,
+            tag,
+            path,
+            portable,
+            json,
+        } = command
+        {
+            let emit_status = !(json || robot);
+            let result = crate::self_update::run_self_update(
+                crate::self_update::SelfUpdateOptions {
+                    check,
+                    force,
+                    tag,
+                    path,
+                    portable,
+                },
+                |message| {
+                    if emit_status {
+                        println!("{message}");
+                    }
+                },
+            )?;
+            if json || robot {
+                crate::output::write_success("self-update", result, Default::default())?;
+            } else if result.already_updated {
+                println!("histo is up to date ({})", result.local_version);
+            } else if check {
+                println!(
+                    "Update available: {} -> {}",
+                    result.local_version, result.remote_version
+                );
+                println!("Release: {}", result.release_url);
+            } else {
+                let target = result.updated_path.as_ref().unwrap_or(&result.binary_path);
+                println!("Release: {}", result.release_url);
+                println!(
+                    "Updated histo: {} -> {}",
+                    result.local_version, result.remote_version
+                );
+                println!("Replaced: {}", target.display());
+            }
+            return Ok(());
+        }
         if let Command::Config { command } = command {
             run_config_command(data_dir, command, robot)?;
             return Ok(());
@@ -2013,6 +2080,7 @@ impl Cli {
                 }
             }
             Command::Skill { command } => run_skill_command(command)?,
+            Command::SelfUpdate { .. } => unreachable!("self-update returns before storage setup"),
             Command::Config { .. } => unreachable!("config returns before storage setup"),
             Command::Completion { .. } => unreachable!("completion returns before storage setup"),
         }
@@ -2024,6 +2092,7 @@ impl Command {
     fn name(&self) -> &'static str {
         match self {
             Command::Update { .. } => "update",
+            Command::SelfUpdate { .. } => "self-update",
             Command::Search { .. } => "search",
             Command::Tui { .. } => "tui",
             Command::Threads { .. } => "threads",
@@ -2050,6 +2119,7 @@ impl Command {
         matches!(
             self,
             Command::Update { json: true, .. }
+                | Command::SelfUpdate { json: true, .. }
                 | Command::Search { json: true, .. }
                 | Command::Threads { json: true, .. }
                 | Command::Show { json: true, .. }

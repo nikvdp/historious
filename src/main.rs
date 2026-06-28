@@ -6,6 +6,7 @@ mod ingest;
 mod memory;
 mod output;
 mod search;
+mod self_update;
 mod server;
 mod skills;
 mod source;
