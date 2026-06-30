@@ -427,7 +427,7 @@ fn finalize_import_stats_with_options_and_progress(
     options: ImportOptions,
     mut progress: impl FnMut(ImportProgress),
 ) -> Result<()> {
-    if store.history_items_projection_ready()? {
+    if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events_with_progress(
             &stats.delta.touched_events,
             |processed, total| {

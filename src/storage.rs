@@ -1400,9 +1400,14 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn history_items_projection_ready(&self) -> Result<bool> {
         self.history_items_projection_health()
             .map(|health| health.ready)
+    }
+
+    pub fn history_items_projection_status_ready(&self) -> Result<bool> {
+        self.with_conn(history_items_projection_status_ready)
     }
 
     pub fn history_items_projection_health(&self) -> Result<HistoryItemsProjectionHealth> {
@@ -6011,9 +6016,7 @@ fn projection_status_ready(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 fn history_items_projection_health(conn: &Connection) -> Result<HistoryItemsProjectionHealth> {
-    let statuses_ready = projection_status_ready(conn, HISTORY_ITEMS_PROJECTION)?
-        && projection_status_ready(conn, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION)?;
-    if !statuses_ready {
+    if !history_items_projection_status_ready(conn)? {
         return Ok(HistoryItemsProjectionHealth {
             ready: false,
             missing_conversation_items: 0,
@@ -6024,6 +6027,11 @@ fn history_items_projection_health(conn: &Connection) -> Result<HistoryItemsProj
         ready: missing_conversation_items == 0,
         missing_conversation_items,
     })
+}
+
+fn history_items_projection_status_ready(conn: &Connection) -> Result<bool> {
+    Ok(projection_status_ready(conn, HISTORY_ITEMS_PROJECTION)?
+        && projection_status_ready(conn, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION)?)
 }
 
 fn history_items_missing_conversation_count(conn: &Connection) -> Result<u64> {

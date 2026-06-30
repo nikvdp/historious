@@ -374,7 +374,7 @@ pub fn refresh_search_index(store: &Store) -> Result<usize> {
 #[allow(dead_code)]
 pub fn refresh_incremental(store: &Store, delta: &ImportDelta) -> Result<usize> {
     let indexed = refresh_search_index_incremental(store, delta)?;
-    if store.history_items_projection_ready()? {
+    if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events(&delta.touched_events)?;
     } else {
         store.refresh_history_items()?;
