@@ -1154,6 +1154,7 @@ impl Cli {
             return Ok(());
         }
 
+        emit_startup_progress(&command, robot);
         let mut config = AppConfig::load(data_dir)?;
         let store = Store::open(&config.data_dir)?;
         match command {
@@ -2147,6 +2148,18 @@ impl Command {
 fn print_completion(shell: Shell) {
     let mut command = Cli::command();
     clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
+}
+
+fn emit_startup_progress(command: &Command, robot: bool) {
+    if robot {
+        return;
+    }
+    if let Command::Update { json, .. } = command {
+        if !json {
+            eprintln!("starting update: loading config and opening database");
+            let _ = io::stderr().flush();
+        }
+    }
 }
 
 fn apply_embeddings_override(config: &mut AppConfig, embeddings: bool, no_embeddings: bool) {
