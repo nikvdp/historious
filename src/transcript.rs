@@ -146,12 +146,12 @@ fn push_view_header(
         out.push_str(title);
         out.push('\n');
     }
-    push_field(out, "agent_session", &session.external_id);
+    push_field(out, "provider_thread", &session.external_id);
+    push_field(out, "histo_session", &session.id);
     if let Some(event) = target_event {
         push_field(out, "event", &format!("#{}", event.ordinal));
     }
     if metadata.verbose {
-        push_field(out, "super_session", &session.id);
         push_field(out, "source_id", &session.source_id);
         push_field(out, "machine_id", &session.machine_id);
         push_field(out, "session_hash", &session.hash);
@@ -205,7 +205,7 @@ fn push_event(
     if verbose {
         out.push_str("event:");
         out.push_str(&event.id);
-        out.push_str(" session:");
+        out.push_str(" histo_session:");
         out.push_str(&event.session_id);
         out.push_str(" ordinal:");
         out.push_str(&event.ordinal.to_string());
@@ -270,7 +270,7 @@ fn push_history_item(
         out.push_str(&item.id);
         out.push_str(" event:");
         out.push_str(&item.event_id);
-        out.push_str(" session:");
+        out.push_str(" histo_session:");
         out.push_str(&item.session_id);
         out.push_str(" ordinal:");
         out.push_str(&item.ordinal.to_string());
@@ -361,7 +361,8 @@ mod tests {
         let rendered = render_context(&context, &ViewMetadata::default(), false);
 
         assert!(rendered.contains("Show"));
-        assert!(rendered.contains("agent_session: external_session_test"));
+        assert!(rendered.contains("provider_thread: external_session_test"));
+        assert!(rendered.contains("histo_session: session_test"));
         assert!(rendered.contains("event: #2"));
         assert!(rendered.contains("=> #2 codex assistant"));
         assert!(rendered.contains("middle full content\nwith newline"));
@@ -460,10 +461,11 @@ mod tests {
         );
 
         assert!(rendered.contains("ref: ab3f"));
-        assert!(rendered.contains("super_session: session_test"));
+        assert!(rendered.contains("provider_thread: external_session_test"));
+        assert!(rendered.contains("histo_session: session_test"));
         assert!(rendered.contains("super_event: event_two"));
         assert!(rendered.contains("event_type: message"));
-        assert!(rendered.contains("=> event:event_two session:session_test ordinal:2"));
+        assert!(rendered.contains("=> event:event_two histo_session:session_test ordinal:2"));
     }
 
     fn fixture_session() -> SessionRecord {
