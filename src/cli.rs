@@ -2908,7 +2908,8 @@ fn refresh_search_after_update_with_progress(
         } else {
             Ok(indexed)
         }?;
-        if store.history_items_projection_ready()? {
+        progress("checking history projection status".to_string());
+        if store.history_items_projection_status_ready()? {
             progress(format!(
                 "projecting changed history items for {} events",
                 format_count(delta.touched_events.len())
@@ -4395,11 +4396,11 @@ impl UpdateProgressView {
 
     fn search_detail(&mut self, detail: String) {
         self.phase = UpdateDisplayPhase::SearchData;
-        if detail.contains("project") {
+        if detail.contains("history") || detail.contains("project") {
             let (current, total) = parse_progress_fraction(&detail).unwrap_or((0, 0));
             let row = self.data_rows.entry("history".to_string()).or_default();
-            row.state = if detail.contains("projected") {
-                "projecting"
+            row.state = if detail.contains("checking") {
+                "checking"
             } else {
                 "projecting"
             };
@@ -6442,7 +6443,7 @@ fn warn_tail_database_locked_once() {
 }
 
 fn ensure_history_items_ready(store: &Store) -> Result<()> {
-    if store.history_items_projection_ready()? {
+    if store.history_items_projection_status_ready()? {
         return Ok(());
     }
     store.refresh_history_items()?;
@@ -6450,7 +6451,7 @@ fn ensure_history_items_ready(store: &Store) -> Result<()> {
 }
 
 fn refresh_tail_history_items(store: &Store, event_ids: &[String]) -> Result<()> {
-    if store.history_items_projection_ready()? {
+    if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events(event_ids)?;
     } else {
         store.refresh_history_items()?;
