@@ -2485,6 +2485,7 @@ struct SessionFilterOutput {
 #[derive(Debug, Serialize)]
 struct ThreadOutput {
     session_id: String,
+    provider_thread_id: String,
     source_kind: String,
     title: Option<String>,
     started_at: Option<DateTime<Utc>>,
@@ -5336,7 +5337,8 @@ fn print_threads_output(
             thread.session.source_kind,
             format_count(thread.event_count as usize)
         );
-        println!("  session: {}", thread.session.id);
+        println!("  provider_thread: {}", thread.session.external_id);
+        println!("  histo_session: {}", thread.session.id);
         if let Some(workspace) = &thread.workspace_path {
             println!("  project: {workspace}");
         }
@@ -5507,6 +5509,7 @@ fn session_filter_output(filters: &ResolvedSessionFilter) -> SessionFilterOutput
 fn thread_output(thread: &crate::storage::ThreadRow) -> ThreadOutput {
     ThreadOutput {
         session_id: thread.session.id.clone(),
+        provider_thread_id: thread.session.external_id.clone(),
         source_kind: thread.session.source_kind.clone(),
         title: thread.session.title.clone(),
         started_at: thread.session.started_at,
