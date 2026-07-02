@@ -2,7 +2,9 @@ use crate::config::AppConfig;
 use crate::ingest;
 use crate::search;
 use crate::server;
-use crate::storage::{RecentResultRefInput, Store, ThreadListOptions, ThreadSortMode};
+use crate::storage::{
+    QuickStatusCounts, RecentResultRefInput, Store, ThreadListOptions, ThreadSortMode,
+};
 use crate::transport;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -3341,12 +3343,12 @@ fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusO
     let history_items_projection = if all {
         status_history_items_projection_full(store)?
     } else {
-        status_history_items_projection_quick()
+        status_history_items_projection_quick(&QuickStatusCounts::default())
     };
     let stats = if all {
         status_stats_full(store)?
     } else {
-        status_stats_quick()
+        status_stats_quick(&QuickStatusCounts::default())
     };
     Ok(StatusOutput {
         data_dir: config.data_dir.display().to_string(),
@@ -3363,14 +3365,15 @@ fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusO
 
 fn status_output_quick(config: &AppConfig) -> StatusOutput {
     let db_path = config.data_dir.join("historious.db");
+    let counts = Store::quick_status_counts(&config.data_dir);
     StatusOutput {
         data_dir: config.data_dir.display().to_string(),
         db_path: db_path.display().to_string(),
         diagnostics: status_diagnostics_output(false),
         config: status_config_output(config),
         disk_usage: status_disk_usage_quick(&db_path),
-        stats: status_stats_quick(),
-        history_items_projection: status_history_items_projection_quick(),
+        stats: status_stats_quick(&counts),
+        history_items_projection: status_history_items_projection_quick(&counts),
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
     }
@@ -3409,6 +3412,7 @@ fn status_config_output(config: &AppConfig) -> StatusConfigOutput {
 
 fn status_stats_full(store: &Store) -> Result<StatusStatsOutput> {
     let stats = store.stats()?;
+    store.refresh_status_projection_counts(&stats)?;
     Ok(StatusStatsOutput {
         exact: true,
         skipped_reason: None,
@@ -3422,16 +3426,18 @@ fn status_stats_full(store: &Store) -> Result<StatusStatsOutput> {
     })
 }
 
-fn status_stats_quick() -> StatusStatsOutput {
+fn status_stats_quick(counts: &QuickStatusCounts) -> StatusStatsOutput {
     StatusStatsOutput {
         exact: false,
-        skipped_reason: Some("exact table counts skipped; use --all".to_string()),
+        skipped_reason: Some(
+            "exact table counts skipped; cached counts shown when available".to_string(),
+        ),
         sources: None,
         raw_artifacts: None,
-        sessions: None,
-        events: None,
-        history_items: None,
-        search_units: None,
+        sessions: counts.sessions,
+        events: counts.events,
+        history_items: counts.history_items,
+        search_units: counts.search_units,
         embeddings: None,
     }
 }
@@ -3482,12 +3488,16 @@ fn status_history_items_projection_full(
     })
 }
 
-fn status_history_items_projection_quick() -> StatusHistoryItemsProjectionOutput {
+fn status_history_items_projection_quick(
+    counts: &QuickStatusCounts,
+) -> StatusHistoryItemsProjectionOutput {
     StatusHistoryItemsProjectionOutput {
-        ready: None,
+        ready: counts.history_items.map(|_| true),
         deep_check: false,
         missing_conversation_items: 0,
-        skipped_reason: Some("projection readiness check skipped; use --all".to_string()),
+        skipped_reason: Some(
+            "deep projection check skipped; cached readiness shown when available".to_string(),
+        ),
     }
 }
 
@@ -5259,7 +5269,7 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
             status_stats_full(store)
         })?
     } else {
-        status_stats_quick()
+        status_stats_quick(&QuickStatusCounts::default())
     };
     println!();
     println!("  {}", status_summary(&stats));
@@ -5268,7 +5278,7 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
             status_history_items_projection_full(store)
         })?
     } else {
-        status_history_items_projection_quick()
+        status_history_items_projection_quick(&QuickStatusCounts::default())
     };
     print_status_indexed_history(&stats, &history_items_projection, color);
     flush_stdout()?;
@@ -5520,13 +5530,20 @@ fn print_status_storage(data_dir: &str, db_path: &str, color: bool) {
 }
 
 fn status_summary(stats: &StatusStatsOutput) -> String {
-    if !stats.exact {
-        return "Quick status ready; exact indexed counts skipped. Use `histo status --all` for full diagnostics."
-            .to_string();
-    }
     let history_items = stats.history_items.unwrap_or(0);
     let sessions = stats.sessions.unwrap_or(0);
     let events = stats.events.unwrap_or(0);
+    if sessions > 0 && history_items > 0 {
+        return format!(
+            "{} sessions indexed into {} searchable history items.",
+            format_count_u64(sessions),
+            format_count_u64(history_items)
+        );
+    }
+    if !stats.exact {
+        return "Quick status ready; collection size unknown. Run `histo update` or `histo status --all` to refresh counts."
+            .to_string();
+    }
     if history_items > 0 {
         format!(
             "{} sessions indexed into {} searchable history items.",

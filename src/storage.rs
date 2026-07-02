@@ -5,8 +5,8 @@ use crate::archive::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{
-    params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction,
-    TransactionBehavior,
+    params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
+    Transaction, TransactionBehavior,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -103,6 +103,14 @@ pub struct ArchiveStats {
     pub history_items: u64,
     pub search_units: u64,
     pub embeddings: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuickStatusCounts {
+    pub sessions: Option<u64>,
+    pub events: Option<u64>,
+    pub history_items: Option<u64>,
+    pub search_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -534,6 +542,30 @@ impl Store {
             migrate(conn)
         })?;
         Ok(store)
+    }
+
+    pub fn quick_status_counts(data_dir: &Path) -> QuickStatusCounts {
+        let db_path = data_dir.join("historious.db");
+        if !db_path.exists() {
+            return QuickStatusCounts::default();
+        }
+        let Ok(conn) = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            return QuickStatusCounts::default();
+        };
+        let _ = conn.busy_timeout(Duration::from_millis(100));
+        QuickStatusCounts {
+            sessions: quick_count(&conn, "sessions"),
+            events: quick_session_activity_event_count(&conn),
+            history_items: projection_status_count(&conn, HISTORY_ITEMS_PROJECTION)
+                .ok()
+                .flatten()
+                .map(|count| count as u64),
+            search_units: projection_status_count(&conn, "search_rrf_v1")
+                .ok()
+                .flatten()
+                .map(|count| count as u64),
+        }
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -1094,6 +1126,19 @@ impl Store {
                 search_units: count(conn, "search_units")?,
                 embeddings: count(conn, "embeddings")?,
             })
+        })
+    }
+
+    pub fn refresh_status_projection_counts(&self, stats: &ArchiveStats) -> Result<()> {
+        self.with_conn(|conn| {
+            update_projection_status(conn, HISTORY_ITEMS_PROJECTION, stats.history_items as usize)?;
+            update_projection_status(
+                conn,
+                HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION,
+                stats.history_items as usize,
+            )?;
+            update_projection_status(conn, "search_rrf_v1", stats.search_units as usize)?;
+            Ok(())
         })
     }
 
@@ -5651,6 +5696,20 @@ fn count(conn: &Connection, table: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count as u64)
+}
+
+fn quick_count(conn: &Connection, table: &str) -> Option<u64> {
+    count(conn, table).ok()
+}
+
+fn quick_session_activity_event_count(conn: &Connection) -> Option<u64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(event_count), 0) FROM session_activity",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|count| count as u64)
 }
 
 fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
