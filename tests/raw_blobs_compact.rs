@@ -102,6 +102,7 @@ fn raw_blobs_compact_previews_and_applies_append_snapshot_cleanup() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
     assert_eq!(status["data"]["stats"]["raw_artifacts"], 1);
     assert_eq!(status["data"]["stats"]["events"], 1);
@@ -119,6 +120,7 @@ fn raw_blobs_migrate_objects_moves_loose_objects_into_sqlite() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
 
     seed_empty_raw_object(&data_dir, &object_hash, object_bytes);
@@ -175,6 +177,7 @@ fn raw_blobs_migrate_objects_skips_invalid_loose_objects() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
 
     seed_empty_raw_object(&data_dir, &object_hash, object_bytes);
@@ -212,6 +215,7 @@ fn raw_blobs_clean_orphans_removes_only_unreferenced_loose_blobs() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
     seed_empty_raw_object(&data_dir, &referenced_hash, referenced_bytes);
     write_loose_blob(&data_dir, &referenced_hash, referenced_bytes);
@@ -267,6 +271,7 @@ fn raw_blobs_clean_manifest_artifacts_deletes_verified_legacy_artifact() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
     seed_manifest_covered_raw_artifact(
         &data_dir,
@@ -318,6 +323,7 @@ fn raw_blobs_clean_manifest_artifacts_keeps_mismatched_legacy_artifact() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
     seed_manifest_covered_raw_artifact_with_legacy_bytes(
         &data_dir,
@@ -359,6 +365,7 @@ fn raw_blobs_clean_source_archives_removes_legacy_archives_only() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
     seed_manifest_covered_raw_artifact(
         &data_dir,
@@ -431,6 +438,7 @@ fn maintenance_compact_previews_and_runs_sqlite_maintenance() {
         data_dir.to_str().expect("data dir"),
         "--robot",
         "status",
+        "--all",
     ]));
 
     let preview = command_json(histo().args([
