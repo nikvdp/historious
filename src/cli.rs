@@ -1160,6 +1160,16 @@ impl Cli {
             run_config_command(data_dir, command, robot)?;
             return Ok(());
         }
+        if let Command::Status { json, all: false } = &command {
+            let config = AppConfig::load(data_dir)?;
+            let output = status_output_quick(&config);
+            if *json || robot {
+                crate::output::write_success("status", output, Default::default())?;
+            } else {
+                print_status_output(&output);
+            }
+            return Ok(());
+        }
 
         emit_startup_progress(&command, robot);
         let mut config = AppConfig::load(data_dir)?;
@@ -2630,7 +2640,7 @@ struct StatusOutput {
     diagnostics: StatusDiagnosticsOutput,
     config: StatusConfigOutput,
     disk_usage: StatusDiskUsageOutput,
-    stats: crate::storage::ArchiveStats,
+    stats: StatusStatsOutput,
     history_items_projection: StatusHistoryItemsProjectionOutput,
     query_embedder: crate::embed::EmbedderStatus,
     query_embedder_probe: Option<EmbedderProbeOutput>,
@@ -2671,8 +2681,21 @@ struct StatusDiskUsageOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct StatusStatsOutput {
+    exact: bool,
+    skipped_reason: Option<String>,
+    sources: Option<u64>,
+    raw_artifacts: Option<u64>,
+    sessions: Option<u64>,
+    events: Option<u64>,
+    history_items: Option<u64>,
+    search_units: Option<u64>,
+    embeddings: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
 struct StatusHistoryItemsProjectionOutput {
-    ready: bool,
+    ready: Option<bool>,
     deep_check: bool,
     missing_conversation_items: u64,
     skipped_reason: Option<String>,
@@ -3318,7 +3341,12 @@ fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusO
     let history_items_projection = if all {
         status_history_items_projection_full(store)?
     } else {
-        status_history_items_projection_quick(store)?
+        status_history_items_projection_quick()
+    };
+    let stats = if all {
+        status_stats_full(store)?
+    } else {
+        status_stats_quick()
     };
     Ok(StatusOutput {
         data_dir: config.data_dir.display().to_string(),
@@ -3326,11 +3354,26 @@ fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusO
         diagnostics: status_diagnostics_output(all),
         config: status_config_output(config),
         disk_usage,
-        stats: store.stats()?,
+        stats,
         history_items_projection,
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
     })
+}
+
+fn status_output_quick(config: &AppConfig) -> StatusOutput {
+    let db_path = config.data_dir.join("historious.db");
+    StatusOutput {
+        data_dir: config.data_dir.display().to_string(),
+        db_path: db_path.display().to_string(),
+        diagnostics: status_diagnostics_output(false),
+        config: status_config_output(config),
+        disk_usage: status_disk_usage_quick(&db_path),
+        stats: status_stats_quick(),
+        history_items_projection: status_history_items_projection_quick(),
+        query_embedder: config.embedder.status_without_loading(),
+        query_embedder_probe: embedder_probe_output(config),
+    }
 }
 
 fn status_diagnostics_output(all: bool) -> StatusDiagnosticsOutput {
@@ -3347,6 +3390,7 @@ fn status_diagnostics_output(all: bool) -> StatusDiagnosticsOutput {
             full: false,
             warning: None,
             skipped: vec![
+                "exact_table_counts",
                 "recursive_disk_usage",
                 "history_items_missing_conversation_count",
             ],
@@ -3360,6 +3404,35 @@ fn status_config_output(config: &AppConfig) -> StatusConfigOutput {
         default_search_mode: config.default_search_mode,
         embeddings_enabled: !config.embedder.is_disabled(),
         treechat_enabled: config.sources.treechat.enabled,
+    }
+}
+
+fn status_stats_full(store: &Store) -> Result<StatusStatsOutput> {
+    let stats = store.stats()?;
+    Ok(StatusStatsOutput {
+        exact: true,
+        skipped_reason: None,
+        sources: Some(stats.sources),
+        raw_artifacts: Some(stats.raw_artifacts),
+        sessions: Some(stats.sessions),
+        events: Some(stats.events),
+        history_items: Some(stats.history_items),
+        search_units: Some(stats.search_units),
+        embeddings: Some(stats.embeddings),
+    })
+}
+
+fn status_stats_quick() -> StatusStatsOutput {
+    StatusStatsOutput {
+        exact: false,
+        skipped_reason: Some("exact table counts skipped; use --all".to_string()),
+        sources: None,
+        raw_artifacts: None,
+        sessions: None,
+        events: None,
+        history_items: None,
+        search_units: None,
+        embeddings: None,
     }
 }
 
@@ -3402,22 +3475,20 @@ fn status_history_items_projection_full(
 ) -> Result<StatusHistoryItemsProjectionOutput> {
     let health = store.history_items_projection_health()?;
     Ok(StatusHistoryItemsProjectionOutput {
-        ready: health.ready,
+        ready: Some(health.ready),
         deep_check: true,
         missing_conversation_items: health.missing_conversation_items,
         skipped_reason: None,
     })
 }
 
-fn status_history_items_projection_quick(
-    store: &Store,
-) -> Result<StatusHistoryItemsProjectionOutput> {
-    Ok(StatusHistoryItemsProjectionOutput {
-        ready: store.history_items_projection_status_ready()?,
+fn status_history_items_projection_quick() -> StatusHistoryItemsProjectionOutput {
+    StatusHistoryItemsProjectionOutput {
+        ready: None,
         deep_check: false,
         missing_conversation_items: 0,
-        skipped_reason: Some("deep missing-conversation check skipped; use --all".to_string()),
-    })
+        skipped_reason: Some("projection readiness check skipped; use --all".to_string()),
+    }
 }
 
 fn status_disk_usage_full(data_dir: &Path, db_path: &Path) -> StatusDiskUsageOutput {
@@ -4842,6 +4913,12 @@ fn format_count_u64(value: u64) -> String {
     format_number_text(&text)
 }
 
+fn format_optional_count_u64(value: Option<u64>) -> String {
+    value
+        .map(format_count_u64)
+        .unwrap_or_else(|| "skipped".to_string())
+}
+
 fn format_number_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + text.len() / 3);
     for (idx, ch) in text.chars().rev().enumerate() {
@@ -5177,7 +5254,13 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
     print_status_storage(&data_dir, &db_path, color);
     flush_stdout()?;
 
-    let stats = status_phase("Reading indexed counts", spinner, || store.stats())?;
+    let stats = if all {
+        status_phase("Reading indexed counts", spinner, || {
+            status_stats_full(store)
+        })?
+    } else {
+        status_stats_quick()
+    };
     println!();
     println!("  {}", status_summary(&stats));
     let history_items_projection = if all {
@@ -5185,9 +5268,7 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
             status_history_items_projection_full(store)
         })?
     } else {
-        status_phase("Reading cached projection status", spinner, || {
-            status_history_items_projection_quick(store)
-        })?
+        status_history_items_projection_quick()
     };
     print_status_indexed_history(&stats, &history_items_projection, color);
     flush_stdout()?;
@@ -5310,42 +5391,62 @@ fn print_status_probe(probe: Option<&EmbedderProbeOutput>, color: bool) {
 }
 
 fn print_status_indexed_history(
-    stats: &crate::storage::ArchiveStats,
+    stats: &StatusStatsOutput,
     history_items_projection: &StatusHistoryItemsProjectionOutput,
     color: bool,
 ) {
     print_section(
         "Indexed history",
         &[
-            ("Sessions", format_count_u64(stats.sessions)),
-            ("History items", format_count_u64(stats.history_items)),
+            ("Sessions", format_optional_count_u64(stats.sessions)),
+            (
+                "History items",
+                format_optional_count_u64(stats.history_items),
+            ),
             (
                 "History item projection",
                 history_items_projection_status(history_items_projection),
             ),
-            ("Events", format_count_u64(stats.events)),
-            ("Sources", format_count_u64(stats.sources)),
+            ("Events", format_optional_count_u64(stats.events)),
+            ("Sources", format_optional_count_u64(stats.sources)),
             (
                 "Legacy raw artifacts",
-                format_count_u64(stats.raw_artifacts),
+                format_optional_count_u64(stats.raw_artifacts),
             ),
-            ("Search units", format_count_u64(stats.search_units)),
-            ("Embeddings", format_count_u64(stats.embeddings)),
+            (
+                "Search units",
+                format_optional_count_u64(stats.search_units),
+            ),
+            ("Embeddings", format_optional_count_u64(stats.embeddings)),
+            (
+                "Exact counts",
+                stats
+                    .skipped_reason
+                    .as_deref()
+                    .unwrap_or("available")
+                    .to_string(),
+            ),
         ],
         color,
     );
 }
 
 fn history_items_projection_status(health: &StatusHistoryItemsProjectionOutput) -> String {
-    if health.ready && health.deep_check {
+    if health.ready == Some(true) && health.deep_check {
         "healthy".to_string()
-    } else if health.ready {
+    } else if health.ready == Some(true) {
         "ready; deep check skipped, use --all".to_string()
     } else if health.missing_conversation_items > 0 {
         format!(
             "stale, {} conversation events missing",
             format_count_u64(health.missing_conversation_items)
         )
+    } else if health.ready.is_none() {
+        health
+            .skipped_reason
+            .as_deref()
+            .unwrap_or("not checked; use --all")
+            .to_string()
     } else {
         "not ready".to_string()
     }
@@ -5418,17 +5519,24 @@ fn print_status_storage(data_dir: &str, db_path: &str, color: bool) {
     );
 }
 
-fn status_summary(stats: &crate::storage::ArchiveStats) -> String {
-    if stats.history_items > 0 {
+fn status_summary(stats: &StatusStatsOutput) -> String {
+    if !stats.exact {
+        return "Quick status ready; exact indexed counts skipped. Use `histo status --all` for full diagnostics."
+            .to_string();
+    }
+    let history_items = stats.history_items.unwrap_or(0);
+    let sessions = stats.sessions.unwrap_or(0);
+    let events = stats.events.unwrap_or(0);
+    if history_items > 0 {
         format!(
             "{} sessions indexed into {} searchable history items.",
-            format_count_u64(stats.sessions),
-            format_count_u64(stats.history_items)
+            format_count_u64(sessions),
+            format_count_u64(history_items)
         )
-    } else if stats.events > 0 {
+    } else if events > 0 {
         format!(
             "{} events indexed; history-item projection has not been built yet.",
-            format_count_u64(stats.events)
+            format_count_u64(events)
         )
     } else {
         "No indexed history yet. Run `histo update` when you are ready to ingest local sessions."
