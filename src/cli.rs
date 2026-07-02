@@ -349,6 +349,12 @@ pub enum Command {
             help = "Only show threads active today"
         )]
         today: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before", "today"],
+            help = "Only show threads active yesterday"
+        )]
+        yesterday: bool,
         #[command(flatten)]
         filters: SessionFilterArgs,
         #[arg(long, help = "Print structured JSON")]
@@ -1377,6 +1383,7 @@ impl Cli {
                 after,
                 before,
                 today,
+                yesterday,
                 filters,
                 json,
                 update,
@@ -1387,10 +1394,11 @@ impl Cli {
                 if implicit_update {
                     refresh_threads_inputs(&store, &config, json || robot)?;
                 }
-                let (after_bound, before_bound) = if today {
+                let (after_bound, before_bound) = if today || yesterday {
+                    let shortcut = if today { "today" } else { "yesterday" };
                     (
-                        Some(parse_search_time("today", TimeFilterBound::After)?),
-                        Some(parse_search_time("today", TimeFilterBound::Before)?),
+                        Some(parse_search_time(shortcut, TimeFilterBound::After)?),
+                        Some(parse_search_time(shortcut, TimeFilterBound::Before)?),
                     )
                 } else {
                     (
