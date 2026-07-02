@@ -28,6 +28,8 @@ const DEFAULT_TAIL_LINES: usize = 20;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
+const STATUS_ALL_WARNING: &str =
+    "histo status --all runs full diagnostics; recursive disk usage and deep projection checks may take a while before JSON is returned.";
 static TAIL_CANCELLED: AtomicBool = AtomicBool::new(false);
 static TAIL_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -710,6 +712,11 @@ pub enum Command {
     Status {
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
+        #[arg(
+            long,
+            help = "Run full status diagnostics, including slower disk and projection checks"
+        )]
+        all: bool,
     },
     /// Read and update persistent Historious configuration.
     Config {
@@ -2062,14 +2069,17 @@ impl Cli {
                     .await?;
                 }
             }
-            Command::Status { json } => {
+            Command::Status { json, all } => {
+                if all && (json || robot || !std::io::stdout().is_terminal()) {
+                    eprintln!("{}", STATUS_ALL_WARNING);
+                }
                 if json || robot {
-                    let output = status_output(&store, &config)?;
+                    let output = status_output(&store, &config, all)?;
                     crate::output::write_success("status", output, Default::default())?;
                 } else if std::io::stdout().is_terminal() {
-                    print_status_output_live(&store, &config)?;
+                    print_status_output_live(&store, &config, all)?;
                 } else {
-                    let output = status_output(&store, &config)?;
+                    let output = status_output(&store, &config, all)?;
                     print_status_output(&output);
                 }
             }
@@ -2617,12 +2627,28 @@ struct HistoryItemOutput {
 struct StatusOutput {
     data_dir: String,
     db_path: String,
+    diagnostics: StatusDiagnosticsOutput,
     config: StatusConfigOutput,
     disk_usage: StatusDiskUsageOutput,
     stats: crate::storage::ArchiveStats,
-    history_items_projection: crate::storage::HistoryItemsProjectionHealth,
+    history_items_projection: StatusHistoryItemsProjectionOutput,
     query_embedder: crate::embed::EmbedderStatus,
     query_embedder_probe: Option<EmbedderProbeOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusDiagnosticsOutput {
+    mode: StatusDiagnosticsMode,
+    full: bool,
+    warning: Option<&'static str>,
+    skipped: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StatusDiagnosticsMode {
+    Quick,
+    All,
 }
 
 #[derive(Debug, Serialize)]
@@ -2635,11 +2661,21 @@ struct StatusConfigOutput {
 
 #[derive(Debug, Serialize)]
 struct StatusDiskUsageOutput {
+    full_scan: bool,
+    skipped_reason: Option<String>,
     total_bytes: u64,
     database_bytes: u64,
     raw_blobs_bytes: u64,
     models_bytes: u64,
     other_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusHistoryItemsProjectionOutput {
+    ready: bool,
+    deep_check: bool,
+    missing_conversation_items: u64,
+    skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3273,18 +3309,49 @@ fn embedding_refresh_from_import_stats(
     }
 }
 
-fn status_output(store: &Store, config: &AppConfig) -> Result<StatusOutput> {
-    let disk_usage = status_disk_usage(&config.data_dir, store.db_path());
+fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusOutput> {
+    let disk_usage = if all {
+        status_disk_usage_full(&config.data_dir, store.db_path())
+    } else {
+        status_disk_usage_quick(store.db_path())
+    };
+    let history_items_projection = if all {
+        status_history_items_projection_full(store)?
+    } else {
+        status_history_items_projection_quick(store)?
+    };
     Ok(StatusOutput {
         data_dir: config.data_dir.display().to_string(),
         db_path: store.db_path().display().to_string(),
+        diagnostics: status_diagnostics_output(all),
         config: status_config_output(config),
         disk_usage,
         stats: store.stats()?,
-        history_items_projection: store.history_items_projection_health()?,
+        history_items_projection,
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
     })
+}
+
+fn status_diagnostics_output(all: bool) -> StatusDiagnosticsOutput {
+    if all {
+        StatusDiagnosticsOutput {
+            mode: StatusDiagnosticsMode::All,
+            full: true,
+            warning: Some(STATUS_ALL_WARNING),
+            skipped: Vec::new(),
+        }
+    } else {
+        StatusDiagnosticsOutput {
+            mode: StatusDiagnosticsMode::Quick,
+            full: false,
+            warning: None,
+            skipped: vec![
+                "recursive_disk_usage",
+                "history_items_missing_conversation_count",
+            ],
+        }
+    }
 }
 
 fn status_config_output(config: &AppConfig) -> StatusConfigOutput {
@@ -3330,18 +3397,56 @@ fn degraded_probe(err: impl std::fmt::Display) -> EmbedderProbeOutput {
     }
 }
 
-fn status_disk_usage(data_dir: &Path, db_path: &Path) -> StatusDiskUsageOutput {
+fn status_history_items_projection_full(
+    store: &Store,
+) -> Result<StatusHistoryItemsProjectionOutput> {
+    let health = store.history_items_projection_health()?;
+    Ok(StatusHistoryItemsProjectionOutput {
+        ready: health.ready,
+        deep_check: true,
+        missing_conversation_items: health.missing_conversation_items,
+        skipped_reason: None,
+    })
+}
+
+fn status_history_items_projection_quick(
+    store: &Store,
+) -> Result<StatusHistoryItemsProjectionOutput> {
+    Ok(StatusHistoryItemsProjectionOutput {
+        ready: store.history_items_projection_status_ready()?,
+        deep_check: false,
+        missing_conversation_items: 0,
+        skipped_reason: Some("deep missing-conversation check skipped; use --all".to_string()),
+    })
+}
+
+fn status_disk_usage_full(data_dir: &Path, db_path: &Path) -> StatusDiskUsageOutput {
     let database_bytes = database_file_bytes(db_path);
     let raw_blobs_bytes = path_bytes(&data_dir.join("blobs"));
     let models_bytes = path_bytes(&data_dir.join("models"));
     let total_bytes = path_bytes(data_dir);
     let other_bytes = total_bytes.saturating_sub(database_bytes + raw_blobs_bytes + models_bytes);
     StatusDiskUsageOutput {
+        full_scan: true,
+        skipped_reason: None,
         total_bytes,
         database_bytes,
         raw_blobs_bytes,
         models_bytes,
         other_bytes,
+    }
+}
+
+fn status_disk_usage_quick(db_path: &Path) -> StatusDiskUsageOutput {
+    let database_bytes = database_file_bytes(db_path);
+    StatusDiskUsageOutput {
+        full_scan: false,
+        skipped_reason: Some("recursive disk scan skipped; use --all".to_string()),
+        total_bytes: database_bytes,
+        database_bytes,
+        raw_blobs_bytes: 0,
+        models_bytes: 0,
+        other_bytes: 0,
     }
 }
 
@@ -5039,6 +5144,7 @@ fn print_status_output(output: &StatusOutput) {
     println!();
     println!("{}", styled("Historious status", "1;32", color));
     println!("  {}", status_summary(&output.stats));
+    print_status_diagnostics(&output.diagnostics, color);
     print_status_search(&output.config, &output.query_embedder, color);
     print_status_attention(&output.query_embedder, color);
     print_status_probe(output.query_embedder_probe.as_ref(), color);
@@ -5048,17 +5154,23 @@ fn print_status_output(output: &StatusOutput) {
     print_status_storage(&output.data_dir, &output.db_path, color);
 }
 
-fn print_status_output_live(store: &Store, config: &AppConfig) -> Result<()> {
+fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Result<()> {
     let color = true;
     let data_dir = config.data_dir.display().to_string();
     let db_path = store.db_path().display().to_string();
     let status_config = status_config_output(config);
     let query_embedder = config.embedder.status_without_loading();
+    let diagnostics = status_diagnostics_output(all);
     let spinner = std::io::stderr().is_terminal();
 
     println!();
     println!("{}", styled("Historious status", "1;32", color));
-    println!("  Loading indexed history and disk usage...");
+    if all {
+        println!("  {STATUS_ALL_WARNING}");
+    } else {
+        println!("  Loading quick indexed history...");
+    }
+    print_status_diagnostics(&diagnostics, color);
     print_status_search(&status_config, &query_embedder, color);
     print_status_attention(&query_embedder, color);
     print_status_config(&status_config, color);
@@ -5068,16 +5180,27 @@ fn print_status_output_live(store: &Store, config: &AppConfig) -> Result<()> {
     let stats = status_phase("Reading indexed counts", spinner, || store.stats())?;
     println!();
     println!("  {}", status_summary(&stats));
-    let history_items_projection =
+    let history_items_projection = if all {
         status_phase("Checking history item projection", spinner, || {
-            store.history_items_projection_health()
-        })?;
+            status_history_items_projection_full(store)
+        })?
+    } else {
+        status_phase("Reading cached projection status", spinner, || {
+            status_history_items_projection_quick(store)
+        })?
+    };
     print_status_indexed_history(&stats, &history_items_projection, color);
     flush_stdout()?;
 
-    let disk_usage = status_phase("Measuring disk usage", spinner, || {
-        Ok(status_disk_usage(&config.data_dir, store.db_path()))
-    })?;
+    let disk_usage = if all {
+        status_phase("Measuring disk usage", spinner, || {
+            Ok(status_disk_usage_full(&config.data_dir, store.db_path()))
+        })?
+    } else {
+        status_phase("Reading database size", spinner, || {
+            Ok(status_disk_usage_quick(store.db_path()))
+        })?
+    };
     print_status_disk_usage(&disk_usage, color);
     flush_stdout()?;
 
@@ -5127,6 +5250,23 @@ fn print_status_search(
     );
 }
 
+fn print_status_diagnostics(diagnostics: &StatusDiagnosticsOutput, color: bool) {
+    let mode = match diagnostics.mode {
+        StatusDiagnosticsMode::Quick => "quick",
+        StatusDiagnosticsMode::All => "all",
+    };
+    let skipped = if diagnostics.skipped.is_empty() {
+        "none".to_string()
+    } else {
+        diagnostics.skipped.join(", ")
+    };
+    let mut rows = vec![("Mode", mode.to_string()), ("Skipped diagnostics", skipped)];
+    if let Some(warning) = diagnostics.warning {
+        rows.push(("Warning", warning.to_string()));
+    }
+    print_section("Diagnostics", &rows, color);
+}
+
 fn print_status_attention(query_embedder: &crate::embed::EmbedderStatus, color: bool) {
     if let Some(reason) = query_embedder.degraded_reason.as_deref() {
         print_section(
@@ -5171,7 +5311,7 @@ fn print_status_probe(probe: Option<&EmbedderProbeOutput>, color: bool) {
 
 fn print_status_indexed_history(
     stats: &crate::storage::ArchiveStats,
-    history_items_projection: &crate::storage::HistoryItemsProjectionHealth,
+    history_items_projection: &StatusHistoryItemsProjectionOutput,
     color: bool,
 ) {
     print_section(
@@ -5196,11 +5336,11 @@ fn print_status_indexed_history(
     );
 }
 
-fn history_items_projection_status(
-    health: &crate::storage::HistoryItemsProjectionHealth,
-) -> String {
-    if health.ready {
+fn history_items_projection_status(health: &StatusHistoryItemsProjectionOutput) -> String {
+    if health.ready && health.deep_check {
         "healthy".to_string()
+    } else if health.ready {
+        "ready; deep check skipped, use --all".to_string()
     } else if health.missing_conversation_items > 0 {
         format!(
             "stale, {} conversation events missing",
@@ -5212,20 +5352,41 @@ fn history_items_projection_status(
 }
 
 fn print_status_disk_usage(disk_usage: &StatusDiskUsageOutput, color: bool) {
-    print_section(
-        "Disk usage",
-        &[
-            ("Total", format_bytes(disk_usage.total_bytes)),
-            (
-                "Database + indexes",
-                format_bytes(disk_usage.database_bytes),
-            ),
-            ("Legacy raw blobs", format_bytes(disk_usage.raw_blobs_bytes)),
-            ("Models", format_bytes(disk_usage.models_bytes)),
-            ("Other app files", format_bytes(disk_usage.other_bytes)),
-        ],
-        color,
-    );
+    if disk_usage.full_scan {
+        print_section(
+            "Disk usage",
+            &[
+                ("Total", format_bytes(disk_usage.total_bytes)),
+                (
+                    "Database + indexes",
+                    format_bytes(disk_usage.database_bytes),
+                ),
+                ("Legacy raw blobs", format_bytes(disk_usage.raw_blobs_bytes)),
+                ("Models", format_bytes(disk_usage.models_bytes)),
+                ("Other app files", format_bytes(disk_usage.other_bytes)),
+            ],
+            color,
+        );
+    } else {
+        print_section(
+            "Disk usage",
+            &[
+                (
+                    "Database + indexes",
+                    format_bytes(disk_usage.database_bytes),
+                ),
+                (
+                    "Full disk scan",
+                    disk_usage
+                        .skipped_reason
+                        .as_deref()
+                        .unwrap_or("skipped")
+                        .to_string(),
+                ),
+            ],
+            color,
+        );
+    }
 }
 
 fn print_status_config(config: &StatusConfigOutput, color: bool) {
