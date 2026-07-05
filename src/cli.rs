@@ -3649,20 +3649,34 @@ fn print_source_delta_summary(sources: &[SourceDeltaOutput], color: bool) {
     if sources.is_empty() {
         return;
     }
+    let mut sources = sources.iter().collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        right
+            .inserted_events
+            .cmp(&left.inserted_events)
+            .then_with(|| right.inserted_sessions.cmp(&left.inserted_sessions))
+            .then_with(|| left.source_kind.cmp(&right.source_kind))
+    });
     let rows = sources
         .iter()
         .map(|source| {
-            (
-                source.source_kind.as_str(),
-                format!(
-                    "+{} threads, +{} events",
-                    format_count(source.inserted_sessions),
-                    format_count(source.inserted_events)
-                ),
-            )
+            vec![
+                source.source_kind.clone(),
+                format!("+{}", format_count(source.inserted_sessions)),
+                format!("+{}", format_count(source.inserted_events)),
+            ]
         })
         .collect::<Vec<_>>();
-    print_section("New by provider", &rows, color);
+    print_table_section(
+        "New by provider",
+        &[
+            TableColumn::left("Provider"),
+            TableColumn::right("Threads"),
+            TableColumn::right("Events"),
+        ],
+        &rows,
+        color,
+    );
 }
 
 fn print_prune_output(output: &PruneOutput) {
@@ -4100,6 +4114,86 @@ fn print_section(title: &str, rows: &[(&str, String)], color: bool) {
     for (label, value) in rows {
         println!("    {label:<width$}  {value}");
     }
+}
+
+#[derive(Clone, Copy)]
+enum TableAlign {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+struct TableColumn {
+    title: &'static str,
+    align: TableAlign,
+}
+
+impl TableColumn {
+    fn left(title: &'static str) -> Self {
+        Self {
+            title,
+            align: TableAlign::Left,
+        }
+    }
+
+    fn right(title: &'static str) -> Self {
+        Self {
+            title,
+            align: TableAlign::Right,
+        }
+    }
+}
+
+fn print_table_section(title: &str, columns: &[TableColumn], rows: &[Vec<String>], color: bool) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("  {}", styled(title, "1;36", color));
+    let widths = table_widths(columns, rows);
+    let header = table_line(
+        &columns
+            .iter()
+            .map(|column| column.title)
+            .collect::<Vec<_>>(),
+        columns,
+        &widths,
+    );
+    println!("    {}", styled(&header, "2", color));
+    for row in rows {
+        println!("    {}", table_line(row, columns, &widths));
+    }
+}
+
+fn table_widths(columns: &[TableColumn], rows: &[Vec<String>]) -> Vec<usize> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            rows.iter()
+                .filter_map(|row| row.get(idx))
+                .map(|value| value.len())
+                .max()
+                .unwrap_or(0)
+                .max(column.title.len())
+        })
+        .collect()
+}
+
+fn table_line<T: AsRef<str>>(values: &[T], columns: &[TableColumn], widths: &[usize]) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let value = values.get(idx).map(AsRef::as_ref).unwrap_or("");
+            let width = widths.get(idx).copied().unwrap_or(value.len());
+            match column.align {
+                TableAlign::Left => format!("{value:<width$}"),
+                TableAlign::Right => format!("{value:>width$}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn embedding_phase_detail(embeddings: &search::EmbeddingRefresh) -> String {
@@ -5525,24 +5619,42 @@ fn print_status_source_counts(sources: &[SourceStatusCounts], color: bool) {
     if sources.is_empty() {
         return;
     }
+    let mut sources = sources.iter().collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        right
+            .events
+            .cmp(&left.events)
+            .then_with(|| right.sessions.cmp(&left.sessions))
+            .then_with(|| left.source_kind.cmp(&right.source_kind))
+    });
     let rows = sources
         .iter()
         .map(|source| {
-            (
-                source.source_kind.as_str(),
-                format!(
-                    "{} threads, {} events, {} items, {} items/event, {} search units ({})",
-                    format_count_u64(source.sessions),
-                    format_count_u64(source.events),
-                    format_count_u64(source.history_items),
-                    history_items_per_event(Some(source.history_items), Some(source.events)),
-                    format_count_u64(source.search_units),
-                    source.confidence
-                ),
-            )
+            vec![
+                source.source_kind.clone(),
+                format_count_u64(source.sessions),
+                format_count_u64(source.events),
+                format_count_u64(source.history_items),
+                history_items_per_event(Some(source.history_items), Some(source.events)),
+                format_count_u64(source.search_units),
+                source.confidence.clone(),
+            ]
         })
         .collect::<Vec<_>>();
-    print_section("By provider", &rows, color);
+    print_table_section(
+        "By provider",
+        &[
+            TableColumn::left("Provider"),
+            TableColumn::right("Threads"),
+            TableColumn::right("Events"),
+            TableColumn::right("Items"),
+            TableColumn::right("Items/event"),
+            TableColumn::right("Search"),
+            TableColumn::left("Basis"),
+        ],
+        &rows,
+        color,
+    );
 }
 
 fn history_items_projection_status(health: &StatusHistoryItemsProjectionOutput) -> String {
