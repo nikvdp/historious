@@ -3,8 +3,8 @@ use crate::ingest;
 use crate::search;
 use crate::server;
 use crate::storage::{
-    QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, Store, ThreadListOptions,
-    ThreadSortMode,
+    QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
+    ThreadListOptions, ThreadSortMode,
 };
 use crate::transport;
 use anyhow::{bail, Result};
@@ -2673,6 +2673,7 @@ struct StatusOutput {
     config: StatusConfigOutput,
     disk_usage: StatusDiskUsageOutput,
     stats: StatusStatsOutput,
+    source_counts: Vec<SourceStatusCounts>,
     history_items_projection: StatusHistoryItemsProjectionOutput,
     query_embedder: crate::embed::EmbedderStatus,
     query_embedder_probe: Option<EmbedderProbeOutput>,
@@ -3396,6 +3397,7 @@ fn status_output(store: &Store, config: &AppConfig, all: bool) -> Result<StatusO
         config: status_config_output(config),
         disk_usage,
         stats,
+        source_counts: store.source_status_counts()?,
         history_items_projection,
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
@@ -3412,6 +3414,7 @@ fn status_output_quick(config: &AppConfig) -> StatusOutput {
         config: status_config_output(config),
         disk_usage: status_disk_usage_quick(&db_path),
         stats: status_stats_quick(&counts),
+        source_counts: counts.sources.clone(),
         history_items_projection: status_history_items_projection_quick(&counts),
         query_embedder: config.embedder.status_without_loading(),
         query_embedder_probe: embedder_probe_output(config),
@@ -5298,6 +5301,7 @@ fn print_status_output(output: &StatusOutput) {
     print_status_attention(&output.query_embedder, color);
     print_status_probe(output.query_embedder_probe.as_ref(), color);
     print_status_indexed_history(&output.stats, &output.history_items_projection, color);
+    print_status_source_counts(&output.source_counts, color);
     print_status_disk_usage(&output.disk_usage, color);
     print_status_config(&output.config, color);
     print_status_storage(&output.data_dir, &output.db_path, color);
@@ -5343,6 +5347,12 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
         status_history_items_projection_quick(&QuickStatusCounts::default())
     };
     print_status_indexed_history(&stats, &history_items_projection, color);
+    let source_counts = if all {
+        store.source_status_counts()?
+    } else {
+        Vec::new()
+    };
+    print_status_source_counts(&source_counts, color);
     flush_stdout()?;
 
     let disk_usage = if all {
@@ -5480,6 +5490,10 @@ fn print_status_indexed_history(
                 history_items_projection_status(history_items_projection),
             ),
             ("Events", format_optional_count_u64(stats.events)),
+            (
+                "History items / event",
+                history_items_per_event(stats.history_items, stats.events),
+            ),
             ("Sources", format_optional_count_u64(stats.sources)),
             (
                 "Legacy raw artifacts",
@@ -5501,6 +5515,30 @@ fn print_status_indexed_history(
         ],
         color,
     );
+}
+
+fn print_status_source_counts(sources: &[SourceStatusCounts], color: bool) {
+    if sources.is_empty() {
+        return;
+    }
+    let rows = sources
+        .iter()
+        .map(|source| {
+            (
+                source.source_kind.as_str(),
+                format!(
+                    "{} threads, {} events, {} items, {} items/event, {} search units ({})",
+                    format_count_u64(source.sessions),
+                    format_count_u64(source.events),
+                    format_count_u64(source.history_items),
+                    history_items_per_event(Some(source.history_items), Some(source.events)),
+                    format_count_u64(source.search_units),
+                    source.confidence
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    print_section("By provider", &rows, color);
 }
 
 fn history_items_projection_status(health: &StatusHistoryItemsProjectionOutput) -> String {
@@ -5621,6 +5659,16 @@ fn status_summary(stats: &StatusStatsOutput) -> String {
         "No indexed history yet. Run `histo update` when you are ready to ingest local sessions."
             .to_string()
     }
+}
+
+fn history_items_per_event(history_items: Option<u64>, events: Option<u64>) -> String {
+    let Some(history_items) = history_items else {
+        return "unknown".to_string();
+    };
+    let Some(events) = events.filter(|events| *events > 0) else {
+        return "unknown".to_string();
+    };
+    format!("{:.2}", history_items as f64 / events as f64)
 }
 
 fn semantic_status(
