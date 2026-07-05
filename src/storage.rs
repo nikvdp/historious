@@ -10,7 +10,7 @@ use rusqlite::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,13 @@ pub struct ImportDelta {
     pub touched_events: Vec<String>,
     pub touched_search_units: Vec<String>,
     pub touched_embeddings: Vec<String>,
+    pub source_counts: BTreeMap<String, SourceDeltaCounts>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceDeltaCounts {
+    pub inserted_sessions: usize,
+    pub inserted_events: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,12 +92,27 @@ impl ImportDelta {
         extend_unique(&mut self.touched_events, other.touched_events);
         extend_unique(&mut self.touched_search_units, other.touched_search_units);
         extend_unique(&mut self.touched_embeddings, other.touched_embeddings);
+        for (source_kind, counts) in other.source_counts {
+            self.source_counts
+                .entry(source_kind)
+                .or_default()
+                .merge(counts);
+        }
     }
 
     pub fn search_index_event_ids(&self) -> Vec<String> {
         let mut event_ids = self.inserted_events.clone();
         extend_unique(&mut event_ids, self.touched_events.clone());
         event_ids
+    }
+}
+
+impl SourceDeltaCounts {
+    fn merge(&mut self, other: SourceDeltaCounts) {
+        self.inserted_sessions = self
+            .inserted_sessions
+            .saturating_add(other.inserted_sessions);
+        self.inserted_events = self.inserted_events.saturating_add(other.inserted_events);
     }
 }
 
@@ -5881,6 +5903,11 @@ fn record_delta(
             }
             if inserted {
                 push_unique(&mut delta.inserted_sessions, session.id.clone());
+                delta
+                    .source_counts
+                    .entry(session.source_kind.clone())
+                    .or_default()
+                    .inserted_sessions += 1;
             }
         }
         ArchiveRecord::Event(event) => {
@@ -5890,6 +5917,11 @@ fn record_delta(
             }
             if inserted {
                 push_unique(&mut delta.inserted_events, event.id.clone());
+                delta
+                    .source_counts
+                    .entry(event.source_kind.clone())
+                    .or_default()
+                    .inserted_events += 1;
             }
         }
         ArchiveRecord::SearchUnit(unit) => {

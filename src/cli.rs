@@ -3,7 +3,8 @@ use crate::ingest;
 use crate::search;
 use crate::server;
 use crate::storage::{
-    QuickStatusCounts, RecentResultRefInput, Store, ThreadListOptions, ThreadSortMode,
+    QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, Store, ThreadListOptions,
+    ThreadSortMode,
 };
 use crate::transport;
 use anyhow::{bail, Result};
@@ -2357,6 +2358,7 @@ fn home_path(relative: &str) -> Result<PathBuf> {
 #[derive(Debug, Serialize)]
 struct UpdateOutput {
     ingest: ingest::UpdateStats,
+    sources: Vec<SourceDeltaOutput>,
     search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
 }
@@ -2364,8 +2366,28 @@ struct UpdateOutput {
 #[derive(Debug, Serialize)]
 struct ImportOutput {
     import: crate::storage::ImportStats,
+    sources: Vec<SourceDeltaOutput>,
     search_index: SearchIndexOutput,
     embeddings: search::EmbeddingRefresh,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceDeltaOutput {
+    source_kind: String,
+    inserted_sessions: usize,
+    inserted_events: usize,
+}
+
+fn source_delta_outputs(counts: &BTreeMap<String, SourceDeltaCounts>) -> Vec<SourceDeltaOutput> {
+    counts
+        .iter()
+        .filter(|(_, counts)| counts.inserted_sessions > 0 || counts.inserted_events > 0)
+        .map(|(source_kind, counts)| SourceDeltaOutput {
+            source_kind: source_kind.clone(),
+            inserted_sessions: counts.inserted_sessions,
+            inserted_events: counts.inserted_events,
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -2756,7 +2778,7 @@ fn run_update_once_machine(
     write_update_progress(
         "scan",
         format!(
-            "{} files, {} new events, {} unchanged, {} errors",
+            "{} files, {} new records, {} unchanged, {} errors",
             format_count(ingest.files_seen),
             format_count(ingest.inserted),
             format_count(ingest.skipped_unchanged),
@@ -2768,6 +2790,7 @@ fn run_update_once_machine(
             "inserted": ingest.inserted,
             "skipped_unchanged": ingest.skipped_unchanged,
             "errors": ingest.errors,
+            "sources": source_delta_outputs(&ingest.delta.source_counts),
         }),
     );
 
@@ -2828,6 +2851,7 @@ fn run_update_once_machine(
     };
 
     Ok(UpdateOutput {
+        sources: source_delta_outputs(&ingest.delta.source_counts),
         ingest,
         search_index: SearchIndexOutput {
             indexed_events: projected,
@@ -2889,6 +2913,7 @@ fn run_update_once_human(
     progress.finish_all();
 
     Ok(UpdateOutput {
+        sources: source_delta_outputs(&ingest.delta.source_counts),
         ingest,
         search_index: SearchIndexOutput {
             indexed_events: projected,
@@ -3245,7 +3270,9 @@ fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<Im
         },
     )?;
     let embeddings = embedding_refresh_from_import_stats(_config, stats.vectors_indexed);
+    let sources = source_delta_outputs(&stats.delta.source_counts);
     Ok(ImportOutput {
+        sources,
         import: stats,
         search_index: SearchIndexOutput {
             indexed_events: projected,
@@ -3310,8 +3337,10 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
         let embed = progress.phase("Updating embeddings");
         embed.finish(embedding_phase_detail(&embeddings));
     }
+    let sources = source_delta_outputs(&stats.delta.source_counts);
 
     Ok(ImportOutput {
+        sources,
         import: stats,
         search_index: SearchIndexOutput {
             indexed_events: projected,
@@ -3575,12 +3604,13 @@ fn print_update_output(output: &UpdateOutput, color: bool) {
         &[
             ("Seen", format_count(output.ingest.files_seen)),
             ("Unchanged", format_count(output.ingest.skipped_unchanged)),
-            ("New events", format_count(output.ingest.inserted)),
+            ("New records", format_count(output.ingest.inserted)),
             ("Duplicates", format_count(output.ingest.duplicates)),
             ("Errors", format_count(output.ingest.errors)),
         ],
         color,
     );
+    print_source_delta_summary(&output.sources, color);
     print_search_summary(output.search_index.indexed_events, color);
     print_embedding_summary(&output.embeddings, color);
 }
@@ -3600,8 +3630,29 @@ fn print_import_output(output: &ImportOutput, color: bool) {
         ],
         color,
     );
+    print_source_delta_summary(&output.sources, color);
     print_search_summary(output.search_index.indexed_events, color);
     print_embedding_summary(&output.embeddings, color);
+}
+
+fn print_source_delta_summary(sources: &[SourceDeltaOutput], color: bool) {
+    if sources.is_empty() {
+        return;
+    }
+    let rows = sources
+        .iter()
+        .map(|source| {
+            (
+                source.source_kind.as_str(),
+                format!(
+                    "+{} threads, +{} events",
+                    format_count(source.inserted_sessions),
+                    format_count(source.inserted_events)
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    print_section("New by provider", &rows, color);
 }
 
 fn print_prune_output(output: &PruneOutput) {
@@ -4220,7 +4271,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             source_file_count,
             stats,
         } => format!(
-            "{} {}/{} file {}/{} {}; {} new, {} unchanged, {} errors",
+            "{} {}/{} file {}/{} {}; {} new records, {} unchanged, {} errors",
             kind,
             format_count(*source_file_index),
             format_count(*source_file_count),
@@ -4236,7 +4287,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             sources: _,
             stats,
         } => format!(
-            "preparing {} changed files; {} new, {} unchanged, {} errors",
+            "preparing {} changed files; {} new records, {} unchanged, {} errors",
             format_count(*changed_files),
             format_count(stats.inserted),
             format_count(stats.skipped_unchanged),
@@ -4250,7 +4301,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             changed_file_count,
             stats,
         } => format!(
-            "importing changed {} {}/{} {}; {} new, {} unchanged, {} errors",
+            "importing changed {} {}/{} {}; {} new records, {} unchanged, {} errors",
             kind,
             format_count(*changed_file_index),
             format_count(*changed_file_count),
@@ -4267,7 +4318,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             changed_file_count,
             stats,
         } => format!(
-            "imported changed {} {}/{} {}; {} new, {} unchanged, {} errors",
+            "imported changed {} {}/{} {}; {} new records, {} unchanged, {} errors",
             kind,
             format_count(*changed_file_index),
             format_count(*changed_file_count),
@@ -4286,7 +4337,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             source_file_count,
             stats,
         } => format!(
-            "{} {}/{} file {}/{} done {}; {} new, {} unchanged, {} errors",
+            "{} {}/{} file {}/{} done {}; {} new records, {} unchanged, {} errors",
             kind,
             format_count(*source_file_index),
             format_count(*source_file_count),
@@ -7954,7 +8005,7 @@ async fn run_daemon(
             |event| scan.update(update_progress_detail(event)),
         )?;
         scan.finish(format!(
-            "{} files, {} new events, {} unchanged, {} errors",
+            "{} files, {} new records, {} unchanged, {} errors",
             format_count(stats.files_seen),
             format_count(stats.inserted),
             format_count(stats.skipped_unchanged),
@@ -7990,6 +8041,7 @@ async fn run_daemon(
 
         print_update_output(
             &UpdateOutput {
+                sources: source_delta_outputs(&stats.delta.source_counts),
                 ingest: stats,
                 search_index: SearchIndexOutput {
                     indexed_events: projected,
