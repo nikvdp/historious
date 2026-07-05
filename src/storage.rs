@@ -136,6 +136,19 @@ pub struct QuickStatusCounts {
     pub events: Option<u64>,
     pub history_items: Option<u64>,
     pub search_units: Option<u64>,
+    pub sources: Vec<SourceStatusCounts>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceStatusCounts {
+    pub source_kind: String,
+    pub sessions: u64,
+    pub events: u64,
+    pub history_items: u64,
+    pub search_units: u64,
+    pub embeddings: u64,
+    pub confidence: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -590,6 +603,7 @@ impl Store {
                 .ok()
                 .flatten()
                 .map(|count| count as u64),
+            sources: source_status_counts(&conn).unwrap_or_default(),
         }
     }
 
@@ -1169,6 +1183,10 @@ impl Store {
 
     pub fn refresh_source_status_counts_exact(&self) -> Result<()> {
         self.with_conn(refresh_source_status_counts_exact)
+    }
+
+    pub fn source_status_counts(&self) -> Result<Vec<SourceStatusCounts>> {
+        self.with_conn(source_status_counts)
     }
 
     pub fn prune_plan(&self, filter: &PruneFilter) -> Result<PrunePlan> {
@@ -5779,6 +5797,37 @@ fn quick_session_activity_event_count(conn: &Connection) -> Option<u64> {
     )
     .ok()
     .map(|count| count as u64)
+}
+
+fn source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_kind, sessions, events, history_items, search_units,
+                embeddings, confidence, updated_at
+         FROM source_status_counts
+         WHERE sessions > 0
+            OR events > 0
+            OR history_items > 0
+            OR search_units > 0
+            OR embeddings > 0
+         ORDER BY source_kind",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SourceStatusCounts {
+            source_kind: row.get(0)?,
+            sessions: row.get::<_, i64>(1)?.max(0) as u64,
+            events: row.get::<_, i64>(2)?.max(0) as u64,
+            history_items: row.get::<_, i64>(3)?.max(0) as u64,
+            search_units: row.get::<_, i64>(4)?.max(0) as u64,
+            embeddings: row.get::<_, i64>(5)?.max(0) as u64,
+            confidence: row.get(6)?,
+            updated_at: parse_dt(row.get(7)?),
+        })
+    })?;
+    let mut counts = Vec::new();
+    for row in rows {
+        counts.push(row?);
+    }
+    Ok(counts)
 }
 
 fn refresh_source_status_counts_exact(conn: &Connection) -> Result<()> {
