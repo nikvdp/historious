@@ -4159,7 +4159,7 @@ fn print_table_section(title: &str, columns: &[TableColumn], rows: &[Vec<String>
         columns,
         &widths,
     );
-    println!("    {}", styled(&header, "2", color));
+    println!("    {}", styled(&header, "1", color));
     for row in rows {
         println!("    {}", table_line(row, columns, &widths));
     }
