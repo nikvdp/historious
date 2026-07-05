@@ -22,6 +22,9 @@ const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 const HISTORY_ITEMS_PROJECTION: &str = "history_items_v2";
 const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v2";
+const SOURCE_STATUS_CONFIDENCE_APPROXIMATE: &str = "approximate";
+const SOURCE_STATUS_CONFIDENCE_EXACT: &str = "exact";
+const SOURCE_STATUS_CONFIDENCE_STALE: &str = "stale";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -1164,6 +1167,10 @@ impl Store {
         })
     }
 
+    pub fn refresh_source_status_counts_exact(&self) -> Result<()> {
+        self.with_conn(refresh_source_status_counts_exact)
+    }
+
     pub fn prune_plan(&self, filter: &PruneFilter) -> Result<PrunePlan> {
         self.with_conn(|conn| {
             let session_ids = prune_session_ids(conn, filter)?;
@@ -1363,6 +1370,7 @@ impl Store {
                 let count = count(tx, "history_items")? as usize;
                 update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
                 update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
+                refresh_source_status_counts_exact(tx)?;
                 Ok(count)
             })
         })
@@ -1407,6 +1415,8 @@ impl Store {
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
+                let replaced_by_source =
+                    source_history_item_counts_for_event_scope(tx, "temp_history_item_event_ids")?;
                 if replaced_count > 0 {
                     tx.execute(
                         "DELETE FROM history_items_fts
@@ -1435,12 +1445,16 @@ impl Store {
                 )?;
                 let rows = stmt.query_map([], row_event)?;
                 let mut inserted_count = 0usize;
+                let mut inserted_by_source = BTreeMap::new();
                 let mut processed_events = 0usize;
                 for row in rows {
                     processed_events += 1;
                     for item in history_items_from_event(&row?)? {
                         if insert_history_item(&tx, &item)? {
                             inserted_count += 1;
+                            *inserted_by_source
+                                .entry(item.source_kind.clone())
+                                .or_insert(0) += 1;
                         }
                     }
                     if processed_events % 1_000 == 0 {
@@ -1462,6 +1476,7 @@ impl Store {
                 };
                 update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
                 update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
+                apply_source_history_item_count_delta(tx, replaced_by_source, inserted_by_source)?;
                 Ok(count)
             })
         })
@@ -3359,6 +3374,7 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
         history_count,
     )?;
     update_projection_status(conn, "search_rrf_v1", count(conn, "search_units")? as usize)?;
+    mark_source_status_counts_stale(conn)?;
     Ok(())
 }
 
@@ -5012,6 +5028,17 @@ fn migrate(conn: &Connection) -> Result<()> {
           updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS source_status_counts (
+          source_kind TEXT PRIMARY KEY,
+          sessions INTEGER NOT NULL DEFAULT 0,
+          events INTEGER NOT NULL DEFAULT 0,
+          history_items INTEGER NOT NULL DEFAULT 0,
+          search_units INTEGER NOT NULL DEFAULT 0,
+          embeddings INTEGER NOT NULL DEFAULT 0,
+          confidence TEXT NOT NULL DEFAULT 'approximate',
+          updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS source_checkpoints (
           source_kind TEXT NOT NULL,
           source_identity TEXT NOT NULL,
@@ -5408,6 +5435,7 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
         enrich_session_metadata(conn, session)?;
     } else {
         ensure_session_activity_row(conn, &session.id)?;
+        update_source_status_count_delta(conn, &session.source_kind, 1, 0, 0, 0, 0)?;
     }
     Ok(changed > 0)
 }
@@ -5486,6 +5514,7 @@ fn insert_event(conn: &Connection, event: &EventRecord) -> Result<bool> {
     )?;
     if changed > 0 {
         update_session_activity_for_event(conn, event)?;
+        update_source_status_count_delta(conn, &event.source_kind, 0, 1, 0, 0, 0)?;
     }
     Ok(changed > 0)
 }
@@ -5596,6 +5625,9 @@ fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool
             unit.hash
         ],
     )?;
+    if changed > 0 {
+        update_source_status_count_delta(conn, &unit.source_kind, 0, 0, 0, 1, 0)?;
+    }
     Ok(changed > 0)
 }
 
@@ -5692,7 +5724,22 @@ fn insert_embedding(conn: &Connection, embedding: &EmbeddingRecord) -> Result<bo
             embedding.hash
         ],
     )?;
+    if changed > 0 {
+        if let Some(source_kind) = source_kind_for_search_unit(conn, &embedding.unit_id)? {
+            update_source_status_count_delta(conn, &source_kind, 0, 0, 0, 0, 1)?;
+        }
+    }
     Ok(changed > 0)
+}
+
+fn source_kind_for_search_unit(conn: &Connection, unit_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT source_kind FROM search_units WHERE id = ?1",
+        params![unit_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn ensure_same_hash(
@@ -5732,6 +5779,168 @@ fn quick_session_activity_event_count(conn: &Connection) -> Option<u64> {
     )
     .ok()
     .map(|count| count as u64)
+}
+
+fn refresh_source_status_counts_exact(conn: &Connection) -> Result<()> {
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute("DELETE FROM source_status_counts", [])?;
+    conn.execute(
+        "INSERT INTO source_status_counts
+         (source_kind, sessions, events, history_items, search_units, embeddings,
+          confidence, updated_at)
+         SELECT source_kind,
+                SUM(sessions),
+                SUM(events),
+                SUM(history_items),
+                SUM(search_units),
+                SUM(embeddings),
+                ?1,
+                ?2
+         FROM (
+           SELECT source_kind,
+                  COUNT(*) AS sessions,
+                  0 AS events,
+                  0 AS history_items,
+                  0 AS search_units,
+                  0 AS embeddings
+           FROM sessions
+           GROUP BY source_kind
+           UNION ALL
+           SELECT s.source_kind,
+                  0,
+                  COALESCE(SUM(a.event_count), 0),
+                  0,
+                  0,
+                  0
+           FROM sessions s
+           LEFT JOIN session_activity a ON a.session_id = s.id
+           GROUP BY s.source_kind
+           UNION ALL
+           SELECT source_kind, 0, 0, COUNT(*), 0, 0
+           FROM history_items
+           GROUP BY source_kind
+           UNION ALL
+           SELECT source_kind, 0, 0, 0, COUNT(*), 0
+           FROM search_units
+           GROUP BY source_kind
+           UNION ALL
+           SELECT su.source_kind, 0, 0, 0, 0, COUNT(*)
+           FROM embeddings e
+           JOIN search_units su ON su.id = e.unit_id
+           GROUP BY su.source_kind
+         )
+         GROUP BY source_kind",
+        params![SOURCE_STATUS_CONFIDENCE_EXACT, updated_at],
+    )?;
+    Ok(())
+}
+
+fn mark_source_status_counts_stale(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE source_status_counts
+         SET confidence = ?1,
+             updated_at = ?2
+         WHERE confidence != ?1",
+        params![SOURCE_STATUS_CONFIDENCE_STALE, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn update_source_status_count_delta(
+    conn: &Connection,
+    source_kind: &str,
+    sessions_delta: i64,
+    events_delta: i64,
+    history_items_delta: i64,
+    search_units_delta: i64,
+    embeddings_delta: i64,
+) -> Result<()> {
+    if source_kind.trim().is_empty() {
+        return Ok(());
+    }
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO source_status_counts
+         (source_kind, sessions, events, history_items, search_units, embeddings,
+          confidence, updated_at)
+         VALUES (
+           ?1,
+           max(?2, 0),
+           max(?3, 0),
+           max(?4, 0),
+           max(?5, 0),
+           max(?6, 0),
+           ?7,
+           ?8
+         )
+         ON CONFLICT(source_kind) DO UPDATE SET
+           sessions = max(0, source_status_counts.sessions + ?2),
+           events = max(0, source_status_counts.events + ?3),
+           history_items = max(0, source_status_counts.history_items + ?4),
+           search_units = max(0, source_status_counts.search_units + ?5),
+           embeddings = max(0, source_status_counts.embeddings + ?6),
+           confidence = CASE
+             WHEN source_status_counts.confidence = ?9 THEN ?9
+             WHEN source_status_counts.confidence = ?10 THEN ?10
+             ELSE ?7
+           END,
+           updated_at = ?8",
+        params![
+            source_kind,
+            sessions_delta,
+            events_delta,
+            history_items_delta,
+            search_units_delta,
+            embeddings_delta,
+            SOURCE_STATUS_CONFIDENCE_APPROXIMATE,
+            updated_at,
+            SOURCE_STATUS_CONFIDENCE_STALE,
+            SOURCE_STATUS_CONFIDENCE_EXACT,
+        ],
+    )?;
+    Ok(())
+}
+
+fn source_history_item_counts_for_event_scope(
+    conn: &Connection,
+    scope_table: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT source_kind, COUNT(*)
+         FROM history_items
+         WHERE event_id IN (SELECT id FROM {scope_table})
+         GROUP BY source_kind"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut counts = BTreeMap::new();
+    for row in rows {
+        let (source_kind, count) = row?;
+        counts.insert(source_kind, count);
+    }
+    Ok(counts)
+}
+
+fn apply_source_history_item_count_delta(
+    conn: &Connection,
+    replaced: BTreeMap<String, i64>,
+    inserted: BTreeMap<String, i64>,
+) -> Result<()> {
+    let mut source_kinds = replaced.keys().cloned().collect::<Vec<_>>();
+    for source_kind in inserted.keys() {
+        if !source_kinds.contains(source_kind) {
+            source_kinds.push(source_kind.clone());
+        }
+    }
+    for source_kind in source_kinds {
+        let delta = inserted.get(&source_kind).copied().unwrap_or(0)
+            - replaced.get(&source_kind).copied().unwrap_or(0);
+        if delta != 0 {
+            update_source_status_count_delta(conn, &source_kind, 0, 0, delta, 0, 0)?;
+        }
+    }
+    Ok(())
 }
 
 fn tiers_are_only_conversation(tiers: &[&str]) -> bool {
