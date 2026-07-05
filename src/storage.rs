@@ -5806,10 +5806,13 @@ fn quick_session_activity_event_count(conn: &Connection) -> Option<u64> {
 fn source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
     let cached = cached_source_status_counts(conn).unwrap_or_default();
     if cached.is_empty() {
-        estimated_source_status_counts(conn)
-    } else {
-        Ok(cached)
+        return estimated_source_status_counts(conn);
     }
+    let estimated = estimated_source_status_counts(conn).unwrap_or_default();
+    if estimated.is_empty() || source_status_totals_match(&cached, &estimated) {
+        return Ok(cached);
+    }
+    Ok(estimated)
 }
 
 fn cached_source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
@@ -5920,6 +5923,14 @@ fn proportional_count(total: u64, part: u64, denominator: u64) -> u64 {
         return 0;
     }
     ((total as u128 * part as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
+}
+
+fn source_status_totals_match(left: &[SourceStatusCounts], right: &[SourceStatusCounts]) -> bool {
+    let left_sessions: u64 = left.iter().map(|source| source.sessions).sum();
+    let left_events: u64 = left.iter().map(|source| source.events).sum();
+    let right_sessions: u64 = right.iter().map(|source| source.sessions).sum();
+    let right_events: u64 = right.iter().map(|source| source.events).sum();
+    left_sessions == right_sessions && left_events == right_events
 }
 
 fn refresh_source_status_counts_exact(conn: &Connection) -> Result<()> {
