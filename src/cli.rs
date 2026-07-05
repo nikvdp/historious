@@ -2944,6 +2944,8 @@ fn refresh_search_after_update_with_progress(
                 format_count(total)
             ));
         })?;
+        progress("refreshing source status counts".to_string());
+        store.refresh_source_status_counts_exact()?;
         Ok(indexed)
     } else {
         let search_event_ids = delta.search_index_event_ids();
@@ -3450,6 +3452,7 @@ fn status_config_output(config: &AppConfig) -> StatusConfigOutput {
 fn status_stats_full(store: &Store) -> Result<StatusStatsOutput> {
     let stats = store.stats()?;
     store.refresh_status_projection_counts(&stats)?;
+    store.refresh_source_status_counts_exact()?;
     Ok(StatusStatsOutput {
         exact: true,
         skipped_reason: None,
