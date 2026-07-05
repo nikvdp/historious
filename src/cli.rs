@@ -3044,6 +3044,8 @@ fn refresh_search_after_update_with_progress(
                 ));
             })?;
         }
+        progress("checking source status counts".to_string());
+        store.seed_source_status_counts_approximate_if_empty()?;
         Ok(indexed)
     }
 }
@@ -3197,6 +3199,8 @@ fn refresh_import_search_index_with_progress(
             },
         )
     }?;
+    progress("checking source status counts".to_string());
+    store.seed_source_status_counts_approximate_if_empty()?;
     Ok(indexed)
 }
 

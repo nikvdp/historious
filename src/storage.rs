@@ -1189,6 +1189,10 @@ impl Store {
         self.with_conn(source_status_counts)
     }
 
+    pub fn seed_source_status_counts_approximate_if_empty(&self) -> Result<()> {
+        self.with_conn(seed_source_status_counts_approximate_if_empty)
+    }
+
     pub fn prune_plan(&self, filter: &PruneFilter) -> Result<PrunePlan> {
         self.with_conn(|conn| {
             let session_ids = prune_session_ids(conn, filter)?;
@@ -5800,6 +5804,15 @@ fn quick_session_activity_event_count(conn: &Connection) -> Option<u64> {
 }
 
 fn source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
+    let cached = cached_source_status_counts(conn).unwrap_or_default();
+    if cached.is_empty() {
+        estimated_source_status_counts(conn)
+    } else {
+        Ok(cached)
+    }
+}
+
+fn cached_source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
     let mut stmt = conn.prepare(
         "SELECT source_kind, sessions, events, history_items, search_units,
                 embeddings, confidence, updated_at
@@ -5828,6 +5841,85 @@ fn source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
         counts.push(row?);
     }
     Ok(counts)
+}
+
+fn estimated_source_status_counts(conn: &Connection) -> Result<Vec<SourceStatusCounts>> {
+    let history_items =
+        projection_status_count(conn, HISTORY_ITEMS_PROJECTION)?.unwrap_or(0) as u64;
+    let search_units = projection_status_count(conn, "search_rrf_v1")?.unwrap_or(0) as u64;
+    let updated_at = Utc::now();
+    let mut stmt = conn.prepare(
+        "SELECT s.source_kind,
+                COUNT(*) AS sessions,
+                COALESCE(SUM(a.event_count), 0) AS events
+         FROM sessions s
+         LEFT JOIN session_activity a ON a.session_id = s.id
+         GROUP BY s.source_kind
+         ORDER BY s.source_kind",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+            row.get::<_, i64>(2)?.max(0) as u64,
+        ))
+    })?;
+    let mut basics = Vec::new();
+    let mut total_events = 0u64;
+    for row in rows {
+        let (source_kind, sessions, events) = row?;
+        total_events = total_events.saturating_add(events);
+        basics.push((source_kind, sessions, events));
+    }
+    Ok(basics
+        .into_iter()
+        .map(|(source_kind, sessions, events)| SourceStatusCounts {
+            source_kind,
+            sessions,
+            events,
+            history_items: proportional_count(history_items, events, total_events),
+            search_units: proportional_count(search_units, events, total_events),
+            embeddings: 0,
+            confidence: SOURCE_STATUS_CONFIDENCE_APPROXIMATE.to_string(),
+            updated_at,
+        })
+        .collect())
+}
+
+fn seed_source_status_counts_approximate_if_empty(conn: &Connection) -> Result<()> {
+    if !cached_source_status_counts(conn)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Ok(());
+    }
+    for source in estimated_source_status_counts(conn)? {
+        conn.execute(
+            "INSERT INTO source_status_counts
+             (source_kind, sessions, events, history_items, search_units, embeddings,
+              confidence, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(source_kind) DO NOTHING",
+            params![
+                source.source_kind,
+                source.sessions as i64,
+                source.events as i64,
+                source.history_items as i64,
+                source.search_units as i64,
+                source.embeddings as i64,
+                source.confidence,
+                source.updated_at.to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn proportional_count(total: u64, part: u64, denominator: u64) -> u64 {
+    if total == 0 || part == 0 || denominator == 0 {
+        return 0;
+    }
+    ((total as u128 * part as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
 }
 
 fn refresh_source_status_counts_exact(conn: &Connection) -> Result<()> {
