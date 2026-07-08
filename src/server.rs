@@ -598,6 +598,7 @@ fn view_metadata_for_event(
         source,
         raw_artifact,
         verbose,
+        timestamps: true,
     })
 }
 
@@ -620,6 +621,7 @@ fn view_metadata_for_session(
         source,
         raw_artifact: None,
         verbose,
+        timestamps: true,
     })
 }
 

@@ -407,6 +407,8 @@ pub enum Command {
         full: bool,
         #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
+        #[arg(long, help = "Omit timestamps from Markdown headings")]
+        no_timestamps: bool,
     },
     /// Deprecated alias for `show`.
     #[command(hide = true)]
@@ -445,6 +447,8 @@ pub enum Command {
         full: bool,
         #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
+        #[arg(long, help = "Omit timestamps from Markdown headings")]
+        no_timestamps: bool,
     },
     /// Show a full conversation transcript.
     Transcript {
@@ -507,6 +511,8 @@ pub enum Command {
         full: bool,
         #[arg(long, help = "Print structured JSON for the selected view")]
         json: bool,
+        #[arg(long, help = "Omit timestamps from Markdown headings")]
+        no_timestamps: bool,
     },
     /// Follow a conversation transcript and append new clean messages to stdout.
     Tail {
@@ -1455,6 +1461,7 @@ impl Cli {
                 verbose,
                 full,
                 json,
+                no_timestamps,
             }
             | Command::Expand {
                 target,
@@ -1467,6 +1474,7 @@ impl Cli {
                 verbose,
                 full,
                 json,
+                no_timestamps,
             } => {
                 let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
                 if json || robot {
@@ -1510,7 +1518,9 @@ impl Cli {
                     let context = store
                         .events_around_event(&event_id, before, after)?
                         .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                    let metadata = view_metadata_for_event(&store, &context.target_event, verbose)?;
+                    let mut metadata =
+                        view_metadata_for_event(&store, &context.target_event, verbose)?;
+                    metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
                     write_stdout(&crate::transcript::render_context(
                         &context, &metadata, color,
@@ -1519,11 +1529,12 @@ impl Cli {
                     let context = store
                         .history_items_around_event(&event_id, before, after)?
                         .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
-                    let metadata = if let Some(event) = &context.target_event {
+                    let mut metadata = if let Some(event) = &context.target_event {
                         view_metadata_for_event(&store, event, verbose)?
                     } else {
                         view_metadata_for_session(&store, &context.session, None, verbose)?
                     };
+                    metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
                     write_stdout(&crate::transcript::render_history_context(
                         &context, &metadata, color,
@@ -1544,6 +1555,7 @@ impl Cli {
                 verbose,
                 full,
                 json,
+                no_timestamps,
             } => {
                 let (session, target_event_id) =
                     resolve_transcript_target(&store, &target, at, search_unit)?;
@@ -1608,12 +1620,13 @@ impl Cli {
                     } else {
                         events
                     };
-                    let metadata = view_metadata_for_session(
+                    let mut metadata = view_metadata_for_session(
                         &store,
                         &session_record,
                         target_event.as_ref(),
                         verbose,
                     )?;
+                    metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
                     let rendered = crate::transcript::render_session(
                         &session_record,
@@ -1624,12 +1637,13 @@ impl Cli {
                     );
                     page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
                 } else {
-                    let metadata = view_metadata_for_session(
+                    let mut metadata = view_metadata_for_session(
                         &store,
                         &session_record,
                         target_event.as_ref(),
                         verbose,
                     )?;
+                    metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
                     let mut context = if let Some(event_id) = target_event_id.as_deref() {
                         store
@@ -6714,6 +6728,7 @@ fn view_metadata_for_event(
         source,
         raw_artifact,
         verbose,
+        timestamps: true,
     })
 }
 
@@ -6736,6 +6751,7 @@ fn view_metadata_for_session(
         source,
         raw_artifact: None,
         verbose,
+        timestamps: true,
     })
 }
 
@@ -6850,7 +6866,7 @@ fn append_tail_updates(
     }
     *last_cursor = new_items.last().map(history_item_cursor);
     write_stdout(&crate::transcript::render_history_items(
-        &new_items, color, verbose,
+        &new_items, color, verbose, true,
     ))?;
     flush_stdout()?;
     Ok(!tail_cancelled())
