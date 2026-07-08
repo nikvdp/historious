@@ -14,14 +14,13 @@ pub struct ViewMetadata {
 
 pub fn render_context(context: &TranscriptContext, metadata: &ViewMetadata, color: bool) -> String {
     let mut out = String::new();
-    push_view_header(
+    push_markdown_header(
         &mut out,
         "Show",
         &context.session,
         Some(&context.target_event),
         metadata,
     );
-    out.push('\n');
     for (idx, event) in context.events.iter().enumerate() {
         push_event(
             &mut out,
@@ -41,14 +40,13 @@ pub fn render_history_context(
     color: bool,
 ) -> String {
     let mut out = String::new();
-    push_view_header(
+    push_markdown_header(
         &mut out,
         "Transcript",
         &context.session,
         context.target_event.as_ref(),
         metadata,
     );
-    out.push('\n');
     if context.omitted_target {
         push_omitted_target(&mut out, color);
     }
@@ -74,8 +72,7 @@ pub fn render_session(
     let mut out = String::new();
     let target_event =
         target_event_id.and_then(|event_id| events.iter().find(|event| event.id == event_id));
-    push_view_header(&mut out, "Transcript", session, target_event, metadata);
-    out.push('\n');
+    push_markdown_header(&mut out, "Transcript", session, target_event, metadata);
     for event in events {
         push_event(
             &mut out,
@@ -105,80 +102,79 @@ pub fn render_history_items(items: &[HistoryItemRecord], color: bool, verbose: b
     out
 }
 
-fn push_view_header(
+fn push_markdown_header(
     out: &mut String,
     label: &str,
     session: &SessionRecord,
     target_event: Option<&EventRecord>,
     metadata: &ViewMetadata,
 ) {
+    out.push_str("# ");
     out.push_str(label);
-    out.push('\n');
+    out.push_str("\n\n");
     if let Some(ref_id) = &metadata.ref_id {
-        push_field(out, "ref", ref_id);
+        push_meta_line(out, "ref", ref_id);
     }
-    out.push_str("source: ");
-    out.push_str(&session.source_kind);
+    push_meta_line(out, "source", &session.source_kind);
     if metadata.verbose {
         if let Some(source) = &metadata.source {
-            out.push_str(" identity:");
-            out.push_str(&source.identity);
+            let mut detail = format!("identity:{}", source.identity);
             if let Some(path) = &source.path {
-                out.push_str(" path:");
-                out.push_str(path);
+                detail.push_str(" path:");
+                detail.push_str(path);
             }
+            push_meta_line(out, "source_detail", &detail);
         }
     }
-    out.push('\n');
     if let Some(when) = target_event
         .and_then(|event| event.occurred_at)
         .or(session.updated_at)
         .or(session.started_at)
     {
         if metadata.verbose {
-            push_field(out, "when", &when.to_rfc3339());
+            push_meta_line(out, "when", &when.to_rfc3339());
         } else {
-            push_field(out, "when", &format_local_timestamp_seconds(when));
+            push_meta_line(out, "when", &format_local_timestamp_seconds(when));
         }
     }
     if let Some(title) = &session.title {
-        out.push_str("title: ");
-        out.push_str(title);
-        out.push('\n');
+        push_meta_line(out, "title", title);
     }
-    push_field(out, "provider_thread", &session.external_id);
-    push_field(out, "histo_session", &session.id);
+    push_meta_line(out, "provider_thread", &session.external_id);
+    push_meta_line(out, "histo_session", &session.id);
     if let Some(event) = target_event {
-        push_field(out, "event", &format!("#{}", event.ordinal));
+        push_meta_line(out, "event", &format!("#{}", event.ordinal));
     }
     if metadata.verbose {
-        push_field(out, "source_id", &session.source_id);
-        push_field(out, "machine_id", &session.machine_id);
-        push_field(out, "session_hash", &session.hash);
+        push_meta_line(out, "source_id", &session.source_id);
+        push_meta_line(out, "machine_id", &session.machine_id);
+        push_meta_line(out, "session_hash", &session.hash);
         if let Some(event) = target_event {
-            push_field(out, "super_event", &event.id);
-            push_field(out, "event_hash", &event.hash);
-            push_field(out, "event_type", &event.event_type);
+            push_meta_line(out, "super_event", &event.id);
+            push_meta_line(out, "event_hash", &event.hash);
+            push_meta_line(out, "event_type", &event.event_type);
             if let Some(role) = &event.role {
-                push_field(out, "role", role);
+                push_meta_line(out, "role", role);
             }
             if let Some(raw_hash) = &event.raw_artifact_hash {
-                push_field(out, "raw_artifact", raw_hash);
+                push_meta_line(out, "raw_artifact", raw_hash);
             }
         }
         if let Some(raw) = &metadata.raw_artifact {
-            push_field(out, "raw_hash", &raw.hash);
-            push_field(out, "raw_path", &raw.path);
-            push_field(out, "raw_media_type", &raw.media_type);
-            push_field(out, "raw_size", &raw.size.to_string());
-            push_field(out, "raw_first_seen", &raw.first_seen_at.to_rfc3339());
+            push_meta_line(out, "raw_hash", &raw.hash);
+            push_meta_line(out, "raw_path", &raw.path);
+            push_meta_line(out, "raw_media_type", &raw.media_type);
+            push_meta_line(out, "raw_size", &raw.size.to_string());
+            push_meta_line(out, "raw_first_seen", &raw.first_seen_at.to_rfc3339());
         }
     }
+    out.push('\n');
 }
 
-fn push_field(out: &mut String, label: &str, value: &str) {
+fn push_meta_line(out: &mut String, label: &str, value: &str) {
+    out.push_str("- **");
     out.push_str(label);
-    out.push_str(": ");
+    out.push_str(":** ");
     out.push_str(value);
     out.push('\n');
 }
@@ -197,56 +193,55 @@ fn push_event(
     verbose: bool,
     mode: RenderMode,
 ) {
-    let marker = if target { "=> " } else { "   " };
+    let mut heading = String::from("## #");
+    heading.push_str(&event.ordinal.to_string());
+    heading.push(' ');
+    heading.push_str(&event.source_kind);
+    if let Some(role) = &event.role {
+        heading.push(' ');
+        heading.push_str(role);
+    }
+    if let Some(occurred_at) = event.occurred_at {
+        heading.push_str(" · ");
+        heading.push_str(&format_local_timestamp_minutes(occurred_at));
+    }
+    if target {
+        heading.push_str(" · selected");
+    }
     if target && color {
         out.push_str("\x1b[1;36m");
+        out.push_str(&heading);
+        out.push_str("\x1b[0m");
+    } else {
+        out.push_str(&heading);
     }
-    out.push_str(marker);
+    out.push('\n');
     if verbose {
-        out.push_str("event:");
-        out.push_str(&event.id);
-        out.push_str(" histo_session:");
-        out.push_str(&event.session_id);
-        out.push_str(" ordinal:");
-        out.push_str(&event.ordinal.to_string());
-        out.push_str(" source:");
-        out.push_str(&event.source_kind);
-        out.push_str(" type:");
-        out.push_str(&event.event_type);
+        out.push('\n');
+        push_meta_line(out, "event", &event.id);
+        push_meta_line(out, "histo_session", &event.session_id);
+        push_meta_line(out, "ordinal", &event.ordinal.to_string());
+        push_meta_line(out, "source", &event.source_kind);
+        push_meta_line(out, "type", &event.event_type);
         if let Some(role) = &event.role {
-            out.push_str(" role:");
-            out.push_str(role);
+            push_meta_line(out, "role", role);
         }
         if let Some(raw_hash) = &event.raw_artifact_hash {
-            out.push_str(" raw:");
-            out.push_str(raw_hash);
+            push_meta_line(out, "raw", raw_hash);
         }
         if let Some(occurred_at) = event.occurred_at {
-            out.push_str(" when:");
-            out.push_str(&occurred_at.to_rfc3339());
+            push_meta_line(out, "when", &occurred_at.to_rfc3339());
         }
-    } else {
-        out.push('#');
-        out.push_str(&event.ordinal.to_string());
-        out.push(' ');
-        out.push_str(&event.source_kind);
-        if let Some(role) = &event.role {
-            out.push(' ');
-            out.push_str(role);
-        }
-        if let Some(occurred_at) = event.occurred_at {
-            out.push(' ');
-            out.push_str(&format_local_timestamp_minutes(occurred_at));
-        }
-    }
-    if target && color {
-        out.push_str("\x1b[0m");
     }
     out.push('\n');
     if should_compact_preview_event(event, target, mode) {
         out.push_str(
-            "[non-message event omitted from context preview; use transcript for full raw transcript]",
+            "> [non-message event omitted from context preview; use transcript for full raw transcript]",
         );
+    } else if is_json_content(&event.content) {
+        out.push_str("```json\n");
+        out.push_str(&event.content);
+        out.push_str("\n```");
     } else {
         out.push_str(&event.content);
     }
@@ -260,42 +255,28 @@ fn push_history_item(
     color: bool,
     verbose: bool,
 ) {
-    let marker = if target { "=> " } else { "   " };
+    let kind_display = capitalize_kind(&item.kind);
+    let heading = build_item_heading(&kind_display, item.occurred_at, target);
     if target && color {
         out.push_str("\x1b[1;36m");
-    }
-    out.push_str(marker);
-    if verbose {
-        out.push_str("history_item:");
-        out.push_str(&item.id);
-        out.push_str(" event:");
-        out.push_str(&item.event_id);
-        out.push_str(" histo_session:");
-        out.push_str(&item.session_id);
-        out.push_str(" ordinal:");
-        out.push_str(&item.ordinal.to_string());
-        out.push_str(" tier:");
-        out.push_str(&item.tier);
-        out.push_str(" kind:");
-        out.push_str(&item.kind);
-        if let Some(occurred_at) = item.occurred_at {
-            out.push_str(" when:");
-            out.push_str(&occurred_at.to_rfc3339());
-        }
-    } else {
-        out.push('#');
-        out.push_str(&item.ordinal.to_string());
-        out.push(' ');
-        out.push_str(&item.source_kind);
-        out.push(' ');
-        out.push_str(&item.kind);
-        if let Some(occurred_at) = item.occurred_at {
-            out.push(' ');
-            out.push_str(&format_local_timestamp_minutes(occurred_at));
-        }
-    }
-    if target && color {
+        out.push_str(&heading);
         out.push_str("\x1b[0m");
+    } else {
+        out.push_str(&heading);
+    }
+    out.push('\n');
+    if verbose {
+        out.push('\n');
+        push_meta_line(out, "history_item", &item.id);
+        push_meta_line(out, "event", &item.event_id);
+        push_meta_line(out, "histo_session", &item.session_id);
+        push_meta_line(out, "ordinal", &item.ordinal.to_string());
+        push_meta_line(out, "subordinal", &item.subordinal.to_string());
+        push_meta_line(out, "tier", &item.tier);
+        push_meta_line(out, "kind", &item.kind);
+        if let Some(occurred_at) = item.occurred_at {
+            push_meta_line(out, "when", &occurred_at.to_rfc3339());
+        }
     }
     out.push('\n');
     out.push_str(&item.text);
@@ -307,7 +288,7 @@ fn push_omitted_target(out: &mut String, color: bool) {
         out.push_str("\x1b[1;36m");
     }
     out.push_str(
-        "=> [target event omitted from clean transcript; use --full to inspect raw event]",
+        "> [target event omitted from clean transcript; use --full to inspect raw event]",
     );
     if color {
         out.push_str("\x1b[0m");
@@ -320,6 +301,31 @@ fn should_compact_preview_event(event: &EventRecord, target: bool, mode: RenderM
         && !target
         && event.role.is_none()
         && (event.content.trim_start().starts_with('{') || event.content.chars().count() > 1200)
+}
+
+fn is_json_content(content: &str) -> bool {
+    content.trim_start().starts_with('{')
+}
+
+fn capitalize_kind(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn build_item_heading(kind: &str, occurred_at: Option<DateTime<Utc>>, selected: bool) -> String {
+    let mut h = String::from("## ");
+    h.push_str(kind);
+    if let Some(when) = occurred_at {
+        h.push_str(" · ");
+        h.push_str(&format_local_timestamp_minutes(when));
+    }
+    if selected {
+        h.push_str(" · selected");
+    }
+    h
 }
 
 fn format_local_timestamp_seconds(value: DateTime<Utc>) -> String {
@@ -361,10 +367,12 @@ mod tests {
         let rendered = render_context(&context, &ViewMetadata::default(), false);
 
         assert!(rendered.contains("Show"));
-        assert!(rendered.contains("provider_thread: external_session_test"));
-        assert!(rendered.contains("histo_session: session_test"));
-        assert!(rendered.contains("event: #2"));
-        assert!(rendered.contains("=> #2 codex assistant"));
+        assert!(rendered.contains("# Show"));
+        assert!(rendered.contains("**provider_thread:** external_session_test"));
+        assert!(rendered.contains("**histo_session:** session_test"));
+        assert!(rendered.contains("**event:** #2"));
+        assert!(rendered.contains("## #2 codex assistant"));
+        assert!(rendered.contains("· selected"));
         assert!(rendered.contains("middle full content\nwith newline"));
     }
 
@@ -383,7 +391,7 @@ mod tests {
 
         let rendered = render_context(&context, &ViewMetadata::default(), false);
 
-        assert!(rendered.contains("#1 codex"));
+        assert!(rendered.contains("## #1 codex"));
         assert!(rendered.contains("non-message event omitted"));
         assert!(!rendered.contains("\"arguments\""));
         assert!(rendered.contains("target"));
@@ -412,11 +420,11 @@ mod tests {
 
         let rendered = render_history_context(&context, &ViewMetadata::default(), false);
 
-        assert!(rendered.contains("Transcript"));
+        assert!(rendered.contains("# Transcript"));
         assert!(rendered.contains("target event omitted from clean transcript"));
-        assert!(rendered.contains("#1 codex user"));
+        assert!(rendered.contains("## User"));
         assert!(rendered.contains("please fix this"));
-        assert!(rendered.contains("#3 codex assistant"));
+        assert!(rendered.contains("## Assistant"));
         assert!(rendered.contains("I fixed it"));
         assert!(!rendered.contains("{\"payload\":\"hidden\"}"));
     }
@@ -435,9 +443,10 @@ mod tests {
             false,
         );
 
-        assert!(rendered.contains("Transcript"));
-        assert!(rendered.contains("   #1 codex"));
-        assert!(rendered.contains("=> #2 codex"));
+        assert!(rendered.contains("# Transcript"));
+        assert!(rendered.contains("## #1 codex assistant"));
+        assert!(rendered.contains("## #2 codex assistant"));
+        assert!(rendered.contains("· selected"));
     }
 
     #[test]
@@ -460,12 +469,13 @@ mod tests {
             false,
         );
 
-        assert!(rendered.contains("ref: ab3f"));
-        assert!(rendered.contains("provider_thread: external_session_test"));
-        assert!(rendered.contains("histo_session: session_test"));
-        assert!(rendered.contains("super_event: event_two"));
-        assert!(rendered.contains("event_type: message"));
-        assert!(rendered.contains("=> event:event_two histo_session:session_test ordinal:2"));
+        assert!(rendered.contains("**ref:** ab3f"));
+        assert!(rendered.contains("**provider_thread:** external_session_test"));
+        assert!(rendered.contains("**histo_session:** session_test"));
+        assert!(rendered.contains("**super_event:** event_two"));
+        assert!(rendered.contains("**event_type:** message"));
+        assert!(rendered.contains("**event:** event_two"));
+        assert!(rendered.contains("**ordinal:** 2"));
     }
 
     fn fixture_session() -> SessionRecord {
