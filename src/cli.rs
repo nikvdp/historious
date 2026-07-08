@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,7 @@ const STATUS_ALL_WARNING: &str =
     "histo status --all runs full diagnostics; recursive disk usage and deep projection checks may take a while before JSON is returned.";
 static TAIL_CANCELLED: AtomicBool = AtomicBool::new(false);
 static TAIL_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
+static DETECTED_THEME_MODE: OnceLock<ThemeMode> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "histo", version)]
@@ -3859,7 +3860,7 @@ fn path_bytes(path: &Path) -> u64 {
 
 fn print_update_output(output: &UpdateOutput, color: bool) {
     println!();
-    println!("{}", styled("Update complete", "1;32", color));
+    println!("{}", styled_role("Update complete", StyleRole::Header, color));
     print_section(
         "Files",
         &[
@@ -3878,7 +3879,7 @@ fn print_update_output(output: &UpdateOutput, color: bool) {
 
 fn print_import_output(output: &ImportOutput, color: bool) {
     println!();
-    println!("{}", styled("Import complete", "1;32", color));
+    println!("{}", styled_role("Import complete", StyleRole::Header, color));
     print_section(
         "Records",
         &[
@@ -4360,7 +4361,7 @@ fn print_embedding_summary(embeddings: &search::EmbeddingRefresh, color: bool) {
 
 fn print_section(title: &str, rows: &[(&str, String)], color: bool) {
     println!();
-    println!("  {}", styled(title, "1;36", color));
+    println!("  {}", styled_role(title, StyleRole::Section, color));
     let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     for (label, value) in rows {
         println!("    {label:<width$}  {value}");
@@ -4400,7 +4401,7 @@ fn print_table_section(title: &str, columns: &[TableColumn], rows: &[Vec<String>
         return;
     }
     println!();
-    println!("  {}", styled(title, "1;36", color));
+    println!("  {}", styled_role(title, StyleRole::Section, color));
     let widths = table_widths(columns, rows);
     let header = table_line(
         &columns
@@ -4410,7 +4411,7 @@ fn print_table_section(title: &str, columns: &[TableColumn], rows: &[Vec<String>
         columns,
         &widths,
     );
-    println!("    {}", styled(&header, "1", color));
+    println!("    {}", styled_role(&header, StyleRole::Title, color));
     for row in rows {
         println!("    {}", table_line(row, columns, &widths));
     }
@@ -5379,12 +5380,132 @@ fn jsonl_progress_detail(progress: transport::JsonlProgress) -> String {
     )
 }
 
-fn styled(text: &str, code: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    } else {
-        text.to_string()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StyleRole {
+    Header,
+    Section,
+    Project,
+    Time,
+    Count,
+    Title,
+    Muted,
+}
+
+fn styled_role(text: &str, role: StyleRole, color: bool) -> String {
+    if !color {
+        return text.to_string();
     }
+    let code = theme_style_code(detect_theme_mode(), role);
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn theme_style_code(mode: ThemeMode, role: StyleRole) -> &'static str {
+    match (mode, role) {
+        // Solarized accents are intentionally low-chroma and balanced for both
+        // light and dark backgrounds. Keep the same accent relationships across
+        // modes, and only shift the neutral muted text for background contrast.
+        (ThemeMode::Light, StyleRole::Header) => "1;38;2;38;139;210",
+        (ThemeMode::Light, StyleRole::Section) => "1;38;2;42;161;152",
+        (ThemeMode::Light, StyleRole::Project) => "1;38;2;108;113;196",
+        (ThemeMode::Light, StyleRole::Time) => "38;2;38;139;210",
+        (ThemeMode::Light, StyleRole::Count) => "38;2;203;75;22",
+        (ThemeMode::Light, StyleRole::Title) => "1",
+        (ThemeMode::Light, StyleRole::Muted) => "38;2;101;123;131",
+        (ThemeMode::Dark, StyleRole::Header) => "1;38;2;38;139;210",
+        (ThemeMode::Dark, StyleRole::Section) => "1;38;2;42;161;152",
+        (ThemeMode::Dark, StyleRole::Project) => "1;38;2;108;113;196",
+        (ThemeMode::Dark, StyleRole::Time) => "38;2;38;139;210",
+        (ThemeMode::Dark, StyleRole::Count) => "38;2;203;75;22",
+        (ThemeMode::Dark, StyleRole::Title) => "1",
+        (ThemeMode::Dark, StyleRole::Muted) => "38;2;131;148;150",
+    }
+}
+
+fn detect_theme_mode() -> ThemeMode {
+    *DETECTED_THEME_MODE.get_or_init(detect_theme_mode_uncached)
+}
+
+fn detect_theme_mode_uncached() -> ThemeMode {
+    if let Ok(value) = std::env::var("HISTO_THEME") {
+        if let Some(mode) = theme_mode_from_text(&value) {
+            return mode;
+        }
+    }
+    if let Ok(value) = std::env::var("COLORFGBG") {
+        if let Some(mode) = theme_mode_from_colorfgbg(&value) {
+            return mode;
+        }
+    }
+    if let Ok(value) = std::env::var("BAT_THEME") {
+        if let Some(mode) = theme_mode_from_bat_theme(&value) {
+            return mode;
+        }
+    }
+    let mut theme_envs = std::env::vars()
+        .filter(|(key, _)| key.contains("THEME"))
+        .collect::<Vec<_>>();
+    theme_envs.sort_by(|left, right| left.0.cmp(&right.0));
+    for (key, value) in theme_envs {
+        if key == "HISTO_THEME" || key == "BAT_THEME" {
+            continue;
+        }
+        if let Some(mode) = theme_mode_from_text(&value) {
+            return mode;
+        }
+    }
+    ThemeMode::Light
+}
+
+fn theme_mode_from_colorfgbg(value: &str) -> Option<ThemeMode> {
+    let bg = value.split(';').next_back()?.parse::<u8>().ok()?;
+    match bg {
+        0..=6 | 8..=14 => Some(ThemeMode::Dark),
+        7 | 15 => Some(ThemeMode::Light),
+        _ => None,
+    }
+}
+
+fn theme_mode_from_bat_theme(value: &str) -> Option<ThemeMode> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("github") && !lower.contains("dark") {
+        return Some(ThemeMode::Light);
+    }
+    theme_mode_from_text(&lower)
+}
+
+fn theme_mode_from_text(value: &str) -> Option<ThemeMode> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("light")
+        || lower.contains("latte")
+        || lower.contains("onehalflight")
+        || lower.contains("solarized-light")
+        || lower.contains("github-light")
+        || lower == "github"
+    {
+        return Some(ThemeMode::Light);
+    }
+    if lower.contains("dark")
+        || lower.contains("dracula")
+        || lower.contains("monokai")
+        || lower.contains("nord")
+        || lower.contains("mocha")
+        || lower.contains("macchiato")
+        || lower.contains("frappe")
+        || lower.contains("gruvbox-dark")
+        || lower.contains("onedark")
+        || lower.contains("twodark")
+        || lower.contains("night")
+        || lower.contains("black")
+    {
+        return Some(ThemeMode::Dark);
+    }
+    None
 }
 
 fn should_color(no_color: bool, color: Option<ColorArg>, robot: bool) -> bool {
@@ -5643,7 +5764,7 @@ fn format_elapsed(duration: Duration) -> String {
 fn print_status_output(output: &StatusOutput) {
     let color = std::io::stdout().is_terminal();
     println!();
-    println!("{}", styled("Historious status", "1;32", color));
+    println!("{}", styled_role("Historious status", StyleRole::Header, color));
     println!("  {}", status_summary(&output.stats));
     print_status_diagnostics(&output.diagnostics, color);
     print_status_search(&output.config, &output.query_embedder, color);
@@ -5666,7 +5787,7 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
     let spinner = std::io::stderr().is_terminal();
 
     println!();
-    println!("{}", styled("Historious status", "1;32", color));
+    println!("{}", styled_role("Historious status", StyleRole::Header, color));
     if all {
         println!("  {STATUS_ALL_WARNING}");
     } else {
@@ -6091,9 +6212,9 @@ fn print_threads_output(
     };
     println!(
         "{}",
-        styled(
+        styled_role(
             &format!("Threads — {scope_label} · {} shown", format_count(threads.len())),
-            "1;32",
+            StyleRole::Header,
             color,
         )
     );
@@ -6136,14 +6257,14 @@ fn print_threads_grouped_by_project(threads: &[crate::storage::ThreadRow], color
         let today_total: u64 = rows.iter().map(|row| row.today_message_count).sum();
         println!(
             "{}",
-            styled(
+            styled_role(
                 &format!("{label} · {} msgs today", format_count(today_total as usize)),
-                "1;35",
+                StyleRole::Project,
                 color,
             )
         );
         if let Some(path) = path {
-            println!("  {}", styled(path, "2", color));
+            println!("  {}", styled_role(path, StyleRole::Muted, color));
         }
         for thread in rows {
             print_thread_card(thread, false, color);
@@ -6157,23 +6278,26 @@ fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool
     let project = thread_project_label(thread.workspace_path.as_deref());
     println!(
         "{}  {} · {} events · {} · {}",
-        styled(&when, "1;36", color),
-        styled(
+        styled_role(&when, StyleRole::Time, color),
+        styled_role(
             &format!("{} msgs today", format_count(thread.today_message_count as usize)),
-            "1;33",
+            StyleRole::Count,
             color,
         ),
         format_count(thread.event_count as usize),
-        thread.session.source_kind,
-        project,
+        styled_role(&thread.session.source_kind, StyleRole::Muted, color),
+        styled_role(&project, StyleRole::Muted, color),
     );
-    println!("  {}", styled(&title, "1", color));
+    println!("  {}", styled_role(&title, StyleRole::Title, color));
     if show_project_path {
         if let Some(path) = &thread.workspace_path {
-            println!("  {}", styled(path, "2", color));
+            println!("  {}", styled_role(path, StyleRole::Muted, color));
         }
     }
-    println!("  session {}", short_id(&thread.session.id));
+    println!(
+        "  {}",
+        styled_role(&format!("session {}", short_id(&thread.session.id)), StyleRole::Muted, color)
+    );
 }
 
 fn thread_project_label(path: Option<&str>) -> String {
@@ -8635,6 +8759,28 @@ mod tests {
     use crate::archive::{stable_hash, ArchiveRecord, EventRecord, SessionRecord, SourceRecord};
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn theme_text_heuristics_detect_common_theme_names() {
+        assert_eq!(theme_mode_from_text("GitHub"), Some(ThemeMode::Light));
+        assert_eq!(theme_mode_from_text("Catppuccin Latte"), Some(ThemeMode::Light));
+        assert_eq!(theme_mode_from_text("Dracula"), Some(ThemeMode::Dark));
+        assert_eq!(theme_mode_from_text("Catppuccin Mocha"), Some(ThemeMode::Dark));
+        assert_eq!(theme_mode_from_text("something custom"), None);
+    }
+
+    #[test]
+    fn bat_theme_treats_github_as_light() {
+        assert_eq!(theme_mode_from_bat_theme("GitHub"), Some(ThemeMode::Light));
+        assert_eq!(theme_mode_from_bat_theme("GitHub Dark"), Some(ThemeMode::Dark));
+    }
+
+    #[test]
+    fn colorfgbg_uses_background_index() {
+        assert_eq!(theme_mode_from_colorfgbg("15;0"), Some(ThemeMode::Dark));
+        assert_eq!(theme_mode_from_colorfgbg("0;15"), Some(ThemeMode::Light));
+        assert_eq!(theme_mode_from_colorfgbg("broken"), None);
+    }
 
     #[test]
     fn exact_cols_controls_order() {
