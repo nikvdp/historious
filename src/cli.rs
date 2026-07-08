@@ -6296,7 +6296,19 @@ fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool
     }
     println!(
         "  {}",
-        styled_role(&format!("session {}", short_id(&thread.session.id)), StyleRole::Muted, color)
+        styled_role(
+            &format!("provider_thread: {}", thread.session.external_id),
+            StyleRole::Muted,
+            color,
+        )
+    );
+    println!(
+        "  {}",
+        styled_role(
+            &format!("histo_session: {}", thread.session.id),
+            StyleRole::Muted,
+            color,
+        )
     );
 }
 
@@ -6306,16 +6318,6 @@ fn thread_project_label(path: Option<&str>) -> String {
         .map(ToOwned::to_owned)
         .or_else(|| path.map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown project".to_string())
-}
-
-fn short_id(id: &str) -> String {
-    let char_count = id.chars().count();
-    if char_count <= 18 {
-        return id.to_string();
-    }
-    let prefix = id.chars().take(8).collect::<String>();
-    let suffix = id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>();
-    format!("{prefix}…{suffix}")
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
