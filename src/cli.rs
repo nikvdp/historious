@@ -58,6 +58,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print the histo version.
+    Version {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+    },
     /// Scan local agent logs and update the search index.
     Update {
         #[arg(long, help = "Scan at most this many newest files")]
@@ -1155,6 +1160,18 @@ impl Cli {
         let command = self.command;
         if let Command::Completion { shell } = command {
             print_completion(shell);
+            return Ok(());
+        }
+        if let Command::Version { json } = command {
+            if json || robot {
+                crate::output::write_success(
+                    "version",
+                    serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+                    Default::default(),
+                )?;
+            } else {
+                println!("histo {}", env!("CARGO_PKG_VERSION"));
+            }
             return Ok(());
         }
         if let Command::SelfUpdate {
@@ -2342,6 +2359,7 @@ impl Cli {
                 }
             }
             Command::Skill { command } => run_skill_command(command)?,
+            Command::Version { .. } => unreachable!("version returns before storage setup"),
             Command::SelfUpdate { .. } => unreachable!("self-update returns before storage setup"),
             Command::Config { .. } => unreachable!("config returns before storage setup"),
             Command::Completion { .. } => unreachable!("completion returns before storage setup"),
@@ -2353,6 +2371,7 @@ impl Cli {
 impl Command {
     fn name(&self) -> &'static str {
         match self {
+            Command::Version { .. } => "version",
             Command::Update { .. } => "update",
             Command::SelfUpdate { .. } => "self-update",
             Command::Search { .. } => "search",
@@ -2380,7 +2399,8 @@ impl Command {
     fn wants_structured_errors(&self) -> bool {
         matches!(
             self,
-            Command::Update { json: true, .. }
+            Command::Version { json: true }
+                | Command::Update { json: true, .. }
                 | Command::SelfUpdate { json: true, .. }
                 | Command::Search { json: true, .. }
                 | Command::Threads { json: true, .. }
