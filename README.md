@@ -87,6 +87,14 @@ histo show <ref> --before 5 --after 8
 histo transcript <session_id> --at <ref>
 ```
 
+Human `show` and `transcript` output is readable Markdown by default. You
+can redirect it directly to a `.md` file:
+
+```bash
+histo transcript <session_id> > conversation.md
+histo show <ref> --only > answer.md
+```
+
 For scripts and agents, use `--robot` so output is stable JSON:
 
 ```bash
@@ -154,9 +162,21 @@ Inspect results:
 ```bash
 histo show <ref>
 histo show <ref> --before 10 --after 10
+histo show <ref> --only              # print only the selected clean item
 histo transcript <session_id> --at <ref>
+histo transcript <session_id> --last          # print the last clean item
+histo transcript <session_id> --last-answer  # print the last assistant answer
+histo transcript <session_id> --no-timestamps
 histo tail <session_id>
 ```
+
+Human output is Markdown: headings for each message, bullet-point metadata,
+and fenced code blocks for raw JSON. Use `--only`, `--last`, or
+`--last-answer` to print a single item to stdout — these bypass the pager and
+are useful for exporting one reply to a file. `--last-assistant` is an alias
+for `--last-answer`. Use `--no-timestamps` to omit timestamps from Markdown
+headings for compact exports. Use `--full` to see raw event payloads instead
+of clean conversation items.
 
 ## Local TUI
 
