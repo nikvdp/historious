@@ -3,6 +3,7 @@ use crate::storage::{
     HistoryItemRecord, HistoryTranscriptContext, RawArtifactSummary, TranscriptContext,
 };
 use chrono::{DateTime, Local, Utc};
+use std::io::IsTerminal;
 
 #[derive(Debug, Clone)]
 pub struct ViewMetadata {
@@ -121,6 +122,21 @@ pub fn render_history_items(
         push_history_item(&mut out, item, false, color, verbose, timestamps);
     }
     out
+}
+
+/// Render a Markdown string to ANSI-styled terminal output using mdvi's renderer.
+/// Returns the raw Markdown string unchanged if rendering fails.
+pub fn render_markdown_to_terminal(markdown: &str) -> String {
+    match mdvi::renderer::render_markdown(markdown) {
+        Ok(doc) => doc.to_ansi_string(),
+        Err(_) => markdown.to_string(),
+    }
+}
+
+/// Decide whether to use rich terminal rendering: only when stdout is a TTY
+/// and color is enabled.
+pub fn should_render_rich(color: bool) -> bool {
+    color && std::io::stdout().is_terminal()
 }
 
 /// Render a single clean history item as Markdown, without a transcript-level header.
@@ -626,6 +642,29 @@ mod tests {
         assert!(rendered.contains("question"));
         assert!(rendered.contains("## Assistant"));
         assert!(rendered.contains("answer"));
+    }
+
+    #[test]
+    fn render_markdown_to_terminal_produces_ansi_for_headings() {
+        let markdown = "# Hello\n\nSome text\n";
+        let ansi = render_markdown_to_terminal(markdown);
+        assert!(ansi.contains("\x1b["));
+        assert!(ansi.contains("Hello"));
+        assert!(ansi.contains("Some text"));
+    }
+
+    #[test]
+    fn render_markdown_to_terminal_produces_ansi_for_code_blocks() {
+        let markdown = "```json\n{\"key\": \"value\"}\n```\n";
+        let ansi = render_markdown_to_terminal(markdown);
+        assert!(ansi.contains("key"));
+        assert!(ansi.contains("\x1b["));
+    }
+
+    #[test]
+    fn should_render_rich_only_when_color_and_tty() {
+        assert!(!should_render_rich(false));
+        assert!(!should_render_rich(true));
     }
 
     fn fixture_session() -> SessionRecord {

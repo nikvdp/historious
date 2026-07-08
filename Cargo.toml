@@ -31,6 +31,7 @@ directories = "5.0"
 fastembed = { version = "5.15.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 hex = "0.4"
 libc = "0.2"
+mdvi = { path = "../../tmp/mdvi", default-features = false }
 notify = "6.1"
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "functions"] }
 serde = { version = "1.0", features = ["derive"] }

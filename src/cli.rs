@@ -1590,13 +1590,13 @@ impl Cli {
                                         )?;
                                         metadata.timestamps = !no_timestamps;
                                         let color = should_color(no_color, color, robot);
-                                        write_stdout(&crate::transcript::render_session(
+                                        print_markdown(&crate::transcript::render_session(
                                             &session_record,
                                             &events,
                                             None,
                                             &metadata,
                                             color,
-                                        ))?;
+                                        ), color)?;
                                     } else {
                                         let mut metadata = view_metadata_for_session(
                                             &store,
@@ -1676,12 +1676,12 @@ impl Cli {
                         );
                     }
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&crate::transcript::render_history_items(
+                    print_markdown(&crate::transcript::render_history_items(
                         &items,
                         color,
                         verbose,
                         !no_timestamps,
-                    ))?;
+                    ), color)?;
                 } else if full {
                     let context = store
                         .events_around_event(&event_id, before, after)?
@@ -1690,9 +1690,9 @@ impl Cli {
                         view_metadata_for_event(&store, &context.target_event, verbose)?;
                     metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&crate::transcript::render_context(
+                    print_markdown(&crate::transcript::render_context(
                         &context, &metadata, color,
-                    ))?;
+                    ), color)?;
                 } else {
                     let context = store
                         .history_items_around_event(&event_id, before, after)?
@@ -1704,9 +1704,9 @@ impl Cli {
                     };
                     metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&crate::transcript::render_history_context(
+                    print_markdown(&crate::transcript::render_history_context(
                         &context, &metadata, color,
-                    ))?;
+                    ), color)?;
                 }
             }
             Command::Transcript {
@@ -1795,12 +1795,12 @@ impl Cli {
                         );
                     }
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&crate::transcript::render_history_items(
+                    print_markdown(&crate::transcript::render_history_items(
                         &items,
                         color,
                         verbose,
                         !no_timestamps,
-                    ))?;
+                    ), color)?;
                 } else if last || last_answer {
                     let context = store
                         .history_items_for_transcript_session(&session)?
@@ -1823,12 +1823,12 @@ impl Cli {
                             })?
                     };
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&crate::transcript::render_single_history_item(
+                    print_markdown(&crate::transcript::render_single_history_item(
                         selected,
                         color,
                         verbose,
                         !no_timestamps,
-                    ))?;
+                    ), color)?;
                 } else if full {
                     let events = store.events_for_session(&session)?;
                     let events = if let Some(grep) = &grep {
@@ -1851,7 +1851,7 @@ impl Cli {
                         &metadata,
                         color,
                     );
-                    page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
+                    page_or_print_markdown(&rendered, target_event_id.as_deref(), no_pager || robot, color)?;
                 } else {
                     let mut metadata = view_metadata_for_session(
                         &store,
@@ -1875,7 +1875,7 @@ impl Cli {
                     }
                     let rendered =
                         crate::transcript::render_history_session(&context, &metadata, color);
-                    page_or_print(&rendered, target_event_id.as_deref(), no_pager || robot)?;
+                    page_or_print_markdown(&rendered, target_event_id.as_deref(), no_pager || robot, color)?;
                 }
             }
             Command::Tail {
@@ -7013,11 +7013,11 @@ async fn run_transcript_tail(
         .history_items_for_transcript_session(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
     let initial_context = tail_initial_context(context.clone(), initial_lines);
-    write_stdout(&crate::transcript::render_history_session(
+    print_markdown(&crate::transcript::render_history_session(
         &initial_context,
         &metadata,
         color,
-    ))?;
+    ), color)?;
     flush_stdout()?;
     let mut last_cursor = context.items.last().map(history_item_cursor);
 
@@ -7094,9 +7094,9 @@ fn append_tail_updates(
         return Ok(true);
     }
     *last_cursor = new_items.last().map(history_item_cursor);
-    write_stdout(&crate::transcript::render_history_items(
+    print_markdown(&crate::transcript::render_history_items(
         &new_items, color, verbose, true,
-    ))?;
+    ), color)?;
     flush_stdout()?;
     Ok(!tail_cancelled())
 }
@@ -7238,27 +7238,6 @@ fn history_item_is_after(
     cursor: &(i64, i64, String),
 ) -> bool {
     (item.ordinal, item.subordinal, item.id.as_str()) > (cursor.0, cursor.1, cursor.2.as_str())
-}
-
-fn page_or_print(output: &str, target_event_id: Option<&str>, no_pager: bool) -> Result<()> {
-    if no_pager || !std::io::stdout().is_terminal() {
-        return write_stdout(output);
-    }
-    let Some(mut pager) = pager_command(target_event_id) else {
-        return write_stdout(output);
-    };
-    match pager.stdin(Stdio::piped()).spawn() {
-        Ok(mut child) => {
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(output.as_bytes())?;
-            }
-            let _ = child.wait();
-        }
-        Err(_) => {
-            write_stdout(output)?;
-        }
-    }
-    Ok(())
 }
 
 fn recent_ref_inputs(results: &[search::SearchResult]) -> Vec<RecentResultRefInput> {
@@ -7668,13 +7647,13 @@ fn open_fzf_selection_in_pager(store: &Store, row: &FzfSelectedRow, color: bool)
             &metadata,
             color,
         );
-        page_or_print(&rendered, Some(&row.event_id), false)?;
+        page_or_print_markdown(&rendered, Some(&row.event_id), false, color)?;
     } else {
         let context = store
             .history_items_around_event(&row.event_id, usize::MAX / 4, usize::MAX / 4)?
             .ok_or_else(|| anyhow::anyhow!("event not found: {}", row.event_id))?;
         let rendered = crate::transcript::render_history_session(&context, &metadata, color);
-        page_or_print(&rendered, Some(&row.event_id), false)?;
+        page_or_print_markdown(&rendered, Some(&row.event_id), false, color)?;
     }
     Ok(())
 }
@@ -7685,7 +7664,7 @@ fn open_remote_fzf_selection_in_pager(
     color: bool,
 ) -> Result<()> {
     let rendered = fetch_remote_fzf_selection(server, row, color)?;
-    page_or_print(&rendered, Some(&row.event_id), false)
+    page_or_print_markdown(&rendered, Some(&row.event_id), false, color)
 }
 
 fn fetch_remote_fzf_selection(server: &str, row: &FzfSelectedRow, color: bool) -> Result<String> {
@@ -8100,6 +8079,44 @@ fn write_stdout(output: &str) -> Result<()> {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Print Markdown to stdout, using mdvi's rich terminal renderer when stdout is a TTY
+/// and color is enabled. Falls back to raw Markdown when piped or color is off.
+fn print_markdown(markdown: &str, color: bool) -> Result<()> {
+    if crate::transcript::should_render_rich(color) {
+        print_markdown(&crate::transcript::render_markdown_to_terminal(markdown), color)
+    } else {
+        write_stdout(markdown)
+    }
+}
+
+/// Like `page_or_print` but routes direct-to-stdout output through rich Markdown rendering
+/// when the terminal supports it. Pager output remains raw Markdown.
+fn page_or_print_markdown(
+    output: &str,
+    target_event_id: Option<&str>,
+    no_pager: bool,
+    color: bool,
+) -> Result<()> {
+    if no_pager || !std::io::stdout().is_terminal() {
+        return print_markdown(output, color);
+    }
+    let Some(mut pager) = pager_command(target_event_id) else {
+        return print_markdown(output, color);
+    };
+    match pager.stdin(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(output.as_bytes())?;
+            }
+            let _ = child.wait();
+        }
+        Err(_) => {
+            print_markdown(output, color)?;
+        }
+    }
+    Ok(())
 }
 
 fn flush_stdout() -> Result<()> {
