@@ -2417,6 +2417,35 @@ impl Store {
         })
     }
 
+    /// Look up pi_agent sessions whose external_id (timestamp-prefixed filename stem)
+    /// ends with `_<native_id>`. This lets users pass the bare UUID that pi itself
+    /// displays instead of the full filename stem.
+    pub fn sessions_by_pi_native_id(
+        &self,
+        native_id: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        let escaped = native_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%\\_{}", escaped);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
+                        started_at, updated_at, metadata_json, hash
+                 FROM sessions
+                 WHERE source_kind = 'pi_agent' AND external_id LIKE ?1 ESCAPE '\\'
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![pattern], row_session)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn source_by_id(&self, source_id: &str) -> Result<Option<SourceRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -8781,6 +8810,56 @@ mod tests {
             .events_around_event("missing_event", 2, 2)
             .expect("context lookup")
             .is_none());
+    }
+
+    #[test]
+    fn pi_native_id_resolves_timestamp_prefixed_external_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_pi");
+        let native_id = "019f4093-8804-7941-ade1-bf7e11481929";
+        let external_id = format!("2026-07-08T07-13-58-276Z_{}", native_id);
+        let session = SessionRecord {
+            id: "session_pi".to_string(),
+            source_id: source.id.clone(),
+            machine_id: "machine_a".to_string(),
+            source_kind: "pi_agent".to_string(),
+            external_id: external_id.clone(),
+            title: Some("pi session".to_string()),
+            status: "open".to_string(),
+            started_at: None,
+            updated_at: None,
+            metadata: json!({}),
+            hash: stable_hash(&("session_pi", source.id.as_str(), "pi"))
+                .expect("session hash"),
+        };
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session.clone()),
+            ])
+            .expect("import pi session");
+
+        // Exact external_id still works
+        let exact = store
+            .sessions_by_external_id(&external_id)
+            .expect("exact external_id lookup");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].id, "session_pi");
+
+        // Native ID resolves via suffix match
+        let by_native = store
+            .sessions_by_pi_native_id(native_id)
+            .expect("pi native id lookup");
+        assert_eq!(by_native.len(), 1);
+        assert_eq!(by_native[0].id, "session_pi");
+        assert_eq!(by_native[0].external_id, external_id);
+
+        // Non-matching ID returns empty
+        let misses = store
+            .sessions_by_pi_native_id("deadbeef-dead-dead-dead-deadbeefdead")
+            .expect("non-matching lookup");
+        assert!(misses.is_empty());
     }
 
     #[test]

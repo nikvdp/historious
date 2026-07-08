@@ -6745,6 +6745,19 @@ fn resolve_session_target(
         return Ok(Some(session));
     }
     let sessions = store.sessions_by_external_id(target)?;
+    if sessions.is_empty() {
+        // Fallback: try pi native session ID (bare UUID without timestamp prefix).
+        let pi_sessions = store.sessions_by_pi_native_id(target)?;
+        return match pi_sessions.len() {
+            0 => Ok(None),
+            1 => Ok(pi_sessions.into_iter().next()),
+            _ => bail!(
+                "ambiguous native session id {target}; matched {} sessions: {}",
+                pi_sessions.len(),
+                format_ambiguous_sessions(&pi_sessions)
+            ),
+        };
+    }
     match sessions.len() {
         0 => Ok(None),
         1 => Ok(sessions.into_iter().next()),
