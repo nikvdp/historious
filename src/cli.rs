@@ -1608,13 +1608,14 @@ impl Cli {
                                         )?;
                                         metadata.timestamps = !no_timestamps;
                                         let color = should_color(no_color, color, robot);
-                                        print_markdown(&crate::transcript::render_session(
+                                        let rendered = crate::transcript::render_session(
                                             &session_record,
                                             &events,
                                             None,
                                             &metadata,
                                             color,
-                                        ), color)?;
+                                        );
+                                        page_or_print_markdown(&rendered, None, false, color)?;
                                     } else {
                                         let mut metadata = view_metadata_for_session(
                                             &store,
@@ -1634,13 +1635,12 @@ impl Cli {
                                                     session.id
                                                 )
                                             })?;
-                                        write_stdout(
-                                            &crate::transcript::render_history_session(
-                                                &context,
-                                                &metadata,
-                                                color,
-                                            ),
-                                        )?;
+                                        let rendered = crate::transcript::render_history_session(
+                                            &context,
+                                            &metadata,
+                                            color,
+                                        );
+                                        page_or_print_markdown(&rendered, None, false, color)?;
                                     }
                                     return Ok(());
                                 }
@@ -8341,8 +8341,15 @@ fn page_or_print_markdown(
         if no_pager {
             write_stdout(&doc.to_ansi_string())?;
         } else {
-            mdvi::app::run_with_doc(doc, 1, mdvi::app::ViewerOptions::default())
-                .map_err(|e| anyhow::anyhow!("mdvi pager error: {e}"))?;
+            mdvi::app::run_with_doc(
+                doc,
+                1,
+                mdvi::app::ViewerOptions {
+                    show_border: false,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("mdvi pager error: {e}"))?;
         }
         return Ok(());
     }
