@@ -1518,8 +1518,10 @@ impl Store {
         self.with_conn(history_items_projection_health)
     }
 
-    #[cfg(test)]
-    pub fn history_items_for_event(&self, event_id: &str) -> Result<Vec<HistoryItemRecord>> {
+    pub fn history_items_for_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Vec<HistoryItemRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, event_id, session_id, source_id, machine_id, source_kind,

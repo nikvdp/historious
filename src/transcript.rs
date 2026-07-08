@@ -123,6 +123,19 @@ pub fn render_history_items(
     out
 }
 
+/// Render a single clean history item as Markdown, without a transcript-level header.
+/// Used by slice selectors (--only, --last, --last-answer) that print one item to stdout.
+pub fn render_single_history_item(
+    item: &HistoryItemRecord,
+    color: bool,
+    verbose: bool,
+    timestamps: bool,
+) -> String {
+    let mut out = String::new();
+    push_history_item(&mut out, item, false, color, verbose, timestamps);
+    out
+}
+
 fn push_markdown_header(
     out: &mut String,
     label: &str,
@@ -578,6 +591,41 @@ mod tests {
         assert!(!rendered.contains("**when:**"));
         // Verify no timestamp date pattern in the heading (only · selected should appear)
         assert!(!rendered.contains("## #2 codex assistant · 20"));
+    }
+
+    #[test]
+    fn render_single_history_item_produces_markdown_without_header() {
+        let item = fixture_history_item(
+            "item_assistant",
+            "event_assistant",
+            3,
+            "assistant",
+            "Here is the answer",
+        );
+        let rendered = render_single_history_item(&item, false, false, true);
+        assert!(rendered.contains("## Assistant"));
+        assert!(rendered.contains("Here is the answer"));
+        assert!(!rendered.contains("# Transcript"));
+        assert!(!rendered.contains("# Show"));
+    }
+
+    #[test]
+    fn render_history_items_renders_multiple_items() {
+        let items = vec![
+            fixture_history_item("item_user", "event_user", 1, "user", "question"),
+            fixture_history_item(
+                "item_assistant",
+                "event_assistant",
+                2,
+                "assistant",
+                "answer",
+            ),
+        ];
+        let rendered = render_history_items(&items, false, false, true);
+        assert!(rendered.contains("## User"));
+        assert!(rendered.contains("question"));
+        assert!(rendered.contains("## Assistant"));
+        assert!(rendered.contains("answer"));
     }
 
     fn fixture_session() -> SessionRecord {
