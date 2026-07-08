@@ -2555,12 +2555,9 @@ impl Store {
                 format!("(? IS NULL OR {last_activity} >= ?)"),
                 format!("(? IS NULL OR {last_activity} < ?)"),
             ];
-            let (today_after, today_before) = local_today_bounds_utc()?;
             let after = opt_dt(options.after);
             let before = opt_dt(options.before);
             let mut values = vec![
-                opt_sql_text(Some(today_after.to_rfc3339())),
-                opt_sql_text(Some(today_before.to_rfc3339())),
                 opt_sql_text(after.clone()),
                 opt_sql_text(after),
                 opt_sql_text(before.clone()),
@@ -2581,13 +2578,6 @@ impl Store {
                         s.metadata_json,
                         s.hash,
                         COALESCE(a.event_count, 0),
-                        (SELECT COUNT(*)
-                         FROM history_items hi INDEXED BY idx_history_items_session_order
-                         WHERE hi.session_id = s.id
-                           AND hi.tier = 'conversation'
-                           AND hi.kind IN ('user', 'assistant')
-                           AND hi.occurred_at >= ?
-                           AND hi.occurred_at < ?) AS today_message_count,
                         a.first_event_at,
                         a.last_event_at,
                         {last_activity} AS last_activity_at
@@ -2615,15 +2605,14 @@ impl Store {
                     metadata: metadata.clone(),
                     hash: row.get(10)?,
                 };
-                let today_message_count = row.get::<_, i64>(12)?.max(0) as u64;
-                let first_event_at = parse_opt_dt(row.get(13)?);
-                let last_event_at = parse_opt_dt(row.get(14)?);
-                let last_activity_at = parse_opt_dt(row.get(15)?);
+                let first_event_at = parse_opt_dt(row.get(12)?);
+                let last_event_at = parse_opt_dt(row.get(13)?);
+                let last_activity_at = parse_opt_dt(row.get(14)?);
                 let workspace_values = session_workspace_values(&metadata);
                 Ok(ThreadRow {
                     session,
                     event_count: row.get::<_, i64>(11)?.max(0) as u64,
-                    today_message_count,
+                    today_message_count: 0,
                     first_event_at,
                     last_event_at,
                     last_activity_at,
@@ -2636,6 +2625,7 @@ impl Store {
             for row in rows {
                 out.push(row?);
             }
+            populate_thread_today_message_counts(conn, &mut out)?;
             Ok(out)
         })
     }
@@ -7295,6 +7285,51 @@ fn row_embedding(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingRecord> {
         metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
         hash: row.get(10)?,
     })
+}
+
+fn populate_thread_today_message_counts(
+    conn: &Connection,
+    threads: &mut [ThreadRow],
+) -> Result<()> {
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let (today_after, today_before) = local_today_bounds_utc()?;
+    let mut counts = HashMap::new();
+    for chunk in threads.chunks(SQLITE_BIND_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT hi.session_id, COUNT(*)
+             FROM history_items hi INDEXED BY idx_history_items_session_order
+             WHERE hi.session_id IN ({placeholders})
+               AND hi.tier = 'conversation'
+               AND hi.kind IN ('user', 'assistant')
+               AND hi.occurred_at >= ?
+               AND hi.occurred_at < ?
+             GROUP BY hi.session_id"
+        );
+        let mut values = chunk
+            .iter()
+            .map(|thread| SqlValue::Text(thread.session.id.clone()))
+            .collect::<Vec<_>>();
+        values.push(opt_sql_text(Some(today_after.to_rfc3339())));
+        values.push(opt_sql_text(Some(today_before.to_rfc3339())));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+        })?;
+        for row in rows {
+            let (session_id, count) = row?;
+            counts.insert(session_id, count);
+        }
+    }
+    for thread in threads {
+        thread.today_message_count = counts.get(&thread.session.id).copied().unwrap_or(0);
+    }
+    Ok(())
 }
 
 fn opt_dt(value: Option<DateTime<Utc>>) -> Option<String> {
