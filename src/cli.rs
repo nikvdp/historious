@@ -5407,23 +5407,23 @@ fn styled_role(text: &str, role: StyleRole, color: bool) -> String {
 
 fn theme_style_code(mode: ThemeMode, role: StyleRole) -> &'static str {
     match (mode, role) {
-        // Solarized accents are intentionally low-chroma and balanced for both
-        // light and dark backgrounds. Keep the same accent relationships across
-        // modes, and only shift the neutral muted text for background contrast.
-        (ThemeMode::Light, StyleRole::Header) => "1;38;2;38;139;210",
-        (ThemeMode::Light, StyleRole::Section) => "1;38;2;42;161;152",
-        (ThemeMode::Light, StyleRole::Project) => "1;38;2;108;113;196",
-        (ThemeMode::Light, StyleRole::Time) => "38;2;38;139;210",
-        (ThemeMode::Light, StyleRole::Count) => "38;2;203;75;22",
+        // GitHub Primer-inspired colors: familiar, restrained, and tuned for
+        // information density. Light mode uses darker ink-like accents; dark
+        // mode uses softer luminous accents so forced modes are visibly distinct.
+        (ThemeMode::Light, StyleRole::Header) => "1;38;2;9;105;218",
+        (ThemeMode::Light, StyleRole::Section) => "1;38;2;26;127;55",
+        (ThemeMode::Light, StyleRole::Project) => "1;38;2;130;80;223",
+        (ThemeMode::Light, StyleRole::Time) => "38;2;9;105;218",
+        (ThemeMode::Light, StyleRole::Count) => "38;2;154;103;0",
         (ThemeMode::Light, StyleRole::Title) => "1",
-        (ThemeMode::Light, StyleRole::Muted) => "38;2;101;123;131",
-        (ThemeMode::Dark, StyleRole::Header) => "1;38;2;38;139;210",
-        (ThemeMode::Dark, StyleRole::Section) => "1;38;2;42;161;152",
-        (ThemeMode::Dark, StyleRole::Project) => "1;38;2;108;113;196",
-        (ThemeMode::Dark, StyleRole::Time) => "38;2;38;139;210",
-        (ThemeMode::Dark, StyleRole::Count) => "38;2;203;75;22",
+        (ThemeMode::Light, StyleRole::Muted) => "38;2;87;96;106",
+        (ThemeMode::Dark, StyleRole::Header) => "1;38;2;88;166;255",
+        (ThemeMode::Dark, StyleRole::Section) => "1;38;2;63;185;80",
+        (ThemeMode::Dark, StyleRole::Project) => "1;38;2;188;140;255",
+        (ThemeMode::Dark, StyleRole::Time) => "38;2;88;166;255",
+        (ThemeMode::Dark, StyleRole::Count) => "38;2;210;153;34",
         (ThemeMode::Dark, StyleRole::Title) => "1",
-        (ThemeMode::Dark, StyleRole::Muted) => "38;2;131;148;150",
+        (ThemeMode::Dark, StyleRole::Muted) => "38;2;139;148;158",
     }
 }
 
