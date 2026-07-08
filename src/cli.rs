@@ -8085,25 +8085,40 @@ fn write_stdout(output: &str) -> Result<()> {
 /// and color is enabled. Falls back to raw Markdown when piped or color is off.
 fn print_markdown(markdown: &str, color: bool) -> Result<()> {
     if crate::transcript::should_render_rich(color) {
-        print_markdown(&crate::transcript::render_markdown_to_terminal(markdown), color)
+        write_stdout(&crate::transcript::render_markdown_to_terminal(markdown))
     } else {
         write_stdout(markdown)
     }
 }
 
-/// Like `page_or_print` but routes direct-to-stdout output through rich Markdown rendering
-/// when the terminal supports it. Pager output remains raw Markdown.
+/// Like `page_or_print` but uses mdvi as an inline pager when stdout is a TTY
+/// and color is enabled. Short output is printed as styled ANSI text directly.
+/// Long output (exceeding terminal height) launches mdvi's full-screen TUI.
+/// When color is off or stdout is piped, falls back to the traditional pager.
 fn page_or_print_markdown(
     output: &str,
     target_event_id: Option<&str>,
     no_pager: bool,
     color: bool,
 ) -> Result<()> {
+    if crate::transcript::should_render_rich(color) {
+        let doc = mdvi::renderer::render_markdown(output)
+            .map_err(|e| anyhow::anyhow!("mdvi render error: {e}"))?;
+        let rows = terminal_rows().unwrap_or(24);
+        if !no_pager && doc.lines.len() > rows {
+            mdvi::app::run_with_doc(doc, 1, mdvi::app::ViewerOptions::default())
+                .map_err(|e| anyhow::anyhow!("mdvi pager error: {e}"))?;
+        } else {
+            write_stdout(&doc.to_ansi_string())?;
+        }
+        return Ok(());
+    }
+    // Fallback: traditional pager for non-TTY or no-color
     if no_pager || !std::io::stdout().is_terminal() {
-        return print_markdown(output, color);
+        return write_stdout(output);
     }
     let Some(mut pager) = pager_command(target_event_id) else {
-        return print_markdown(output, color);
+        return write_stdout(output);
     };
     match pager.stdin(Stdio::piped()).spawn() {
         Ok(mut child) => {
@@ -8113,10 +8128,33 @@ fn page_or_print_markdown(
             let _ = child.wait();
         }
         Err(_) => {
-            print_markdown(output, color)?;
+            write_stdout(output)?;
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn terminal_rows() -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result =
+        unsafe { libc::ioctl(std::io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_row > 0 {
+        Some(size.ws_row as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_rows() -> Option<usize> {
+    None
 }
 
 fn flush_stdout() -> Result<()> {
