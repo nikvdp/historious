@@ -791,8 +791,9 @@ mod tests {
         let body = response_text(response).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Transcript"));
-        assert!(body.contains("=> #2 codex assistant"));
+        assert!(body.contains("# Transcript"));
+        assert!(body.contains("## Assistant"));
+        assert!(body.contains("· selected"));
         assert!(body.contains("remote target text"));
         assert!(body.contains("remote before text"));
         assert!(body.contains("remote after text"));
@@ -819,11 +820,12 @@ mod tests {
         let body = response_text(response).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Transcript"));
-        assert!(body.contains("=> #2 codex assistant"));
+        assert!(body.contains("# Transcript"));
+        assert!(body.contains("## #2 codex assistant"));
+        assert!(body.contains("· selected"));
         assert!(body.contains("remote target text"));
-        assert!(body.contains("#1 codex user"));
-        assert!(body.contains("#3 codex assistant"));
+        assert!(body.contains("## #1 codex user"));
+        assert!(body.contains("## #3 codex assistant"));
     }
 
     #[tokio::test]
