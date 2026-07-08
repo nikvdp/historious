@@ -6297,7 +6297,7 @@ fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool
     println!(
         "  {}",
         styled_role(
-            &format!("provider_thread: {}", thread.session.external_id),
+            &format!("provider id  {}", display_provider_id(thread)),
             StyleRole::Muted,
             color,
         )
@@ -6305,11 +6305,32 @@ fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool
     println!(
         "  {}",
         styled_role(
-            &format!("histo_session: {}", thread.session.id),
+            &format!("session      {}", thread.session.id),
             StyleRole::Muted,
             color,
         )
     );
+}
+
+fn display_provider_id(thread: &crate::storage::ThreadRow) -> String {
+    provider_id_from_raw(&thread.session.external_id).to_string()
+}
+
+fn provider_id_from_raw(raw: &str) -> &str {
+    raw.rsplit_once('_')
+        .map(|(_, suffix)| suffix)
+        .filter(|suffix| is_uuid_like(suffix))
+        .unwrap_or(raw)
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(idx, ch)| match idx {
+        8 | 13 | 18 | 23 => ch == '-',
+        _ => ch.is_ascii_hexdigit(),
+    })
 }
 
 fn thread_project_label(path: Option<&str>) -> String {
@@ -8789,6 +8810,19 @@ mod tests {
         assert_eq!(theme_mode_from_colorfgbg("15;0"), Some(ThemeMode::Dark));
         assert_eq!(theme_mode_from_colorfgbg("0;15"), Some(ThemeMode::Light));
         assert_eq!(theme_mode_from_colorfgbg("broken"), None);
+    }
+
+    #[test]
+    fn provider_id_display_strips_pi_timestamp_prefix() {
+        assert_eq!(
+            provider_id_from_raw("2026-07-08T11-31-14-591Z_019f417f-121f-7f72-994e-2fc5781c4b3b"),
+            "019f417f-121f-7f72-994e-2fc5781c4b3b"
+        );
+        assert_eq!(
+            provider_id_from_raw("019f417f-121f-7f72-994e-2fc5781c4b3b"),
+            "019f417f-121f-7f72-994e-2fc5781c4b3b"
+        );
+        assert_eq!(provider_id_from_raw("not_uuid_suffix"), "not_uuid_suffix");
     }
 
     #[test]
