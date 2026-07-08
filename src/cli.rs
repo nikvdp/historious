@@ -6065,13 +6065,18 @@ fn print_threads_output(
     color: bool,
 ) {
     println!();
-    println!("{}", styled("Threads", "1;32", color));
-    match scope.mode {
-        ThreadScopeMode::All => println!("scope: all projects"),
-        ThreadScopeMode::Path => {
-            println!("scope: {}", scope.path.as_deref().unwrap_or("unknown"));
-        }
-    }
+    let scope_label = match scope.mode {
+        ThreadScopeMode::All => "all projects".to_string(),
+        ThreadScopeMode::Path => thread_project_label(scope.path.as_deref()),
+    };
+    println!(
+        "{}",
+        styled(
+            &format!("Threads — {scope_label} · {} shown", format_count(threads.len())),
+            "1;32",
+            color,
+        )
+    );
     print_thread_filter_summary(filters);
     if threads.is_empty() {
         println!();
@@ -6079,28 +6084,103 @@ fn print_threads_output(
         return;
     }
     println!();
-    for thread in threads {
-        let when = format_thread_time(thread.last_activity_at);
-        let title = display_thread_title(thread);
-        println!(
-            "{}  {}",
-            styled(&when, "1;36", color),
-            styled(&title, "1", color)
-        );
-        println!(
-            "  updated: {}  last event: {}  source: {}  events: {}  today msgs: {}",
-            format_thread_time(thread.session.updated_at),
-            format_thread_time(thread.last_event_at),
-            thread.session.source_kind,
-            format_count(thread.event_count as usize),
-            format_count(thread.today_message_count as usize)
-        );
-        println!("  provider_thread: {}", thread.session.external_id);
-        println!("  histo_session: {}", thread.session.id);
-        if let Some(workspace) = &thread.workspace_path {
-            println!("  project: {workspace}");
+    match scope.mode {
+        ThreadScopeMode::All => print_threads_grouped_by_project(threads, color),
+        ThreadScopeMode::Path => {
+            for thread in threads {
+                print_thread_card(thread, true, color);
+            }
         }
     }
+}
+
+fn print_threads_grouped_by_project(threads: &[crate::storage::ThreadRow], color: bool) {
+    let mut groups: Vec<(String, Option<String>, Vec<&crate::storage::ThreadRow>)> = Vec::new();
+    for thread in threads {
+        let path = thread.workspace_path.clone();
+        let label = thread_project_label(path.as_deref());
+        if let Some((_, _, rows)) = groups
+            .iter_mut()
+            .find(|(existing_label, existing_path, _)| *existing_label == label && *existing_path == path)
+        {
+            rows.push(thread);
+        } else {
+            groups.push((label, path, vec![thread]));
+        }
+    }
+
+    for (idx, (label, path, rows)) in groups.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        let today_total: u64 = rows.iter().map(|row| row.today_message_count).sum();
+        println!(
+            "{}",
+            styled(
+                &format!("{label} · {} msgs today", format_count(today_total as usize)),
+                "1;35",
+                color,
+            )
+        );
+        if let Some(path) = path {
+            println!("  {}", styled(path, "2", color));
+        }
+        for thread in rows {
+            print_thread_card(thread, false, color);
+        }
+    }
+}
+
+fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool, color: bool) {
+    let when = format_thread_time_short(thread.last_activity_at);
+    let title = truncate_chars(&display_thread_title(thread), 96);
+    let project = thread_project_label(thread.workspace_path.as_deref());
+    println!(
+        "{}  {} · {} events · {} · {}",
+        styled(&when, "1;36", color),
+        styled(
+            &format!("{} msgs today", format_count(thread.today_message_count as usize)),
+            "1;33",
+            color,
+        ),
+        format_count(thread.event_count as usize),
+        thread.session.source_kind,
+        project,
+    );
+    println!("  {}", styled(&title, "1", color));
+    if show_project_path {
+        if let Some(path) = &thread.workspace_path {
+            println!("  {}", styled(path, "2", color));
+        }
+    }
+    println!("  session {}", short_id(&thread.session.id));
+}
+
+fn thread_project_label(path: Option<&str>) -> String {
+    path.and_then(|path| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| path.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown project".to_string())
+}
+
+fn short_id(id: &str) -> String {
+    let char_count = id.chars().count();
+    if char_count <= 18 {
+        return id.to_string();
+    }
+    let prefix = id.chars().take(8).collect::<String>();
+    let suffix = id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    out.push('…');
+    out
 }
 
 fn print_thread_filter_summary(filters: &ResolvedSessionFilter) {
@@ -6129,10 +6209,17 @@ fn display_thread_title(thread: &crate::storage::ThreadRow) -> String {
         .unwrap_or_else(|| format!("(untitled) {}", thread.session.external_id))
 }
 
-fn format_thread_time(value: Option<DateTime<Utc>>) -> String {
+fn format_thread_time_short(value: Option<DateTime<Utc>>) -> String {
     value
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .map(|dt| {
+            let local = dt.with_timezone(&Local);
+            if local.date_naive() == Local::now().date_naive() {
+                local.format("%H:%M").to_string()
+            } else {
+                local.format("%m-%d %H:%M").to_string()
+            }
+        })
+        .unwrap_or_else(|| "--:--".to_string())
 }
 
 fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Result<()> {
