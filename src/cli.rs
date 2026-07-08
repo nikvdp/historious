@@ -409,6 +409,12 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Omit timestamps from Markdown headings")]
         no_timestamps: bool,
+        #[arg(
+            long,
+            conflicts_with = "full",
+            help = "Print only the selected clean history item as Markdown"
+        )]
+        only: bool,
     },
     /// Deprecated alias for `show`.
     #[command(hide = true)]
@@ -449,6 +455,12 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Omit timestamps from Markdown headings")]
         no_timestamps: bool,
+        #[arg(
+            long,
+            conflicts_with = "full",
+            help = "Print only the selected clean history item as Markdown"
+        )]
+        only: bool,
     },
     /// Show a full conversation transcript.
     Transcript {
@@ -513,6 +525,25 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Omit timestamps from Markdown headings")]
         no_timestamps: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["full", "last", "last_answer"],
+            help = "Print only the targeted clean history item as Markdown"
+        )]
+        only: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["at", "search_unit", "full", "last_answer", "only"],
+            help = "Print the last clean conversation item as Markdown"
+        )]
+        last: bool,
+        #[arg(
+            long = "last-answer",
+            visible_alias = "last-assistant",
+            conflicts_with_all = ["at", "search_unit", "full", "last", "only"],
+            help = "Print the last assistant answer as Markdown"
+        )]
+        last_answer: bool,
     },
     /// Follow a conversation transcript and append new clean messages to stdout.
     Tail {
@@ -1462,6 +1493,7 @@ impl Cli {
                 full,
                 json,
                 no_timestamps,
+                only,
             }
             | Command::Expand {
                 target,
@@ -1475,6 +1507,7 @@ impl Cli {
                 full,
                 json,
                 no_timestamps,
+                only,
             } => {
                 let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
                 if json || robot {
@@ -1514,6 +1547,20 @@ impl Cli {
                             },
                         )?;
                     }
+                } else if only {
+                    let items = store.history_items_for_event(&event_id)?;
+                    if items.is_empty() {
+                        bail!(
+                            "target event has no clean history item; use --full to inspect raw event"
+                        );
+                    }
+                    let color = should_color(no_color, color, robot);
+                    write_stdout(&crate::transcript::render_history_items(
+                        &items,
+                        color,
+                        verbose,
+                        !no_timestamps,
+                    ))?;
                 } else if full {
                     let context = store
                         .events_around_event(&event_id, before, after)?
@@ -1556,6 +1603,9 @@ impl Cli {
                 full,
                 json,
                 no_timestamps,
+                only,
+                last,
+                last_answer,
             } => {
                 let (session, target_event_id) =
                     resolve_transcript_target(&store, &target, at, search_unit)?;
@@ -1613,6 +1663,51 @@ impl Cli {
                             Default::default(),
                         )?;
                     }
+                } else if only {
+                    let event_id = target_event_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--only requires --at <ref> or --search-unit <id> to identify a target event"))?;
+                    let items = store.history_items_for_event(event_id)?;
+                    if items.is_empty() {
+                        bail!(
+                            "target event has no clean history item; use --full to inspect raw event"
+                        );
+                    }
+                    let color = should_color(no_color, color, robot);
+                    write_stdout(&crate::transcript::render_history_items(
+                        &items,
+                        color,
+                        verbose,
+                        !no_timestamps,
+                    ))?;
+                } else if last || last_answer {
+                    let context = store
+                        .history_items_for_transcript_session(&session)?
+                        .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+                    let selected = if last_answer {
+                        context
+                            .items
+                            .iter()
+                            .rev()
+                            .find(|item| item.kind == "assistant")
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("no assistant answer found in session {session}")
+                            })?
+                    } else {
+                        context
+                            .items
+                            .last()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("no conversation items found in session {session}")
+                            })?
+                    };
+                    let color = should_color(no_color, color, robot);
+                    write_stdout(&crate::transcript::render_single_history_item(
+                        selected,
+                        color,
+                        verbose,
+                        !no_timestamps,
+                    ))?;
                 } else if full {
                     let events = store.events_for_session(&session)?;
                     let events = if let Some(grep) = &grep {
@@ -8868,6 +8963,50 @@ mod tests {
         .expect_err("embedding override flags should conflict");
 
         assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn show_only_conflicts_with_full() {
+        let error = Cli::try_parse_from(["histo", "show", "some-ref", "--only", "--full"])
+            .expect_err("--only should conflict with --full");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn transcript_last_conflicts_with_at() {
+        let error =
+            Cli::try_parse_from(["histo", "transcript", "sess", "--last", "--at", "ref"])
+                .expect_err("--last should conflict with --at");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn transcript_last_answer_conflicts_with_last() {
+        let error = Cli::try_parse_from([
+            "histo", "transcript", "sess", "--last", "--last-answer",
+        ])
+        .expect_err("--last should conflict with --last-answer");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn transcript_only_conflicts_with_last() {
+        let error =
+            Cli::try_parse_from(["histo", "transcript", "sess", "--only", "--last"])
+                .expect_err("--only should conflict with --last");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn transcript_last_answer_accepts_last_assistant_alias() {
+        let parsed = Cli::try_parse_from(["histo", "transcript", "sess", "--last-assistant"])
+            .expect("--last-assistant should parse as alias for --last-answer");
+        match parsed.command {
+            Command::Transcript { last_answer, .. } => {
+                assert!(last_answer);
+            }
+            _ => panic!("expected transcript command"),
+        }
     }
 
     #[test]
