@@ -1445,6 +1445,7 @@ fn session_title(
 ) -> Option<String> {
     native_titles
         .get(kind, external_session_id)
+        .filter(|title| !is_rejected_title_content(title))
         .or_else(|| inline_session_title(kind, lines))
         .or_else(|| fallback_session_title(lines))
 }
@@ -1463,6 +1464,7 @@ fn pi_session_info_title(lines: &[ParsedLine]) -> Option<String> {
         .find(|line| line.event_type == "session_info")
         .and_then(|line| string_at(&line.value, &["name"]))
         .and_then(|name| normalized_nonempty_title(&name))
+        .filter(|title| !is_rejected_title_content(title))
 }
 
 fn fallback_session_title(lines: &[ParsedLine]) -> Option<String> {
@@ -1472,6 +1474,7 @@ fn fallback_session_title(lines: &[ParsedLine]) -> Option<String> {
         .or_else(|| {
             lines
                 .iter()
+                .filter(|line| !is_instruction_event_line(line))
                 .find(|line| line_title_candidate(line).is_some())
         })
         .and_then(line_title_candidate)
@@ -1482,7 +1485,7 @@ fn is_human_line(line: &ParsedLine) -> bool {
 }
 
 fn title_candidate(content: &str) -> Option<String> {
-    if is_bootstrap_content(content) {
+    if is_rejected_title_content(content) {
         return None;
     }
     normalized_nonempty_title(content)
@@ -1520,6 +1523,93 @@ fn is_bootstrap_content(content: &str) -> bool {
     content.starts_with("# AGENTS.md instructions")
         || content.starts_with("<INSTRUCTIONS>")
         || content.starts_with("<environment_context>")
+}
+
+/// Returns true when content looks like instruction/system/policy text
+/// or generic session metadata rather than concise user-facing conversation
+/// content, making it a poor transcript title candidate.
+fn is_rejected_title_content(content: &str) -> bool {
+    if is_bootstrap_content(content) {
+        return true;
+    }
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if looks_like_session_metadata(trimmed) {
+        return true;
+    }
+    if looks_like_instruction_block(trimmed) {
+        return true;
+    }
+    false
+}
+
+/// Returns true when a parsed line is an instruction/system event that
+/// should never be used as a title source.
+fn is_instruction_event_line(line: &ParsedLine) -> bool {
+    if is_instruction_role(line.role.as_deref()) {
+        return true;
+    }
+    let event_type = line.event_type.to_ascii_lowercase();
+    matches!(
+        event_type.as_str(),
+        "system" | "developer" | "system_prompt" | "instructions"
+    )
+}
+
+fn looks_like_instruction_block(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    // Markdown header-style instruction blocks
+    lower.starts_with("# instructions")
+        || lower.starts_with("# policy")
+        || lower.starts_with("# system")
+        || lower.starts_with("# guidelines")
+        || lower.starts_with("# rules")
+        // Common instruction/preamble markers at the start of the text
+        || lower.starts_with("you are ")
+        || lower.starts_with("your task ")
+        || lower.starts_with("your role ")
+        || lower.starts_with("instructions:")
+        || lower.starts_with("follow these ")
+        || lower.starts_with("policy:")
+        || lower.starts_with("system prompt:")
+        || lower.starts_with("<system>")
+        || lower.starts_with("<developer>")
+        // Long text (>200 chars) with a high density of instruction phrases
+        // is likely bootstrap/policy text rather than a user message.
+        || (content.len() > 200 && instruction_marker_density(&lower) >= 3)
+}
+
+fn instruction_marker_density(lower: &str) -> usize {
+    let markers = [
+        "you are",
+        "your task",
+        "your role",
+        "instructions",
+        "follow these",
+        "policy",
+        "guidelines",
+        "must ",
+        "should ",
+        "always ",
+        "never ",
+        "do not",
+        "ensure",
+        "required",
+        "preamble",
+        "bootstrap",
+    ];
+    markers.iter().filter(|marker| lower.contains(*marker)).count()
+}
+
+fn looks_like_session_metadata(content: &str) -> bool {
+    let trimmed = content.trim();
+    // JSON-like metadata dumps are not useful titles
+    (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || trimmed.contains("\"sessionId\"")
+        || trimmed.contains("\"session_id\"")
 }
 
 fn session_metadata(path_text: &str, workspace: Option<&WorkspaceIdentity>) -> Value {
@@ -2370,6 +2460,162 @@ mod tests {
         assert_eq!(
             session_title("pi_agent", "pi-session-1", &lines, &native_titles).as_deref(),
             Some("first real pi prompt")
+        );
+    }
+
+    #[test]
+    fn claude_session_title_skips_instruction_text_for_user_message() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "session_id": "claude-1",
+                    "type": "user",
+                    "role": "user",
+                    "content": "You are a helpful coding assistant. Follow these instructions carefully. Your task is to assist with code review and debugging. You must ensure all code follows the project guidelines and style rules. Always use descriptive variable names. Never commit directly to main.",
+                    "timestamp": "2026-06-03T00:00:00Z"
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "session_id": "claude-1",
+                    "type": "message",
+                    "role": "user",
+                    "content": "Help me debug the auth flow",
+                    "timestamp": "2026-06-03T00:00:01Z"
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("claude_code", "claude-1", &lines, &native_titles).as_deref(),
+            Some("Help me debug the auth flow")
+        );
+    }
+
+    #[test]
+    fn pi_session_title_skips_instruction_text_for_user_message() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "type": "session_info",
+                    "name": "You are a helpful coding assistant with tool access. Follow the project guidelines carefully."
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first real pi prompt"}]
+                    }
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("pi_agent", "pi-session-1", &lines, &native_titles).as_deref(),
+            Some("first real pi prompt")
+        );
+    }
+
+    #[test]
+    fn claude_session_title_skips_system_role_line() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "session_id": "claude-sys",
+                    "type": "system",
+                    "role": "system",
+                    "content": "System prompt: you must follow all project policies.",
+                    "timestamp": "2026-06-03T00:00:00Z"
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "session_id": "claude-sys",
+                    "type": "message",
+                    "role": "user",
+                    "content": "Refactor the config loader",
+                    "timestamp": "2026-06-03T00:00:01Z"
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("claude_code", "claude-sys", &lines, &native_titles).as_deref(),
+            Some("Refactor the config loader")
+        );
+    }
+
+    #[test]
+    fn instruction_native_title_is_rejected_for_fallback() {
+        let mut native_titles = NativeTitleIndex::default();
+        native_titles.insert(
+            "claude_code",
+            "claude-bad-native",
+            "You are a helpful assistant. Follow these instructions.",
+        );
+        let lines = vec![parsed_line(
+            0,
+            json!({
+                "session_id": "claude-bad-native",
+                "type": "message",
+                "role": "user",
+                "content": "actual user question",
+                "timestamp": "2026-06-03T00:00:00Z"
+            }),
+            0,
+            1,
+        )];
+
+        assert_eq!(
+            session_title("claude_code", "claude-bad-native", &lines, &native_titles)
+                .as_deref(),
+            Some("actual user question")
+        );
+    }
+
+    #[test]
+    fn clean_native_title_is_preserved() {
+        let mut native_titles = NativeTitleIndex::default();
+        native_titles.insert("claude_code", "claude-clean", "Clean Claude Title");
+        let lines = vec![parsed_line(
+            0,
+            json!({
+                "session_id": "claude-clean",
+                "type": "user",
+                "role": "user",
+                "content": "fallback user request",
+                "timestamp": "2026-06-03T00:00:00Z"
+            }),
+            0,
+            1,
+        )];
+
+        assert_eq!(
+            session_title("claude_code", "claude-clean", &lines, &native_titles).as_deref(),
+            Some("Clean Claude Title")
         );
     }
 
