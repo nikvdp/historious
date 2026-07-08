@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "historious"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "assert_cmd",
