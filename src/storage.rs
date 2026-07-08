@@ -3,7 +3,7 @@ use crate::archive::{
     SourceRecord,
 };
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
     Transaction, TransactionBehavior,
@@ -485,6 +485,7 @@ pub struct ThreadListOptions {
 pub struct ThreadRow {
     pub session: SessionRecord,
     pub event_count: u64,
+    pub today_message_count: u64,
     pub first_event_at: Option<DateTime<Utc>>,
     pub last_event_at: Option<DateTime<Utc>>,
     pub last_activity_at: Option<DateTime<Utc>>,
@@ -2554,9 +2555,12 @@ impl Store {
                 format!("(? IS NULL OR {last_activity} >= ?)"),
                 format!("(? IS NULL OR {last_activity} < ?)"),
             ];
+            let (today_after, today_before) = local_today_bounds_utc()?;
             let after = opt_dt(options.after);
             let before = opt_dt(options.before);
             let mut values = vec![
+                opt_sql_text(Some(today_after.to_rfc3339())),
+                opt_sql_text(Some(today_before.to_rfc3339())),
                 opt_sql_text(after.clone()),
                 opt_sql_text(after),
                 opt_sql_text(before.clone()),
@@ -2577,6 +2581,13 @@ impl Store {
                         s.metadata_json,
                         s.hash,
                         COALESCE(a.event_count, 0),
+                        (SELECT COUNT(*)
+                         FROM history_items hi INDEXED BY idx_history_items_session_order
+                         WHERE hi.session_id = s.id
+                           AND hi.tier = 'conversation'
+                           AND hi.kind IN ('user', 'assistant')
+                           AND hi.occurred_at >= ?
+                           AND hi.occurred_at < ?) AS today_message_count,
                         a.first_event_at,
                         a.last_event_at,
                         {last_activity} AS last_activity_at
@@ -2604,13 +2615,15 @@ impl Store {
                     metadata: metadata.clone(),
                     hash: row.get(10)?,
                 };
-                let first_event_at = parse_opt_dt(row.get(12)?);
-                let last_event_at = parse_opt_dt(row.get(13)?);
-                let last_activity_at = parse_opt_dt(row.get(14)?);
+                let today_message_count = row.get::<_, i64>(12)?.max(0) as u64;
+                let first_event_at = parse_opt_dt(row.get(13)?);
+                let last_event_at = parse_opt_dt(row.get(14)?);
+                let last_activity_at = parse_opt_dt(row.get(15)?);
                 let workspace_values = session_workspace_values(&metadata);
                 Ok(ThreadRow {
                     session,
                     event_count: row.get::<_, i64>(11)?.max(0) as u64,
+                    today_message_count,
                     first_event_at,
                     last_event_at,
                     last_activity_at,
@@ -7286,6 +7299,33 @@ fn row_embedding(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingRecord> {
 
 fn opt_dt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(|dt| dt.to_rfc3339())
+}
+
+fn local_today_bounds_utc() -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let today = Local::now().date_naive();
+    let tomorrow = today
+        .succ_opt()
+        .ok_or_else(|| anyhow::anyhow!("local date is too large"))?;
+    Ok((
+        local_naive_to_utc(
+            today
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow::anyhow!("could not build local day boundary"))?,
+        )?,
+        local_naive_to_utc(
+            tomorrow
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow::anyhow!("could not build local day boundary"))?,
+        )?,
+    ))
+}
+
+fn local_naive_to_utc(value: NaiveDateTime) -> Result<DateTime<Utc>> {
+    match Local.from_local_datetime(&value) {
+        LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, _) => Ok(earliest.with_timezone(&Utc)),
+        LocalResult::None => bail!("local time does not exist: {value}"),
+    }
 }
 
 fn opt_sql_text(value: Option<String>) -> SqlValue {
