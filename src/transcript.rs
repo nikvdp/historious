@@ -4,12 +4,25 @@ use crate::storage::{
 };
 use chrono::{DateTime, Local, Utc};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ViewMetadata {
     pub ref_id: Option<String>,
     pub source: Option<SourceRecord>,
     pub raw_artifact: Option<RawArtifactSummary>,
     pub verbose: bool,
+    pub timestamps: bool,
+}
+
+impl Default for ViewMetadata {
+    fn default() -> Self {
+        Self {
+            ref_id: None,
+            source: None,
+            raw_artifact: None,
+            verbose: false,
+            timestamps: true,
+        }
+    }
 }
 
 pub fn render_context(context: &TranscriptContext, metadata: &ViewMetadata, color: bool) -> String {
@@ -28,6 +41,7 @@ pub fn render_context(context: &TranscriptContext, metadata: &ViewMetadata, colo
             idx == context.target_index,
             color,
             metadata.verbose,
+            metadata.timestamps,
             RenderMode::Preview,
         );
     }
@@ -57,6 +71,7 @@ pub fn render_history_context(
             context.target_index == Some(idx),
             color,
             metadata.verbose,
+            metadata.timestamps,
         );
     }
     out
@@ -80,6 +95,7 @@ pub fn render_session(
             target_event_id == Some(event.id.as_str()),
             color,
             metadata.verbose,
+            metadata.timestamps,
             RenderMode::Full,
         );
     }
@@ -94,10 +110,15 @@ pub fn render_history_session(
     render_history_context(context, metadata, color)
 }
 
-pub fn render_history_items(items: &[HistoryItemRecord], color: bool, verbose: bool) -> String {
+pub fn render_history_items(
+    items: &[HistoryItemRecord],
+    color: bool,
+    verbose: bool,
+    timestamps: bool,
+) -> String {
     let mut out = String::new();
     for item in items {
-        push_history_item(&mut out, item, false, color, verbose);
+        push_history_item(&mut out, item, false, color, verbose, timestamps);
     }
     out
 }
@@ -131,10 +152,12 @@ fn push_markdown_header(
         .or(session.updated_at)
         .or(session.started_at)
     {
-        if metadata.verbose {
-            push_meta_line(out, "when", &when.to_rfc3339());
-        } else {
-            push_meta_line(out, "when", &format_local_timestamp_seconds(when));
+        if metadata.timestamps {
+            if metadata.verbose {
+                push_meta_line(out, "when", &when.to_rfc3339());
+            } else {
+                push_meta_line(out, "when", &format_local_timestamp_seconds(when));
+            }
         }
     }
     if let Some(title) = &session.title {
@@ -191,6 +214,7 @@ fn push_event(
     target: bool,
     color: bool,
     verbose: bool,
+    timestamps: bool,
     mode: RenderMode,
 ) {
     let mut heading = String::from("## #");
@@ -201,9 +225,11 @@ fn push_event(
         heading.push(' ');
         heading.push_str(role);
     }
-    if let Some(occurred_at) = event.occurred_at {
-        heading.push_str(" · ");
-        heading.push_str(&format_local_timestamp_minutes(occurred_at));
+    if timestamps {
+        if let Some(occurred_at) = event.occurred_at {
+            heading.push_str(" · ");
+            heading.push_str(&format_local_timestamp_minutes(occurred_at));
+        }
     }
     if target {
         heading.push_str(" · selected");
@@ -254,9 +280,10 @@ fn push_history_item(
     target: bool,
     color: bool,
     verbose: bool,
+    timestamps: bool,
 ) {
     let kind_display = capitalize_kind(&item.kind);
-    let heading = build_item_heading(&kind_display, item.occurred_at, target);
+    let heading = build_item_heading(&kind_display, item.occurred_at, target, timestamps);
     if target && color {
         out.push_str("\x1b[1;36m");
         out.push_str(&heading);
@@ -315,12 +342,19 @@ fn capitalize_kind(kind: &str) -> String {
     }
 }
 
-fn build_item_heading(kind: &str, occurred_at: Option<DateTime<Utc>>, selected: bool) -> String {
+fn build_item_heading(
+    kind: &str,
+    occurred_at: Option<DateTime<Utc>>,
+    selected: bool,
+    timestamps: bool,
+) -> String {
     let mut h = String::from("## ");
     h.push_str(kind);
-    if let Some(when) = occurred_at {
-        h.push_str(" · ");
-        h.push_str(&format_local_timestamp_minutes(when));
+    if timestamps {
+        if let Some(when) = occurred_at {
+            h.push_str(" · ");
+            h.push_str(&format_local_timestamp_minutes(when));
+        }
     }
     if selected {
         h.push_str(" · selected");
@@ -476,6 +510,74 @@ mod tests {
         assert!(rendered.contains("**event_type:** message"));
         assert!(rendered.contains("**event:** event_two"));
         assert!(rendered.contains("**ordinal:** 2"));
+    }
+
+    #[test]
+    fn history_context_omits_timestamps_when_disabled() {
+        let session = fixture_session();
+        let item_with_ts = {
+            let mut item = fixture_history_item(
+                "item_user",
+                "event_user",
+                1,
+                "user",
+                "hello",
+            );
+            item.occurred_at = Some(Utc::now());
+            item
+        };
+        let context = HistoryTranscriptContext {
+            session,
+            target_event: None,
+            items: vec![item_with_ts],
+            target_index: None,
+            omitted_target: false,
+        };
+        let rendered_with = render_history_context(
+            &context,
+            &ViewMetadata {
+                timestamps: true,
+                ..ViewMetadata::default()
+            },
+            false,
+        );
+        assert!(rendered_with.contains("## User ·"));
+
+        let rendered_without = render_history_context(
+            &context,
+            &ViewMetadata {
+                timestamps: false,
+                ..ViewMetadata::default()
+            },
+            false,
+        );
+        assert!(rendered_without.contains("## User\n"));
+        assert!(!rendered_without.contains("## User ·"));
+    }
+
+    #[test]
+    fn event_omits_timestamps_when_disabled() {
+        let session = fixture_session();
+        let event = fixture_event("event_two", 2, "target");
+        let context = TranscriptContext {
+            session,
+            target_event: event.clone(),
+            events: vec![event],
+            target_index: 0,
+        };
+        let rendered = render_context(
+            &context,
+            &ViewMetadata {
+                timestamps: false,
+                ..ViewMetadata::default()
+            },
+            false,
+        );
+        assert!(rendered.contains("## #2 codex assistant"));
+        assert!(rendered.contains("· selected"));
+        assert!(!rendered.contains("**when:**"));
+        // Verify no timestamp date pattern in the heading (only · selected should appear)
+        assert!(!rendered.contains("## #2 codex assistant · 20"));
     }
 
     fn fixture_session() -> SessionRecord {
