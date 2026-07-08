@@ -1509,7 +1509,128 @@ impl Cli {
                 no_timestamps,
                 only,
             } => {
-                let event_id = resolve_context_event_id(&store, target, event, search_unit)?;
+                let has_explicit_event = event.is_some() || search_unit.is_some();
+                let event_id = match resolve_context_event_id(
+                    &store,
+                    target.clone(),
+                    event,
+                    search_unit,
+                ) {
+                    Ok(id) => id,
+                    Err(original_err) => {
+                        if !has_explicit_event {
+                            if let Some(ref target_str) = target {
+                                if let Some(session) =
+                                    resolve_session_target(&store, target_str)?
+                                {
+                                    if only {
+                                        bail!(
+                                            "--only requires a specific event; \
+                                             '{target_str}' resolved as a session, not an event"
+                                        );
+                                    }
+                                    eprintln!(
+                                        "warning: '{}' is a session, not an event; \
+                                         showing transcript for session {}",
+                                        target_str,
+                                        session.id
+                                    );
+                                    let session_record = store
+                                        .session_by_id(&session.id)?
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "session not found: {}",
+                                                session.id
+                                            )
+                                        })?;
+                                    if json || robot {
+                                        if full {
+                                            let events =
+                                                store.events_for_session(&session.id)?;
+                                            crate::output::write_success(
+                                                "transcript",
+                                                transcript_output(
+                                                    &store,
+                                                    &session_record,
+                                                    &events,
+                                                    None,
+                                                    None,
+                                                )?,
+                                                Default::default(),
+                                            )?;
+                                        } else {
+                                            let context = store
+                                                .history_items_for_transcript_session(
+                                                    &session.id,
+                                                )?
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!(
+                                                        "session not found: {}",
+                                                        session.id
+                                                    )
+                                                })?;
+                                            crate::output::write_success(
+                                                "transcript",
+                                                history_transcript_output(
+                                                    &store,
+                                                    &context,
+                                                    None,
+                                                )?,
+                                                Default::default(),
+                                            )?;
+                                        }
+                                    } else if full {
+                                        let events =
+                                            store.events_for_session(&session.id)?;
+                                        let mut metadata = view_metadata_for_session(
+                                            &store,
+                                            &session_record,
+                                            None,
+                                            verbose,
+                                        )?;
+                                        metadata.timestamps = !no_timestamps;
+                                        let color = should_color(no_color, color, robot);
+                                        write_stdout(&crate::transcript::render_session(
+                                            &session_record,
+                                            &events,
+                                            None,
+                                            &metadata,
+                                            color,
+                                        ))?;
+                                    } else {
+                                        let mut metadata = view_metadata_for_session(
+                                            &store,
+                                            &session_record,
+                                            None,
+                                            verbose,
+                                        )?;
+                                        metadata.timestamps = !no_timestamps;
+                                        let color = should_color(no_color, color, robot);
+                                        let context = store
+                                            .history_items_for_transcript_session(
+                                                &session.id,
+                                            )?
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "session not found: {}",
+                                                    session.id
+                                                )
+                                            })?;
+                                        write_stdout(
+                                            &crate::transcript::render_history_session(
+                                                &context,
+                                                &metadata,
+                                                color,
+                                            ),
+                                        )?;
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        return Err(original_err);
+                    }
+                };
                 if json || robot {
                     if full {
                         let context = store
@@ -9417,6 +9538,147 @@ mod tests {
         assert!(filtered.omitted_target);
         assert_eq!(filtered.items.len(), 1);
         assert_eq!(filtered.items[0].id, "history_after");
+    }
+
+    #[test]
+    fn show_falls_back_to_session_when_target_is_session_id() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+
+        // A session id cannot be resolved as an event ref or event id.
+        let event_err = resolve_context_event_id(
+            &store,
+            Some("session_view".to_string()),
+            None,
+            None,
+        )
+        .expect_err("session id should not resolve as event");
+        assert!(event_err.to_string().contains("not found"));
+
+        // But it CAN be resolved as a session — the fallback condition.
+        let session =
+            resolve_session_target(&store, "session_view").expect("session resolve");
+        assert!(session.is_some());
+        assert_eq!(session.unwrap().id, "session_view");
+    }
+
+    #[test]
+    fn show_falls_back_to_session_when_target_is_external_id() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+
+        let event_err = resolve_context_event_id(
+            &store,
+            Some("agent_session_view".to_string()),
+            None,
+            None,
+        )
+        .expect_err("external id should not resolve as event");
+        assert!(event_err.to_string().contains("not found"));
+
+        let session =
+            resolve_session_target(&store, "agent_session_view").expect("session resolve");
+        assert!(session.is_some());
+        assert_eq!(session.unwrap().id, "session_view");
+    }
+
+    #[test]
+    fn show_valid_event_ref_does_not_trigger_fallback() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+
+        // An event ref resolves as an event — no fallback needed.
+        let event_id = resolve_context_event_id(
+            &store,
+            Some("event_view".to_string()),
+            None,
+            None,
+        )
+        .expect("event id should resolve");
+        assert_eq!(event_id, "event_view");
+
+        // The event id should NOT resolve as a session.
+        let session =
+            resolve_session_target(&store, "event_view").expect("session resolve");
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn show_unresolvable_target_errors_for_both_event_and_session() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+
+        let event_err = resolve_context_event_id(
+            &store,
+            Some("nonexistent_target".to_string()),
+            None,
+            None,
+        )
+        .expect_err("unresolvable target should error");
+        assert!(event_err.to_string().contains("not found"));
+
+        let session =
+            resolve_session_target(&store, "nonexistent_target").expect("session resolve");
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn show_session_fallback_produces_transcript_json_shape() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: None,
+            items: vec![fixture_history_item(
+                "history_view",
+                "event_view",
+                7,
+                "assistant",
+                "clean assistant text",
+            )],
+            target_index: None,
+            omitted_target: false,
+        };
+
+        let output =
+            history_transcript_output(&store, &context, None).expect("transcript output");
+        let value = serde_json::to_value(output).expect("serialize");
+
+        // Transcript JSON shape has "items", not the show-specific "before/target/after".
+        assert!(value.get("items").is_some());
+        assert!(value.get("before").is_none());
+        assert!(value.get("target").is_none());
+        assert!(value.get("after").is_none());
+        assert_eq!(value["items"][0]["text"], "clean assistant text");
+        // No target event in fallback transcript.
+        assert_eq!(value["target_event_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn show_session_fallback_renders_transcript_heading() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let session = store
+            .session_by_id("session_view")
+            .expect("session lookup")
+            .expect("session exists");
+        let context = crate::storage::HistoryTranscriptContext {
+            session,
+            target_event: None,
+            items: vec![fixture_history_item(
+                "history_view",
+                "event_view",
+                7,
+                "assistant",
+                "clean assistant text",
+            )],
+            target_index: None,
+            omitted_target: false,
+        };
+        let metadata = crate::transcript::ViewMetadata::default();
+
+        let rendered = crate::transcript::render_history_session(&context, &metadata, false);
+
+        // The fallback uses the transcript renderer, which produces a Transcript heading.
+        assert!(rendered.contains("# Transcript"));
     }
 
     fn fixture_store_with_viewer_ref() -> (tempfile::TempDir, Store) {
