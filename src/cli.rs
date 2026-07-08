@@ -2789,6 +2789,7 @@ struct ThreadOutput {
     last_event_at: Option<DateTime<Utc>>,
     last_activity_at: Option<DateTime<Utc>>,
     event_count: u64,
+    today_message_count: u64,
     workspace_path: Option<String>,
     workspace_values: Vec<String>,
 }
@@ -6087,11 +6088,12 @@ fn print_threads_output(
             styled(&title, "1", color)
         );
         println!(
-            "  updated: {}  last event: {}  source: {}  events: {}",
+            "  updated: {}  last event: {}  source: {}  events: {}  today msgs: {}",
             format_thread_time(thread.session.updated_at),
             format_thread_time(thread.last_event_at),
             thread.session.source_kind,
-            format_count(thread.event_count as usize)
+            format_count(thread.event_count as usize),
+            format_count(thread.today_message_count as usize)
         );
         println!("  provider_thread: {}", thread.session.external_id);
         println!("  histo_session: {}", thread.session.id);
@@ -6274,6 +6276,7 @@ fn thread_output(thread: &crate::storage::ThreadRow) -> ThreadOutput {
         last_event_at: thread.last_event_at,
         last_activity_at: thread.last_activity_at,
         event_count: thread.event_count,
+        today_message_count: thread.today_message_count,
         workspace_path: thread.workspace_path.clone(),
         workspace_values: thread.workspace_values.clone(),
     }
