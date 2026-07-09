@@ -6255,10 +6255,16 @@ fn print_threads_grouped_by_project(threads: &[crate::storage::ThreadRow], color
             println!();
         }
         let today_total: u64 = rows.iter().map(|row| row.today_message_count).sum();
+        let thread_total = rows.len();
         println!(
             "{}",
             styled_role(
-                &format!("{label} · {} msgs today", format_count(today_total as usize)),
+                &format!(
+                    "{label} · {} {} · {} msgs today",
+                    format_count(thread_total),
+                    if thread_total == 1 { "thread" } else { "threads" },
+                    format_count(today_total as usize)
+                ),
                 StyleRole::Project,
                 color,
             )
