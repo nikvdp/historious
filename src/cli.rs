@@ -825,6 +825,11 @@ pub enum SkillCommand {
 pub enum ConfigCommand {
     /// Show the config file path and effective settings.
     Show,
+    /// Show or change the persistent machine name used for new records.
+    Machine {
+        #[arg(help = "New machine name; omit to show the current name")]
+        name: Option<String>,
+    },
     /// Show or change persistent embedding behavior.
     Embeddings {
         #[arg(value_enum, default_value_t = ConfigEmbeddingState::Status)]
@@ -2456,6 +2461,8 @@ fn apply_embeddings_override(config: &mut AppConfig, embeddings: bool, no_embedd
 #[derive(Debug, Serialize)]
 struct ConfigOutput {
     config_path: String,
+    machine_name: String,
+    machine_id: String,
     embeddings_enabled: bool,
     treechat_enabled: bool,
 }
@@ -2469,13 +2476,21 @@ fn run_config_command(
     let path = crate::config::config_path(&data_dir);
     match command {
         ConfigCommand::Show => {
-            let output = ConfigOutput {
-                config_path: path.display().to_string(),
-                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
-                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
-            };
+            let output = config_output(&data_dir, &path)?;
             if robot {
                 crate::output::write_success("config show", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
+        ConfigCommand::Machine { name } => {
+            let path = match name {
+                Some(name) => crate::config::set_machine_name(&data_dir, &name)?,
+                None => path,
+            };
+            let output = config_output(&data_dir, &path)?;
+            if robot {
+                crate::output::write_success("config machine", output, Default::default())?;
             } else {
                 print_config_output(&output);
             }
@@ -2488,11 +2503,7 @@ fn run_config_command(
                 }
                 ConfigEmbeddingState::Status => path,
             };
-            let output = ConfigOutput {
-                config_path: path.display().to_string(),
-                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
-                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
-            };
+            let output = config_output(&data_dir, &path)?;
             if robot {
                 crate::output::write_success("config embeddings", output, Default::default())?;
             } else {
@@ -2505,11 +2516,7 @@ fn run_config_command(
                 ConfigSourceState::Off => crate::config::set_treechat_enabled(&data_dir, false)?,
                 ConfigSourceState::Status => path,
             };
-            let output = ConfigOutput {
-                config_path: path.display().to_string(),
-                embeddings_enabled: crate::config::load_embeddings_enabled(&data_dir)?,
-                treechat_enabled: crate::config::load_treechat_enabled(&data_dir)?,
-            };
+            let output = config_output(&data_dir, &path)?;
             if robot {
                 crate::output::write_success("config treechat", output, Default::default())?;
             } else {
@@ -2520,8 +2527,21 @@ fn run_config_command(
     Ok(())
 }
 
+fn config_output(data_dir: &std::path::Path, path: &std::path::Path) -> Result<ConfigOutput> {
+    let config = AppConfig::load(Some(data_dir.to_path_buf()))?;
+    Ok(ConfigOutput {
+        config_path: path.display().to_string(),
+        machine_name: config.machine_name,
+        machine_id: config.machine_id,
+        embeddings_enabled: !config.embedder.is_disabled(),
+        treechat_enabled: config.sources.treechat.enabled,
+    })
+}
+
 fn print_config_output(output: &ConfigOutput) {
     println!("config_path={}", output.config_path);
+    println!("machine.name={}", output.machine_name);
+    println!("machine_id={}", output.machine_id);
     println!("embeddings.enabled={}", output.embeddings_enabled);
     println!("sources.treechat.enabled={}", output.treechat_enabled);
 }
@@ -2948,6 +2968,7 @@ enum StatusDiagnosticsMode {
 
 #[derive(Debug, Serialize)]
 struct StatusConfigOutput {
+    machine_name: String,
     machine_id: String,
     default_search_mode: search::SearchMode,
     embeddings_enabled: bool,
@@ -3701,6 +3722,7 @@ fn status_diagnostics_output(all: bool) -> StatusDiagnosticsOutput {
 
 fn status_config_output(config: &AppConfig) -> StatusConfigOutput {
     StatusConfigOutput {
+        machine_name: config.machine_name.clone(),
         machine_id: config.machine_id.clone(),
         default_search_mode: config.default_search_mode,
         embeddings_enabled: !config.embedder.is_disabled(),
@@ -6100,7 +6122,8 @@ fn print_status_config(config: &StatusConfigOutput, color: bool) {
                 "Treechat",
                 enabled_label(config.treechat_enabled).to_string(),
             ),
-            ("Machine", config.machine_id.clone()),
+            ("Machine", config.machine_name.clone()),
+            ("Machine id", config.machine_id.clone()),
         ],
         color,
     );

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub data_dir: PathBuf,
+    pub machine_name: String,
     pub machine_id: String,
     pub embedder: EmbedderConfig,
     pub default_search_mode: SearchMode,
@@ -21,11 +22,13 @@ impl AppConfig {
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         let file_config = load_file_config(&data_dir)?;
-        let machine_id = load_machine_id(&data_dir)?;
+        let machine_name = ensure_machine_name(&data_dir, file_config.machine.name)?;
+        let machine_id = machine_id_for_name(&machine_name);
         let embedder =
             EmbedderConfig::from_config_and_env(&data_dir, file_config.embeddings.enabled);
         Ok(Self {
             data_dir,
+            machine_name,
             machine_id,
             embedder,
             default_search_mode: file_config.search.default_mode,
@@ -37,11 +40,18 @@ impl AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct FileConfig {
     #[serde(default)]
+    machine: MachineConfig,
+    #[serde(default)]
     search: SearchConfig,
     #[serde(default)]
     embeddings: EmbeddingsConfig,
     #[serde(default)]
     sources: SourceConfigs,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MachineConfig {
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,12 +112,9 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("config.toml")
 }
 
-pub fn load_embeddings_enabled(data_dir: &Path) -> Result<bool> {
-    Ok(load_file_config(data_dir)?.embeddings.enabled)
-}
-
-pub fn load_treechat_enabled(data_dir: &Path) -> Result<bool> {
-    Ok(load_file_config(data_dir)?.sources.treechat.enabled)
+pub fn set_machine_name(data_dir: &Path, name: &str) -> Result<PathBuf> {
+    let name = normalize_machine_name(name)?;
+    set_config_string(data_dir, &["machine", "name"], &name)
 }
 
 pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
@@ -119,6 +126,18 @@ pub fn set_treechat_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
 }
 
 fn set_config_bool(data_dir: &Path, path_parts: &[&str], enabled: bool) -> Result<PathBuf> {
+    set_config_value(data_dir, path_parts, toml::Value::Boolean(enabled))
+}
+
+fn set_config_string(data_dir: &Path, path_parts: &[&str], text: &str) -> Result<PathBuf> {
+    set_config_value(data_dir, path_parts, toml::Value::String(text.to_string()))
+}
+
+fn set_config_value(
+    data_dir: &Path,
+    path_parts: &[&str],
+    replacement: toml::Value,
+) -> Result<PathBuf> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
     let path = config_path(data_dir);
@@ -146,7 +165,7 @@ fn set_config_bool(data_dir: &Path, path_parts: &[&str], enabled: bool) -> Resul
         }
         cursor = value.as_table_mut().expect("config table");
     }
-    cursor.insert((*last).to_string(), toml::Value::Boolean(enabled));
+    cursor.insert((*last).to_string(), replacement);
     fs::write(
         &path,
         toml::to_string_pretty(&value).context("serializing config")?,
@@ -159,6 +178,7 @@ fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
     let path = config_path(data_dir);
     if !path.exists() {
         return Ok(FileConfig {
+            machine: MachineConfig::default(),
             search: SearchConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             sources: SourceConfigs::default(),
@@ -266,7 +286,6 @@ mod tests {
 
         assert_eq!(path, dir.path().join("config.toml"));
         assert!(config.embedder.is_disabled());
-        assert!(!load_embeddings_enabled(dir.path()).expect("load embeddings config"));
     }
 
     #[test]
@@ -278,7 +297,6 @@ mod tests {
 
         assert_eq!(path, dir.path().join("config.toml"));
         assert!(config.sources.treechat.enabled);
-        assert!(load_treechat_enabled(dir.path()).expect("load treechat config"));
     }
 
     #[test]
@@ -346,6 +364,45 @@ mod tests {
             "new"
         );
     }
+
+    #[test]
+    fn missing_machine_name_is_initialized_in_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+        let text = fs::read_to_string(dir.path().join("config.toml")).expect("config text");
+
+        assert!(!config.machine_name.trim().is_empty());
+        assert_eq!(config.machine_id, machine_id_for_name(&config.machine_name));
+        assert!(text.contains("[machine]"));
+        assert!(text.contains("name = "));
+    }
+
+    #[test]
+    fn config_file_can_set_machine_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[machine]\nname = \"Dev Box\"\n",
+        )
+        .expect("write config");
+
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert_eq!(config.machine_name, "Dev Box");
+        assert_eq!(config.machine_id, "machine_dev_box");
+    }
+
+    #[test]
+    fn set_machine_name_updates_the_configured_source_of_truth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        set_machine_name(dir.path(), "Laptop 2").expect("set machine name");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert_eq!(config.machine_name, "Laptop 2");
+        assert_eq!(config.machine_id, "machine_laptop_2");
+    }
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -365,28 +422,40 @@ fn expand_home(path: PathBuf) -> PathBuf {
     path
 }
 
-fn load_machine_id(data_dir: &PathBuf) -> Result<String> {
-    let path = data_dir.join("machine-id");
-    if path.exists() {
-        return std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))
-            .map(|text| text.trim().to_string());
+fn ensure_machine_name(data_dir: &Path, configured: Option<String>) -> Result<String> {
+    if let Some(name) = configured {
+        return normalize_machine_name(&name);
     }
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string());
-    let id = format!(
-        "machine_{}_{}",
-        sanitize(&host),
-        uuid::Uuid::new_v4().simple()
-    );
-    std::fs::write(&path, format!("{id}\n"))
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(id)
+    let name = default_machine_name();
+    set_machine_name(data_dir, &name)?;
+    Ok(name)
 }
 
-fn sanitize(input: &str) -> String {
+fn default_machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+fn normalize_machine_name(input: &str) -> Result<String> {
+    let name = input.trim();
+    if name.is_empty() {
+        anyhow::bail!("machine name must not be empty");
+    }
+    Ok(name.to_string())
+}
+
+pub fn machine_id_for_name(name: &str) -> String {
+    format!("machine_{}", sanitize_machine_name(name))
+}
+
+pub fn machine_id_prefix_for_name(name: &str) -> String {
+    machine_id_for_name(name)
+}
+
+fn sanitize_machine_name(input: &str) -> String {
     input
+        .trim()
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {

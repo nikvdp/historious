@@ -913,21 +913,7 @@ fn is_memory_like_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn machine_id_prefix_for_hostname(hostname: &str) -> String {
-    format!("machine_{}_", sanitize_machine_hostname(hostname))
-}
-
-fn sanitize_machine_hostname(input: &str) -> String {
-    input
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    crate::config::machine_id_prefix_for_name(hostname)
 }
 
 fn embedding_input(text: &str) -> String {
