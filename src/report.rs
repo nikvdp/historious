@@ -3,7 +3,7 @@ use crate::provenance;
 use crate::storage::Store;
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -37,6 +37,7 @@ pub struct UsageReport {
     pub model_mix_by_month: Vec<MixPoint>,
     pub rhythms: Rhythms,
     pub frequencies: FrequencySection,
+    pub topics: Option<TopicSection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +116,40 @@ pub struct TermCount {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicSection {
+    pub version: String,
+    pub model_id: String,
+    pub assigned_messages: u64,
+    pub corpus_messages: u64,
+    pub topics: Vec<TopicSummary>,
+    pub by_month: Vec<TopicPeriod>,
+    pub by_project: Vec<TopicProject>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicSummary {
+    pub topic_id: i64,
+    pub label: String,
+    pub messages: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicPeriod {
+    pub month: String,
+    pub topic_id: i64,
+    pub label: String,
+    pub messages: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicProject {
+    pub workspace_path: String,
+    pub topic_id: i64,
+    pub label: String,
+    pub messages: u64,
+}
+
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
@@ -139,6 +174,8 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     let rhythms = report_rhythms(store, options.since.as_deref(), project_pattern.as_deref())?;
     let frequencies =
         report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let (topics, topic_warning) =
+        report_topics(store, options.since.as_deref(), project_pattern.as_deref())?;
     let mut warnings = analytics::freshness(store)?
         .into_iter()
         .filter(|status| status.stale)
@@ -163,6 +200,9 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
             "{missing_opencode} OpenCode sessions have no token data; run the OpenCode backfill, then `histo lab rebuild`"
         ));
     }
+    if let Some(warning) = topic_warning {
+        warnings.push(warning);
+    }
 
     Ok(UsageReport {
         schema: "historious.report.v1",
@@ -182,7 +222,137 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         model_mix_by_month,
         rhythms,
         frequencies,
+        topics,
     })
+}
+
+fn report_topics(
+    store: &Store,
+    since: Option<&str>,
+    project: Option<&str>,
+) -> Result<(Option<TopicSection>, Option<String>)> {
+    let Some((version, model_id, corpus_messages, selected_k)) = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT version, model_id, item_count, selected_k
+             FROM topic_runs
+             WHERE status = 'completed'
+             ORDER BY completed_at DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    })?
+    else {
+        return Ok((None, Some("topics are unavailable; run `histo lab topics cluster` and `histo lab topics label`".to_string())));
+    };
+    let labeled: i64 = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM topics WHERE version = ?1 AND label IS NOT NULL",
+            params![version],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })?;
+    if labeled != selected_k {
+        return Ok((
+            None,
+            Some(format!(
+                "topic version {version} has {labeled} of {selected_k} labels; run `histo lab topics label`"
+            )),
+        ));
+    }
+    let topics = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT a.topic_id, t.label, COUNT(*)
+             FROM topic_assignments a
+             JOIN topics t ON t.version = a.version AND t.topic_id = a.topic_id
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN session_facts sf ON sf.session_id = hi.session_id
+             WHERE a.version = ?1
+               AND (?2 IS NULL OR hi.occurred_at >= ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY a.topic_id, t.label
+             ORDER BY COUNT(*) DESC, a.topic_id",
+        )?;
+        let rows = stmt.query_map(params![version, since, project], |row| {
+            Ok(TopicSummary {
+                topic_id: row.get(0)?,
+                label: row.get(1)?,
+                messages: nonnegative(row.get(2)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let by_month = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT strftime('%Y-%m', hi.occurred_at, 'localtime'), a.topic_id, t.label, COUNT(*)
+             FROM topic_assignments a
+             JOIN topics t ON t.version = a.version AND t.topic_id = a.topic_id
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN session_facts sf ON sf.session_id = hi.session_id
+             WHERE a.version = ?1 AND hi.occurred_at IS NOT NULL
+               AND (?2 IS NULL OR hi.occurred_at >= ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY 1, a.topic_id, t.label ORDER BY 1, COUNT(*) DESC",
+        )?;
+        let rows = stmt.query_map(params![version, since, project], |row| {
+            Ok(TopicPeriod {
+                month: row.get(0)?,
+                topic_id: row.get(1)?,
+                label: row.get(2)?,
+                messages: nonnegative(row.get(3)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let by_project = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(sf.workspace_path, 'unknown'), a.topic_id, t.label, COUNT(*)
+             FROM topic_assignments a
+             JOIN topics t ON t.version = a.version AND t.topic_id = a.topic_id
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN session_facts sf ON sf.session_id = hi.session_id
+             WHERE a.version = ?1
+               AND (?2 IS NULL OR hi.occurred_at >= ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY sf.workspace_path, a.topic_id, t.label
+             ORDER BY COUNT(*) DESC, sf.workspace_path, a.topic_id",
+        )?;
+        let rows = stmt.query_map(params![version, since, project], |row| {
+            Ok(TopicProject {
+                workspace_path: row.get(0)?,
+                topic_id: row.get(1)?,
+                label: row.get(2)?,
+                messages: nonnegative(row.get(3)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let assigned_messages = topics.iter().map(|topic| topic.messages).sum();
+    Ok((
+        Some(TopicSection {
+            version,
+            model_id,
+            assigned_messages,
+            corpus_messages: nonnegative(corpus_messages),
+            topics,
+            by_month,
+            by_project,
+        }),
+        None,
+    ))
 }
 
 fn report_frequencies(
@@ -689,6 +859,32 @@ pub fn render_terminal(report: &UsageReport) -> String {
         }
         out.push('\n');
     }
+    if let Some(topics) = &report.topics {
+        out.push_str(&format!(
+            "\nTopics — {} · {} of {} messages\n",
+            topics.version, topics.assigned_messages, topics.corpus_messages
+        ));
+        for topic in topics.topics.iter().take(15) {
+            out.push_str(&format!(
+                "  {:>6}  {:<36} #{}\n",
+                topic.messages, topic.label, topic.topic_id
+            ));
+        }
+        out.push_str("\nTopic prevalence by month\n");
+        for point in topics.by_month.iter().rev().take(20).rev() {
+            out.push_str(&format!(
+                "  {}  {:>5}  {}\n",
+                point.month, point.messages, point.label
+            ));
+        }
+        out.push_str("\nTopics by project\n");
+        for point in topics.by_project.iter().take(20) {
+            out.push_str(&format!(
+                "  {:>5}  {:<32} {}\n",
+                point.messages, point.label, point.workspace_path
+            ));
+        }
+    }
     out
 }
 
@@ -802,6 +998,7 @@ mod tests {
         );
         assert_eq!(report.provider_mix_by_month[0].name, "codex");
         assert_eq!(report.model_mix_by_month.len(), 2);
+        assert!(report.topics.is_none());
 
         let filtered = compute(
             &store,
@@ -814,5 +1011,85 @@ mod tests {
         .expect("compute filtered report");
         assert_eq!(filtered.totals.sessions, 1);
         assert_eq!(filtered.totals.human_messages, 0);
+    }
+
+    #[test]
+    fn topic_report_uses_latest_completed_labeled_version_and_aggregate_dimensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO session_facts (session_id, source_kind, workspace_path)
+                    VALUES ('session_a', 'codex', '/repo/project-alpha'),
+                           ('session_b', 'codex', '/repo/project-beta');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('item_a', 'event_a', 'session_a', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', 'a', 'hash_a', '2026-05-01T00:00:00Z',
+                       1, 'required', '{}', 'item_hash_a'),
+                      ('item_b', 'event_b', 'session_b', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', 'b', 'hash_b', '2026-06-01T00:00:00Z',
+                       1, 'required', '{}', 'item_hash_b');
+
+                    INSERT INTO topic_runs
+                      (version, algorithm_version, model_id, input_hash, item_count, selected_k,
+                       silhouette_score, status, started_at, completed_at)
+                    VALUES
+                      ('complete', 1, 'model', 'input', 2, 2, 0.8, 'completed',
+                       '2026-07-01T00:00:00Z', '2026-07-01T00:01:00Z'),
+                      ('building', 1, 'model', 'input2', 2, NULL, NULL, 'building',
+                       '2026-07-02T00:00:00Z', NULL);
+
+                    INSERT INTO topic_assignments (version, item_id, topic_id, distance)
+                    VALUES ('complete', 'item_a', 0, 0.1), ('complete', 'item_b', 1, 0.2);
+                    "#,
+                )?;
+                for (topic_id, label) in [(0, "Project alpha"), (1, "Project beta")] {
+                    conn.execute(
+                        "INSERT INTO topics (version, topic_id, size, centroid, label)
+                         VALUES ('complete', ?1, 1, ?2, ?3)",
+                        params![topic_id, vec![0u8], label],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("insert topic report fixtures");
+
+        let (topics, warning) = report_topics(&store, None, None).expect("topic report");
+        let topics = topics.expect("completed topics");
+        assert!(warning.is_none());
+        assert_eq!(topics.version, "complete");
+        assert_eq!(topics.assigned_messages, 2);
+        assert_eq!(topics.by_month[0].month, "2026-05");
+        assert_eq!(topics.by_project[0].workspace_path, "/repo/gail");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO topic_runs
+                     (version, algorithm_version, model_id, input_hash, item_count, selected_k,
+                      silhouette_score, status, started_at, completed_at)
+                     VALUES ('unlabeled', 1, 'model', 'input3', 2, 2, 0.9, 'completed',
+                             '2026-07-03T00:00:00Z', '2026-07-03T00:01:00Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO topics (version, topic_id, size, centroid, label)
+                     VALUES ('unlabeled', 0, 1, ?1, 'Ready'),
+                            ('unlabeled', 1, 1, ?1, NULL)",
+                    params![vec![0u8]],
+                )?;
+                Ok(())
+            })
+            .expect("insert incomplete labels");
+        let (topics, warning) = report_topics(&store, None, None).expect("incomplete topics");
+        assert!(topics.is_none());
+        assert!(warning.expect("warning").contains("1 of 2 labels"));
     }
 }
