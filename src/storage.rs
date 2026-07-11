@@ -5084,6 +5084,42 @@ fn migrate(conn: &Connection) -> Result<()> {
           updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS message_provenance (
+          item_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          authored_by TEXT NOT NULL,
+          sentiment_usable TEXT,
+          rule TEXT NOT NULL,
+          occurred_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_provenance_author_time
+          ON message_provenance(authored_by, occurred_at);
+
+        CREATE TABLE IF NOT EXISTS session_facts (
+          session_id TEXT PRIMARY KEY,
+          source_kind TEXT NOT NULL,
+          workspace_path TEXT,
+          session_class TEXT,
+          models_json TEXT NOT NULL DEFAULT '[]',
+          primary_model TEXT,
+          input_tokens INTEGER,
+          cached_input_tokens INTEGER,
+          output_tokens INTEGER,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          user_message_count INTEGER NOT NULL DEFAULT 0,
+          first_event_at TEXT,
+          last_event_at TEXT,
+          duration_secs INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_facts_workspace
+          ON session_facts(workspace_path);
+
+        CREATE INDEX IF NOT EXISTS idx_session_facts_source
+          ON session_facts(source_kind);
+
         CREATE TABLE IF NOT EXISTS source_status_counts (
           source_kind TEXT PRIMARY KEY,
           sessions INTEGER NOT NULL DEFAULT 0,

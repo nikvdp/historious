@@ -1,3 +1,4 @@
+mod analytics;
 mod archive;
 mod cli;
 mod config;

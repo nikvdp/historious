@@ -1,3 +1,4 @@
+use crate::analytics;
 use crate::config::AppConfig;
 use crate::ingest;
 use crate::search;
@@ -780,6 +781,11 @@ pub enum Command {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    /// Rebuild and inspect experimental derived data.
+    Lab {
+        #[command(subcommand)]
+        command: LabCommand,
+    },
     /// Output agent instructions for Historious.
     Onboard {
         #[arg(long, help = "Emit only the AGENTS.md-ready block")]
@@ -861,6 +867,12 @@ pub enum MaintenanceCommand {
         )]
         confirm: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LabCommand {
+    /// Rebuild analytics projections from stored events and sessions.
+    Rebuild,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2275,6 +2287,23 @@ impl Cli {
                     }
                 }
             },
+            Command::Lab { command } => match command {
+                LabCommand::Rebuild => {
+                    let mut last_completed = 0;
+                    let statuses = analytics::rebuild_all(&store, |name, completed, total| {
+                        if completed > last_completed {
+                            println!("Rebuilt {name} ({completed}/{total})");
+                            last_completed = completed;
+                        }
+                    })?;
+                    if analytics::is_stale(&store)? {
+                        bail!("analytics projections remain stale after rebuild");
+                    }
+                    for status in statuses {
+                        println!("{}: {} rows, fresh", status.name, status.row_count);
+                    }
+                }
+            },
             Command::Daemon {
                 interval_secs,
                 max_files,
@@ -2396,6 +2425,7 @@ impl Command {
             Command::Status { .. } => "status",
             Command::Config { .. } => "config",
             Command::Maintenance { .. } => "maintenance",
+            Command::Lab { .. } => "lab",
             Command::Onboard { .. } => "onboard",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
@@ -9309,6 +9339,17 @@ mod tests {
                 _ => panic!("expected config command"),
             }
         }
+    }
+
+    #[test]
+    fn lab_rebuild_subcommand_parses() {
+        let cli = Cli::try_parse_from(["histo", "lab", "rebuild"]).expect("parse lab rebuild");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Rebuild
+            }
+        ));
     }
 
     #[test]
