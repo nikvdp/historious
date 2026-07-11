@@ -8,6 +8,7 @@ use crate::storage::{
     QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
     ThreadListOptions, ThreadSortMode,
 };
+use crate::topics;
 use crate::transport;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -895,6 +896,20 @@ pub enum LabCommand {
         rule: Option<String>,
         #[arg(short = 'n', default_value_t = 20)]
         limit: usize,
+    },
+    /// Build local embeddings for topic analysis.
+    Topics {
+        #[command(subcommand)]
+        command: TopicCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TopicCommand {
+    /// Embed human-authored messages that do not have a topic vector yet.
+    Embed {
+        #[arg(long, help = "Embed at most this many missing messages")]
+        limit: Option<usize>,
     },
 }
 
@@ -2422,6 +2437,29 @@ impl Cli {
                             println!("    {occurred_at}");
                         }
                     }
+                }
+                LabCommand::Topics {
+                    command: TopicCommand::Embed { limit },
+                } => {
+                    if limit == Some(0) {
+                        bail!("topic embedding limit must be greater than zero");
+                    }
+                    let embedder = topics::load_embedder(&config.data_dir)?;
+                    let outcome = topics::backfill(
+                        &store,
+                        &config.machine_id,
+                        embedder.as_ref(),
+                        limit,
+                    )?;
+                    println!(
+                        "Topic embeddings ({}): {} added, {} reused, {} pending, {} vectors indexed ({:.1}/s)",
+                        outcome.model_id,
+                        outcome.embedded,
+                        outcome.reused,
+                        outcome.pending,
+                        outcome.vectors_indexed,
+                        outcome.per_second()
+                    );
                 }
             },
             Command::Daemon {
@@ -9532,6 +9570,22 @@ mod tests {
                     limit: 30,
                 }
             } if rule == "default.human"
+        ));
+    }
+
+    #[test]
+    fn lab_topic_embedding_limit_parses() {
+        let cli = Cli::try_parse_from([
+            "histo", "lab", "topics", "embed", "--limit", "25",
+        ])
+        .expect("parse topic embedding command");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Topics {
+                    command: TopicCommand::Embed { limit: Some(25) }
+                }
+            }
         ));
     }
 

@@ -916,13 +916,13 @@ pub fn machine_id_prefix_for_hostname(hostname: &str) -> String {
     crate::config::machine_id_prefix_for_name(hostname)
 }
 
-fn embedding_input(text: &str) -> String {
+pub(crate) fn embedding_input(text: &str) -> String {
     text.chars()
         .take(EMBEDDING_TEXT_MAX_CHARS)
         .collect::<String>()
 }
 
-fn embedding_record(
+pub(crate) fn embedding_record(
     machine_id: &str,
     embedder: &dyn Embedder,
     unit: &HistoryItemForEmbedding,

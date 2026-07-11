@@ -16,6 +16,7 @@ mod server;
 mod skills;
 mod source;
 mod storage;
+mod topics;
 mod transcript;
 mod transport;
 mod treechat;
