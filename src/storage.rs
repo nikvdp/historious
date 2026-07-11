@@ -5113,6 +5113,49 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_annotations_version_axis_score
           ON message_annotations(annotator_version, axis, score);
 
+        CREATE TABLE IF NOT EXISTS topic_runs (
+          version TEXT PRIMARY KEY,
+          algorithm_version INTEGER NOT NULL,
+          model_id TEXT NOT NULL,
+          input_hash TEXT NOT NULL,
+          item_count INTEGER NOT NULL,
+          selected_k INTEGER,
+          silhouette_score REAL,
+          candidates_json TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_topic_runs_completed
+          ON topic_runs(status, completed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS topics (
+          version TEXT NOT NULL,
+          topic_id INTEGER NOT NULL,
+          size INTEGER NOT NULL,
+          centroid BLOB NOT NULL,
+          label TEXT,
+          label_model TEXT,
+          labeler_version TEXT,
+          labeled_at TEXT,
+          PRIMARY KEY (version, topic_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS topic_assignments (
+          version TEXT NOT NULL,
+          item_id TEXT NOT NULL,
+          topic_id INTEGER NOT NULL,
+          distance REAL NOT NULL,
+          PRIMARY KEY (version, item_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_topic_assignments_topic
+          ON topic_assignments(version, topic_id);
+
+        CREATE INDEX IF NOT EXISTS idx_topic_assignments_item
+          ON topic_assignments(item_id, version);
+
         CREATE TABLE IF NOT EXISTS session_facts (
           session_id TEXT PRIMARY KEY,
           source_kind TEXT NOT NULL,
@@ -5239,7 +5282,7 @@ pub fn f32_vector_to_blob(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
-#[cfg(test)]
+#[cfg_attr(not(feature = "analytics-topics"), allow(dead_code))]
 pub fn f32_vector_from_blob(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % std::mem::size_of::<f32>() != 0 {
         bail!("invalid f32 vector byte length {}", bytes.len());

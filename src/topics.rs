@@ -1,14 +1,21 @@
+#![cfg_attr(not(feature = "analytics-topics"), allow(dead_code))]
+
 use crate::archive::ArchiveRecord;
 #[cfg(feature = "semantic-fastembed")]
 use crate::embed::EmbedderConfig;
 use crate::embed::{Embedder, DEFAULT_SEMANTIC_DIMS};
 use crate::provenance;
 use crate::storage::{HistoryItemEmbeddingCursor, HistoryItemForEmbedding, Store};
-use anyhow::{bail, Result};
-use rusqlite::params;
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+#[cfg(feature = "analytics-topics")]
+use uuid::Uuid;
 
 const BATCH_SIZE: usize = 64;
+const TOPIC_CLUSTER_ALGORITHM_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct TopicEmbeddingOutcome {
@@ -216,6 +223,483 @@ fn repair_vector_projection(store: &Store, model_id: &str) -> Result<usize> {
     store.refresh_vector_projection_for_embeddings(&ids)
 }
 
+#[derive(Debug, Clone)]
+pub struct ClusterOptions {
+    pub min_k: usize,
+    pub max_k: usize,
+    pub step: usize,
+    pub sample_size: usize,
+    pub rebuild: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusterCandidate {
+    pub k: usize,
+    pub silhouette: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterOutcome {
+    pub version: String,
+    pub item_count: usize,
+    pub selected_k: usize,
+    pub silhouette: f64,
+    pub candidates: Vec<ClusterCandidate>,
+    pub reused: bool,
+}
+
+#[cfg(feature = "analytics-topics")]
+pub fn cluster(
+    store: &Store,
+    options: &ClusterOptions,
+    mut progress: impl FnMut(&ClusterCandidate),
+) -> Result<ClusterOutcome> {
+    validate_cluster_options(options)?;
+    let dataset = load_topic_dataset(store)?;
+    if !options.rebuild {
+        if let Some(mut existing) =
+            completed_cluster_for_input(store, &dataset.model_id, &dataset.input_hash)?
+        {
+            existing.reused = true;
+            return Ok(existing);
+        }
+    }
+
+    let version = format!("topics_{}", Uuid::new_v4().simple());
+    start_cluster_run(store, &version, &dataset)?;
+    let sample = sample_points(&dataset.points, DEFAULT_SEMANTIC_DIMS, options.sample_size);
+    let sample_count = sample.len() / DEFAULT_SEMANTIC_DIMS;
+    let candidates = candidate_ks(options)
+        .into_iter()
+        .filter(|k| *k < sample_count)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!("topic clustering needs more sampled messages than candidate clusters");
+    }
+
+    let mut scores = Vec::with_capacity(candidates.len());
+    for k in candidates {
+        let model = fit_kmeans(&sample, k, 30, 1)?;
+        let assignments = model
+            .predict(&sample)
+            .context("assigning topic score sample")?;
+        let candidate = ClusterCandidate {
+            k,
+            silhouette: centroid_silhouette(
+                &sample,
+                DEFAULT_SEMANTIC_DIMS,
+                model.centroids(),
+                k,
+                &assignments,
+            ),
+        };
+        progress(&candidate);
+        scores.push(candidate);
+    }
+    let best = scores
+        .iter()
+        .max_by(|left, right| left.silhouette.total_cmp(&right.silhouette))
+        .expect("non-empty candidates");
+    let model = fit_kmeans_minibatch(&dataset.points, best.k)?;
+    let assignments = model
+        .predict(&dataset.points)
+        .context("assigning topic corpus")?;
+    let distances = assigned_distances(
+        &dataset.points,
+        DEFAULT_SEMANTIC_DIMS,
+        model.centroids(),
+        &assignments,
+    );
+    persist_cluster_run(
+        store,
+        &version,
+        &dataset,
+        model.centroids(),
+        &assignments,
+        &distances,
+        &scores,
+        best.k,
+        best.silhouette,
+    )?;
+    prune_topic_versions(store)?;
+
+    Ok(ClusterOutcome {
+        version,
+        item_count: dataset.item_ids.len(),
+        selected_k: best.k,
+        silhouette: best.silhouette,
+        candidates: scores,
+        reused: false,
+    })
+}
+
+#[cfg(not(feature = "analytics-topics"))]
+pub fn cluster(
+    _store: &Store,
+    _options: &ClusterOptions,
+    _progress: impl FnMut(&ClusterCandidate),
+) -> Result<ClusterOutcome> {
+    bail!("topic clustering requires the analytics-topics feature")
+}
+
+fn validate_cluster_options(options: &ClusterOptions) -> Result<()> {
+    if options.min_k < 2 {
+        bail!("minimum topic count must be at least two");
+    }
+    if options.max_k < options.min_k {
+        bail!("maximum topic count must not be smaller than the minimum");
+    }
+    if options.step == 0 {
+        bail!("topic count step must be greater than zero");
+    }
+    if options.sample_size <= options.max_k {
+        bail!("topic sample size must be greater than the maximum topic count");
+    }
+    Ok(())
+}
+
+fn candidate_ks(options: &ClusterOptions) -> Vec<usize> {
+    (options.min_k..=options.max_k)
+        .step_by(options.step)
+        .collect()
+}
+
+struct TopicDataset {
+    model_id: String,
+    input_hash: String,
+    item_ids: Vec<String>,
+    points: Vec<f32>,
+}
+
+fn load_topic_dataset(store: &Store) -> Result<TopicDataset> {
+    let total = human_topic_item_count(store)?;
+    let model_id = store
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT e.model_id
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             JOIN embeddings e ON e.unit_id = hi.id AND e.text_hash = hi.text_hash
+             WHERE p.authored_by = 'human'
+               AND COALESCE(p.sentiment_usable, 'no') != 'no'
+               AND e.dims = 384
+             GROUP BY e.model_id
+             ORDER BY COUNT(*) DESC, e.model_id
+             LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })?
+        .context("no human topic embeddings found; run `histo lab topics embed`")?;
+    let rows = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT hi.id, e.vector
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             JOIN embeddings e
+               ON e.unit_id = hi.id
+              AND e.text_hash = hi.text_hash
+              AND e.model_id = ?1
+              AND e.dims = 384
+             WHERE p.authored_by = 'human'
+               AND COALESCE(p.sentiment_usable, 'no') != 'no'
+             ORDER BY hi.rowid",
+        )?;
+        let rows = stmt.query_map(params![model_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    if rows.len() != total {
+        bail!(
+            "topic embeddings are incomplete: {} of {} human messages ready; run `histo lab topics embed`",
+            rows.len(),
+            total
+        );
+    }
+    let mut item_ids = Vec::with_capacity(rows.len());
+    let mut points = Vec::with_capacity(rows.len() * DEFAULT_SEMANTIC_DIMS);
+    for (item_id, vector) in rows {
+        let vector = crate::storage::f32_vector_from_blob(&vector)?;
+        if vector.len() != DEFAULT_SEMANTIC_DIMS {
+            bail!("topic embedding {item_id} is not 384-dimensional");
+        }
+        item_ids.push(item_id);
+        points.extend(vector);
+    }
+    let input_hash =
+        crate::archive::stable_hash(&(TOPIC_CLUSTER_ALGORITHM_VERSION, &model_id, &item_ids))?;
+    Ok(TopicDataset {
+        model_id,
+        input_hash,
+        item_ids,
+        points,
+    })
+}
+
+fn sample_points(points: &[f32], dims: usize, limit: usize) -> Vec<f32> {
+    let count = points.len() / dims;
+    let sample_count = count.min(limit);
+    if sample_count == count {
+        return points.to_vec();
+    }
+    let mut sample = Vec::with_capacity(sample_count * dims);
+    for index in 0..sample_count {
+        let source = index * count / sample_count;
+        sample.extend_from_slice(&points[source * dims..(source + 1) * dims]);
+    }
+    sample
+}
+
+#[cfg(feature = "analytics-topics")]
+fn fit_kmeans(
+    points: &[f32],
+    k: usize,
+    iterations: usize,
+    attempts: usize,
+) -> Result<kmeans_uni::KMeans<f32>> {
+    kmeans_uni::KMeansBuilder::new(k)
+        .iterations(iterations)
+        .attempts(attempts)
+        .seed(0x4849_5354_4f52_494f_u64.wrapping_add(k as u64))
+        .cpu_simd()
+        .euclidean()
+        .parallel()
+        .fit(points, DEFAULT_SEMANTIC_DIMS)
+        .context("fitting topic k-means")
+}
+
+#[cfg(feature = "analytics-topics")]
+fn fit_kmeans_minibatch(points: &[f32], k: usize) -> Result<kmeans_uni::KMeans<f32>> {
+    let source = kmeans_uni::SlicePointSource::new(points, DEFAULT_SEMANTIC_DIMS)
+        .context("reading topic vectors for k-means")?;
+    kmeans_uni::KMeansBuilder::new(k)
+        .iterations(100)
+        .attempts(2)
+        .seed(0x4849_5354_4f52_494f_u64.wrapping_add(k as u64))
+        .cpu_simd()
+        .euclidean()
+        .parallel()
+        .fit_mini_batch_from_source(&source, 1_024.min(points.len() / DEFAULT_SEMANTIC_DIMS))
+        .context("fitting full topic k-means")
+}
+
+fn centroid_silhouette(
+    points: &[f32],
+    dims: usize,
+    centroids: &[f32],
+    k: usize,
+    assignments: &[usize],
+) -> f64 {
+    let mut total = 0.0;
+    for (point, own) in points.chunks_exact(dims).zip(assignments.iter().copied()) {
+        let mut own_distance = 0.0;
+        let mut nearest_other = f32::INFINITY;
+        for (topic_id, centroid) in centroids.chunks_exact(dims).take(k).enumerate() {
+            let distance = squared_distance(point, centroid);
+            if topic_id == own {
+                own_distance = distance;
+            } else {
+                nearest_other = nearest_other.min(distance);
+            }
+        }
+        let denominator = own_distance.max(nearest_other);
+        if denominator > 0.0 && denominator.is_finite() {
+            total += ((nearest_other - own_distance) / denominator) as f64;
+        }
+    }
+    total / assignments.len().max(1) as f64
+}
+
+fn assigned_distances(
+    points: &[f32],
+    dims: usize,
+    centroids: &[f32],
+    assignments: &[usize],
+) -> Vec<f32> {
+    points
+        .chunks_exact(dims)
+        .zip(assignments.iter().copied())
+        .map(|(point, topic_id)| {
+            squared_distance(point, &centroids[topic_id * dims..(topic_id + 1) * dims]).sqrt()
+        })
+        .collect()
+}
+
+fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let delta = left - right;
+            delta * delta
+        })
+        .sum()
+}
+
+fn start_cluster_run(store: &Store, version: &str, dataset: &TopicDataset) -> Result<()> {
+    store.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO topic_runs
+             (version, algorithm_version, model_id, input_hash, item_count, status, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'building', ?6)",
+            params![
+                version,
+                TOPIC_CLUSTER_ALGORITHM_VERSION,
+                dataset.model_id,
+                dataset.input_hash,
+                dataset.item_ids.len() as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_cluster_run(
+    store: &Store,
+    version: &str,
+    dataset: &TopicDataset,
+    centroids: &[f32],
+    assignments: &[usize],
+    distances: &[f32],
+    candidates: &[ClusterCandidate],
+    selected_k: usize,
+    silhouette: f64,
+) -> Result<()> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting topic cluster write")?;
+        let mut sizes = vec![0usize; selected_k];
+        for topic_id in assignments {
+            sizes[*topic_id] += 1;
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO topics (version, topic_id, size, centroid)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (topic_id, centroid) in centroids
+                .chunks_exact(DEFAULT_SEMANTIC_DIMS)
+                .take(selected_k)
+                .enumerate()
+            {
+                stmt.execute(params![
+                    version,
+                    topic_id as i64,
+                    sizes[topic_id] as i64,
+                    crate::storage::f32_vector_to_blob(centroid),
+                ])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO topic_assignments (version, item_id, topic_id, distance)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for ((item_id, topic_id), distance) in
+                dataset.item_ids.iter().zip(assignments).zip(distances)
+            {
+                stmt.execute(params![version, item_id, *topic_id as i64, distance])?;
+            }
+        }
+        tx.execute(
+            "UPDATE topic_runs
+             SET selected_k = ?2, silhouette_score = ?3, candidates_json = ?4,
+                 status = 'completed', completed_at = ?5
+             WHERE version = ?1",
+            params![
+                version,
+                selected_k as i64,
+                silhouette,
+                serde_json::to_string(candidates)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.commit().context("committing topic cluster write")
+    })
+}
+
+fn completed_cluster_for_input(
+    store: &Store,
+    model_id: &str,
+    input_hash: &str,
+) -> Result<Option<ClusterOutcome>> {
+    let row = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT version, item_count, selected_k, silhouette_score, candidates_json
+             FROM topic_runs
+             WHERE status = 'completed'
+               AND algorithm_version = ?1
+               AND model_id = ?2
+               AND input_hash = ?3
+             ORDER BY completed_at DESC
+             LIMIT 1",
+            params![TOPIC_CLUSTER_ALGORITHM_VERSION, model_id, input_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    row.map(
+        |(version, item_count, selected_k, silhouette, candidates)| {
+            Ok(ClusterOutcome {
+                version,
+                item_count: item_count.max(0) as usize,
+                selected_k: selected_k.max(0) as usize,
+                silhouette,
+                candidates: serde_json::from_str(&candidates)?,
+                reused: false,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn prune_topic_versions(store: &Store) -> Result<()> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting topic version pruning")?;
+        for table in ["topic_assignments", "topics"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE version NOT IN (
+                         SELECT version FROM topic_runs
+                         WHERE status = 'completed'
+                         ORDER BY completed_at DESC
+                         LIMIT 2
+                     )"
+                ),
+                [],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM topic_runs
+             WHERE status != 'completed'
+                OR version NOT IN (
+                    SELECT version FROM topic_runs
+                    WHERE status = 'completed'
+                    ORDER BY completed_at DESC
+                    LIMIT 2
+                )",
+            [],
+        )?;
+        tx.commit().context("committing topic version pruning")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +807,133 @@ mod tests {
         assert_eq!(counts, (2, 2));
     }
 
+    #[cfg(feature = "analytics-topics")]
+    #[test]
+    fn synthetic_clusters_are_assigned_to_distinct_centroids() {
+        let mut points = Vec::new();
+        for index in 0..12 {
+            let mut point = vec![0.0f32; DEFAULT_SEMANTIC_DIMS];
+            point[0] = 1.0;
+            point[2] = index as f32 * 0.001;
+            points.extend(point);
+        }
+        for index in 0..12 {
+            let mut point = vec![0.0f32; DEFAULT_SEMANTIC_DIMS];
+            point[1] = 1.0;
+            point[2] = index as f32 * 0.001;
+            points.extend(point);
+        }
+
+        let model = fit_kmeans(&points, 2, 50, 2).expect("fit synthetic clusters");
+        let assignments = model.predict(&points).expect("assign synthetic clusters");
+        assert!(assignments[..12]
+            .iter()
+            .all(|topic| *topic == assignments[0]));
+        assert!(assignments[12..]
+            .iter()
+            .all(|topic| *topic == assignments[12]));
+        assert_ne!(assignments[0], assignments[12]);
+        assert!(
+            centroid_silhouette(
+                &points,
+                DEFAULT_SEMANTIC_DIMS,
+                model.centroids(),
+                2,
+                &assignments,
+            ) > 0.99
+        );
+    }
+
+    #[test]
+    fn completed_topic_versions_ignore_interruptions_and_retain_two_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let candidates = vec![ClusterCandidate {
+            k: 2,
+            silhouette: 0.8,
+        }];
+        let centroids = vec![0.0; DEFAULT_SEMANTIC_DIMS * 2];
+        let assignments = vec![0, 0, 1];
+        let distances = vec![0.1, 0.2, 0.3];
+
+        let first = fixture_topic_dataset("input_1");
+        start_cluster_run(&store, "version_1", &first).expect("start first run");
+        persist_cluster_run(
+            &store,
+            "version_1",
+            &first,
+            &centroids,
+            &assignments,
+            &distances,
+            &candidates,
+            2,
+            0.8,
+        )
+        .expect("complete first run");
+        let interrupted = fixture_topic_dataset("input_interrupted");
+        start_cluster_run(&store, "interrupted", &interrupted).expect("start interrupted run");
+        assert_eq!(
+            completed_cluster_for_input(&store, "fixture-topic-384", "input_1")
+                .expect("read completed run")
+                .expect("completed run")
+                .version,
+            "version_1"
+        );
+
+        for (version, input_hash) in [("version_2", "input_2"), ("version_3", "input_3")] {
+            let dataset = fixture_topic_dataset(input_hash);
+            start_cluster_run(&store, version, &dataset).expect("start retained run");
+            persist_cluster_run(
+                &store,
+                version,
+                &dataset,
+                &centroids,
+                &assignments,
+                &distances,
+                &candidates,
+                2,
+                0.8,
+            )
+            .expect("complete retained run");
+            prune_topic_versions(&store).expect("prune topic versions");
+        }
+
+        let counts = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM topic_runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM topics", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM topic_assignments", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM topic_runs WHERE version IN ('version_1', 'interrupted')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .expect("count retained topic versions");
+        assert_eq!(counts, (2, 4, 6, 0));
+    }
+
+    fn fixture_topic_dataset(input_hash: &str) -> TopicDataset {
+        TopicDataset {
+            model_id: "fixture-topic-384".to_string(),
+            input_hash: input_hash.to_string(),
+            item_ids: vec![
+                "item_1".to_string(),
+                "item_2".to_string(),
+                "item_3".to_string(),
+            ],
+            points: Vec::new(),
+        }
+    }
+
     #[cfg(not(feature = "semantic-fastembed"))]
     #[test]
     fn feature_disabled_build_returns_a_clear_error() {
@@ -332,5 +943,21 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("semantic-fastembed"));
+    }
+
+    #[cfg(not(feature = "analytics-topics"))]
+    #[test]
+    fn clustering_feature_disabled_build_returns_a_clear_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let options = ClusterOptions {
+            min_k: 2,
+            max_k: 2,
+            step: 1,
+            sample_size: 3,
+            rebuild: false,
+        };
+        let error = cluster(&store, &options, |_| {}).expect_err("feature should be required");
+        assert!(error.to_string().contains("analytics-topics"));
     }
 }

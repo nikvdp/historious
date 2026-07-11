@@ -911,6 +911,19 @@ pub enum TopicCommand {
         #[arg(long, help = "Embed at most this many missing messages")]
         limit: Option<usize>,
     },
+    /// Cluster the completed human-message embedding corpus.
+    Cluster {
+        #[arg(long, default_value_t = 8)]
+        min_k: usize,
+        #[arg(long, default_value_t = 32)]
+        max_k: usize,
+        #[arg(long, default_value_t = 4)]
+        step: usize,
+        #[arg(long, default_value_t = 2_000)]
+        sample_size: usize,
+        #[arg(long, help = "Create a new version even when the corpus is unchanged")]
+        rebuild: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2459,6 +2472,49 @@ impl Cli {
                         outcome.pending,
                         outcome.vectors_indexed,
                         outcome.per_second()
+                    );
+                }
+                LabCommand::Topics {
+                    command:
+                        TopicCommand::Cluster {
+                            min_k,
+                            max_k,
+                            step,
+                            sample_size,
+                            rebuild,
+                        },
+                } => {
+                    let outcome = topics::cluster(
+                        &store,
+                        &topics::ClusterOptions {
+                            min_k,
+                            max_k,
+                            step,
+                            sample_size,
+                            rebuild,
+                        },
+                        |candidate| {
+                            println!(
+                                "  k={:<3} centroid silhouette {:.4}",
+                                candidate.k, candidate.silhouette
+                            );
+                        },
+                    )?;
+                    if outcome.reused {
+                        for candidate in &outcome.candidates {
+                            println!(
+                                "  k={:<3} centroid silhouette {:.4}",
+                                candidate.k, candidate.silhouette
+                            );
+                        }
+                    }
+                    println!(
+                        "Topic clustering {}: {} messages, k={}, silhouette {:.4}{}",
+                        outcome.version,
+                        outcome.item_count,
+                        outcome.selected_k,
+                        outcome.silhouette,
+                        if outcome.reused { " (reused)" } else { "" }
                     );
                 }
             },
@@ -9584,6 +9640,40 @@ mod tests {
             Command::Lab {
                 command: LabCommand::Topics {
                     command: TopicCommand::Embed { limit: Some(25) }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn lab_topic_cluster_options_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "lab",
+            "topics",
+            "cluster",
+            "--min-k",
+            "4",
+            "--max-k",
+            "12",
+            "--step",
+            "2",
+            "--sample-size",
+            "500",
+            "--rebuild",
+        ])
+        .expect("parse topic cluster command");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Topics {
+                    command: TopicCommand::Cluster {
+                        min_k: 4,
+                        max_k: 12,
+                        step: 2,
+                        sample_size: 500,
+                        rebuild: true,
+                    }
                 }
             }
         ));

@@ -16,7 +16,8 @@ name = "histo"
 path = "src/main.rs"
 
 [features]
-default = ["semantic-fastembed"]
+default = ["semantic-fastembed", "analytics-topics"]
+analytics-topics = ["dep:kmeans_uni"]
 semantic-fastembed = ["dep:fastembed"]
 
 [dependencies]
@@ -31,6 +32,7 @@ directories = "5.0"
 fastembed = { version = "5.15.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 hex = "0.4"
 libc = "0.2"
+kmeans_uni = { version = "0.2.0", optional = true }
 mdvi = { git = "https://github.com/nikvdp/mdvi.git", default-features = false, features = ["app"] }
 notify = "6.1"
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "functions"] }
