@@ -255,7 +255,7 @@ fn report_frequencies(
     })
 }
 
-fn tokenize_frequency_text(text: &str) -> Vec<String> {
+pub(crate) fn tokenize_frequency_text(text: &str) -> Vec<String> {
     let mut outside_code = String::new();
     let mut in_fence = false;
     for line in text.lines() {
@@ -326,7 +326,7 @@ fn top_terms(counts: HashMap<String, u64>, minimum: u64, limit: usize) -> Vec<Te
     terms
 }
 
-fn english_stopwords() -> HashSet<&'static str> {
+pub(crate) fn english_stopwords() -> HashSet<&'static str> {
     [
         "a", "all", "also", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can",
         "could", "do", "for", "from", "had", "has", "have", "he", "her", "here", "him", "his",

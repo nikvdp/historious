@@ -2,6 +2,8 @@ use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Transaction, TransactionBehavior};
+use serde_json::Value;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageAnnotation {
@@ -111,6 +113,95 @@ pub fn latest_annotations(store: &Store) -> Result<Vec<MessageAnnotation>> {
         .collect()
 }
 
+pub trait JsonLlm {
+    fn model(&self) -> &str;
+    fn complete_json(&self, system: &str, prompt: &str) -> Result<String>;
+}
+
+pub struct OpenAiJsonLlm {
+    url: String,
+    api_key: String,
+    model: String,
+}
+
+impl OpenAiJsonLlm {
+    pub fn from_env(url: Option<String>, model: Option<String>) -> Result<Self> {
+        let url = url
+            .or_else(|| std::env::var("HISTO_LLM_URL").ok())
+            .or_else(|| {
+                std::env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .map(chat_completions_url)
+            })
+            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
+        let api_key = std::env::var("HISTO_LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .context("set HISTO_LLM_API_KEY or OPENAI_API_KEY for LLM labeling")?;
+        let model = model
+            .or_else(|| std::env::var("HISTO_LLM_MODEL").ok())
+            .or_else(|| std::env::var("OPENAI_MODEL").ok())
+            .context("set --model, HISTO_LLM_MODEL, or OPENAI_MODEL for LLM labeling")?;
+        Ok(Self {
+            url,
+            api_key,
+            model,
+        })
+    }
+}
+
+impl JsonLlm for OpenAiJsonLlm {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn complete_json(&self, system: &str, prompt: &str) -> Result<String> {
+        for attempt in 0..4 {
+            let result = ureq::post(&self.url)
+                .set("Authorization", &format!("Bearer {}", self.api_key))
+                .set("Content-Type", "application/json")
+                .send_json(serde_json::json!({
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "response_format": {"type": "json_object"}
+                }));
+            match result {
+                Ok(response) => {
+                    let value: Value = response.into_json().context("parsing LLM response")?;
+                    return chat_content(&value).map(ToOwned::to_owned);
+                }
+                Err(ureq::Error::Status(status, _))
+                    if (status == 429 || status >= 500) && attempt < 3 =>
+                {
+                    std::thread::sleep(Duration::from_secs(1 << attempt));
+                }
+                Err(error) => return Err(error).context("calling LLM labeling endpoint"),
+            }
+        }
+        unreachable!("retry loop returns on its final attempt")
+    }
+}
+
+fn chat_completions_url(base: String) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
+fn chat_content(value: &Value) -> Result<&str> {
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .context("LLM response did not include choices[0].message.content")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +263,28 @@ mod tests {
 
         let error = insert_annotations(&store, &[invalid]).expect_err("reject invalid score");
         assert!(error.to_string().contains("between 1 and 5"));
+    }
+
+    #[test]
+    fn openai_response_content_and_base_urls_parse() {
+        let response = serde_json::json!({
+            "choices": [{"message": {"content": "{\"label\":\"Databases\"}"}}]
+        });
+        assert_eq!(
+            chat_content(&response).expect("chat content"),
+            "{\"label\":\"Databases\"}"
+        );
+        assert_eq!(
+            chat_completions_url("http://localhost:4000".to_string()),
+            "http://localhost:4000/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://localhost:4000/v1/chat/completions".to_string()),
+            "http://localhost:4000/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://localhost:4000/v1".to_string()),
+            "http://localhost:4000/v1/chat/completions"
+        );
     }
 }

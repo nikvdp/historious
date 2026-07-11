@@ -924,6 +924,17 @@ pub enum TopicCommand {
         #[arg(long, help = "Create a new version even when the corpus is unchanged")]
         rebuild: bool,
     },
+    /// Label current topic clusters with an OpenAI-compatible model.
+    Label {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = "topic-label-v1")]
+        labeler_version: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, help = "Exact chat completions endpoint URL")]
+        url: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2515,6 +2526,30 @@ impl Cli {
                         outcome.selected_k,
                         outcome.silhouette,
                         if outcome.reused { " (reused)" } else { "" }
+                    );
+                }
+                LabCommand::Topics {
+                    command:
+                        TopicCommand::Label {
+                            limit,
+                            labeler_version,
+                            model,
+                            url,
+                        },
+                } => {
+                    if limit == Some(0) {
+                        bail!("topic label limit must be greater than zero");
+                    }
+                    let llm = crate::annotate::OpenAiJsonLlm::from_env(url, model)?;
+                    let outcome =
+                        topics::label_topics(&store, &llm, &labeler_version, limit)?;
+                    println!(
+                        "Topic labels {} ({}): {} added, {} reused, {} pending",
+                        outcome.version,
+                        outcome.model,
+                        outcome.labeled,
+                        outcome.skipped,
+                        outcome.pending
                     );
                 }
             },
@@ -9676,6 +9711,36 @@ mod tests {
                     }
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn lab_topic_label_options_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "lab",
+            "topics",
+            "label",
+            "--limit",
+            "20",
+            "--labeler-version",
+            "labels-v2",
+            "--model",
+            "small-model",
+        ])
+        .expect("parse topic label command");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Topics {
+                    command: TopicCommand::Label {
+                        limit: Some(20),
+                        labeler_version,
+                        model: Some(model),
+                        url: None,
+                    }
+                }
+            } if labeler_version == "labels-v2" && model == "small-model"
         ));
     }
 

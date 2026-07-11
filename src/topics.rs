@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "analytics-topics"), allow(dead_code))]
 
+use crate::annotate::JsonLlm;
 use crate::archive::ArchiveRecord;
 #[cfg(feature = "semantic-fastembed")]
 use crate::embed::EmbedderConfig;
@@ -10,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 #[cfg(feature = "analytics-topics")]
 use uuid::Uuid;
@@ -700,9 +702,256 @@ fn prune_topic_versions(store: &Store) -> Result<()> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct TopicLabelOutcome {
+    pub version: String,
+    pub model: String,
+    pub labeled: usize,
+    pub skipped: usize,
+    pub pending: usize,
+}
+
+pub fn label_topics(
+    store: &Store,
+    llm: &dyn JsonLlm,
+    labeler_version: &str,
+    limit: Option<usize>,
+) -> Result<TopicLabelOutcome> {
+    let version = current_topic_version(store)?;
+    let pending_before = unlabeled_topic_ids(store, &version, labeler_version)?;
+    let total = topic_count(store, &version)?;
+    let terms = distinctive_topic_terms(store, &version)?;
+    let mut labeled = 0;
+    for topic_id in pending_before
+        .iter()
+        .copied()
+        .take(limit.unwrap_or(usize::MAX))
+    {
+        let representatives = topic_representatives(store, &version, topic_id, 5)?;
+        let prompt = serde_json::json!({
+            "topic_id": topic_id,
+            "distinctive_terms": terms.get(&topic_id).cloned().unwrap_or_default(),
+            "representative_messages": representatives,
+        })
+        .to_string();
+        let response = llm.complete_json(
+            "Name a cluster of the user's coding-agent requests. Return JSON only as {\"label\":\"2-6 concrete words\"}. Use \"misc\" when incoherent. Never infer psychology or personality.",
+            &prompt,
+        )?;
+        let label = parse_topic_label(&response)?;
+        store_topic_label(
+            store,
+            &version,
+            topic_id,
+            &label,
+            llm.model(),
+            labeler_version,
+        )?;
+        labeled += 1;
+    }
+    let pending = unlabeled_topic_ids(store, &version, labeler_version)?.len();
+    Ok(TopicLabelOutcome {
+        version,
+        model: llm.model().to_string(),
+        labeled,
+        skipped: total.saturating_sub(pending_before.len()),
+        pending,
+    })
+}
+
+fn current_topic_version(store: &Store) -> Result<String> {
+    store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT version FROM topic_runs
+             WHERE status = 'completed'
+             ORDER BY completed_at DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("no completed topic version; run `histo lab topics cluster`")
+    })
+}
+
+fn topic_count(store: &Store, version: &str) -> Result<usize> {
+    store.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM topics WHERE version = ?1",
+            params![version],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    })
+}
+
+fn unlabeled_topic_ids(store: &Store, version: &str, labeler_version: &str) -> Result<Vec<i64>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT topic_id FROM topics
+             WHERE version = ?1
+               AND (label IS NULL OR labeler_version IS NULL OR labeler_version != ?2)
+             ORDER BY size DESC, topic_id",
+        )?;
+        let rows = stmt.query_map(params![version, labeler_version], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
+fn topic_representatives(
+    store: &Store,
+    version: &str,
+    topic_id: i64,
+    limit: usize,
+) -> Result<Vec<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT hi.text, p.rule, p.sentiment_usable
+             FROM topic_assignments a
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN message_provenance p ON p.item_id = a.item_id
+             WHERE a.version = ?1 AND a.topic_id = ?2
+             ORDER BY a.distance, a.item_id
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![version, topic_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (text, rule, usable) = row?;
+            let text = if usable == "strip_wrapper" {
+                provenance::strip_human_wrapper(&text, &rule)
+            } else {
+                text
+            };
+            out.push(text.chars().take(800).collect());
+        }
+        Ok(out)
+    })
+}
+
+fn distinctive_topic_terms(store: &Store, version: &str) -> Result<HashMap<i64, Vec<String>>> {
+    let rows = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT a.topic_id, hi.text, p.rule, p.sentiment_usable
+             FROM topic_assignments a
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN message_provenance p ON p.item_id = a.item_id
+             WHERE a.version = ?1",
+        )?;
+        let rows = stmt.query_map(params![version], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let stopwords = crate::report::english_stopwords();
+    let mut counts = HashMap::<i64, HashMap<String, u64>>::new();
+    let mut topic_terms = HashMap::<i64, HashSet<String>>::new();
+    for (topic_id, text, rule, usable) in rows {
+        let text = if usable == "strip_wrapper" {
+            provenance::strip_human_wrapper(&text, &rule)
+        } else {
+            text
+        };
+        let unique = crate::report::tokenize_frequency_text(&text)
+            .into_iter()
+            .filter(|term| term.len() > 1 && !stopwords.contains(term.as_str()))
+            .collect::<HashSet<_>>();
+        for term in unique {
+            *counts
+                .entry(topic_id)
+                .or_default()
+                .entry(term.clone())
+                .or_default() += 1;
+            topic_terms.entry(topic_id).or_default().insert(term);
+        }
+    }
+    let topic_total = counts.len().max(1) as f64;
+    let mut document_frequency = HashMap::<String, usize>::new();
+    for terms in topic_terms.values() {
+        for term in terms {
+            *document_frequency.entry(term.clone()).or_default() += 1;
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(topic_id, counts)| {
+            let mut scored = counts
+                .into_iter()
+                .map(|(term, count)| {
+                    let df = document_frequency[&term] as f64;
+                    let score = count as f64 * ((1.0 + topic_total) / (1.0 + df)).ln();
+                    (term, score)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            scored.truncate(12);
+            (topic_id, scored.into_iter().map(|(term, _)| term).collect())
+        })
+        .collect())
+}
+
+fn parse_topic_label(response: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(response).context("parsing topic label")?;
+    let label = value
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .context("topic label response did not include a label")?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() || label.chars().count() > 60 {
+        bail!("topic label must contain between 1 and 60 characters");
+    }
+    Ok(label)
+}
+
+fn store_topic_label(
+    store: &Store,
+    version: &str,
+    topic_id: i64,
+    label: &str,
+    model: &str,
+    labeler_version: &str,
+) -> Result<()> {
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE topics
+             SET label = ?3, label_model = ?4, labeler_version = ?5, labeled_at = ?6
+             WHERE version = ?1 AND topic_id = ?2",
+            params![
+                version,
+                topic_id,
+                label,
+                model,
+                labeler_version,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct FixtureEmbedder {
@@ -932,6 +1181,100 @@ mod tests {
             ],
             points: Vec::new(),
         }
+    }
+
+    struct MockLabeler {
+        calls: AtomicUsize,
+    }
+
+    impl JsonLlm for MockLabeler {
+        fn model(&self) -> &str {
+            "mock-labeler"
+        }
+
+        fn complete_json(&self, _system: &str, _prompt: &str) -> Result<String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("{{\"label\":\"Topic {}\"}}", call + 1))
+        }
+    }
+
+    #[test]
+    fn topic_labeling_resumes_by_labeler_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO topic_runs
+                      (version, algorithm_version, model_id, input_hash, item_count, selected_k,
+                       silhouette_score, status, started_at, completed_at)
+                    VALUES
+                      ('current', 1, 'fixture-topic-384', 'input', 2, 2, 0.8, 'completed',
+                       '2026-07-12T00:00:00Z', '2026-07-12T00:01:00Z');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('item_a', 'event_a', 'session', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', 'database migration schema', 'hash_a',
+                       1, 'required', '{}', 'item_hash_a'),
+                      ('item_b', 'event_b', 'session', 'source', 'machine', 'codex', 1, 0,
+                       'conversation', 'user', 'browser layout css', 'hash_b',
+                       1, 'required', '{}', 'item_hash_b');
+
+                    INSERT INTO message_provenance
+                      (item_id, session_id, source_kind, authored_by, sentiment_usable, rule)
+                    VALUES
+                      ('item_a', 'session', 'codex', 'human', 'yes', 'default.human'),
+                      ('item_b', 'session', 'codex', 'human', 'yes', 'default.human');
+
+                    INSERT INTO topic_assignments (version, item_id, topic_id, distance)
+                    VALUES ('current', 'item_a', 0, 0.1), ('current', 'item_b', 1, 0.1);
+                    "#,
+                )?;
+                for topic_id in 0..2 {
+                    conn.execute(
+                        "INSERT INTO topics (version, topic_id, size, centroid)
+                         VALUES ('current', ?1, 1, ?2)",
+                        params![topic_id, crate::storage::f32_vector_to_blob(&[0.0; 384])],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("insert label fixtures");
+        let labeler = MockLabeler {
+            calls: AtomicUsize::new(0),
+        };
+
+        let first = label_topics(&store, &labeler, "labels-v1", Some(1)).expect("label one");
+        assert_eq!((first.labeled, first.skipped, first.pending), (1, 0, 1));
+        let second = label_topics(&store, &labeler, "labels-v1", None).expect("resume labels");
+        assert_eq!((second.labeled, second.skipped, second.pending), (1, 1, 0));
+        let third = label_topics(&store, &labeler, "labels-v1", None).expect("skip labels");
+        assert_eq!((third.labeled, third.skipped, third.pending), (0, 2, 0));
+        assert_eq!(labeler.calls.load(Ordering::SeqCst), 2);
+
+        let stored = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT label, label_model, labeler_version FROM topics ORDER BY topic_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("read stored labels");
+        assert_eq!(stored[0].1, "mock-labeler");
+        assert!(stored.iter().all(|row| row.2 == "labels-v1"));
     }
 
     #[cfg(not(feature = "semantic-fastembed"))]
