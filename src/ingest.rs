@@ -10,7 +10,7 @@ use crate::source::{
 use crate::storage::{ImportDelta, SourceCheckpointFingerprint, SourceFileStatus, Store};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::{json, Value};
@@ -29,6 +29,12 @@ pub struct UpdateStats {
     pub errors: usize,
     #[serde(skip)]
     pub delta: ImportDelta,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct OpencodeUsageBackfill {
+    pub scanned: usize,
+    pub updated: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1356,6 +1362,7 @@ fn prepare_opencode_db_import(
             .as_object()
             .cloned()
             .unwrap_or_default();
+            metadata.extend(opencode_usage_metadata(&message_value));
             search.apply_compat_metadata(&mut metadata);
             records.push(ArchiveRecord::Event(EventRecord {
                 id: event_id,
@@ -1378,6 +1385,124 @@ fn prepare_opencode_db_import(
     }
 
     Ok(PreparedImport::archive(vec![source_upsert], records))
+}
+
+fn opencode_usage_metadata(message: &Value) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    if let Some(model_id) = message.get("modelID").and_then(Value::as_str) {
+        metadata.insert("opencode_model_id".to_string(), json!(model_id));
+    }
+    if let Some(provider_id) = message.get("providerID").and_then(Value::as_str) {
+        metadata.insert("opencode_provider_id".to_string(), json!(provider_id));
+    }
+    if let Some(tokens) = message.get("tokens") {
+        metadata.insert("opencode_tokens".to_string(), tokens.clone());
+    }
+    metadata
+}
+
+pub(crate) fn backfill_default_opencode_usage(store: &Store) -> Result<OpencodeUsageBackfill> {
+    let path = home_dir()
+        .context("cannot locate the home directory for the OpenCode database")?
+        .join(".local/share/opencode/opencode.db");
+    backfill_opencode_usage(store, &path)
+}
+
+fn backfill_opencode_usage(store: &Store, path: &Path) -> Result<OpencodeUsageBackfill> {
+    const BATCH_SIZE: i64 = 500;
+
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening OpenCode database {}", path.display()))?;
+    let event_ids = opencode_event_ids(store)?;
+    let mut outcome = OpencodeUsageBackfill::default();
+    let mut message_rowid = 0i64;
+    let mut part_rowid = 0i64;
+
+    loop {
+        let batch = {
+            let mut stmt = conn.prepare(
+                "SELECT m.rowid, p.rowid, m.id, p.id, m.data
+                 FROM message m
+                 JOIN part p ON p.message_id = m.id
+                 WHERE (m.rowid > ?1 OR (m.rowid = ?1 AND p.rowid > ?2))
+                   AND json_extract(m.data, '$.role') = 'assistant'
+                   AND json_extract(p.data, '$.type') = 'text'
+                 ORDER BY m.rowid, p.rowid
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![message_rowid, part_rowid, BATCH_SIZE], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.last().expect("non-empty OpenCode usage batch");
+        message_rowid = last.0;
+        part_rowid = last.1;
+        outcome.scanned += batch.len();
+
+        outcome.updated += store.with_conn(|histo| {
+            let tx = Transaction::new_unchecked(histo, TransactionBehavior::Immediate)
+                .context("starting OpenCode usage backfill batch")?;
+            let mut updated = 0usize;
+            for (_, _, message_id, part_id, message_data) in &batch {
+                let Some(event_id) = event_ids.get(&(message_id.clone(), part_id.clone())) else {
+                    continue;
+                };
+                let message: Value = serde_json::from_str(message_data)
+                    .with_context(|| format!("parsing OpenCode message {message_id}"))?;
+                let patch = Value::Object(opencode_usage_metadata(&message));
+                if patch.as_object().is_none_or(Map::is_empty) {
+                    continue;
+                }
+                let patch = patch.to_string();
+                updated += tx.execute(
+                    "UPDATE events
+                     SET metadata_json = json_patch(metadata_json, ?1)
+                     WHERE id = ?2
+                       AND metadata_json != json_patch(metadata_json, ?1)",
+                    params![patch, event_id],
+                )?;
+            }
+            tx.commit().context("committing OpenCode usage backfill batch")?;
+            Ok(updated)
+        })?;
+    }
+
+    Ok(outcome)
+}
+
+fn opencode_event_ids(store: &Store) -> Result<HashMap<(String, String), String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,
+                    json_extract(metadata_json, '$.opencode_message_id'),
+                    json_extract(metadata_json, '$.opencode_part_id')
+             FROM events INDEXED BY idx_events_source
+             WHERE source_id IN (SELECT id FROM sources WHERE kind = 'opencode')
+               AND json_type(metadata_json, '$.opencode_message_id') = 'text'
+               AND json_type(metadata_json, '$.opencode_part_id') = 'text'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                row.get::<_, String>(0)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(Into::into)
+    })
 }
 
 fn clean_optional_title(title: &str) -> Option<String> {
@@ -2990,13 +3115,29 @@ mod tests {
             ("msg_user", "user", 1_775_640_000_100i64),
             ("msg_assistant", "assistant", 1_775_640_001_000i64),
         ] {
+            let data = if role == "assistant" {
+                json!({
+                    "role": role,
+                    "time": {"created": time},
+                    "modelID": "gpt-5.4",
+                    "providerID": "openai",
+                    "tokens": {
+                        "input": 120,
+                        "output": 30,
+                        "reasoning": 10,
+                        "cache": {"read": 40, "write": 5}
+                    }
+                })
+            } else {
+                json!({"role": role, "time": {"created": time}})
+            };
             conn.execute(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data)
                  VALUES (?1, 'ses_fixture', ?2, ?2, ?3)",
                 (
                     message_id,
                     time,
-                    json!({"role": role, "time": {"created": time}}).to_string(),
+                    data.to_string(),
                 ),
             )
             .expect("insert message");
@@ -3058,6 +3199,124 @@ mod tests {
         assert_eq!(events[0].content, "user asks for OpenCode ingestion");
         assert_eq!(events[1].role.as_deref(), Some("assistant"));
         assert_eq!(events[1].content, "assistant explains the OpenCode parser");
+        assert_eq!(events[1].metadata["opencode_model_id"], "gpt-5.4");
+        assert_eq!(events[1].metadata["opencode_provider_id"], "openai");
+        assert_eq!(events[1].metadata["opencode_tokens"]["input"], 120);
+        assert_eq!(events[1].metadata["opencode_tokens"]["cache"]["read"], 40);
+    }
+
+    #[test]
+    fn backfills_opencode_usage_without_changing_event_identity_or_checkpoint() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let db_path = temp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE message (
+              id text PRIMARY KEY,
+              session_id text NOT NULL,
+              data text NOT NULL
+            );
+            CREATE TABLE part (
+              id text PRIMARY KEY,
+              message_id text NOT NULL,
+              data text NOT NULL
+            );
+            "#,
+        )
+        .expect("create usage schema");
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('msg_old', 'ses_old', ?1)",
+            [json!({
+                "role": "assistant",
+                "modelID": "claude-opus-4-6",
+                "providerID": "anthropic",
+                "tokens": {
+                    "input": 90,
+                    "output": 20,
+                    "reasoning": 4,
+                    "cache": {"read": 30, "write": 2}
+                }
+            })
+            .to_string()],
+        )
+        .expect("insert assistant message");
+        conn.execute(
+            "INSERT INTO part (id, message_id, data) VALUES ('part_old', 'msg_old', ?1)",
+            [json!({"type": "text", "text": "legacy assistant answer"}).to_string()],
+        )
+        .expect("insert assistant part");
+        drop(conn);
+
+        let event = EventRecord {
+            id: "event_old".to_string(),
+            session_id: "session_old".to_string(),
+            source_id: "source_old".to_string(),
+            machine_id: "machine_old".to_string(),
+            source_kind: "opencode".to_string(),
+            ordinal: 0,
+            event_type: "text".to_string(),
+            role: Some("assistant".to_string()),
+            content: "legacy assistant answer".to_string(),
+            raw_artifact_hash: None,
+            occurred_at: None,
+            metadata: json!({
+                "opencode_message_id": "msg_old",
+                "opencode_part_id": "part_old"
+            }),
+            hash: "event_hash_old".to_string(),
+        };
+        let now = Utc::now();
+        store
+            .import_records(&[
+                ArchiveRecord::Source(crate::archive::SourceRecord {
+                    id: "source_old".to_string(),
+                    kind: "opencode".to_string(),
+                    identity: db_path.to_string_lossy().to_string(),
+                    path: Some(db_path.to_string_lossy().to_string()),
+                    first_seen_at: now,
+                    updated_at: now,
+                    hash: "source_hash_old".to_string(),
+                }),
+                ArchiveRecord::Event(event.clone()),
+            ])
+            .expect("insert legacy event");
+        let identity = db_path.to_string_lossy().to_string();
+        store
+            .upsert_source_checkpoint(
+                "opencode",
+                &identity,
+                Some("fixture-checkpoint"),
+                &json!({"kept": true}),
+            )
+            .expect("store checkpoint");
+
+        let first = backfill_opencode_usage(&store, &db_path).expect("backfill usage");
+        assert_eq!(first.scanned, 1);
+        assert_eq!(first.updated, 1);
+        let enriched = store
+            .events_for_session("session_old")
+            .expect("load enriched event")
+            .pop()
+            .expect("enriched event");
+        assert_eq!(enriched.id, event.id);
+        assert_eq!(enriched.hash, event.hash);
+        assert_eq!(enriched.content, event.content);
+        assert_eq!(enriched.metadata["opencode_model_id"], "claude-opus-4-6");
+        assert_eq!(enriched.metadata["opencode_provider_id"], "anthropic");
+        assert_eq!(enriched.metadata["opencode_tokens"]["output"], 20);
+        assert_eq!(
+            store
+                .source_checkpoint("opencode", &identity)
+                .expect("load checkpoint")
+                .and_then(|checkpoint| checkpoint.cursor),
+            Some("fixture-checkpoint".to_string())
+        );
+
+        let second = backfill_opencode_usage(&store, &db_path).expect("rerun backfill");
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.updated, 0);
     }
 
     #[test]

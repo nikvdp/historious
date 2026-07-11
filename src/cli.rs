@@ -873,6 +873,8 @@ pub enum MaintenanceCommand {
 pub enum LabCommand {
     /// Rebuild analytics projections from stored events and sessions.
     Rebuild,
+    /// Add model and token metadata to existing OpenCode events.
+    BackfillOpencodeTokens,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2302,6 +2304,13 @@ impl Cli {
                     for status in statuses {
                         println!("{}: {} rows, fresh", status.name, status.row_count);
                     }
+                }
+                LabCommand::BackfillOpencodeTokens => {
+                    let outcome = ingest::backfill_default_opencode_usage(&store)?;
+                    println!(
+                        "OpenCode usage backfill: {} assistant parts scanned, {} events updated",
+                        outcome.scanned, outcome.updated
+                    );
                 }
             },
             Command::Daemon {
@@ -9348,6 +9357,18 @@ mod tests {
             cli.command,
             Command::Lab {
                 command: LabCommand::Rebuild
+            }
+        ));
+    }
+
+    #[test]
+    fn lab_opencode_backfill_subcommand_parses() {
+        let cli = Cli::try_parse_from(["histo", "lab", "backfill-opencode-tokens"])
+            .expect("parse OpenCode usage backfill");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::BackfillOpencodeTokens
             }
         ));
     }
