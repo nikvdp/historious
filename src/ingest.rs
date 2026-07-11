@@ -43,6 +43,37 @@ pub struct SourceSelection {
     sources: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the analytics projection children
+pub(crate) enum SessionClass {
+    Interactive,
+    Subagent,
+    Automation,
+    Unknown,
+}
+
+#[allow(dead_code)] // consumed by the analytics projection children
+pub(crate) fn classify_session(
+    source_kind: &str,
+    session_metadata: &Value,
+    event_contents: &[&str],
+) -> SessionClass {
+    match source_kind {
+        "codex" => classify_codex_session(event_contents),
+        "opencode" => classify_opencode_session(session_metadata),
+        "claude_code" => classify_claude_session(event_contents),
+        _ => SessionClass::Unknown,
+    }
+}
+
+#[allow(dead_code)] // consumed by the analytics projection children
+pub(crate) fn classify_event(source_kind: &str, event_content: &str) -> SessionClass {
+    match source_kind {
+        "claude_code" => classify_claude_event(event_content),
+        _ => SessionClass::Unknown,
+    }
+}
+
 impl SourceSelection {
     pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut sources = BTreeSet::new();
@@ -1131,6 +1162,51 @@ fn prepare_file_import(
     Ok(PreparedImport::archive(vec![source_upsert], records))
 }
 
+fn classify_codex_session(event_contents: &[&str]) -> SessionClass {
+    for content in event_contents {
+        let Ok(value) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let payload = value.get("payload").unwrap_or(&value);
+        if let Some(thread_source) = string_at(payload, &["thread_source"])
+            .or_else(|| string_at(payload, &["source", "thread_source"]))
+        {
+            return match thread_source.as_str() {
+                "user" => SessionClass::Interactive,
+                "subagent" => SessionClass::Subagent,
+                "automation" => SessionClass::Automation,
+                _ => SessionClass::Unknown,
+            };
+        }
+        if payload
+            .get("source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"))
+        {
+            return SessionClass::Subagent;
+        }
+        match string_at(payload, &["originator"]).as_deref() {
+            Some("codex_exec") => return SessionClass::Automation,
+            Some("codex_chatgpt_ios_remote") => return SessionClass::Interactive,
+            _ => {}
+        }
+        if string_at(payload, &["base_instructions"])
+            .or_else(|| string_at(payload, &["base_instructions", "text"]))
+            .is_some_and(|instructions| is_reviewer_instructions(&instructions))
+        {
+            return SessionClass::Automation;
+        }
+    }
+    SessionClass::Interactive
+}
+
+fn is_reviewer_instructions(instructions: &str) -> bool {
+    instructions
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("you are acting as a reviewer")
+}
+
 fn prepare_opencode_db_import(
     machine_id: &str,
     path: &Path,
@@ -1352,6 +1428,18 @@ fn opencode_session_metadata(
         map.insert("opencode_version".to_string(), json!(version));
     }
     metadata
+}
+
+fn classify_opencode_session(session_metadata: &Value) -> SessionClass {
+    if session_metadata
+        .get("opencode_parent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|parent_id| !parent_id.trim().is_empty())
+    {
+        SessionClass::Subagent
+    } else {
+        SessionClass::Interactive
+    }
 }
 
 impl NativeTitleIndex {
@@ -1680,6 +1768,71 @@ fn workspace_from_value(value: &Value) -> Option<WorkspaceIdentity> {
         source,
         confidence: "direct".to_string(),
     })
+}
+
+fn classify_claude_session(event_contents: &[&str]) -> SessionClass {
+    let values = event_contents
+        .iter()
+        .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+        .collect::<Vec<_>>();
+
+    if values.iter().any(|value| {
+        string_at(value, &["entrypoint"])
+            .or_else(|| string_at(value, &["payload", "entrypoint"]))
+            .is_some_and(|entrypoint| {
+                let entrypoint = entrypoint.to_ascii_lowercase();
+                entrypoint.contains("sdk") || entrypoint.contains("headless")
+            })
+    }) {
+        return SessionClass::Automation;
+    }
+
+    let user_events = values
+        .iter()
+        .filter(|value| claude_event_role(value).as_deref() == Some("user"))
+        .collect::<Vec<_>>();
+    if !user_events.is_empty()
+        && user_events
+            .iter()
+            .all(|value| value.get("isSidechain").and_then(Value::as_bool) == Some(true))
+    {
+        return SessionClass::Subagent;
+    }
+    if !user_events.is_empty()
+        || values.iter().any(|value| {
+            string_at(value, &["entrypoint"])
+                .or_else(|| string_at(value, &["payload", "entrypoint"]))
+                .is_some_and(|entrypoint| {
+                    matches!(entrypoint.to_ascii_lowercase().as_str(), "claude-desktop" | "cli")
+                })
+        })
+    {
+        SessionClass::Interactive
+    } else {
+        SessionClass::Unknown
+    }
+}
+
+fn classify_claude_event(event_content: &str) -> SessionClass {
+    serde_json::from_str::<Value>(event_content)
+        .ok()
+        .filter(|value| claude_event_role(value).as_deref() == Some("user"))
+        .and_then(|value| value.get("isSidechain").and_then(Value::as_bool))
+        .map(|sidechain| {
+            if sidechain {
+                SessionClass::Subagent
+            } else {
+                SessionClass::Interactive
+            }
+        })
+        .unwrap_or(SessionClass::Unknown)
+}
+
+fn claude_event_role(value: &Value) -> Option<String> {
+    string_at(value, &["role"])
+        .or_else(|| string_at(value, &["message", "role"]))
+        .or_else(|| string_at(value, &["type"]))
+        .map(|role| role.to_ascii_lowercase())
 }
 
 fn workspace_path_candidate(value: &Value) -> Option<(String, String)> {
@@ -2205,6 +2358,149 @@ fn file_mtime_ms(metadata: &fs::Metadata) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::storage::Store;
+
+    #[test]
+    fn classifies_codex_session_signals() {
+        for (source, expected) in [
+            ("user", SessionClass::Interactive),
+            ("subagent", SessionClass::Subagent),
+            ("automation", SessionClass::Automation),
+        ] {
+            let content = json!({
+                "type": "session_meta",
+                "payload": {"source": {"thread_source": source}}
+            })
+            .to_string();
+            assert_eq!(
+                classify_session("codex", &json!({}), &[content.as_str()]),
+                expected
+            );
+        }
+
+        let direct_thread_source =
+            json!({"payload": {"thread_source": "subagent"}}).to_string();
+        assert_eq!(
+            classify_session(
+                "codex",
+                &json!({}),
+                &[direct_thread_source.as_str()]
+            ),
+            SessionClass::Subagent
+        );
+
+        for (payload, expected) in [
+            (
+                json!({"source": {"subagent": {"thread_spawn": {"agent_nickname": "reviewer"}}}}),
+                SessionClass::Subagent,
+            ),
+            (json!({"originator": "codex_exec"}), SessionClass::Automation),
+            (
+                json!({"originator": "codex_chatgpt_ios_remote"}),
+                SessionClass::Interactive,
+            ),
+            (
+                json!({"base_instructions": {"text": "You are acting as a reviewer for these changes."}}),
+                SessionClass::Automation,
+            ),
+        ] {
+            let content = json!({"type": "session_meta", "payload": payload}).to_string();
+            assert_eq!(
+                classify_session("codex", &json!({}), &[content.as_str()]),
+                expected
+            );
+        }
+
+        assert_eq!(
+            classify_session("codex", &json!({}), &[]),
+            SessionClass::Interactive
+        );
+    }
+
+    #[test]
+    fn classifies_opencode_parent_sessions_as_subagents() {
+        assert_eq!(
+            classify_session(
+                "opencode",
+                &json!({"opencode_parent_id": "ses_parent"}),
+                &[]
+            ),
+            SessionClass::Subagent
+        );
+        assert_eq!(
+            classify_session("opencode", &json!({"opencode_parent_id": null}), &[]),
+            SessionClass::Interactive
+        );
+    }
+
+    #[test]
+    fn classifies_claude_sidechains_and_entrypoints() {
+        let sidechain_one = json!({
+            "type": "user",
+            "isSidechain": true,
+            "message": {"role": "user", "content": "review this"}
+        })
+        .to_string();
+        let sidechain_two = json!({
+            "type": "user",
+            "isSidechain": true,
+            "message": {"role": "user", "content": "continue"}
+        })
+        .to_string();
+        assert_eq!(
+            classify_session(
+                "claude_code",
+                &json!({}),
+                &[sidechain_one.as_str(), sidechain_two.as_str()]
+            ),
+            SessionClass::Subagent
+        );
+        assert_eq!(
+            classify_event("claude_code", &sidechain_one),
+            SessionClass::Subagent
+        );
+
+        let interactive = json!({
+            "type": "user",
+            "isSidechain": false,
+            "message": {"role": "user", "content": "hello"}
+        })
+        .to_string();
+        assert_eq!(
+            classify_session(
+                "claude_code",
+                &json!({}),
+                &[sidechain_one.as_str(), interactive.as_str()]
+            ),
+            SessionClass::Interactive
+        );
+        assert_eq!(
+            classify_event("claude_code", &interactive),
+            SessionClass::Interactive
+        );
+
+        let sdk = json!({"entrypoint": "sdk-ts"}).to_string();
+        assert_eq!(
+            classify_session("claude_code", &json!({}), &[sdk.as_str()]),
+            SessionClass::Automation
+        );
+        let desktop = json!({"entrypoint": "claude-desktop"}).to_string();
+        assert_eq!(
+            classify_session("claude_code", &json!({}), &[desktop.as_str()]),
+            SessionClass::Interactive
+        );
+    }
+
+    #[test]
+    fn leaves_unmarked_providers_unknown() {
+        assert_eq!(
+            classify_session("pi_agent", &json!({}), &[]),
+            SessionClass::Unknown
+        );
+        assert_eq!(
+            classify_event("hermes", "{}"),
+            SessionClass::Unknown
+        );
+    }
 
     #[test]
     fn indexes_user_message_text() {
