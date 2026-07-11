@@ -46,6 +46,37 @@ pub struct ProjectionFreshness {
     pub row_count: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuditCount {
+    pub authored_by: String,
+    pub sentiment_usable: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditRuleCount {
+    pub rule: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditSample {
+    pub source_kind: String,
+    pub occurred_at: Option<String>,
+    pub workspace_path: Option<String>,
+    pub authored_by: String,
+    pub sentiment_usable: String,
+    pub rule: String,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvenanceAudit {
+    pub buckets: Vec<AuditCount>,
+    pub rules: Vec<AuditRuleCount>,
+    pub samples: Vec<AuditSample>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectionState {
     version: u32,
@@ -76,6 +107,94 @@ pub fn freshness(store: &Store) -> Result<Vec<ProjectionFreshness>> {
 
 pub fn is_stale(store: &Store) -> Result<bool> {
     Ok(freshness(store)?.iter().any(|status| status.stale))
+}
+
+pub fn audit_provenance(
+    store: &Store,
+    bucket: Option<&str>,
+    rule: Option<&str>,
+    limit: usize,
+) -> Result<ProvenanceAudit> {
+    store.with_conn(|conn| {
+        let buckets = {
+            let mut stmt = conn.prepare(
+                "SELECT authored_by, sentiment_usable, COUNT(*)
+                 FROM message_provenance
+                 GROUP BY authored_by, sentiment_usable
+                 ORDER BY authored_by, sentiment_usable",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(AuditCount {
+                    authored_by: row.get(0)?,
+                    sentiment_usable: row.get(1)?,
+                    count: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let rules = {
+            let mut stmt = conn.prepare(
+                "SELECT rule, COUNT(*)
+                 FROM message_provenance
+                 GROUP BY rule
+                 ORDER BY COUNT(*) DESC, rule",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(AuditRuleCount {
+                    rule: row.get(0)?,
+                    count: row.get::<_, i64>(1)?.max(0) as u64,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let samples = {
+            let mut stmt = conn.prepare(
+                "SELECT p.source_kind, p.occurred_at, s.metadata_json, p.authored_by,
+                        p.sentiment_usable, p.rule, hi.text
+                 FROM message_provenance p
+                 JOIN history_items hi ON hi.id = p.item_id
+                 JOIN sessions s ON s.id = p.session_id
+                 WHERE (?1 IS NULL OR p.authored_by = ?1)
+                   AND (?2 IS NULL OR p.rule = ?2)
+                 ORDER BY random()
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![bucket, rule, limit.min(200) as i64], |row| {
+                let metadata = row.get::<_, String>(2)?;
+                let metadata = serde_json::from_str::<Value>(&metadata)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                Ok(AuditSample {
+                    source_kind: row.get(0)?,
+                    occurred_at: row.get(1)?,
+                    workspace_path: workspace_path(&metadata),
+                    authored_by: row.get(3)?,
+                    sentiment_usable: row.get(4)?,
+                    rule: row.get(5)?,
+                    preview: collapsed_preview(&row.get::<_, String>(6)?, 200),
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(ProvenanceAudit {
+            buckets,
+            rules,
+            samples,
+        })
+    })
+}
+
+fn collapsed_preview(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let mut preview = collapsed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        preview.push('…');
+        preview
+    }
 }
 
 fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
@@ -582,6 +701,12 @@ fn set_projection_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_preview_collapses_lines_and_caps_characters() {
+        assert_eq!(collapsed_preview("one\n  two\tthree", 50), "one two three");
+        assert_eq!(collapsed_preview("abcdef", 5), "abcd…");
+    }
 
     #[test]
     fn session_facts_rebuild_projects_usage_activity_and_workspace() {

@@ -875,6 +875,32 @@ pub enum LabCommand {
     Rebuild,
     /// Add model and token metadata to existing OpenCode events.
     BackfillOpencodeTokens,
+    /// Inspect provenance counts and random message samples.
+    Audit {
+        #[arg(long, value_enum)]
+        bucket: Option<ProvenanceBucket>,
+        #[arg(long)]
+        rule: Option<String>,
+        #[arg(short = 'n', default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ProvenanceBucket {
+    Human,
+    Agent,
+    Harness,
+}
+
+impl ProvenanceBucket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Harness => "harness",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2311,6 +2337,60 @@ impl Cli {
                         "OpenCode usage backfill: {} assistant parts scanned, {} events updated",
                         outcome.scanned, outcome.updated
                     );
+                }
+                LabCommand::Audit {
+                    bucket,
+                    rule,
+                    limit,
+                } => {
+                    if limit == 0 {
+                        bail!("audit sample count must be greater than zero");
+                    }
+                    if let Some(status) = analytics::freshness(&store)?
+                        .into_iter()
+                        .find(|status| status.name == analytics::MESSAGE_PROVENANCE_PROJECTION)
+                        .filter(|status| status.stale)
+                    {
+                        println!(
+                            "Note: provenance is stale by {} event rows; run `histo lab rebuild`.",
+                            status.new_event_rows
+                        );
+                    }
+                    let audit = analytics::audit_provenance(
+                        &store,
+                        bucket.map(ProvenanceBucket::as_str),
+                        rule.as_deref(),
+                        limit,
+                    )?;
+                    println!("Buckets");
+                    for count in audit.buckets {
+                        println!(
+                            "  {:<8} {:<13} {}",
+                            count.authored_by, count.sentiment_usable, count.count
+                        );
+                    }
+                    println!("\nRules");
+                    for count in audit.rules {
+                        println!("  {:<32} {}", count.rule, count.count);
+                    }
+                    println!("\nSamples");
+                    for sample in audit.samples {
+                        println!(
+                            "  [{} · {} · {} · {} · {}] {}",
+                            sample.source_kind,
+                            sample.authored_by,
+                            sample.sentiment_usable,
+                            sample.rule,
+                            sample
+                                .workspace_path
+                                .as_deref()
+                                .unwrap_or("unknown workspace"),
+                            sample.preview
+                        );
+                        if let Some(occurred_at) = sample.occurred_at {
+                            println!("    {occurred_at}");
+                        }
+                    }
                 }
             },
             Command::Daemon {
@@ -9370,6 +9450,32 @@ mod tests {
             Command::Lab {
                 command: LabCommand::BackfillOpencodeTokens
             }
+        ));
+    }
+
+    #[test]
+    fn lab_audit_filters_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "lab",
+            "audit",
+            "--bucket",
+            "human",
+            "--rule",
+            "default.human",
+            "-n",
+            "30",
+        ])
+        .expect("parse provenance audit");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Audit {
+                    bucket: Some(ProvenanceBucket::Human),
+                    rule: Some(rule),
+                    limit: 30,
+                }
+            } if rule == "default.human"
         ));
     }
 
