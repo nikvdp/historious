@@ -1,6 +1,7 @@
 use crate::analytics;
 use crate::config::AppConfig;
 use crate::ingest;
+use crate::report;
 use crate::search;
 use crate::server;
 use crate::storage::{
@@ -771,6 +772,17 @@ pub enum Command {
         )]
         all: bool,
     },
+    /// Summarize agent usage, projects, models, and working rhythms.
+    Report {
+        #[arg(long, help = "Only include activity at or after this date or timestamp")]
+        since: Option<String>,
+        #[arg(long, help = "Only include workspace paths containing this text")]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value_t = ReportSortArg::Tokens)]
+        sort: ReportSortArg,
+        #[arg(long, help = "Print the reusable aggregate report model as JSON")]
+        json: bool,
+    },
     /// Read and update persistent Historious configuration.
     Config {
         #[command(subcommand)]
@@ -891,6 +903,25 @@ pub enum ProvenanceBucket {
     Human,
     Agent,
     Harness,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReportSortArg {
+    Tokens,
+    Sessions,
+    Messages,
+    Duration,
+}
+
+impl From<ReportSortArg> for report::ReportSort {
+    fn from(value: ReportSortArg) -> Self {
+        match value {
+            ReportSortArg::Tokens => Self::Tokens,
+            ReportSortArg::Sessions => Self::Sessions,
+            ReportSortArg::Messages => Self::Messages,
+            ReportSortArg::Duration => Self::Duration,
+        }
+    }
 }
 
 impl ProvenanceBucket {
@@ -2475,6 +2506,29 @@ impl Cli {
                     print_status_output(&output);
                 }
             }
+            Command::Report {
+                since,
+                project,
+                sort,
+                json,
+            } => {
+                let since = transport::parse_since_arg(since.as_deref())?
+                    .map(|value| value.to_rfc3339());
+                let report = report::compute(
+                    &store,
+                    &report::ReportOptions {
+                        since,
+                        project,
+                        sort: sort.into(),
+                    },
+                )?;
+                if json || robot {
+                    serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+                    println!();
+                } else {
+                    write_stdout(&report::render_terminal(&report))?;
+                }
+            }
             Command::Onboard { agents_md } => {
                 if agents_md {
                     write_stdout(crate::skills::onboard_agents_md())?;
@@ -2512,6 +2566,7 @@ impl Command {
             Command::Daemon { .. } => "daemon",
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
+            Command::Report { .. } => "report",
             Command::Config { .. } => "config",
             Command::Maintenance { .. } => "maintenance",
             Command::Lab { .. } => "lab",
@@ -2547,6 +2602,7 @@ impl Command {
                     command: MaintenanceCommand::Compact { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
+                | Command::Report { json: true, .. }
         )
     }
 }
@@ -9476,6 +9532,31 @@ mod tests {
                     limit: 30,
                 }
             } if rule == "default.human"
+        ));
+    }
+
+    #[test]
+    fn report_filters_and_sort_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "report",
+            "--since",
+            "2026-06-01",
+            "--project",
+            "example-project",
+            "--sort",
+            "messages",
+            "--json",
+        ])
+        .expect("parse report");
+        assert!(matches!(
+            cli.command,
+            Command::Report {
+                since: Some(since),
+                project: Some(project),
+                sort: ReportSortArg::Messages,
+                json: true,
+            } if since == "2026-06-01" && project == "sme-os"
         ));
     }
 
