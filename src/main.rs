@@ -6,6 +6,7 @@ mod embed;
 mod ingest;
 mod memory;
 mod output;
+mod provenance;
 mod search;
 mod self_update;
 mod server;

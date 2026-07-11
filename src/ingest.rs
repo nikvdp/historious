@@ -50,7 +50,6 @@ pub struct SourceSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the analytics projection children
 pub(crate) enum SessionClass {
     Interactive,
     Subagent,
@@ -58,7 +57,6 @@ pub(crate) enum SessionClass {
     Unknown,
 }
 
-#[allow(dead_code)] // consumed by the analytics projection children
 pub(crate) fn classify_session(
     source_kind: &str,
     session_metadata: &Value,
@@ -72,7 +70,6 @@ pub(crate) fn classify_session(
     }
 }
 
-#[allow(dead_code)] // consumed by the analytics projection children
 pub(crate) fn classify_event(source_kind: &str, event_content: &str) -> SessionClass {
     match source_kind {
         "claude_code" => classify_claude_event(event_content),
