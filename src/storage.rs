@@ -5097,6 +5097,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_provenance_author_time
           ON message_provenance(authored_by, occurred_at);
 
+        CREATE TABLE IF NOT EXISTS message_annotations (
+          item_id TEXT NOT NULL,
+          axis TEXT NOT NULL,
+          score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+          model TEXT NOT NULL,
+          annotator_version TEXT NOT NULL,
+          annotated_at TEXT NOT NULL,
+          PRIMARY KEY (item_id, axis, annotator_version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_annotations_latest
+          ON message_annotations(annotated_at DESC, annotator_version);
+
+        CREATE INDEX IF NOT EXISTS idx_message_annotations_version_axis_score
+          ON message_annotations(annotator_version, axis, score);
+
         CREATE TABLE IF NOT EXISTS session_facts (
           session_id TEXT PRIMARY KEY,
           source_kind TEXT NOT NULL,

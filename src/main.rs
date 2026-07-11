@@ -1,4 +1,6 @@
 mod analytics;
+#[allow(dead_code)]
+mod annotate;
 mod archive;
 mod cli;
 mod config;
