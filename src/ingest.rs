@@ -57,6 +57,150 @@ pub(crate) enum SessionClass {
     Unknown,
 }
 
+impl SessionClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Subagent => "subagent",
+            Self::Automation => "automation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageEvent {
+    pub content: String,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionUsage {
+    pub models: Vec<String>,
+    pub primary_model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) -> SessionUsage {
+    let mut models = HashMap::<String, usize>::new();
+    let mut input = 0i64;
+    let mut cached = 0i64;
+    let mut output = 0i64;
+    let mut usage_seen = false;
+    let mut opencode_messages = BTreeSet::new();
+
+    for event in events {
+        let content = serde_json::from_str::<Value>(&event.content).ok();
+        match source_kind {
+            "codex" => {
+                let Some(value) = content.as_ref() else {
+                    continue;
+                };
+                if let Some(model) = string_at(value, &["payload", "model"]) {
+                    *models.entry(model).or_default() += 1;
+                }
+                if let Some(total) = value
+                    .pointer("/payload/info/total_token_usage")
+                    .and_then(Value::as_object)
+                {
+                    usage_seen = true;
+                    input = input.max(json_i64(total.get("input_tokens")));
+                    cached = cached.max(json_i64(total.get("cached_input_tokens")));
+                    output = output.max(json_i64(total.get("output_tokens")));
+                }
+            }
+            "claude_code" => {
+                let Some(value) = content.as_ref() else {
+                    continue;
+                };
+                if let Some(model) = string_at(value, &["message", "model"]) {
+                    *models.entry(model).or_default() += 1;
+                }
+                if let Some(usage) = value.pointer("/message/usage").and_then(Value::as_object) {
+                    usage_seen = true;
+                    input = input.saturating_add(json_i64(usage.get("input_tokens")));
+                    cached = cached.saturating_add(json_i64(usage.get("cache_read_input_tokens")));
+                    output = output.saturating_add(json_i64(usage.get("output_tokens")));
+                }
+            }
+            "pi_agent" => {
+                let Some(value) = content.as_ref() else {
+                    continue;
+                };
+                if let Some(model) = string_at(value, &["message", "model"]) {
+                    *models.entry(model).or_default() += 1;
+                }
+                if let Some(usage) = value.pointer("/message/usage").and_then(Value::as_object) {
+                    usage_seen = true;
+                    input = input.saturating_add(json_i64(usage.get("input")));
+                    cached = cached.saturating_add(json_i64(usage.get("cacheRead")));
+                    output = output.saturating_add(json_i64(usage.get("output")));
+                }
+            }
+            "opencode" => {
+                let Some(message_id) = event
+                    .metadata
+                    .get("opencode_message_id")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if !opencode_messages.insert(message_id.to_string()) {
+                    continue;
+                }
+                if let Some(model) = event
+                    .metadata
+                    .get("opencode_model_id")
+                    .and_then(Value::as_str)
+                {
+                    *models.entry(model.to_string()).or_default() += 1;
+                }
+                if let Some(usage) = event
+                    .metadata
+                    .get("opencode_tokens")
+                    .and_then(Value::as_object)
+                {
+                    usage_seen = true;
+                    input = input.saturating_add(json_i64(usage.get("input")));
+                    cached = cached.saturating_add(
+                        usage
+                            .get("cache")
+                            .and_then(Value::as_object)
+                            .map(|cache| json_i64(cache.get("read")))
+                            .unwrap_or(0),
+                    );
+                    output = output.saturating_add(json_i64(usage.get("output")));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let primary_model = models
+        .iter()
+        .max_by(|(left_model, left_count), (right_model, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_model.cmp(left_model))
+        })
+        .map(|(model, _)| model.clone());
+    let mut models = models.into_keys().collect::<Vec<_>>();
+    models.sort();
+    SessionUsage {
+        models,
+        primary_model,
+        input_tokens: usage_seen.then_some(input),
+        cached_input_tokens: usage_seen.then_some(cached),
+        output_tokens: usage_seen.then_some(output),
+    }
+}
+
+fn json_i64(value: Option<&Value>) -> i64 {
+    value.and_then(Value::as_i64).unwrap_or(0).max(0)
+}
+
 pub(crate) fn classify_session(
     source_kind: &str,
     session_metadata: &Value,
@@ -2622,6 +2766,94 @@ mod tests {
             classify_event("hermes", "{}"),
             SessionClass::Unknown
         );
+    }
+
+    #[test]
+    fn extracts_codex_cumulative_max_and_primary_model() {
+        let events = vec![
+            usage_event(json!({"payload": {"model": "gpt-5.4"}})),
+            usage_event(json!({"payload": {"model": "gpt-5.4"}})),
+            usage_event(json!({"payload": {"model": "gpt-5.5"}})),
+            usage_event(json!({
+                "payload": {"info": {"total_token_usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 30
+                }}}
+            })),
+            usage_event(json!({
+                "payload": {"info": {"total_token_usage": {
+                    "input_tokens": 180,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 55
+                }}}
+            })),
+        ];
+
+        let usage = extract_session_usage("codex", &events);
+        assert_eq!(usage.models, vec!["gpt-5.4", "gpt-5.5"]);
+        assert_eq!(usage.primary_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(usage.input_tokens, Some(180));
+        assert_eq!(usage.cached_input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, Some(55));
+    }
+
+    #[test]
+    fn sums_claude_and_pi_usage_and_deduplicates_opencode_messages() {
+        let claude = extract_session_usage(
+            "claude_code",
+            &[
+                usage_event(json!({"message": {"model": "claude-opus", "usage": {
+                    "input_tokens": 10, "cache_read_input_tokens": 3, "output_tokens": 5
+                }}})),
+                usage_event(json!({"message": {"model": "claude-opus", "usage": {
+                    "input_tokens": 20, "cache_read_input_tokens": 7, "output_tokens": 9
+                }}})),
+            ],
+        );
+        assert_eq!(claude.input_tokens, Some(30));
+        assert_eq!(claude.cached_input_tokens, Some(10));
+        assert_eq!(claude.output_tokens, Some(14));
+
+        let pi = extract_session_usage(
+            "pi_agent",
+            &[usage_event(json!({"message": {"model": "glm-5", "usage": {
+                "input": 90, "cacheRead": 30, "output": 12
+            }}}))],
+        );
+        assert_eq!(pi.input_tokens, Some(90));
+        assert_eq!(pi.cached_input_tokens, Some(30));
+        assert_eq!(pi.output_tokens, Some(12));
+
+        let metadata = json!({
+            "opencode_message_id": "msg_1",
+            "opencode_model_id": "kimi-k2",
+            "opencode_tokens": {"input": 50, "output": 8, "cache": {"read": 11}}
+        });
+        let opencode = extract_session_usage(
+            "opencode",
+            &[
+                UsageEvent {
+                    content: "part one".to_string(),
+                    metadata: metadata.clone(),
+                },
+                UsageEvent {
+                    content: "part two".to_string(),
+                    metadata,
+                },
+            ],
+        );
+        assert_eq!(opencode.models, vec!["kimi-k2"]);
+        assert_eq!(opencode.input_tokens, Some(50));
+        assert_eq!(opencode.cached_input_tokens, Some(11));
+        assert_eq!(opencode.output_tokens, Some(8));
+    }
+
+    fn usage_event(value: Value) -> UsageEvent {
+        UsageEvent {
+            content: value.to_string(),
+            metadata: json!({}),
+        }
     }
 
     #[test]

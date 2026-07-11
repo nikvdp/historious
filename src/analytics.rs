@@ -2,7 +2,7 @@ use crate::ingest::{self, SessionClass};
 use crate::provenance;
 use crate::storage::Store;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 2;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
-pub const SESSION_FACTS_VERSION: u32 = 1;
+pub const SESSION_FACTS_VERSION: u32 = 2;
 
 const PROJECTIONS: [Projection; 2] = [
     Projection {
@@ -82,10 +82,10 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
     let input_rowid = store.with_conn(max_event_rowid)?;
     set_projection_building(store, projection, input_rowid)?;
 
-    let result = if projection.name == MESSAGE_PROVENANCE_PROJECTION {
-        rebuild_message_provenance(store)
-    } else {
-        clear_projection(store, projection)
+    let result = match projection.name {
+        MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store),
+        SESSION_FACTS_PROJECTION => rebuild_session_facts(store),
+        _ => clear_projection(store, projection),
     };
 
     match result {
@@ -95,6 +95,185 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn rebuild_session_facts(store: &Store) -> Result<()> {
+    const BATCH_SIZE: i64 = 500;
+
+    clear_projection(store, PROJECTIONS[1])?;
+    let mut last_rowid = 0i64;
+    loop {
+        let batch = store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.rowid, s.id, s.source_kind, s.metadata_json,
+                        COALESCE(sa.event_count,
+                          (SELECT COUNT(*) FROM events e
+                           WHERE e.session_id = s.id)),
+                        COALESCE(sa.first_event_at, s.started_at),
+                        COALESCE(sa.last_event_at, s.updated_at),
+                        (SELECT COUNT(*)
+                         FROM history_items hi INDEXED BY idx_history_items_session_order
+                         WHERE hi.session_id = s.id
+                           AND hi.tier = 'conversation'
+                           AND hi.kind = 'user')
+                 FROM sessions s
+                 LEFT JOIN session_activity sa ON sa.session_id = s.id
+                 WHERE s.rowid > ?1
+                 ORDER BY s.rowid
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![last_rowid, BATCH_SIZE], |row| {
+                Ok(SessionFactInput {
+                    rowid: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    metadata_json: row.get(3)?,
+                    event_count: row.get::<_, i64>(4)?.max(0),
+                    first_event_at: row.get(5)?,
+                    last_event_at: row.get(6)?,
+                    user_message_count: row.get::<_, i64>(7)?.max(0),
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })?;
+        if batch.is_empty() {
+            break;
+        }
+        last_rowid = batch.last().expect("non-empty session facts batch").rowid;
+
+        let mut rows = Vec::with_capacity(batch.len());
+        for input in batch {
+            let metadata = serde_json::from_str::<Value>(&input.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let events = session_usage_events(store, &input.session_id)?;
+            let event_contents = events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>();
+            let session_class =
+                ingest::classify_session(&input.source_kind, &metadata, &event_contents);
+            let usage = ingest::extract_session_usage(&input.source_kind, &events);
+            rows.push(SessionFactRow {
+                session_id: input.session_id,
+                source_kind: input.source_kind,
+                workspace_path: workspace_path(&metadata),
+                session_class: session_class.as_str(),
+                models_json: serde_json::to_string(&usage.models)?,
+                primary_model: usage.primary_model,
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                event_count: input.event_count,
+                user_message_count: input.user_message_count,
+                duration_secs: duration_secs(
+                    input.first_event_at.as_deref(),
+                    input.last_event_at.as_deref(),
+                ),
+                first_event_at: input.first_event_at,
+                last_event_at: input.last_event_at,
+            });
+        }
+        insert_session_facts_batch(store, &rows)?;
+    }
+    Ok(())
+}
+
+fn session_usage_events(store: &Store, session_id: &str) -> Result<Vec<ingest::UsageEvent>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT content, metadata_json
+             FROM events INDEXED BY idx_events_session_ordinal
+             WHERE session_id = ?1
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let metadata = row.get::<_, String>(1)?;
+            Ok(ingest::UsageEvent {
+                content: row.get(0)?,
+                metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| serde_json::json!({})),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
+fn workspace_path(metadata: &Value) -> Option<String> {
+    metadata
+        .get("workspace_path")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.pointer("/workspace/path").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn duration_secs(first: Option<&str>, last: Option<&str>) -> Option<i64> {
+    let first = DateTime::parse_from_rfc3339(first?).ok()?;
+    let last = DateTime::parse_from_rfc3339(last?).ok()?;
+    Some((last - first).num_seconds().max(0))
+}
+
+fn insert_session_facts_batch(store: &Store, rows: &[SessionFactRow<'_>]) -> Result<()> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting session facts batch")?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO session_facts
+                 (session_id, source_kind, workspace_path, session_class, models_json,
+                  primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
+                  user_message_count, first_event_at, last_event_at, duration_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            for row in rows {
+                stmt.execute(params![
+                    row.session_id,
+                    row.source_kind,
+                    row.workspace_path,
+                    row.session_class,
+                    row.models_json,
+                    row.primary_model,
+                    row.input_tokens,
+                    row.cached_input_tokens,
+                    row.output_tokens,
+                    row.event_count,
+                    row.user_message_count,
+                    row.first_event_at,
+                    row.last_event_at,
+                    row.duration_secs,
+                ])?;
+            }
+        }
+        tx.commit().context("committing session facts batch")
+    })
+}
+
+struct SessionFactInput {
+    rowid: i64,
+    session_id: String,
+    source_kind: String,
+    metadata_json: String,
+    event_count: i64,
+    user_message_count: i64,
+    first_event_at: Option<String>,
+    last_event_at: Option<String>,
+}
+
+struct SessionFactRow<'a> {
+    session_id: String,
+    source_kind: String,
+    workspace_path: Option<String>,
+    session_class: &'a str,
+    models_json: String,
+    primary_model: Option<String>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    event_count: i64,
+    user_message_count: i64,
+    first_event_at: Option<String>,
+    last_event_at: Option<String>,
+    duration_secs: Option<i64>,
 }
 
 fn clear_projection(store: &Store, projection: Projection) -> Result<()> {
@@ -403,6 +582,92 @@ fn set_projection_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_facts_rebuild_projects_usage_activity_and_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       started_at, updated_at, metadata_json, hash)
+                    VALUES
+                      ('session_usage', 'source', 'machine', 'opencode', 'usage', 'open',
+                       '2026-07-12T00:00:00Z', '2026-07-12T00:00:10Z',
+                       '{"workspace_path":"/repo/project","opencode_parent_id":null}',
+                       'session_usage_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, occurred_at, metadata_json, hash)
+                    VALUES
+                      ('usage_event_1', 'session_usage', 'source', 'machine', 'opencode', 0, 'text',
+                       'assistant', 'answer one', '2026-07-12T00:00:00Z',
+                       '{"opencode_message_id":"msg_1","opencode_model_id":"kimi-k2","opencode_tokens":{"input":100,"output":20,"cache":{"read":30}}}',
+                       'usage_event_hash_1'),
+                      ('usage_event_2', 'session_usage', 'source', 'machine', 'opencode', 1, 'text',
+                       'assistant', 'answer two', '2026-07-12T00:00:10Z',
+                       '{"opencode_message_id":"msg_2","opencode_model_id":"kimi-k2","opencode_tokens":{"input":50,"output":10,"cache":{"read":5}}}',
+                       'usage_event_hash_2');
+
+                    INSERT OR REPLACE INTO session_activity
+                      (session_id, event_count, first_event_at, last_event_at)
+                    VALUES
+                      ('session_usage', 2, '2026-07-12T00:00:00Z', '2026-07-12T00:00:10Z');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, lexical_indexable, semantic_policy,
+                       metadata_json, hash)
+                    VALUES
+                      ('usage_user_item', 'usage_event_1', 'session_usage', 'source', 'machine',
+                       'opencode', 0, 0, 'conversation', 'user', 'question', 'usage_user_hash',
+                       1, 'required', '{}', 'usage_user_item_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert session facts fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild session facts");
+        let facts = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT workspace_path, session_class, models_json, primary_model,
+                            input_tokens, cached_input_tokens, output_tokens, event_count,
+                            user_message_count, duration_secs
+                     FROM session_facts
+                     WHERE session_id = 'session_usage'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .expect("load session facts");
+
+        assert_eq!(facts.0, "/repo/project");
+        assert_eq!(facts.1, "interactive");
+        assert_eq!(facts.2, "[\"kimi-k2\"]");
+        assert_eq!(facts.3, "kimi-k2");
+        assert_eq!((facts.4, facts.5, facts.6), (150, 35, 30));
+        assert_eq!((facts.7, facts.8, facts.9), (2, 1, 10));
+    }
 
     #[test]
     fn provenance_rebuild_classifies_every_user_conversation_item() {
