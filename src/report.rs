@@ -1,10 +1,11 @@
 use crate::analytics;
+use crate::provenance;
 use crate::storage::Store;
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::params;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReportSort {
@@ -35,6 +36,7 @@ pub struct UsageReport {
     pub provider_mix_by_month: Vec<MixPoint>,
     pub model_mix_by_month: Vec<MixPoint>,
     pub rhythms: Rhythms,
+    pub frequencies: FrequencySection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +102,19 @@ pub struct Rhythms {
     pub by_weekday: Vec<RhythmBucket>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FrequencySection {
+    pub unigrams: Vec<TermCount>,
+    pub bigrams: Vec<TermCount>,
+    pub trigrams: Vec<TermCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TermCount {
+    pub term: String,
+    pub count: u64,
+}
+
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
@@ -122,6 +137,8 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         project_pattern.as_deref(),
     )?;
     let rhythms = report_rhythms(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let frequencies =
+        report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
     let mut warnings = analytics::freshness(store)?
         .into_iter()
         .filter(|status| status.stale)
@@ -164,7 +181,162 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         provider_mix_by_month,
         model_mix_by_month,
         rhythms,
+        frequencies,
     })
+}
+
+fn report_frequencies(
+    store: &Store,
+    since: Option<&str>,
+    project: Option<&str>,
+) -> Result<FrequencySection> {
+    let messages = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT hi.text, p.sentiment_usable, p.rule
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human'
+               AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+               AND (?1 IS NULL OR hi.occurred_at >= ?1)
+               AND (?2 IS NULL OR sf.workspace_path LIKE ?2)",
+        )?;
+        let rows = stmt.query_map(params![since, project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+
+    let stopwords = english_stopwords();
+    let mut unigrams = HashMap::new();
+    let mut bigrams = HashMap::new();
+    let mut trigrams = HashMap::new();
+    for (text, usable, rule) in messages {
+        let text = if usable == "strip_wrapper" {
+            provenance::strip_human_wrapper(&text, &rule)
+        } else {
+            text
+        };
+        let tokens = tokenize_frequency_text(&text);
+        let mut message_unigrams = HashMap::new();
+        let mut message_bigrams = HashMap::new();
+        let mut message_trigrams = HashMap::new();
+        for token in &tokens {
+            if token.len() > 1 && !stopwords.contains(token.as_str()) {
+                increment_capped(&mut unigrams, &mut message_unigrams, token.clone());
+            }
+        }
+        for window in tokens.windows(2) {
+            if window
+                .iter()
+                .any(|token| !stopwords.contains(token.as_str()))
+            {
+                increment_capped(&mut bigrams, &mut message_bigrams, window.join(" "));
+            }
+        }
+        for window in tokens.windows(3) {
+            if window
+                .iter()
+                .any(|token| !stopwords.contains(token.as_str()))
+            {
+                increment_capped(&mut trigrams, &mut message_trigrams, window.join(" "));
+            }
+        }
+    }
+    Ok(FrequencySection {
+        unigrams: top_terms(unigrams, 3, 20),
+        bigrams: top_terms(bigrams, 3, 20),
+        trigrams: top_terms(trigrams, 3, 20),
+    })
+}
+
+fn tokenize_frequency_text(text: &str) -> Vec<String> {
+    let mut outside_code = String::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            outside_code.push_str(line);
+            outside_code.push(' ');
+        }
+    }
+    let without_paths = outside_code
+        .split_whitespace()
+        .filter(|chunk| {
+            let chunk = chunk.trim_matches(|character: char| {
+                matches!(character, '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';')
+            });
+            !chunk.starts_with("http://")
+                && !chunk.starts_with("https://")
+                && !chunk.starts_with('/')
+                && !chunk.starts_with("~/")
+                && !chunk.contains("://")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    without_paths
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '\'' {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| !token.chars().any(|character| character.is_ascii_digit()))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn increment_capped(
+    totals: &mut HashMap<String, u64>,
+    message_counts: &mut HashMap<String, u8>,
+    term: String,
+) {
+    let count = message_counts.entry(term.clone()).or_default();
+    if *count < 3 {
+        *totals.entry(term).or_default() += 1;
+        *count += 1;
+    }
+}
+
+fn top_terms(counts: HashMap<String, u64>, minimum: u64, limit: usize) -> Vec<TermCount> {
+    let mut terms = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= minimum)
+        .map(|(term, count)| TermCount { term, count })
+        .collect::<Vec<_>>();
+    terms.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.term.cmp(&right.term))
+    });
+    terms.truncate(limit);
+    terms
+}
+
+fn english_stopwords() -> HashSet<&'static str> {
+    [
+        "a", "all", "also", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can",
+        "could", "do", "for", "from", "had", "has", "have", "he", "her", "here", "him", "his",
+        "how", "i", "if", "in", "into", "is", "it", "its", "just", "me", "my", "no", "not", "of",
+        "on", "or", "our", "please", "she", "should", "so", "that", "the", "their", "them", "then",
+        "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when",
+        "where", "which", "who", "why", "will", "with", "would", "you", "your",
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn report_totals(
@@ -505,12 +677,53 @@ pub fn render_terminal(report: &UsageReport) -> String {
         out.push_str(&format!("{}:{} ", bucket.label, bucket.human_messages));
     }
     out.push('\n');
+    out.push_str("\nMost typed words and phrases\n");
+    for (label, terms) in [
+        ("words", &report.frequencies.unigrams),
+        ("bigrams", &report.frequencies.bigrams),
+        ("trigrams", &report.frequencies.trigrams),
+    ] {
+        out.push_str(&format!("  {label}: "));
+        for term in terms.iter().take(12) {
+            out.push_str(&format!("{} ({})  ", term.term, term.count));
+        }
+        out.push('\n');
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frequency_tokenizer_removes_code_urls_paths_and_punctuation() {
+        let tokens = tokenize_frequency_text(
+            "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
+        );
+        assert_eq!(tokens, vec!["hello", "friend", "visit", "okay", "done"]);
+    }
+
+    #[test]
+    fn frequency_counts_apply_threshold_and_stable_order() {
+        let terms = top_terms(
+            HashMap::from([
+                ("alpha".to_string(), 4),
+                ("beta".to_string(), 4),
+                ("rare".to_string(), 2),
+            ]),
+            3,
+            10,
+        );
+        assert_eq!(
+            terms
+                .iter()
+                .map(|term| (term.term.as_str(), term.count))
+                .collect::<Vec<_>>(),
+            vec![("alpha", 4), ("beta", 4)]
+        );
+        assert!(english_stopwords().contains("please"));
+    }
 
     #[test]
     fn report_computes_aggregate_sections_and_ignores_null_rhythm_times() {

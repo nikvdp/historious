@@ -97,6 +97,20 @@ pub(crate) fn classify_message(
     classified("human", "yes", "default.human")
 }
 
+pub(crate) fn strip_human_wrapper(text: &str, rule: &str) -> String {
+    match rule {
+        "tag.image" => text
+            .find('>')
+            .map(|end| text[end + 1..].trim().to_string())
+            .unwrap_or_else(|| text.trim().to_string()),
+        "tag.command_name" => text
+            .find("</command-name>")
+            .map(|end| text[end + "</command-name>".len()..].trim().to_string())
+            .unwrap_or_else(|| text.trim().to_string()),
+        _ => text.to_string(),
+    }
+}
+
 fn classified(
     authored_by: &'static str,
     sentiment_usable: &'static str,
@@ -249,5 +263,24 @@ mod tests {
         );
         assert_eq!(long.rule, "dup.template");
         assert_eq!(long.authored_by, "agent");
+    }
+
+    #[test]
+    fn strips_only_known_human_wrappers() {
+        assert_eq!(
+            strip_human_wrapper("<image name='x'> a caption", "tag.image"),
+            "a caption"
+        );
+        assert_eq!(
+            strip_human_wrapper(
+                "<command-name>/review</command-name> focus on auth",
+                "tag.command_name"
+            ),
+            "focus on auth"
+        );
+        assert_eq!(
+            strip_human_wrapper("plain text", "default.human"),
+            "plain text"
+        );
     }
 }
