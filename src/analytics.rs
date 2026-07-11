@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
-pub const MESSAGE_PROVENANCE_VERSION: u32 = 2;
+pub const MESSAGE_PROVENANCE_VERSION: u32 = 3;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
@@ -488,13 +488,18 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
 fn repeated_template_hashes(store: &Store) -> Result<HashSet<String>> {
     store.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT text_hash
-             FROM history_items
-             WHERE tier = 'conversation'
-               AND kind = 'user'
-               AND length(text) > 200
-             GROUP BY text_hash
-             HAVING COUNT(DISTINCT session_id) > 3",
+            "SELECT hi.text_hash
+             FROM history_items hi
+             JOIN sessions s ON s.id = hi.session_id
+             WHERE hi.tier = 'conversation'
+               AND hi.kind = 'user'
+               AND length(hi.text) > 200
+             GROUP BY hi.text_hash
+             HAVING COUNT(DISTINCT hi.session_id) > 3
+                AND COUNT(DISTINCT COALESCE(
+                      json_extract(s.metadata_json, '$.workspace_path'),
+                      json_extract(s.metadata_json, '$.path')
+                    )) > 3",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<HashSet<_>>>()
@@ -706,6 +711,56 @@ mod tests {
     fn audit_preview_collapses_lines_and_caps_characters() {
         assert_eq!(collapsed_preview("one\n  two\tthree", 50), "one two three");
         assert_eq!(collapsed_preview("abcdef", 5), "abcd…");
+    }
+
+    #[test]
+    fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                for index in 0..4 {
+                    for (prefix, text_hash, workspace) in [
+                        ("wide", "hash_wide", format!("/repo/{index}")),
+                        ("fork", "hash_fork", "/repo/shared".to_string()),
+                    ] {
+                        let session_id = format!("{prefix}_session_{index}");
+                        conn.execute(
+                            "INSERT INTO sessions
+                             (id, source_id, machine_id, source_kind, external_id, status,
+                              metadata_json, hash)
+                             VALUES (?1, 'source', 'machine', 'codex', ?1, 'open', ?2, ?3)",
+                            params![
+                                session_id,
+                                serde_json::json!({"workspace_path": workspace}).to_string(),
+                                format!("{prefix}_session_hash_{index}")
+                            ],
+                        )?;
+                        conn.execute(
+                            "INSERT INTO history_items
+                             (id, event_id, session_id, source_id, machine_id, source_kind,
+                              ordinal, subordinal, tier, kind, text, text_hash,
+                              lexical_indexable, semantic_policy, metadata_json, hash)
+                             VALUES (?1, ?2, ?3, 'source', 'machine', 'codex', 0, 0,
+                                     'conversation', 'user', ?4, ?5, 1, 'required', '{}', ?6)",
+                            params![
+                                format!("{prefix}_item_{index}"),
+                                format!("{prefix}_event_{index}"),
+                                session_id,
+                                "template text ".repeat(20),
+                                text_hash,
+                                format!("{prefix}_item_hash_{index}")
+                            ],
+                        )?;
+                    }
+                }
+                Ok(())
+            })
+            .expect("insert duplicate template fixtures");
+
+        let hashes = repeated_template_hashes(&store).expect("find repeated templates");
+        assert!(hashes.contains("hash_wide"));
+        assert!(!hashes.contains("hash_fork"));
     }
 
     #[test]
