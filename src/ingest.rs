@@ -124,8 +124,37 @@ pub(crate) fn resolve_session_relationship(
         }
     }
 
+    if source_kind == "omp" {
+        if let Some(parent_external_id) = session_metadata
+            .get("omp_parent_external_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|parent_id| !parent_id.is_empty())
+        {
+            let relationship = match session_metadata
+                .get("omp_relationship")
+                .and_then(Value::as_str)
+            {
+                Some("subagent") => SessionRelationshipKind::Subagent,
+                Some("fork") => SessionRelationshipKind::Fork,
+                _ => SessionRelationshipKind::None,
+            };
+            let rule = match relationship {
+                SessionRelationshipKind::Subagent => "omp.artifact_path",
+                SessionRelationshipKind::Fork => "omp.parent_session",
+                SessionRelationshipKind::None => "omp.root",
+            };
+            return SessionRelationshipHint {
+                parent_external_id: Some(parent_external_id.to_string()),
+                relationship,
+                rule,
+            };
+        }
+    }
+
     let rule = match source_kind {
         "pi_agent" => "pi_agent.capture_gap",
+        "omp" => "omp.root",
         "hermes" => "hermes.capture_gap",
         _ => "default.none",
     };
@@ -365,6 +394,7 @@ pub(crate) fn classify_session(
         "codex" => classify_codex_session(event_contents),
         "opencode" => classify_opencode_session(session_metadata),
         "claude_code" => classify_claude_session(event_contents),
+        "omp" => classify_omp_session(session_metadata),
         _ => SessionClass::Unknown,
     }
 }
@@ -512,6 +542,13 @@ struct WorkspaceIdentity {
     git_branch: Option<String>,
     source: String,
     confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OmpSessionIdentity {
+    external_id: String,
+    parent_external_id: Option<String>,
+    relationship: SessionRelationshipKind,
 }
 
 pub fn update_local_with_progress(
@@ -1455,9 +1492,15 @@ fn prepare_file_import(
         parse_json_file(&text)
     };
     let lines = lines.with_context(|| format!("parsing {}", path.display()))?;
-    let external_session_id = lines
-        .iter()
-        .find_map(|line| line.external_session_id.clone())
+    let omp_identity = (kind == "omp").then(|| omp_session_identity(path, &lines));
+    let external_session_id = omp_identity
+        .as_ref()
+        .map(|identity| identity.external_id.clone())
+        .or_else(|| {
+            lines
+                .iter()
+                .find_map(|line| line.external_session_id.clone())
+        })
         .unwrap_or_else(|| file_stem(path));
     let session_id = stable_id(&["session", kind, &path_text, &external_session_id]);
     let title = session_title(kind, &external_session_id, &lines, native_titles);
@@ -1473,7 +1516,12 @@ fn prepare_file_import(
         status: "open".to_string(),
         started_at: lines.iter().find_map(|line| line.occurred_at),
         updated_at: lines.iter().rev().find_map(|line| line.occurred_at),
-        metadata: session_metadata(&path_text, workspace.as_ref()),
+        metadata: session_metadata_for_kind(
+            kind,
+            &path_text,
+            workspace.as_ref(),
+            omp_identity.as_ref(),
+        ),
         hash: session_hash,
     }));
 
@@ -1532,6 +1580,57 @@ fn prepare_file_import(
         }));
     }
     Ok(PreparedImport::archive(vec![source_upsert], records))
+}
+
+fn omp_session_identity(path: &Path, lines: &[ParsedLine]) -> OmpSessionIdentity {
+    let mut transcript_chain = vec![file_stem(path)];
+    let mut cursor = path.to_path_buf();
+    while let Some(parent_path) = omp_parent_transcript_path(&cursor) {
+        transcript_chain.push(file_stem(&parent_path));
+        cursor = parent_path;
+    }
+    transcript_chain.reverse();
+
+    if transcript_chain.len() > 1 {
+        let parent_external_id = transcript_chain[..transcript_chain.len() - 1].join("/");
+        return OmpSessionIdentity {
+            external_id: transcript_chain.join("/"),
+            parent_external_id: Some(parent_external_id),
+            relationship: SessionRelationshipKind::Subagent,
+        };
+    }
+
+    let parent_external_id = lines
+        .iter()
+        .find(|line| line.event_type == "session")
+        .and_then(|line| string_at(&line.value, &["parentSession"]))
+        .and_then(|parent| omp_parent_session_external_id(&parent));
+    OmpSessionIdentity {
+        external_id: transcript_chain.pop().unwrap_or_else(|| file_stem(path)),
+        relationship: if parent_external_id.is_some() {
+            SessionRelationshipKind::Fork
+        } else {
+            SessionRelationshipKind::None
+        },
+        parent_external_id,
+    }
+}
+
+fn omp_parent_transcript_path(path: &Path) -> Option<PathBuf> {
+    let parent_path = path.parent()?.with_extension("jsonl");
+    parent_path.is_file().then_some(parent_path)
+}
+
+fn omp_parent_session_external_id(parent: &str) -> Option<String> {
+    let parent = parent.trim();
+    if parent.is_empty() {
+        return None;
+    }
+    let path = Path::new(parent);
+    if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+        return Some(file_stem(path));
+    }
+    Some(parent.to_string())
 }
 
 fn classify_codex_session(event_contents: &[&str]) -> SessionClass {
@@ -1933,6 +2032,18 @@ fn classify_opencode_session(session_metadata: &Value) -> SessionClass {
     }
 }
 
+fn classify_omp_session(session_metadata: &Value) -> SessionClass {
+    if session_metadata
+        .get("omp_relationship")
+        .and_then(Value::as_str)
+        == Some("subagent")
+    {
+        SessionClass::Subagent
+    } else {
+        SessionClass::Interactive
+    }
+}
+
 impl NativeTitleIndex {
     fn load() -> Self {
         let mut index = Self::default();
@@ -2243,6 +2354,32 @@ fn session_metadata(path_text: &str, workspace: Option<&WorkspaceIdentity>) -> V
         );
     }
     Value::Object(metadata)
+}
+
+fn session_metadata_for_kind(
+    kind: &str,
+    path_text: &str,
+    workspace: Option<&WorkspaceIdentity>,
+    omp_identity: Option<&OmpSessionIdentity>,
+) -> Value {
+    let mut metadata = session_metadata(path_text, workspace);
+    if kind == "omp" {
+        if let (Value::Object(map), Some(identity)) = (&mut metadata, omp_identity) {
+            map.insert(
+                "omp_parent_external_id".to_string(),
+                identity
+                    .parent_external_id
+                    .as_ref()
+                    .map(|parent| Value::String(parent.clone()))
+                    .unwrap_or(Value::Null),
+            );
+            map.insert(
+                "omp_relationship".to_string(),
+                Value::String(identity.relationship.as_str().to_string()),
+            );
+        }
+    }
+    metadata
 }
 
 fn session_workspace(

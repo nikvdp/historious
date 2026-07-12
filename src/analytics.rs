@@ -324,20 +324,9 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
             &metadata,
             &event_contents,
         );
-        let mut parent_session_id =
-            hint.parent_external_id.as_ref().and_then(|external_id| {
-                session_ids
-                    .get(&(
-                        session.machine_id.clone(),
-                        session.source_kind.clone(),
-                        external_id.clone(),
-                    ))
-                    .and_then(|ids| {
-                        ids.iter()
-                            .find(|id| id.as_str() != session.session_id)
-                            .cloned()
-                    })
-            });
+        let mut parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
+            relationship_parent_session_id(session, external_id, &session_ids)
+        });
         let mut hint = hint;
         if session.source_kind == "codex" {
             if let Some((codex_parent_session_id, collision)) =
@@ -412,6 +401,41 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         insert_event_session_overrides_batch(store, batch)?;
     }
     Ok(())
+}
+
+fn relationship_parent_session_id(
+    session: &RelationshipSession,
+    parent_external_id: &str,
+    session_ids: &HashMap<(String, String, String), Vec<String>>,
+) -> Option<String> {
+    let exact_key = (
+        session.machine_id.clone(),
+        session.source_kind.clone(),
+        parent_external_id.to_string(),
+    );
+    if let Some(parent_id) = session_ids.get(&exact_key).and_then(|ids| {
+        ids.iter()
+            .find(|id| id.as_str() != session.session_id)
+            .cloned()
+    }) {
+        return Some(parent_id);
+    }
+    if session.source_kind != "omp" || parent_external_id.contains('/') {
+        return None;
+    }
+
+    let suffix = format!("_{parent_external_id}");
+    let mut matches = session_ids
+        .iter()
+        .filter(|((machine_id, source_kind, external_id), _)| {
+            machine_id == &session.machine_id
+                && source_kind == "omp"
+                && external_id.ends_with(&suffix)
+        })
+        .flat_map(|(_, ids)| ids)
+        .filter(|id| id.as_str() != session.session_id);
+    let parent_id = matches.next()?.clone();
+    matches.next().is_none().then_some(parent_id)
 }
 
 fn codex_fork_parents(

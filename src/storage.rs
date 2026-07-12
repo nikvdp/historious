@@ -2418,9 +2418,8 @@ impl Store {
         })
     }
 
-    /// Look up pi_agent sessions whose external_id (timestamp-prefixed filename stem)
-    /// ends with `_<native_id>`. This lets users pass the bare UUID that pi itself
-    /// displays instead of the full filename stem.
+    /// Look up pi-compatible sessions whose timestamp-prefixed external_id ends with
+    /// `_<native_id>`. This lets users pass the bare UUID displayed by pi or OMP.
     pub fn sessions_by_pi_native_id(
         &self,
         native_id: &str,
@@ -2435,8 +2434,9 @@ impl Store {
                 "SELECT id, source_id, machine_id, source_kind, external_id, title, status,
                         started_at, updated_at, metadata_json, hash
                  FROM sessions
-                 WHERE source_kind = 'pi_agent' AND external_id LIKE ?1 ESCAPE '\\'
-                 ORDER BY id",
+                 WHERE source_kind IN ('pi_agent', 'omp')
+                   AND external_id LIKE ?1 ESCAPE '\\'
+                 ORDER BY source_kind, id",
             )?;
             let rows = stmt.query_map(params![pattern], row_session)?;
             let mut out = Vec::new();
