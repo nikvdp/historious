@@ -804,6 +804,7 @@ mod tests {
             logging_and_retention: "unknown".to_string(),
             resumability: "yes".to_string(),
             deletion: "delete command".to_string(),
+            schema_description: "1..5 test scale".to_string(),
         };
 
         record_enrichment_run(&store, "sentiment", "v1", &preflight)
@@ -814,6 +815,60 @@ mod tests {
         let error = record_enrichment_run(&store, "sentiment", "v1", &preflight)
             .expect_err("version metadata must not change");
         assert!(error.to_string().contains("different provider metadata"));
+    }
+
+    #[test]
+    fn deleting_enrichment_keeps_local_topic_labels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        insert_annotations(
+            &store,
+            &[annotation("happiness", 4, "delete-v1", "2026-07-12T00:00:00Z")],
+        )
+        .expect("insert sentiment enrichment");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO topics
+                     (version, topic_id, size, centroid, label, label_model, labeler_version, labeled_at)
+                     VALUES ('topic-v1', 1, 1, ?1, 'local database work', 'local', 'local-v1', ?2)",
+                    params![
+                        crate::storage::f32_vector_to_blob(&[0.0; 384]),
+                        "2026-07-12T00:00:00Z"
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT INTO topic_label_enrichments
+                     (topic_version, topic_id, label, provider, model, destination,
+                      labeler_version, data_scope, labeled_at)
+                     VALUES ('topic-v1', 1, 'provider database work', 'openai', 'gpt-test',
+                             'https://example.test/v1/chat/completions', 'delete-v1',
+                             'representatives', '2026-07-12T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("insert topic enrichment");
+
+        assert_eq!(delete_enrichment(&store, "sentiment", "delete-v1").expect("delete").derived_rows, 1);
+        assert_eq!(delete_enrichment(&store, "topics", "delete-v1").expect("delete").derived_rows, 1);
+        store
+            .with_conn(|conn| {
+                let local: String = conn.query_row(
+                    "SELECT label FROM topics WHERE version = 'topic-v1' AND topic_id = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let overlays: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM topic_label_enrichments",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(local, "local database work");
+                assert_eq!(overlays, 0);
+                Ok(())
+            })
+            .expect("verify local fallback");
     }
 
     #[test]

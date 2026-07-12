@@ -9945,6 +9945,28 @@ mod tests {
                 }
             }
         ));
+
+        let delete = Cli::try_parse_from([
+            "histo",
+            "enrich",
+            "delete",
+            "--kind",
+            "topics",
+            "--version",
+            "labels-v1",
+            "--yes",
+        ])
+        .expect("parse explicit enrichment deletion");
+        assert!(matches!(
+            delete.command,
+            Command::Enrich {
+                command: EnrichCommand::Delete {
+                    kind: EnrichmentKindArg::Topics,
+                    yes: true,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

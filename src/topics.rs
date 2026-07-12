@@ -1445,21 +1445,35 @@ mod tests {
         let stored = store
             .with_conn(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT label, label_model, labeler_version FROM topics ORDER BY topic_id",
+                    "SELECT label, provider, model, labeler_version
+                     FROM topic_label_enrichments ORDER BY topic_id",
                 )?;
                 let rows = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(Into::into)
             })
             .expect("read stored labels");
-        assert_eq!(stored[0].1, "mock-labeler");
-        assert!(stored.iter().all(|row| row.2 == "labels-v1"));
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|row| row.1 == "unknown"));
+        assert!(stored.iter().all(|row| row.2 == "mock-labeler"));
+        assert!(stored.iter().all(|row| row.3 == "labels-v1"));
+        let local_labels = store
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM topics WHERE label IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .expect("count local labels");
+        assert_eq!(local_labels, 0);
     }
 
     #[cfg(not(feature = "semantic-fastembed"))]
