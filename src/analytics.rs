@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
-pub const MESSAGE_PROVENANCE_VERSION: u32 = 3;
+pub const MESSAGE_PROVENANCE_VERSION: u32 = 4;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 5;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
@@ -812,14 +812,17 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
     loop {
         let batch = store.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.text,
-                        hi.text_hash, hi.occurred_at, s.metadata_json, e.content
+                "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
+                        hi.text_hash, hi.occurred_at, s.metadata_json,
+                        COALESCE(sr.relationship, 'none')
                  FROM history_items hi
                  JOIN sessions s ON s.id = hi.session_id
-                 JOIN events e ON e.id = hi.event_id
+                 LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
+                 LEFT JOIN session_relationships sr
+                   ON sr.session_id = COALESCE(eso.session_id, hi.session_id)
                  WHERE hi.rowid > ?1
                    AND hi.tier = 'conversation'
-                   AND hi.kind = 'user'
+                   AND hi.kind IN ('user', 'assistant')
                  ORDER BY hi.rowid
                  LIMIT ?2",
             )?;
@@ -829,11 +832,12 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
                     item_id: row.get(1)?,
                     session_id: row.get(2)?,
                     source_kind: row.get(3)?,
-                    text: row.get(4)?,
-                    text_hash: row.get(5)?,
-                    occurred_at: row.get(6)?,
-                    session_metadata: row.get(7)?,
-                    event_content: row.get(8)?,
+                    message_kind: row.get(4)?,
+                    text: row.get(5)?,
+                    text_hash: row.get(6)?,
+                    occurred_at: row.get(7)?,
+                    session_metadata: row.get(8)?,
+                    relationship: row.get(9)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -860,12 +864,12 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
                 session_classes.insert(input.session_id.clone(), class);
                 class
             };
-            let event_class = ingest::classify_event(&input.source_kind, &input.event_content);
             let classification = provenance::classify_message(
                 &input.text,
+                &input.message_kind,
                 repeated_templates.contains(&input.text_hash),
+                &input.relationship,
                 session_class,
-                event_class,
             );
             rows.push(ProvenanceRow {
                 item_id: input.item_id,
@@ -969,11 +973,12 @@ struct ProvenanceInput {
     item_id: String,
     session_id: String,
     source_kind: String,
+    message_kind: String,
     text: String,
     text_hash: String,
     occurred_at: Option<String>,
     session_metadata: String,
-    event_content: String,
+    relationship: String,
 }
 
 struct ProvenanceRow<'a> {

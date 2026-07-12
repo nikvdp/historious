@@ -9,17 +9,11 @@ pub(crate) struct MessageProvenance {
 
 pub(crate) fn classify_message(
     text: &str,
+    message_kind: &str,
     repeated_template: bool,
+    relationship: &str,
     session_class: SessionClass,
-    event_class: SessionClass,
 ) -> MessageProvenance {
-    if event_class == SessionClass::Subagent || session_class == SessionClass::Subagent {
-        return classified("agent", "no", "session.subagent");
-    }
-    if event_class == SessionClass::Automation || session_class == SessionClass::Automation {
-        return classified("harness", "no", "session.automation");
-    }
-
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     for (prefix, authored_by, sentiment_usable, rule) in [
@@ -90,6 +84,15 @@ pub(crate) fn classify_message(
         if lower.starts_with(prefix) {
             return classified("harness", "no", rule);
         }
+    }
+    if session_class == SessionClass::Automation {
+        return classified("harness", "no", "session.automation");
+    }
+    if relationship == "subagent" {
+        return classified("agent", "no", "relationship.subagent");
+    }
+    if message_kind == "assistant" {
+        return classified("assistant", "no", "message.assistant");
     }
     if repeated_template && text.chars().count() > 200 {
         return classified("agent", "no", "dup.template");

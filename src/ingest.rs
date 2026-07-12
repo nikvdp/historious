@@ -369,13 +369,6 @@ pub(crate) fn classify_session(
     }
 }
 
-pub(crate) fn classify_event(source_kind: &str, event_content: &str) -> SessionClass {
-    match source_kind {
-        "claude_code" => classify_claude_event(event_content),
-        _ => SessionClass::Unknown,
-    }
-}
-
 impl SourceSelection {
     pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut sources = BTreeSet::new();
@@ -2270,21 +2263,6 @@ fn claude_has_task_tool_use(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(claude_has_task_tool_use),
         _ => false,
     }
-}
-
-fn classify_claude_event(event_content: &str) -> SessionClass {
-    serde_json::from_str::<Value>(event_content)
-        .ok()
-        .filter(|value| claude_event_role(value).as_deref() == Some("user"))
-        .and_then(|value| value.get("isSidechain").and_then(Value::as_bool))
-        .map(|sidechain| {
-            if sidechain {
-                SessionClass::Subagent
-            } else {
-                SessionClass::Interactive
-            }
-        })
-        .unwrap_or(SessionClass::Unknown)
 }
 
 fn claude_event_role(value: &Value) -> Option<String> {
