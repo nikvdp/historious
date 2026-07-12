@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 const BATCH_SIZE: usize = 64;
 const TOPIC_CLUSTER_ALGORITHM_VERSION: u32 = 2;
-const MIN_TOPIC_SILHOUETTE: f64 = 0.18;
+pub(crate) const MIN_TOPIC_SILHOUETTE: f64 = 0.18;
 const MISC_TOPIC_LABEL: &str = "miscellaneous";
 const MISC_TOPIC_LABELER_VERSION: &str = "coherence-gate-v1";
 

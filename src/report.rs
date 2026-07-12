@@ -578,9 +578,9 @@ fn report_topics(
     since: Option<&str>,
     project: Option<&str>,
 ) -> Result<(Option<TopicSection>, Option<String>)> {
-    let Some((version, model_id, corpus_messages, selected_k)) = store.with_conn(|conn| {
+    let Some((version, model_id, corpus_messages, selected_k, silhouette)) = store.with_conn(|conn| {
         conn.query_row(
-            "SELECT version, model_id, item_count, selected_k
+            "SELECT version, model_id, item_count, selected_k, silhouette_score
              FROM topic_runs
              WHERE status = 'completed'
              ORDER BY completed_at DESC
@@ -592,6 +592,7 @@ fn report_topics(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
                 ))
             },
         )
@@ -601,6 +602,9 @@ fn report_topics(
     else {
         return Ok((None, Some("topics are unavailable; run `histo lab topics cluster` and `histo lab topics label`".to_string())));
     };
+    if silhouette < crate::topics::MIN_TOPIC_SILHOUETTE {
+        return Ok((None, None));
+    }
     let labeled: i64 = store.with_conn(|conn| {
         conn.query_row(
             "SELECT COUNT(*) FROM topics WHERE version = ?1 AND label IS NOT NULL",
