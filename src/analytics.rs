@@ -1371,6 +1371,96 @@ mod tests {
     }
 
     #[test]
+    fn claude_inline_sidechains_project_synthetic_children_and_orphans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('claude_inline_parent', 'source', 'machine', 'claude_code', 'parent',
+                       'open', '{"path":"/logs/parent.jsonl"}', 'claude_inline_parent_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, metadata_json, hash)
+                    VALUES
+                      ('task_event', 'claude_inline_parent', 'source', 'machine', 'claude_code', 0,
+                       'assistant', 'assistant', 'task',
+                       '{"claude_relationship":{"uuid":"task","parent_uuid":null,"is_sidechain":false,"task_tool_use":true}}',
+                       'task_event_hash'),
+                      ('sidechain_root', 'claude_inline_parent', 'source', 'machine', 'claude_code', 1,
+                       'user', 'user', 'root',
+                       '{"claude_relationship":{"uuid":"root","parent_uuid":"task","is_sidechain":true,"task_tool_use":false}}',
+                       'sidechain_root_hash'),
+                      ('sidechain_child', 'claude_inline_parent', 'source', 'machine', 'claude_code', 2,
+                       'assistant', 'assistant', 'child',
+                       '{"claude_relationship":{"uuid":"child","parent_uuid":"root","is_sidechain":true,"task_tool_use":false}}',
+                       'sidechain_child_hash'),
+                      ('sidechain_orphan', 'claude_inline_parent', 'source', 'machine', 'claude_code', 3,
+                       'user', 'user', 'orphan',
+                       '{"claude_relationship":{"uuid":"orphan","parent_uuid":"missing","is_sidechain":true,"task_tool_use":false}}',
+                       'sidechain_orphan_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert Claude inline fixtures");
+
+        for _ in 0..2 {
+            rebuild_all(&store, |_, _, _| {}).expect("rebuild Claude inline relationships");
+        }
+        let relationships = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE rule LIKE 'claude.inline_%'
+                     ORDER BY rule",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load Claude inline relationships");
+        let overrides = store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM event_session_overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(Into::into)
+            })
+            .expect("count Claude event overrides");
+
+        assert_eq!(relationships.len(), 2);
+        assert_eq!(relationships[0].0, None);
+        assert!(relationships[0].1.starts_with("sc_"));
+        assert_eq!(relationships[0].2, "none");
+        assert_eq!(relationships[0].3, "claude.inline_orphan");
+        assert_eq!(
+            relationships[1],
+            (
+                Some("claude_inline_parent".to_string()),
+                "claude_inline_parent".to_string(),
+                "subagent".to_string(),
+                "claude.inline_sidechain".to_string()
+            )
+        );
+        assert_eq!(overrides, 3);
+    }
+
+    #[test]
     fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");

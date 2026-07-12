@@ -3004,6 +3004,18 @@ mod tests {
             &[],
         );
         assert_eq!(unrelated.relationship, SessionRelationshipKind::None);
+
+        let inline = claude_event_relationship_metadata(&json!({
+            "uuid": "task-message",
+            "parentUuid": "user-message",
+            "isSidechain": false,
+            "message": {"content": [{"type": "tool_use", "name": "Task"}]}
+        }))
+        .expect("Claude relationship metadata");
+        assert_eq!(inline["uuid"], "task-message");
+        assert_eq!(inline["parent_uuid"], "user-message");
+        assert_eq!(inline["is_sidechain"], false);
+        assert_eq!(inline["task_tool_use"], true);
     }
 
     #[test]
