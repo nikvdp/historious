@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 4;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
-pub const SESSION_RELATIONSHIPS_VERSION: u32 = 5;
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 6;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
@@ -248,19 +248,17 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     })?;
-    let session_ids = sessions
-        .iter()
-        .map(|session| {
-            (
-                (
-                    session.machine_id.clone(),
-                    session.source_kind.clone(),
-                    session.external_id.clone(),
-                ),
-                session.session_id.clone(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    let mut session_ids = HashMap::<(String, String, String), Vec<String>>::new();
+    for session in &sessions {
+        session_ids
+            .entry((
+                session.machine_id.clone(),
+                session.source_kind.clone(),
+                session.external_id.clone(),
+            ))
+            .or_default()
+            .push(session.session_id.clone());
+    }
 
     let codex_notifications = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -313,15 +311,20 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
             &metadata,
             &event_contents,
         );
-        let mut parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
-            session_ids
-                .get(&(
-                    session.machine_id.clone(),
-                    session.source_kind.clone(),
-                    external_id.clone(),
-                ))
-                .cloned()
-        });
+        let mut parent_session_id =
+            hint.parent_external_id.as_ref().and_then(|external_id| {
+                session_ids
+                    .get(&(
+                        session.machine_id.clone(),
+                        session.source_kind.clone(),
+                        external_id.clone(),
+                    ))
+                    .and_then(|ids| {
+                        ids.iter()
+                            .find(|id| id.as_str() != session.session_id)
+                            .cloned()
+                    })
+            });
         let mut hint = hint;
         if session.source_kind == "codex" {
             if let Some((codex_parent_session_id, collision)) =
