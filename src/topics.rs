@@ -1262,6 +1262,76 @@ mod tests {
     }
 
     #[test]
+    fn weak_topic_runs_are_stored_as_local_miscellaneous_without_model_labeling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let dataset = fixture_topic_dataset("weak_input");
+        let candidates = vec![ClusterCandidate {
+            k: 8,
+            silhouette: 0.14,
+        }];
+        start_cluster_run(&store, "weak", &dataset).expect("start weak run");
+        persist_cluster_run(
+            &store,
+            "weak",
+            &dataset,
+            &[0.0; DEFAULT_SEMANTIC_DIMS],
+            &[0, 0, 0],
+            &[0.1, 0.2, 0.3],
+            &candidates,
+            1,
+            0.14,
+        )
+        .expect("complete weak run");
+
+        let topic = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT label, label_model, labeler_version, size FROM topics
+                     WHERE version = 'weak' AND topic_id = 0",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .expect("read miscellaneous topic");
+        assert_eq!(
+            topic,
+            (
+                MISC_TOPIC_LABEL.to_string(),
+                "local".to_string(),
+                MISC_TOPIC_LABELER_VERSION.to_string(),
+                3,
+            )
+        );
+
+        let completed = completed_cluster_for_input(
+            &store,
+            "fixture-topic-384",
+            "weak_input",
+        )
+        .expect("read weak run")
+        .expect("completed weak run");
+        assert!(completed.demoted);
+        assert_eq!(completed.selected_k, 1);
+
+        let labeler = MockLabeler {
+            calls: AtomicUsize::new(0),
+        };
+        let error = label_topics(&store, &labeler, "labels-v1", None)
+            .expect_err("weak run should keep its local label");
+        assert!(error.to_string().contains("below the 0.18 coherence bar"));
+        assert_eq!(labeler.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn topic_labeling_resumes_by_labeler_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -1273,7 +1343,7 @@ mod tests {
                       (version, algorithm_version, model_id, input_hash, item_count, selected_k,
                        silhouette_score, status, started_at, completed_at)
                     VALUES
-                      ('current', 1, 'fixture-topic-384', 'input', 2, 2, 0.8, 'completed',
+                      ('current', 2, 'fixture-topic-384', 'input', 2, 2, 0.8, 'completed',
                        '2026-07-12T00:00:00Z', '2026-07-12T00:01:00Z');
 
                     INSERT INTO history_items
