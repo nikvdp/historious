@@ -1296,6 +1296,11 @@ mod tests {
             })
             .expect("insert report fixtures");
 
+        rebuild_snapshot(&store).expect("build report snapshot");
+        let snapshot_generated_at = read_snapshot(&store)
+            .expect("read report snapshot")
+            .expect("stored report snapshot")
+            .generated_at;
         let report = compute(
             &store,
             &ReportOptions {
@@ -1307,6 +1312,7 @@ mod tests {
         .expect("compute report");
 
         assert!(!report.contains_raw_text);
+        assert_eq!(report.generated_at, snapshot_generated_at);
         assert_eq!(report.totals.sessions, 2);
         assert_eq!(report.totals.threads, 1);
         assert_eq!(report.totals.events, 3);
@@ -1332,6 +1338,10 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("sentiment is unavailable")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
 
         let filtered = compute(
             &store,

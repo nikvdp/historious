@@ -2009,13 +2009,14 @@ mod tests {
         rebuild_all(&store, |_, _, _| {}).expect("rebuild projections");
         assert!(!is_stale(&store).expect("freshness after rebuild"));
         let statuses = freshness(&store).expect("projection statuses");
-        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses.len(), 4);
         assert_eq!(
             statuses[0].stored_version,
             Some(SESSION_RELATIONSHIPS_VERSION)
         );
         assert_eq!(statuses[1].stored_version, Some(MESSAGE_PROVENANCE_VERSION));
         assert_eq!(statuses[2].stored_version, Some(SESSION_FACTS_VERSION));
+        assert_eq!(statuses[3].stored_version, Some(REPORT_SNAPSHOT_VERSION));
 
         insert_event(&store, "event-2", 2);
         let statuses = freshness(&store).expect("stale projection statuses");
