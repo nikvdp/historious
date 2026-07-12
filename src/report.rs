@@ -2,7 +2,7 @@ use crate::analytics;
 use crate::provenance;
 use crate::storage::Store;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -937,15 +937,28 @@ fn report_activity(
             let (label, messages) = row?;
             values.entry(label).or_default().1 = messages;
         }
-        Ok(values
+        let mut activity = values
             .into_iter()
             .map(|(bucket, (sessions, human_messages))| ActivityPoint {
                 bucket,
                 sessions,
                 human_messages,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        activity.sort_by_key(|point| activity_bucket_order(&point.bucket));
+        Ok(activity)
     })
+}
+
+fn activity_bucket_order(bucket: &str) -> i32 {
+    if let Ok(day) = NaiveDate::parse_from_str(bucket, "%Y-%m-%d") {
+        return day.year() * 400 + day.ordinal() as i32;
+    }
+    bucket
+        .split_once("-W")
+        .and_then(|(year, week)| year.parse::<i32>().ok().zip(week.parse::<i32>().ok()))
+        .map(|(year, week)| year * 400 + week * 7)
+        .unwrap_or(i32::MIN)
 }
 
 fn report_changes(
@@ -1357,17 +1370,6 @@ pub fn render_terminal(report: &UsageReport) -> String {
             row.duration_secs as f64 / 3_600.0
         ));
     }
-    if !report.frequencies.unigrams.is_empty() {
-        out.push_str("  Recurring terms: ");
-        for (index, term) in report.frequencies.unigrams.iter().take(6).enumerate() {
-            if index > 0 {
-                out.push_str(" · ");
-            }
-            out.push_str(&term.term);
-        }
-        out.push('\n');
-    }
-
     if report.topics.as_ref().is_some_and(|topics| {
         topics
             .topics
