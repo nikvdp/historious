@@ -2107,6 +2107,24 @@ mod tests {
         let (topics, warning) = report_topics(&store, None, None).expect("incomplete topics");
         assert!(topics.is_none());
         assert!(warning.expect("warning").contains("1 of 2 labels"));
+
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO topic_runs
+                       (version, algorithm_version, model_id, input_hash, item_count, selected_k,
+                        silhouette_score, status, started_at, completed_at)
+                     VALUES ('demoted', 2, 'model', 'input4', 2, 1, 0.07, 'completed',
+                             '2026-07-04T00:00:00Z', '2026-07-04T00:01:00Z');
+                     INSERT INTO topics (version, topic_id, size, centroid, label)
+                     VALUES ('demoted', 0, 2, X'00', 'miscellaneous');",
+                )?;
+                Ok(())
+            })
+            .expect("insert demoted topics");
+        let (topics, warning) = report_topics(&store, None, None).expect("demoted topics");
+        assert!(topics.is_none());
+        assert!(warning.is_none());
     }
 
     #[test]
