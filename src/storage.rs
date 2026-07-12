@@ -5112,6 +5112,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_session_relationships_root
           ON session_relationships(root_session_id);
 
+        CREATE TABLE IF NOT EXISTS event_session_overrides (
+          event_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_session_overrides_session
+          ON event_session_overrides(session_id);
+
         CREATE TABLE IF NOT EXISTS message_annotations (
           item_id TEXT NOT NULL,
           axis TEXT NOT NULL,

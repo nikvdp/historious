@@ -1,3 +1,4 @@
+use crate::archive::stable_id;
 use crate::ingest::{self, SessionClass};
 use crate::provenance;
 use crate::storage::Store;
@@ -11,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 3;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
-pub const SESSION_RELATIONSHIPS_VERSION: u32 = 4;
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 5;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
@@ -227,6 +228,7 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
 fn rebuild_session_relationships(store: &Store) -> Result<()> {
     let projection = PROJECTIONS[0];
     clear_projection(store, projection)?;
+    clear_event_session_overrides(store)?;
 
     let sessions = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -295,6 +297,8 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
 
     let mut hints = Vec::with_capacity(sessions.len());
     let mut parents = HashMap::with_capacity(sessions.len());
+    let mut inline_relationships = Vec::new();
+    let mut event_overrides = Vec::new();
     for session in &sessions {
         let metadata = serde_json::from_str::<Value>(&session.metadata_json)
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -332,12 +336,26 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
                 };
             }
         }
+        if session.source_kind == "claude_code"
+            && hint.relationship == ingest::SessionRelationshipKind::None
+        {
+            let (relationships, overrides) =
+                claude_inline_relationships(store, &session.session_id)?;
+            inline_relationships.extend(relationships);
+            event_overrides.extend(overrides);
+        }
         parents.insert(session.session_id.clone(), parent_session_id.clone());
         hints.push((hint, parent_session_id));
     }
+    for relationship in &inline_relationships {
+        parents.insert(
+            relationship.session_id.clone(),
+            relationship.parent_session_id.clone(),
+        );
+    }
 
     let resolved_at = Utc::now().to_rfc3339();
-    let rows = sessions
+    let mut rows = sessions
         .into_iter()
         .zip(hints)
         .map(|(session, (hint, parent_session_id))| {
@@ -351,11 +369,170 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for relationship in inline_relationships {
+        rows.push(SessionRelationshipRow {
+            root_session_id: root_session_id(&relationship.session_id, &parents)?,
+            session_id: relationship.session_id,
+            parent_session_id: relationship.parent_session_id,
+            relationship: relationship.relationship.as_str(),
+            rule: relationship.rule,
+            resolved_at: resolved_at.as_str(),
+        });
+    }
 
     for batch in rows.chunks(500) {
         insert_session_relationships_batch(store, batch)?;
     }
+    for batch in event_overrides.chunks(500) {
+        insert_event_session_overrides_batch(store, batch)?;
+    }
     Ok(())
+}
+
+fn claude_inline_relationships(
+    store: &Store,
+    parent_session_id: &str,
+) -> Result<(Vec<InlineRelationship>, Vec<EventSessionOverride>)> {
+    let events = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, metadata_json
+             FROM events INDEXED BY idx_events_session_ordinal
+             WHERE session_id = ?1
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([parent_session_id], |row| {
+            let metadata = row.get::<_, String>(1)?;
+            let metadata = serde_json::from_str::<Value>(&metadata)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let relationship = metadata.get("claude_relationship");
+            Ok(InlineClaudeEvent {
+                event_id: row.get(0)?,
+                uuid: relationship
+                    .and_then(|value| value.get("uuid"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                parent_uuid: relationship
+                    .and_then(|value| value.get("parent_uuid"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                is_sidechain: relationship
+                    .and_then(|value| value.get("is_sidechain"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                task_tool_use: relationship
+                    .and_then(|value| value.get("task_tool_use"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    if !events.iter().any(|event| event.is_sidechain) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let by_uuid = events
+        .iter()
+        .filter_map(|event| event.uuid.as_ref().map(|uuid| (uuid.as_str(), event)))
+        .collect::<HashMap<_, _>>();
+    let mut roots = HashMap::<String, Vec<String>>::new();
+    for event in events.iter().filter(|event| event.is_sidechain) {
+        let mut current = event;
+        let mut visited = HashSet::new();
+        while let Some(parent) = current
+            .parent_uuid
+            .as_deref()
+            .and_then(|uuid| by_uuid.get(uuid).copied())
+            .filter(|parent| parent.is_sidechain)
+        {
+            if !visited.insert(current.event_id.as_str()) {
+                bail!("cycle in Claude inline sidechain at {}", current.event_id);
+            }
+            current = parent;
+        }
+        let root_key = current
+            .uuid
+            .clone()
+            .unwrap_or_else(|| current.event_id.clone());
+        roots.entry(root_key).or_default().push(event.event_id.clone());
+    }
+
+    let mut relationships = Vec::with_capacity(roots.len());
+    let mut overrides = Vec::new();
+    for (root_uuid, event_ids) in roots {
+        let root = by_uuid.get(root_uuid.as_str()).copied();
+        let mut ancestor_uuid = root.and_then(|event| event.parent_uuid.as_deref());
+        let mut visited = HashSet::new();
+        let mut linked = false;
+        while let Some(uuid) = ancestor_uuid {
+            if !visited.insert(uuid) {
+                bail!("cycle in Claude inline parent chain at {uuid}");
+            }
+            let Some(ancestor) = by_uuid.get(uuid).copied() else {
+                break;
+            };
+            if ancestor.task_tool_use && !ancestor.is_sidechain {
+                linked = true;
+                break;
+            }
+            ancestor_uuid = ancestor.parent_uuid.as_deref();
+        }
+
+        let synthetic_session_id = stable_id(&[
+            "session_relationship",
+            "claude_inline",
+            parent_session_id,
+            &root_uuid,
+        ]);
+        for event_id in event_ids {
+            overrides.push(EventSessionOverride {
+                event_id,
+                session_id: synthetic_session_id.clone(),
+            });
+        }
+        relationships.push(InlineRelationship {
+            session_id: synthetic_session_id,
+            parent_session_id: linked.then(|| parent_session_id.to_string()),
+            relationship: if linked {
+                ingest::SessionRelationshipKind::Subagent
+            } else {
+                ingest::SessionRelationshipKind::None
+            },
+            rule: if linked {
+                "claude.inline_sidechain"
+            } else {
+                "claude.inline_orphan"
+            },
+        });
+    }
+    Ok((relationships, overrides))
+}
+
+fn clear_event_session_overrides(store: &Store) -> Result<()> {
+    store.with_conn(|conn| {
+        conn.execute("DELETE FROM event_session_overrides", [])?;
+        Ok(())
+    })
+}
+
+fn insert_event_session_overrides_batch(
+    store: &Store,
+    rows: &[EventSessionOverride],
+) -> Result<()> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting event session override batch")?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO event_session_overrides (event_id, session_id) VALUES (?1, ?2)",
+            )?;
+            for row in rows {
+                stmt.execute(params![row.event_id, row.session_id])?;
+            }
+        }
+        tx.commit().context("committing event session override batch")
+    })
 }
 
 fn root_session_id(session_id: &str, parents: &HashMap<String, Option<String>>) -> Result<String> {
@@ -414,6 +591,26 @@ struct SessionRelationshipRow<'a> {
     relationship: &'a str,
     rule: &'a str,
     resolved_at: &'a str,
+}
+
+struct InlineClaudeEvent {
+    event_id: String,
+    uuid: Option<String>,
+    parent_uuid: Option<String>,
+    is_sidechain: bool,
+    task_tool_use: bool,
+}
+
+struct InlineRelationship {
+    session_id: String,
+    parent_session_id: Option<String>,
+    relationship: ingest::SessionRelationshipKind,
+    rule: &'static str,
+}
+
+struct EventSessionOverride {
+    event_id: String,
+    session_id: String,
 }
 
 fn rebuild_session_facts(store: &Store) -> Result<()> {

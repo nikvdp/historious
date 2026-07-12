@@ -1434,6 +1434,11 @@ fn prepare_file_import(
             "capture_fidelity".to_string(),
             Value::String("normalized_local_log".to_string()),
         );
+        if kind == "claude_code" {
+            if let Some(relationship) = claude_event_relationship_metadata(&line.value) {
+                metadata.insert("claude_relationship".to_string(), relationship);
+            }
+        }
         if line.content_compacted {
             metadata.insert("content_compacted".to_string(), Value::Bool(true));
             metadata.insert(
@@ -2231,6 +2236,39 @@ fn classify_claude_session(event_contents: &[&str]) -> SessionClass {
         SessionClass::Interactive
     } else {
         SessionClass::Unknown
+    }
+}
+
+fn claude_event_relationship_metadata(value: &Value) -> Option<Value> {
+    let uuid = value.get("uuid").and_then(Value::as_str);
+    let parent_uuid = value.get("parentUuid").and_then(Value::as_str);
+    let is_sidechain = value
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let task_tool_use = claude_has_task_tool_use(value);
+    (uuid.is_some() || parent_uuid.is_some() || is_sidechain || task_tool_use).then(|| {
+        json!({
+            "uuid": uuid,
+            "parent_uuid": parent_uuid,
+            "is_sidechain": is_sidechain,
+            "task_tool_use": task_tool_use
+        })
+    })
+}
+
+fn claude_has_task_tool_use(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let is_task = map.get("type").and_then(Value::as_str) == Some("tool_use")
+                && map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("task"));
+            is_task || map.values().any(claude_has_task_tool_use)
+        }
+        Value::Array(items) => items.iter().any(claude_has_task_tool_use),
+        _ => false,
     }
 }
 
