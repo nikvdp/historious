@@ -96,9 +96,24 @@ pub(crate) struct SessionRelationshipHint {
 pub(crate) fn resolve_session_relationship(
     source_kind: &str,
     _session_external_id: &str,
-    _session_metadata: &Value,
+    session_metadata: &Value,
     _event_contents: &[&str],
 ) -> SessionRelationshipHint {
+    if source_kind == "opencode" {
+        if let Some(parent_external_id) = session_metadata
+            .get("opencode_parent_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|parent_id| !parent_id.is_empty())
+        {
+            return SessionRelationshipHint {
+                parent_external_id: Some(parent_external_id.to_string()),
+                relationship: SessionRelationshipKind::Subagent,
+                rule: "opencode.parent_id",
+            };
+        }
+    }
+
     let rule = match source_kind {
         "pi_agent" => "pi_agent.capture_gap",
         "hermes" => "hermes.capture_gap",
