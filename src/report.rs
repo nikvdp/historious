@@ -3,12 +3,11 @@ use crate::cli::{styled_role, StyleRole};
 use crate::provenance;
 use crate::storage::Store;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const INSIGHT_LIMIT: usize = 5;
 const PROJECT_INSIGHT_LIMIT: usize = 2;
 const MIN_CHANGE_SAMPLE: u64 = 20;
 const MIN_CHANGE_ABSOLUTE: u64 = 5;
@@ -42,7 +41,7 @@ pub struct UsageReport {
     pub totals: ReportTotals,
     pub activity: Vec<ActivityPoint>,
     #[serde(default)]
-    pub changes: Vec<ChangeInsight>,
+    pub comparisons: Vec<ComparisonWindow>,
     pub tokens_by_session_end_date: Vec<TokenPoint>,
     pub projects: Vec<ProjectRow>,
     pub provider_mix_by_month: Vec<MixPoint>,
@@ -95,6 +94,38 @@ pub struct ChangeInsight {
     pub current: u64,
     pub previous: u64,
     pub change_percent: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonWindow {
+    pub days: u16,
+    pub current_start: String,
+    pub current_end: String,
+    pub previous_start: String,
+    pub previous_end: String,
+    pub metrics: Vec<ChangeInsight>,
+    pub project_changes: Vec<ChangeInsight>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportWindow {
+    Default,
+    Seven,
+    Fourteen,
+    TwentyEight,
+    All,
+}
+
+impl ReportWindow {
+    fn includes(self, days: u16) -> bool {
+        match self {
+            Self::Default => days == 7 || days == 28,
+            Self::Seven => days == 7,
+            Self::Fourteen => days == 14,
+            Self::TwentyEight => days == 28,
+            Self::All => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,7 +349,7 @@ fn compute_live(
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
     let activity = report_activity(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let changes = report_changes(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let comparisons = report_comparisons(store, options.since.as_deref(), project_pattern.as_deref())?;
     let tokens_by_session_end_date =
         report_tokens(store, options.since.as_deref(), project_pattern.as_deref())?;
     let mut projects =
@@ -398,7 +429,7 @@ fn compute_live(
         warnings,
         totals,
         activity,
-        changes,
+        comparisons,
         tokens_by_session_end_date,
         projects,
         provider_mix_by_month,
@@ -1054,33 +1085,44 @@ fn activity_bucket_order(bucket: &str) -> i32 {
         .unwrap_or(i32::MIN)
 }
 
-fn report_changes(
+fn report_comparisons(
     store: &Store,
     since: Option<&str>,
     project: Option<&str>,
-) -> Result<Vec<ChangeInsight>> {
+) -> Result<Vec<ComparisonWindow>> {
     if since.is_some() {
         return Ok(Vec::new());
     }
-    let (current_sessions, previous_sessions, current_tokens, previous_tokens) =
-        store.with_conn(|conn| {
+    let today = Local::now().date_naive();
+    let mut windows = Vec::new();
+    for days in [7u16, 14, 28] {
+        let current_start = today - ChronoDuration::days(i64::from(days - 1));
+        let current_end = today;
+        let previous_end = current_start - ChronoDuration::days(1);
+        let previous_start = previous_end - ChronoDuration::days(i64::from(days - 1));
+        let dates = (
+            current_start.to_string(),
+            current_end.to_string(),
+            previous_start.to_string(),
+            previous_end.to_string(),
+        );
+        let (current_sessions, previous_sessions, current_tokens, previous_tokens) =
+            store.with_conn(|conn| {
             conn.query_row(
                 "SELECT
-                   COALESCE(SUM(julianday(last_event_at) >= julianday('now', '-28 days')), 0),
-                   COALESCE(SUM(julianday(last_event_at) >= julianday('now', '-56 days')
-                                AND julianday(last_event_at) < julianday('now', '-28 days')), 0),
-                   COALESCE(SUM(CASE WHEN julianday(last_event_at) >= julianday('now', '-28 days')
+                   COALESCE(SUM(date(last_event_at, 'localtime') BETWEEN ?1 AND ?2), 0),
+                   COALESCE(SUM(date(last_event_at, 'localtime') BETWEEN ?3 AND ?4), 0),
+                   COALESCE(SUM(CASE WHEN date(last_event_at, 'localtime') BETWEEN ?1 AND ?2
                                      THEN COALESCE(input_tokens, 0)
                                         + COALESCE(cached_input_tokens, 0)
                                         + COALESCE(output_tokens, 0) ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN julianday(last_event_at) >= julianday('now', '-56 days')
-                                          AND julianday(last_event_at) < julianday('now', '-28 days')
+                   COALESCE(SUM(CASE WHEN date(last_event_at, 'localtime') BETWEEN ?3 AND ?4
                                      THEN COALESCE(input_tokens, 0)
                                         + COALESCE(cached_input_tokens, 0)
                                         + COALESCE(output_tokens, 0) ELSE 0 END), 0)
                  FROM session_facts
-                 WHERE (?1 IS NULL OR workspace_path LIKE ?1)",
-                params![project],
+                 WHERE (?5 IS NULL OR workspace_path LIKE ?5)",
+                params![dates.0, dates.1, dates.2, dates.3, project],
                 |row| {
                     Ok((
                         nonnegative(row.get(0)?),
@@ -1092,72 +1134,91 @@ fn report_changes(
             )
             .map_err(Into::into)
         })?;
-    let (current_messages, previous_messages) = store.with_conn(|conn| {
-        conn.query_row(
+        let (current_messages, previous_messages) = store.with_conn(|conn| {
+            conn.query_row(
             "SELECT
-               COALESCE(SUM(julianday(p.occurred_at) >= julianday('now', '-28 days')), 0),
-               COALESCE(SUM(julianday(p.occurred_at) >= julianday('now', '-56 days')
-                            AND julianday(p.occurred_at) < julianday('now', '-28 days')), 0)
+               COALESCE(SUM(date(p.occurred_at, 'localtime') BETWEEN ?1 AND ?2), 0),
+               COALESCE(SUM(date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?4), 0)
              FROM message_provenance p
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human'
-               AND (?1 IS NULL OR sf.workspace_path LIKE ?1)",
-            params![project],
+               AND (?5 IS NULL OR sf.workspace_path LIKE ?5)",
+            params![dates.0, dates.1, dates.2, dates.3, project],
             |row| Ok((nonnegative(row.get(0)?), nonnegative(row.get(1)?))),
         )
         .map_err(Into::into)
     })?;
-
-    let mut ranked = Vec::<(f64, ChangeInsight)>::new();
-    for (metric, current, previous) in [
-        ("sessions", current_sessions, previous_sessions),
-        ("human messages", current_messages, previous_messages),
-        ("tokens", current_tokens, previous_tokens),
-    ] {
-        push_change(&mut ranked, metric, None, current, previous);
-    }
-
-    let projects = store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
+        let metrics = [
+            ("sessions", current_sessions, previous_sessions),
+            ("human turns", current_messages, previous_messages),
+            ("tokens", current_tokens, previous_tokens),
+        ]
+        .into_iter()
+        .map(|(metric, current, previous)| change_row(metric, None, current, previous))
+        .collect();
+        let projects = store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
             "SELECT COALESCE(sf.workspace_path, 'unknown'),
-                    SUM(julianday(p.occurred_at) >= julianday('now', '-28 days')),
-                    SUM(julianday(p.occurred_at) >= julianday('now', '-56 days')
-                        AND julianday(p.occurred_at) < julianday('now', '-28 days'))
+                    SUM(date(p.occurred_at, 'localtime') BETWEEN ?1 AND ?2),
+                    SUM(date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?4)
              FROM message_provenance p
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human'
-               AND julianday(p.occurred_at) >= julianday('now', '-56 days')
-               AND (?1 IS NULL OR sf.workspace_path LIKE ?1)
+               AND date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?2
+               AND (?5 IS NULL OR sf.workspace_path LIKE ?5)
              GROUP BY sf.workspace_path",
         )?;
-        let rows = stmt.query_map(params![project], |row| {
+            let rows = stmt.query_map(params![dates.0, dates.1, dates.2, dates.3, project], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 nonnegative(row.get(1)?),
                 nonnegative(row.get(2)?),
             ))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })?;
-    let mut project_ranked = Vec::new();
-    for (workspace_path, current, previous) in projects {
-        push_change(
-            &mut project_ranked,
-            "project human messages",
-            Some(project_label(&workspace_path)),
-            current,
-            previous,
-        );
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })?;
+        let mut project_ranked = Vec::new();
+        for (workspace_path, current, previous) in projects {
+            push_change(
+                &mut project_ranked,
+                "human turns",
+                Some(project_label(&workspace_path)),
+                current,
+                previous,
+            );
+        }
+        project_ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+        windows.push(ComparisonWindow {
+            days,
+            current_start: dates.0,
+            current_end: dates.1,
+            previous_start: dates.2,
+            previous_end: dates.3,
+            metrics,
+            project_changes: project_ranked
+                .into_iter()
+                .take(PROJECT_INSIGHT_LIMIT)
+                .map(|(_, insight)| insight)
+                .collect(),
+        });
     }
-    project_ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
-    ranked.extend(project_ranked.into_iter().take(PROJECT_INSIGHT_LIMIT));
-    ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
-    Ok(ranked
-        .into_iter()
-        .take(INSIGHT_LIMIT)
-        .map(|(_, insight)| insight)
-        .collect())
+    Ok(windows)
+}
+
+fn change_row(metric: &str, subject: Option<String>, current: u64, previous: u64) -> ChangeInsight {
+    let change_percent = if previous == 0 {
+        None
+    } else {
+        Some((((current as f64 - previous as f64) * 100.0) / previous as f64).round() as i64)
+    };
+    ChangeInsight {
+        metric: metric.to_string(),
+        subject,
+        current,
+        previous,
+        change_percent,
+    }
 }
 
 fn push_change(
@@ -1496,7 +1557,17 @@ pub fn render_terminal(report: &UsageReport) -> String {
     render_terminal_themed(report, 80, false)
 }
 
+#[cfg(test)]
 pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -> String {
+    render_terminal_window(report, width, color, ReportWindow::Default)
+}
+
+pub fn render_terminal_window(
+    report: &UsageReport,
+    width: usize,
+    color: bool,
+    window: ReportWindow,
+) -> String {
     let width = width.max(20);
     let mut out = String::new();
     out.push_str(&styled_role("Historious report", StyleRole::Header, color));
@@ -1611,33 +1682,23 @@ pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -
     out.push('\n');
     out.push_str(&styled_role("What changed", StyleRole::Section, color));
     out.push('\n');
-    push_wrapped(
-        &mut out,
-        "trailing 4 weeks vs prior 4 weeks",
-        width,
-        2,
-        StyleRole::Muted,
-        color,
-    );
-    if report.changes.is_empty() {
+    let selected = report
+        .comparisons
+        .iter()
+        .filter(|comparison| window.includes(comparison.days))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
         push_wrapped(
             &mut out,
-            "No change cleared the sample and effect thresholds.",
+            "No comparison data is available for this filtered report.",
             width,
             2,
             StyleRole::Muted,
             color,
         );
     } else {
-        for insight in &report.changes {
-            push_wrapped(
-                &mut out,
-                &render_change(insight, width),
-                width,
-                2,
-                StyleRole::Title,
-                color,
-            );
+        for comparison in selected {
+            render_comparison_table(&mut out, comparison, width, color);
         }
     }
 
@@ -1757,34 +1818,86 @@ fn ellipsize_middle(value: &str, width: usize) -> String {
     format!("{start}...{end}")
 }
 
-fn render_change(insight: &ChangeInsight, width: usize) -> String {
-    let label = insight
+fn render_comparison_table(
+    out: &mut String,
+    comparison: &ComparisonWindow,
+    width: usize,
+    color: bool,
+) {
+    out.push_str(&format!(
+        "  {}\n",
+        styled_role(&format!("{} days", comparison.days), StyleRole::Title, color)
+    ));
+    if width < 64 {
+        out.push_str(&format!(
+            "  {}–{}\n  vs {}–{}\n",
+            comparison.current_start,
+            comparison.current_end,
+            comparison.previous_start,
+            comparison.previous_end
+        ));
+        for row in comparison.metrics.iter().chain(&comparison.project_changes) {
+            let label = comparison_row_label(row, width.saturating_sub(2));
+            out.push_str(&format!(
+                "  {}\n    cur {} · prev {} · {}\n",
+                styled_role(&label, StyleRole::Time, color),
+                comparison_value(row),
+                previous_value(row),
+                change_value(row)
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "  {}–{} vs {}–{}\n",
+            comparison.current_start,
+            comparison.current_end,
+            comparison.previous_start,
+            comparison.previous_end
+        ));
+        out.push_str("  metric                    current   previous    change\n");
+        for row in comparison.metrics.iter().chain(&comparison.project_changes) {
+            out.push_str(&format!(
+                "  {:<24} {:>9}  {:>9}  {:>8}\n",
+                comparison_row_label(row, 24),
+                comparison_value(row),
+                previous_value(row),
+                change_value(row)
+            ));
+        }
+    }
+}
+
+fn comparison_row_label(row: &ChangeInsight, width: usize) -> String {
+    let label = row
         .subject
         .as_ref()
-        .map(|subject| {
-            format!(
-                "{} in {}",
-                insight.metric,
-                ellipsize_middle(subject, width.saturating_sub(28).max(12))
-            )
-        })
-        .unwrap_or_else(|| insight.metric.clone());
-    match insight.change_percent {
-        Some(percent) if percent >= 0 => format!(
-            "{label} rose {percent}% · {} now vs {} before",
-            compact_number(insight.current),
-            compact_number(insight.previous)
-        ),
-        Some(percent) => format!(
-            "{label} fell {}% · {} now vs {} before",
-            percent.unsigned_abs(),
-            compact_number(insight.current),
-            compact_number(insight.previous)
-        ),
-        None => format!(
-            "{label} is new · {} now vs none before",
-            compact_number(insight.current)
-        ),
+        .map(|subject| format!("{subject} · {}", row.metric))
+        .unwrap_or_else(|| row.metric.clone());
+    ellipsize_middle(&label, width)
+}
+
+fn comparison_value(row: &ChangeInsight) -> String {
+    if row.metric == "tokens" {
+        compact_number(row.current)
+    } else {
+        exact_number(row.current)
+    }
+}
+
+fn previous_value(row: &ChangeInsight) -> String {
+    if row.metric == "tokens" {
+        compact_number(row.previous)
+    } else {
+        exact_number(row.previous)
+    }
+}
+
+fn change_value(row: &ChangeInsight) -> String {
+    match row.change_percent {
+        Some(percent) if percent > 0 => format!("+{percent}%"),
+        Some(percent) => format!("{percent}%"),
+        None if row.current > 0 => "new".to_string(),
+        None => "—".to_string(),
     }
 }
 

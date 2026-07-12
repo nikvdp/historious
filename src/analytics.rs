@@ -16,7 +16,7 @@ pub const SESSION_RELATIONSHIPS_VERSION: u32 = 7;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
-pub const REPORT_SNAPSHOT_VERSION: u32 = 6;
+pub const REPORT_SNAPSHOT_VERSION: u32 = 7;
 
 const PROJECTIONS: [Projection; 4] = [
     Projection {

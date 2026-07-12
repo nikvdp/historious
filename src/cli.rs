@@ -787,6 +787,8 @@ pub enum Command {
         plain: bool,
         #[arg(long, value_enum, help = "Color output: auto, always, or never")]
         color: Option<ColorArg>,
+        #[arg(long, value_enum, help = "Comparison window: 7, 14, 28, or all")]
+        window: Option<ReportWindowArg>,
     },
     /// Send explicitly approved local data to a configured enrichment provider.
     Enrich {
@@ -1050,6 +1052,29 @@ pub enum ReportSortArg {
     Sessions,
     Messages,
     Duration,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReportWindowArg {
+    #[value(name = "7")]
+    Seven,
+    #[value(name = "14")]
+    Fourteen,
+    #[value(name = "28")]
+    TwentyEight,
+    All,
+}
+
+impl From<Option<ReportWindowArg>> for report::ReportWindow {
+    fn from(value: Option<ReportWindowArg>) -> Self {
+        match value {
+            None => Self::Default,
+            Some(ReportWindowArg::Seven) => Self::Seven,
+            Some(ReportWindowArg::Fourteen) => Self::Fourteen,
+            Some(ReportWindowArg::TwentyEight) => Self::TwentyEight,
+            Some(ReportWindowArg::All) => Self::All,
+        }
+    }
 }
 
 impl From<ReportSortArg> for report::ReportSort {
@@ -2838,6 +2863,7 @@ impl Cli {
                 json,
                 plain,
                 color,
+                window,
             } => {
                 let since = transport::parse_since_arg(since.as_deref())?
                     .map(|value| value.to_rfc3339());
@@ -2855,10 +2881,11 @@ impl Cli {
                 } else {
                     let no_color = plain || std::env::var_os("NO_COLOR").is_some();
                     let color = should_color(no_color, color, robot);
-                    write_stdout(&report::render_terminal_themed(
+                    write_stdout(&report::render_terminal_window(
                         &report,
                         terminal_columns(),
                         color,
+                        window.into(),
                     ))?;
                 }
             }
