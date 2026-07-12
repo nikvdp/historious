@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
-pub const MESSAGE_PROVENANCE_VERSION: u32 = 7;
+pub const MESSAGE_PROVENANCE_VERSION: u32 = 8;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 6;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
@@ -906,21 +906,45 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
 
 fn inherited_parent_items(store: &Store) -> Result<HashSet<(String, String, String)>> {
     store.with_conn(|conn| {
+        let edges = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, parent_session_id
+             FROM session_relationships
+             WHERE relationship = 'subagent'
+               AND parent_session_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
+        };
+        let parent_ids = edges
+            .iter()
+            .map(|(_, parent_id)| parent_id.clone())
+            .collect::<HashSet<_>>();
+        let mut by_parent = HashMap::<String, Vec<(String, String)>>::new();
         let mut stmt = conn.prepare(
-            "SELECT sr.session_id, hi.kind, hi.text_hash
-             FROM session_relationships sr
-             JOIN history_items hi INDEXED BY idx_history_items_session_order
-               ON hi.session_id = sr.parent_session_id
-             WHERE sr.relationship = 'subagent'
-               AND sr.parent_session_id IS NOT NULL
-               AND hi.tier = 'conversation'
-               AND hi.kind IN ('user', 'assistant')",
+            "SELECT kind, text_hash
+             FROM history_items INDEXED BY idx_history_items_session_order
+             WHERE session_id = ?1
+               AND tier = 'conversation'
+               AND kind IN ('user', 'assistant')",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-        rows.collect::<rusqlite::Result<HashSet<_>>>()
-            .map_err(Into::into)
+        for parent_id in parent_ids {
+            let rows = stmt.query_map([parent_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            by_parent.insert(
+                parent_id,
+                rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?,
+            );
+        }
+
+        let mut inherited = HashSet::new();
+        for (child_id, parent_id) in edges {
+            if let Some(items) = by_parent.get(&parent_id) {
+                for (kind, text_hash) in items {
+                    inherited.insert((child_id.clone(), kind.clone(), text_hash.clone()));
+                }
+            }
+        }
+        Ok(inherited)
     })
 }
 
