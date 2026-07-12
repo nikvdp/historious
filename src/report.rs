@@ -108,6 +108,8 @@ pub struct ProjectRow {
     pub total_tokens: Option<i64>,
     pub duration_secs: i64,
     pub last_activity_at: Option<String>,
+    #[serde(default)]
+    pub terms: Vec<TermCount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,8 +332,14 @@ fn compute_live(
     let rhythms = report_rhythms(store, options.since.as_deref(), project_pattern.as_deref())?;
     let dayparts = report_dayparts(&rhythms);
     let daypart_insights = select_daypart_insights(&dayparts);
-    let frequencies =
+    let (frequencies, project_terms) =
         report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
+    for project in &mut projects {
+        project.terms = project_terms
+            .get(&project.workspace_path)
+            .cloned()
+            .unwrap_or_default();
+    }
     let (topics, topic_warning) =
         report_topics(store, options.since.as_deref(), project_pattern.as_deref())?;
     let (sentiment, sentiment_warning) =
@@ -698,10 +706,11 @@ fn report_frequencies(
     store: &Store,
     since: Option<&str>,
     project: Option<&str>,
-) -> Result<FrequencySection> {
+) -> Result<(FrequencySection, HashMap<String, Vec<TermCount>>)> {
     let messages = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT hi.text, p.sentiment_usable, p.rule
+            "SELECT hi.text, p.sentiment_usable, p.rule,
+                    COALESCE(sf.workspace_path, 'unknown')
              FROM message_provenance p
              JOIN history_items hi ON hi.id = p.item_id
              JOIN session_facts sf ON sf.session_id = p.session_id
@@ -715,6 +724,7 @@ fn report_frequencies(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -725,7 +735,9 @@ fn report_frequencies(
     let mut unigrams = HashMap::new();
     let mut bigrams = HashMap::new();
     let mut trigrams = HashMap::new();
-    for (text, usable, rule) in messages {
+    let project_noise = project_noise_words();
+    let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
+    for (text, usable, rule, workspace_path) in messages {
         let text = if usable == "strip_wrapper" {
             provenance::strip_human_wrapper(&text, &rule)
         } else {
@@ -733,11 +745,22 @@ fn report_frequencies(
         };
         let tokens = tokenize_frequency_text(&text);
         let mut message_unigrams = HashMap::new();
+        let mut project_message_unigrams = HashMap::new();
         let mut message_bigrams = HashMap::new();
         let mut message_trigrams = HashMap::new();
         for token in &tokens {
             if token.len() > 1 && !stopwords.contains(token.as_str()) {
                 increment_capped(&mut unigrams, &mut message_unigrams, token.clone());
+            }
+            if token.len() > 2
+                && !stopwords.contains(token.as_str())
+                && !project_noise.contains(token.as_str())
+            {
+                increment_capped(
+                    project_unigrams.entry(workspace_path.clone()).or_default(),
+                    &mut project_message_unigrams,
+                    token.clone(),
+                );
             }
         }
         for window in tokens.windows(2) {
@@ -757,11 +780,66 @@ fn report_frequencies(
             }
         }
     }
-    Ok(FrequencySection {
-        unigrams: top_terms(unigrams, 3, 20),
-        bigrams: top_terms(bigrams, 3, 20),
-        trigrams: top_terms(trigrams, 3, 20),
-    })
+    Ok((
+        FrequencySection {
+            unigrams: top_terms(unigrams, 3, 20),
+            bigrams: top_terms(bigrams, 3, 20),
+            trigrams: top_terms(trigrams, 3, 20),
+        },
+        distinctive_project_terms(project_unigrams),
+    ))
+}
+
+fn project_noise_words() -> HashSet<&'static str> {
+    [
+        "agent", "branch", "check", "code", "continue", "done", "fix", "get", "good",
+        "issue", "just", "look", "make", "need", "okay", "please", "proceed", "sure",
+        "thing", "things", "use", "want", "work", "yes",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn distinctive_project_terms(
+    counts: HashMap<String, HashMap<String, u64>>,
+) -> HashMap<String, Vec<TermCount>> {
+    let project_count = counts.len().max(1) as f64;
+    let mut document_frequency = HashMap::<String, usize>::new();
+    for terms in counts.values() {
+        for term in terms.keys() {
+            *document_frequency.entry(term.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(project, counts)| {
+            let mut scored = counts
+                .into_iter()
+                .filter(|(_, count)| *count >= 3)
+                .map(|(term, count)| {
+                    let frequency = document_frequency[&term] as f64;
+                    let score = count as f64
+                        * ((1.0 + project_count) / (1.0 + frequency)).ln();
+                    (term, count, score)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .2
+                    .total_cmp(&left.2)
+                    .then_with(|| right.1.cmp(&left.1))
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            scored.truncate(3);
+            (
+                project,
+                scored
+                    .into_iter()
+                    .map(|(term, count, _)| TermCount { term, count })
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn tokenize_frequency_text(text: &str) -> Vec<String> {
@@ -1165,6 +1243,7 @@ fn report_projects(
                 total_tokens: row.get::<_, Option<i64>>(3)?.map(|value| value.max(0)),
                 duration_secs: row.get::<_, i64>(4)?.max(0),
                 last_activity_at: row.get(5)?,
+                terms: Vec::new(),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1592,6 +1671,23 @@ pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -
                 color
             )
         ));
+        if !row.terms.is_empty() {
+            push_wrapped(
+                &mut out,
+                &format!(
+                    "about {}",
+                    row.terms
+                        .iter()
+                        .map(|term| term.term.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ),
+                width,
+                4,
+                StyleRole::Muted,
+                color,
+            );
+        }
     }
     if report.topics.as_ref().is_some_and(|topics| {
         topics
