@@ -1747,6 +1747,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_primitives_bound_width_and_handle_empty_or_flat_values() {
+        assert_eq!(sparkline(&[], 10), "");
+        assert_eq!(sparkline(&[5, 5, 5], 10), "▄▄▄");
+        assert!(sparkline(&[1, 2, 3, 4, 5], 3).chars().count() <= 3);
+
+        assert_eq!(horizontal_bar(5.0, 10.0, 6).chars().count(), 6);
+        assert_eq!(horizontal_bar(5.0, 0.0, 4), "░░░░");
+        assert_eq!(neutral_bar(-0.5, 1.0, 9).chars().count(), 9);
+        assert!(neutral_bar(0.0, 1.0, 9).contains('│'));
+
+        assert_eq!(compact_heatmap(&[], 8), "");
+        assert!(compact_heatmap(&[0, 1, 2, 3, 4], 3).chars().count() <= 3);
+    }
+
+    #[test]
     fn frequency_tokenizer_removes_code_urls_paths_and_punctuation() {
         let tokens = tokenize_frequency_text(
             "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
@@ -1873,6 +1888,10 @@ mod tests {
         assert!(rendered.contains("Leading projects"));
         assert!(!rendered.contains("Provider mix by month"));
         assert!(!rendered.contains("Sentiment by local hour"));
+        let narrow = render_terminal_themed(&report, 40, false);
+        assert!(narrow.lines().all(|line| line.chars().count() <= 40));
+        assert!(!narrow.contains('\x1b'));
+        assert!(render_terminal_themed(&report, 80, true).contains("\x1b["));
 
         let filtered = compute(
             &store,

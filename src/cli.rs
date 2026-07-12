@@ -9867,7 +9867,28 @@ mod tests {
                 project: Some(project),
                 sort: ReportSortArg::Messages,
                 json: true,
+                ..
             } if since == "2026-06-01" && project == "sme-os"
+        ));
+    }
+
+    #[test]
+    fn report_plain_and_color_controls_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "report",
+            "--plain",
+            "--color",
+            "always",
+        ])
+        .expect("parse report rendering controls");
+        assert!(matches!(
+            cli.command,
+            Command::Report {
+                plain: true,
+                color: Some(ColorArg::Always),
+                ..
+            }
         ));
     }
 
