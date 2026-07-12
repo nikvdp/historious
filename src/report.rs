@@ -2000,7 +2000,6 @@ mod tests {
 
     #[test]
     fn ranked_changes_and_dayparts_suppress_weak_patterns() {
-        assert!(activity_bucket_order("2026-W19") < activity_bucket_order("2026-07-12"));
         let mut ranked = Vec::new();
         push_change(&mut ranked, "weak sample", None, 11, 10);
         push_change(&mut ranked, "weak effect", None, 110, 100);
@@ -2037,10 +2036,6 @@ mod tests {
 
     #[test]
     fn terminal_primitives_bound_width_and_handle_empty_or_flat_values() {
-        assert_eq!(sparkline(&[], 10), "");
-        assert_eq!(sparkline(&[5, 5, 5], 10), "▄▄▄");
-        assert!(sparkline(&[1, 2, 3, 4, 5], 3).chars().count() <= 3);
-
         assert_eq!(horizontal_bar(5.0, 10.0, 6).chars().count(), 6);
         assert_eq!(horizontal_bar(5.0, 0.0, 4), "░░░░");
         assert_eq!(neutral_bar(-0.5, 1.0, 9).chars().count(), 9);
@@ -2048,6 +2043,38 @@ mod tests {
 
         assert_eq!(compact_heatmap(&[], 8), "");
         assert!(compact_heatmap(&[0, 1, 2, 3, 4], 3).chars().count() <= 3);
+    }
+
+    #[test]
+    fn contribution_calendar_uses_quantiles_and_stays_width_bounded() {
+        let positive = vec![1, 2, 3, 100];
+        assert_eq!(calendar_glyph(0, &positive), '·');
+        assert_eq!(calendar_glyph(1, &positive), '░');
+        assert_eq!(calendar_glyph(2, &positive), '▒');
+        assert_eq!(calendar_glyph(3, &positive), '▓');
+        assert_eq!(calendar_glyph(100, &positive), '█');
+
+        let start = NaiveDate::from_ymd_opt(2025, 7, 13).expect("start date");
+        let activity = (0..365)
+            .map(|offset| ActivityPoint {
+                bucket: (start + ChronoDuration::days(offset)).to_string(),
+                sessions: (offset % 5) as u64,
+                human_turns: if offset % 11 == 0 { 100 } else { (offset % 7) as u64 },
+            })
+            .collect::<Vec<_>>();
+        for width in [40, 80, 120, 200] {
+            let mut plain = String::new();
+            render_activity_calendar(&mut plain, &activity, width, false);
+            assert!(plain.lines().all(|line| line.chars().count() <= width));
+            for weekday in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] {
+                assert!(plain.lines().any(|line| line.starts_with(weekday)));
+            }
+            assert!(plain.contains("Less"));
+            assert!(!plain.contains('\x1b'));
+        }
+        let mut colored = String::new();
+        render_activity_calendar(&mut colored, &activity, 80, true);
+        assert!(colored.contains("\x1b["));
     }
 
     #[test]
