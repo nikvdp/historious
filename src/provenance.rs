@@ -195,9 +195,10 @@ mod tests {
         ] {
             let result = classify_message(
                 text,
+                "user",
                 false,
+                "none",
                 SessionClass::Interactive,
-                SessionClass::Unknown,
             );
             assert_eq!(
                 (result.authored_by, result.sentiment_usable, result.rule),
@@ -217,9 +218,10 @@ mod tests {
         ] {
             let result = classify_message(
                 text,
+                "user",
                 false,
+                "none",
                 SessionClass::Interactive,
-                SessionClass::Unknown,
             );
             assert_eq!(result.authored_by, "human");
             assert_eq!(result.sentiment_usable, "strip_wrapper");
@@ -228,21 +230,54 @@ mod tests {
     }
 
     #[test]
-    fn session_override_precedes_message_rules() {
+    fn relationship_and_message_kind_drive_non_human_authorship() {
         let result = classify_message(
             "hello from a subagent",
+            "user",
             false,
-            SessionClass::Subagent,
-            SessionClass::Unknown,
+            "subagent",
+            SessionClass::Interactive,
         );
         assert_eq!(result.authored_by, "agent");
-        assert_eq!(result.rule, "session.subagent");
+        assert_eq!(result.rule, "relationship.subagent");
 
         let result = classify_message(
-            "<image name='x'>caption",
+            "assistant answer",
+            "assistant",
             false,
+            "none",
+            SessionClass::Interactive,
+        );
+        assert_eq!(result.authored_by, "assistant");
+        assert_eq!(result.sentiment_usable, "no");
+        assert_eq!(result.rule, "message.assistant");
+
+        let result = classify_message(
+            "assistant subagent answer",
+            "assistant",
+            false,
+            "subagent",
+            SessionClass::Interactive,
+        );
+        assert_eq!(result.authored_by, "agent");
+        assert_eq!(result.rule, "relationship.subagent");
+
+        let result = classify_message(
+            "<turn_aborted>stopped</turn_aborted>",
+            "user",
+            false,
+            "subagent",
+            SessionClass::Interactive,
+        );
+        assert_eq!(result.authored_by, "harness");
+        assert_eq!(result.rule, "tag.turn_aborted");
+
+        let result = classify_message(
+            "automated prompt",
+            "user",
+            false,
+            "none",
             SessionClass::Automation,
-            SessionClass::Unknown,
         );
         assert_eq!(result.authored_by, "harness");
         assert_eq!(result.rule, "session.automation");
@@ -252,17 +287,19 @@ mod tests {
     fn duplicate_rule_ignores_short_human_repeats() {
         let short = classify_message(
             "continue",
+            "user",
             true,
+            "none",
             SessionClass::Interactive,
-            SessionClass::Unknown,
         );
         assert_eq!(short.rule, "default.human");
 
         let long = classify_message(
             &"repeated automation template ".repeat(12),
+            "user",
             true,
+            "none",
             SessionClass::Interactive,
-            SessionClass::Unknown,
         );
         assert_eq!(long.rule, "dup.template");
         assert_eq!(long.authored_by, "agent");

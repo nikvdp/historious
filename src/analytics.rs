@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_rebuild_classifies_every_user_conversation_item() {
+    fn provenance_rebuild_uses_relationships_and_includes_assistant_items() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         store
@@ -1612,21 +1612,34 @@ mod tests {
                     INSERT INTO sessions
                       (id, source_id, machine_id, source_kind, external_id, status, metadata_json, hash)
                     VALUES
+                      ('session_parent', 'source', 'machine', 'codex', 'parent', 'open', '{}', 'session_parent_hash'),
                       ('session_sub', 'source', 'machine', 'codex', 'sub', 'open', '{}', 'session_sub_hash'),
+                      ('session_heuristic', 'source', 'machine', 'codex', 'heuristic', 'open', '{}', 'session_heuristic_hash'),
                       ('session_human', 'source', 'machine', 'codex', 'human', 'open', '{}', 'session_human_hash');
 
                     INSERT INTO events
                       (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
                        role, content, metadata_json, hash)
                     VALUES
+                      ('event_notification', 'session_parent', 'source', 'machine', 'codex', 0,
+                       'message', 'user',
+                       '<subagent_notification>{"agent_path":"sub"}</subagent_notification>',
+                       '{}', 'event_notification_hash'),
                       ('event_meta', 'session_sub', 'source', 'machine', 'codex', 0, 'session_meta',
                        NULL, '{"payload":{"thread_source":"subagent"}}', '{}', 'event_meta_hash'),
                       ('event_sub', 'session_sub', 'source', 'machine', 'codex', 1, 'message',
                        'user', 'please review this', '{}', 'event_sub_hash'),
+                      ('event_heuristic_meta', 'session_heuristic', 'source', 'machine', 'codex', 0,
+                       'session_meta', NULL, '{"payload":{"thread_source":"subagent"}}',
+                       '{}', 'event_heuristic_meta_hash'),
+                      ('event_heuristic_user', 'session_heuristic', 'source', 'machine', 'codex', 1,
+                       'message', 'user', 'real human turn', '{}', 'event_heuristic_user_hash'),
                       ('event_abort', 'session_human', 'source', 'machine', 'codex', 0, 'message',
                        'user', '<turn_aborted>stopped</turn_aborted>', '{}', 'event_abort_hash'),
                       ('event_image', 'session_human', 'source', 'machine', 'codex', 1, 'message',
-                       'user', '<image name="photo.png">my caption', '{}', 'event_image_hash');
+                       'user', '<image name="photo.png">my caption', '{}', 'event_image_hash'),
+                      ('event_assistant', 'session_human', 'source', 'machine', 'codex', 2, 'message',
+                       'assistant', 'helpful answer', '{}', 'event_assistant_hash');
 
                     INSERT INTO history_items
                       (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
@@ -1635,10 +1648,16 @@ mod tests {
                     VALUES
                       ('item_sub', 'event_sub', 'session_sub', 'source', 'machine', 'codex', 1,
                        0, 'conversation', 'user', 'please review this', 'hash_sub', 1, 'required', '{}', 'item_sub_hash'),
+                      ('item_heuristic', 'event_heuristic_user', 'session_heuristic', 'source',
+                       'machine', 'codex', 1, 0, 'conversation', 'user', 'real human turn',
+                       'hash_heuristic', 1, 'required', '{}', 'item_heuristic_hash'),
                       ('item_abort', 'event_abort', 'session_human', 'source', 'machine', 'codex', 0,
                        0, 'conversation', 'user', '<turn_aborted>stopped</turn_aborted>', 'hash_abort', 1, 'required', '{}', 'item_abort_hash'),
                       ('item_image', 'event_image', 'session_human', 'source', 'machine', 'codex', 1,
-                       0, 'conversation', 'user', '<image name="photo.png">my caption', 'hash_image', 1, 'required', '{}', 'item_image_hash');
+                       0, 'conversation', 'user', '<image name="photo.png">my caption', 'hash_image', 1, 'required', '{}', 'item_image_hash'),
+                      ('item_assistant', 'event_assistant', 'session_human', 'source', 'machine',
+                       'codex', 2, 0, 'conversation', 'assistant', 'helpful answer',
+                       'hash_assistant', 1, 'required', '{}', 'item_assistant_hash');
                     "#,
                 )?;
                 Ok(())
@@ -1666,7 +1685,7 @@ mod tests {
             })
             .expect("load provenance rows");
 
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 5);
         assert_eq!(
             rows[0],
             (
@@ -1676,10 +1695,15 @@ mod tests {
                 "tag.turn_aborted".to_string()
             )
         );
-        assert_eq!(rows[1].1, "human");
-        assert_eq!(rows[1].2, "strip_wrapper");
-        assert_eq!(rows[2].1, "agent");
-        assert_eq!(rows[2].3, "session.subagent");
+        assert_eq!(rows[1].1, "assistant");
+        assert_eq!(rows[1].2, "no");
+        assert_eq!(rows[1].3, "message.assistant");
+        assert_eq!(rows[2].1, "human");
+        assert_eq!(rows[2].3, "default.human");
+        assert_eq!(rows[3].1, "human");
+        assert_eq!(rows[3].2, "strip_wrapper");
+        assert_eq!(rows[4].1, "agent");
+        assert_eq!(rows[4].3, "relationship.subagent");
     }
 
     #[test]

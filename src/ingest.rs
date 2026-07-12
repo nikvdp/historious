@@ -2925,11 +2925,6 @@ mod tests {
             ),
             SessionClass::Subagent
         );
-        assert_eq!(
-            classify_event("claude_code", &sidechain_one),
-            SessionClass::Subagent
-        );
-
         let interactive = json!({
             "type": "user",
             "isSidechain": false,
@@ -2944,11 +2939,6 @@ mod tests {
             ),
             SessionClass::Interactive
         );
-        assert_eq!(
-            classify_event("claude_code", &interactive),
-            SessionClass::Interactive
-        );
-
         let sdk = json!({"entrypoint": "sdk-ts"}).to_string();
         assert_eq!(
             classify_session("claude_code", &json!({}), &[sdk.as_str()]),
@@ -3000,10 +2990,6 @@ mod tests {
     fn leaves_unmarked_providers_unknown() {
         assert_eq!(
             classify_session("pi_agent", &json!({}), &[]),
-            SessionClass::Unknown
-        );
-        assert_eq!(
-            classify_event("hermes", "{}"),
             SessionClass::Unknown
         );
     }
