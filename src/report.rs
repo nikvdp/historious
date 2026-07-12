@@ -1887,6 +1887,29 @@ mod tests {
     }
 
     #[test]
+    fn project_terms_prefer_distinctive_subjects_over_shared_workflow_words() {
+        assert!(project_noise_words().contains("make"));
+        let terms = distinctive_project_terms(HashMap::from([
+            (
+                "/repo/booking".to_string(),
+                HashMap::from([
+                    ("booking".to_string(), 10),
+                    ("shared".to_string(), 8),
+                ]),
+            ),
+            (
+                "/repo/wallet".to_string(),
+                HashMap::from([
+                    ("wallet".to_string(), 9),
+                    ("shared".to_string(), 8),
+                ]),
+            ),
+        ]));
+        assert_eq!(terms["/repo/booking"][0].term, "booking");
+        assert_eq!(terms["/repo/wallet"][0].term, "wallet");
+    }
+
+    #[test]
     fn report_computes_aggregate_sections_and_ignores_null_rhythm_times() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
