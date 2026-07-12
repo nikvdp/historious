@@ -1073,6 +1073,55 @@ mod tests {
     }
 
     #[test]
+    fn opencode_parent_metadata_resolves_to_the_native_parent_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('opencode_parent', 'source', 'machine', 'opencode', 'ses_parent', 'open',
+                       '{"opencode_parent_id":null}', 'opencode_parent_hash'),
+                      ('opencode_child', 'source', 'machine', 'opencode', 'ses_child', 'open',
+                       '{"opencode_parent_id":"ses_parent"}', 'opencode_child_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert OpenCode relationship fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild OpenCode relationships");
+        let relationship = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE session_id = 'opencode_child'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .expect("load OpenCode relationship");
+
+        assert_eq!(relationship.0, "opencode_parent");
+        assert_eq!(relationship.1, "opencode_parent");
+        assert_eq!(relationship.2, "subagent");
+        assert_eq!(relationship.3, "opencode.parent_id");
+    }
+
+    #[test]
     fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");

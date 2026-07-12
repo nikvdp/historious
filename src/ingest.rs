@@ -2835,6 +2835,25 @@ mod tests {
             classify_session("opencode", &json!({"opencode_parent_id": null}), &[]),
             SessionClass::Interactive
         );
+
+        let relationship = resolve_session_relationship(
+            "opencode",
+            "ses_child",
+            &json!({"opencode_parent_id": "ses_parent"}),
+            &[],
+        );
+        assert_eq!(relationship.parent_external_id.as_deref(), Some("ses_parent"));
+        assert_eq!(relationship.relationship, SessionRelationshipKind::Subagent);
+        assert_eq!(relationship.rule, "opencode.parent_id");
+
+        let none = resolve_session_relationship(
+            "opencode",
+            "ses_root",
+            &json!({"opencode_parent_id": null}),
+            &[],
+        );
+        assert_eq!(none.parent_external_id, None);
+        assert_eq!(none.relationship, SessionRelationshipKind::None);
     }
 
     #[test]
