@@ -111,6 +111,72 @@ pub(crate) fn resolve_session_relationship(
     }
 }
 
+pub(crate) fn codex_subagent_paths(event_content: &str) -> Vec<String> {
+    if !event_content.contains("subagent_notification") {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(event_content) {
+        collect_codex_agent_paths(&value, &mut paths);
+    }
+    collect_embedded_agent_paths(event_content, &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_codex_agent_paths(value: &Value, paths: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(path) = map.get("agent_path").and_then(Value::as_str) {
+                paths.push(path.to_string());
+            }
+            for child in map.values() {
+                collect_codex_agent_paths(child, paths);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_codex_agent_paths(item, paths);
+            }
+        }
+        Value::String(text) => collect_embedded_agent_paths(text, paths),
+        _ => {}
+    }
+}
+
+fn collect_embedded_agent_paths(text: &str, paths: &mut Vec<String>) {
+    let key = "\"agent_path\"";
+    let mut offset = 0;
+    while let Some(index) = text[offset..].find(key) {
+        let key_end = offset + index + key.len();
+        let Some(colon) = text[key_end..].find(':') else {
+            break;
+        };
+        let value = text[key_end + colon + 1..].trim_start();
+        if let Some(path) = json_string_prefix(value) {
+            paths.push(path);
+        }
+        offset = key_end;
+    }
+}
+
+fn json_string_prefix(value: &str) -> Option<String> {
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate().skip(1) {
+        match (byte, escaped) {
+            (b'"', false) => return serde_json::from_str(&value[..=index]).ok(),
+            (b'\\', false) => escaped = true,
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UsageEvent {
     pub content: String,

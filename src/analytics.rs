@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 3;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
-pub const SESSION_RELATIONSHIPS_VERSION: u32 = 1;
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 2;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
@@ -260,6 +260,39 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         })
         .collect::<HashMap<_, _>>();
 
+    let codex_notifications = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT s.machine_id, e.session_id, e.content
+             FROM events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.source_kind = 'codex'
+               AND e.content LIKE '%subagent_notification%'
+             ORDER BY e.rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let mut codex_parents = HashMap::<(String, String), (String, bool)>::new();
+    for (machine_id, parent_session_id, content) in codex_notifications {
+        for child_external_id in ingest::codex_subagent_paths(&content) {
+            codex_parents
+                .entry((machine_id.clone(), child_external_id))
+                .and_modify(|(existing_parent_id, collision)| {
+                    if existing_parent_id != &parent_session_id {
+                        *collision = true;
+                    }
+                })
+                .or_insert_with(|| (parent_session_id.clone(), false));
+        }
+    }
+
     let mut hints = Vec::with_capacity(sessions.len());
     let mut parents = HashMap::with_capacity(sessions.len());
     for session in &sessions {
@@ -276,7 +309,7 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
             &metadata,
             &event_contents,
         );
-        let parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
+        let mut parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
             session_ids
                 .get(&(
                     session.machine_id.clone(),
@@ -285,6 +318,20 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
                 ))
                 .cloned()
         });
+        let mut hint = hint;
+        if session.source_kind == "codex" {
+            if let Some((codex_parent_session_id, collision)) =
+                codex_parents.get(&(session.machine_id.clone(), session.external_id.clone()))
+            {
+                parent_session_id = Some(codex_parent_session_id.clone());
+                hint.relationship = ingest::SessionRelationshipKind::Subagent;
+                hint.rule = if *collision {
+                    "codex.subagent_notification.collision"
+                } else {
+                    "codex.subagent_notification"
+                };
+            }
+        }
         parents.insert(session.session_id.clone(), parent_session_id.clone());
         hints.push((hint, parent_session_id));
     }
