@@ -1411,6 +1411,7 @@ mod tests {
 
     #[test]
     fn ranked_changes_and_dayparts_suppress_weak_patterns() {
+        assert!(activity_bucket_order("2026-W19") < activity_bucket_order("2026-07-12"));
         let mut ranked = Vec::new();
         push_change(&mut ranked, "weak sample", None, 11, 10);
         push_change(&mut ranked, "weak effect", None, 110, 100);
