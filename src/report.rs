@@ -7,6 +7,15 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+const INSIGHT_LIMIT: usize = 5;
+const PROJECT_INSIGHT_LIMIT: usize = 2;
+const MIN_CHANGE_SAMPLE: u64 = 20;
+const MIN_CHANGE_ABSOLUTE: u64 = 5;
+const MIN_CHANGE_PERCENT: f64 = 20.0;
+const MIN_DAYPART_MESSAGES: u64 = 50;
+const MIN_DAYPART_LIFT: f64 = 1.25;
+const MIN_DAYPART_SHARE_GAP: f64 = 5.0;
+
 #[derive(Debug, Clone, Copy)]
 pub enum ReportSort {
     Tokens,
@@ -31,11 +40,17 @@ pub struct UsageReport {
     pub warnings: Vec<String>,
     pub totals: ReportTotals,
     pub activity: Vec<ActivityPoint>,
+    #[serde(default)]
+    pub changes: Vec<ChangeInsight>,
     pub tokens_by_session_end_date: Vec<TokenPoint>,
     pub projects: Vec<ProjectRow>,
     pub provider_mix_by_month: Vec<MixPoint>,
     pub model_mix_by_month: Vec<MixPoint>,
     pub rhythms: Rhythms,
+    #[serde(default)]
+    pub dayparts: Vec<DaypartBucket>,
+    #[serde(default)]
+    pub daypart_insights: Vec<DaypartInsight>,
     pub frequencies: FrequencySection,
     pub topics: Option<TopicSection>,
     pub sentiment: Option<SentimentSection>,
@@ -65,6 +80,15 @@ pub struct ActivityPoint {
     pub bucket: String,
     pub sessions: u64,
     pub human_messages: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeInsight {
+    pub metric: String,
+    pub subject: Option<String>,
+    pub current: u64,
+    pub previous: u64,
+    pub change_percent: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +126,23 @@ pub struct RhythmBucket {
 pub struct Rhythms {
     pub by_hour: Vec<RhythmBucket>,
     pub by_weekday: Vec<RhythmBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaypartBucket {
+    pub label: String,
+    pub human_messages: u64,
+    pub share_percent: f64,
+    pub baseline_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaypartInsight {
+    pub label: String,
+    pub human_messages: u64,
+    pub share_percent: f64,
+    pub baseline_percent: f64,
+    pub lift: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -267,6 +308,7 @@ fn compute_live(
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
     let activity = report_activity(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let changes = report_changes(store, options.since.as_deref(), project_pattern.as_deref())?;
     let tokens_by_session_end_date =
         report_tokens(store, options.since.as_deref(), project_pattern.as_deref())?;
     let mut projects =
@@ -285,6 +327,8 @@ fn compute_live(
         project_pattern.as_deref(),
     )?;
     let rhythms = report_rhythms(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let dayparts = report_dayparts(&rhythms);
+    let daypart_insights = select_daypart_insights(&dayparts);
     let frequencies =
         report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
     let (topics, topic_warning) =
@@ -338,11 +382,14 @@ fn compute_live(
         warnings,
         totals,
         activity,
+        changes,
         tokens_by_session_end_date,
         projects,
         provider_mix_by_month,
         model_mix_by_month,
         rhythms,
+        dayparts,
+        daypart_insights,
         frequencies,
         topics,
         sentiment,
@@ -901,6 +948,145 @@ fn report_activity(
     })
 }
 
+fn report_changes(
+    store: &Store,
+    since: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<ChangeInsight>> {
+    if since.is_some() {
+        return Ok(Vec::new());
+    }
+    let (current_sessions, previous_sessions, current_tokens, previous_tokens) =
+        store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT
+                   COALESCE(SUM(julianday(last_event_at) >= julianday('now', '-28 days')), 0),
+                   COALESCE(SUM(julianday(last_event_at) >= julianday('now', '-56 days')
+                                AND julianday(last_event_at) < julianday('now', '-28 days')), 0),
+                   COALESCE(SUM(CASE WHEN julianday(last_event_at) >= julianday('now', '-28 days')
+                                     THEN COALESCE(input_tokens, 0)
+                                        + COALESCE(cached_input_tokens, 0)
+                                        + COALESCE(output_tokens, 0) ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN julianday(last_event_at) >= julianday('now', '-56 days')
+                                          AND julianday(last_event_at) < julianday('now', '-28 days')
+                                     THEN COALESCE(input_tokens, 0)
+                                        + COALESCE(cached_input_tokens, 0)
+                                        + COALESCE(output_tokens, 0) ELSE 0 END), 0)
+                 FROM session_facts
+                 WHERE (?1 IS NULL OR workspace_path LIKE ?1)",
+                params![project],
+                |row| {
+                    Ok((
+                        nonnegative(row.get(0)?),
+                        nonnegative(row.get(1)?),
+                        nonnegative(row.get(2)?),
+                        nonnegative(row.get(3)?),
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })?;
+    let (current_messages, previous_messages) = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT
+               COALESCE(SUM(julianday(p.occurred_at) >= julianday('now', '-28 days')), 0),
+               COALESCE(SUM(julianday(p.occurred_at) >= julianday('now', '-56 days')
+                            AND julianday(p.occurred_at) < julianday('now', '-28 days')), 0)
+             FROM message_provenance p
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human'
+               AND (?1 IS NULL OR sf.workspace_path LIKE ?1)",
+            params![project],
+            |row| Ok((nonnegative(row.get(0)?), nonnegative(row.get(1)?))),
+        )
+        .map_err(Into::into)
+    })?;
+
+    let mut ranked = Vec::<(f64, ChangeInsight)>::new();
+    for (metric, current, previous) in [
+        ("sessions", current_sessions, previous_sessions),
+        ("human messages", current_messages, previous_messages),
+        ("tokens", current_tokens, previous_tokens),
+    ] {
+        push_change(&mut ranked, metric, None, current, previous);
+    }
+
+    let projects = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(sf.workspace_path, 'unknown'),
+                    SUM(julianday(p.occurred_at) >= julianday('now', '-28 days')),
+                    SUM(julianday(p.occurred_at) >= julianday('now', '-56 days')
+                        AND julianday(p.occurred_at) < julianday('now', '-28 days'))
+             FROM message_provenance p
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human'
+               AND julianday(p.occurred_at) >= julianday('now', '-56 days')
+               AND (?1 IS NULL OR sf.workspace_path LIKE ?1)
+             GROUP BY sf.workspace_path",
+        )?;
+        let rows = stmt.query_map(params![project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                nonnegative(row.get(1)?),
+                nonnegative(row.get(2)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let mut project_ranked = Vec::new();
+    for (workspace_path, current, previous) in projects {
+        push_change(
+            &mut project_ranked,
+            "project human messages",
+            Some(workspace_path),
+            current,
+            previous,
+        );
+    }
+    project_ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+    ranked.extend(project_ranked.into_iter().take(PROJECT_INSIGHT_LIMIT));
+    ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+    Ok(ranked
+        .into_iter()
+        .take(INSIGHT_LIMIT)
+        .map(|(_, insight)| insight)
+        .collect())
+}
+
+fn push_change(
+    ranked: &mut Vec<(f64, ChangeInsight)>,
+    metric: &str,
+    subject: Option<String>,
+    current: u64,
+    previous: u64,
+) {
+    if current + previous < MIN_CHANGE_SAMPLE
+        || current.abs_diff(previous) < MIN_CHANGE_ABSOLUTE
+    {
+        return;
+    }
+    let change = if previous == 0 {
+        None
+    } else {
+        Some((current as f64 - previous as f64) * 100.0 / previous as f64)
+    };
+    if change.is_some_and(|percent| percent.abs() < MIN_CHANGE_PERCENT) {
+        return;
+    }
+    let score = change.map_or(100.0, f64::abs) * (current + previous) as f64;
+    ranked.push((
+        score,
+        ChangeInsight {
+            metric: metric.to_string(),
+            subject,
+            current,
+            previous,
+            change_percent: change.map(|percent| percent.round() as i64),
+        },
+    ));
+}
+
 fn report_tokens(
     store: &Store,
     since: Option<&str>,
@@ -1031,6 +1217,63 @@ fn report_rhythms(store: &Store, since: Option<&str>, project: Option<&str>) -> 
     })
 }
 
+fn report_dayparts(rhythms: &Rhythms) -> Vec<DaypartBucket> {
+    let definitions = [
+        ("night", 8u64),
+        ("early morning", 4),
+        ("morning", 3),
+        ("afternoon", 5),
+        ("evening", 4),
+    ];
+    let mut counts = [0u64; 5];
+    for bucket in &rhythms.by_hour {
+        let Ok(hour) = bucket.label.parse::<u8>() else {
+            continue;
+        };
+        let index = match hour {
+            5..=8 => 1,
+            9..=11 => 2,
+            12..=16 => 3,
+            17..=20 => 4,
+            _ => 0,
+        };
+        counts[index] += bucket.human_messages;
+    }
+    let total = counts.iter().sum::<u64>().max(1) as f64;
+    definitions
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, hours))| DaypartBucket {
+            label: label.to_string(),
+            human_messages: counts[index],
+            share_percent: counts[index] as f64 * 100.0 / total,
+            baseline_percent: hours as f64 * 100.0 / 24.0,
+        })
+        .collect()
+}
+
+fn select_daypart_insights(dayparts: &[DaypartBucket]) -> Vec<DaypartInsight> {
+    let mut insights = dayparts
+        .iter()
+        .filter_map(|bucket| {
+            let lift = bucket.share_percent / bucket.baseline_percent;
+            (bucket.human_messages >= MIN_DAYPART_MESSAGES
+                && lift >= MIN_DAYPART_LIFT
+                && bucket.share_percent - bucket.baseline_percent >= MIN_DAYPART_SHARE_GAP)
+                .then(|| DaypartInsight {
+                    label: bucket.label.clone(),
+                    human_messages: bucket.human_messages,
+                    share_percent: bucket.share_percent,
+                    baseline_percent: bucket.baseline_percent,
+                    lift,
+                })
+        })
+        .collect::<Vec<_>>();
+    insights.sort_by(|left, right| right.lift.total_cmp(&left.lift));
+    insights.truncate(2);
+    insights
+}
+
 fn sort_projects(rows: &mut [ProjectRow], sort: ReportSort) {
     rows.sort_by(|left, right| match sort {
         ReportSort::Tokens => right
@@ -1049,171 +1292,115 @@ fn nonnegative(value: i64) -> u64 {
 
 pub fn render_terminal(report: &UsageReport) -> String {
     let mut out = String::new();
-    out.push_str("Historious usage report\n\n");
+    out.push_str("Historious report\n");
     out.push_str(&format!(
-        "Sessions {} · Threads {} · Events {} · Human messages {} · Agent {} · Harness {}\n",
-        report.totals.sessions,
-        report.totals.threads,
-        report.totals.events,
-        report.totals.human_messages,
-        report.totals.agent_messages,
-        report.totals.harness_messages
+        "Period {} → {} · snapshot {} · local time\n",
+        report.totals.first_activity_at.as_deref().unwrap_or("unknown"),
+        report.totals.last_activity_at.as_deref().unwrap_or("unknown"),
+        report.generated_at
     ));
-    out.push_str(&format!(
-        "Span {} → {} · local-time buckets\n",
-        report
-            .totals
-            .first_activity_at
-            .as_deref()
-            .unwrap_or("unknown"),
-        report
-            .totals
-            .last_activity_at
-            .as_deref()
-            .unwrap_or("unknown")
-    ));
+    if report.filters.since.is_some() || report.filters.project.is_some() {
+        out.push_str(&format!(
+            "Filters · since {} · project {}\n",
+            report.filters.since.as_deref().unwrap_or("all time"),
+            report.filters.project.as_deref().unwrap_or("all projects")
+        ));
+    }
     for warning in &report.warnings {
         out.push_str(&format!("Note: {warning}\n"));
     }
 
-    out.push_str("\nActivity (older weeks, recent days)\n");
-    for point in report.activity.iter().rev().take(16).rev() {
+    out.push_str("\nActivity overview\n");
+    out.push_str(&format!(
+        "  {} sessions · {} threads · {} human messages · {} agent messages\n",
+        report.totals.sessions,
+        report.totals.threads,
+        report.totals.human_messages,
+        report.totals.agent_messages
+    ));
+    for point in report.activity.iter().rev().take(6).rev() {
         out.push_str(&format!(
-            "  {:<10} sessions {:>5}  human messages {:>6}\n",
+            "  {:<10} {:>5} sessions · {:>6} human messages\n",
             point.bucket, point.sessions, point.human_messages
         ));
     }
-    out.push_str("\nTokens by session end date\n");
-    for point in report
-        .tokens_by_session_end_date
-        .iter()
-        .rev()
-        .take(14)
-        .rev()
-    {
-        out.push_str(&format!(
-            "  {}  input {:>12}  cached {:>12}  output {:>10}\n",
-            point.day, point.input_tokens, point.cached_input_tokens, point.output_tokens
-        ));
-    }
-    out.push_str(
-        "  Session-granularity caveat: multi-day usage is attributed to the session end date.\n",
-    );
 
-    out.push_str("\nProjects\n");
-    out.push_str("  sessions  messages       tokens   duration(h)  workspace\n");
-    for row in report.projects.iter().take(20) {
+    out.push_str("\nWhat changed · trailing 4 weeks vs prior 4 weeks\n");
+    if report.changes.is_empty() {
+        out.push_str("  No change cleared the sample and effect thresholds.\n");
+    } else {
+        for insight in &report.changes {
+            out.push_str(&format!("  {}\n", render_change(insight)));
+        }
+    }
+
+    if !report.daypart_insights.is_empty() {
+        out.push_str("\nWorking rhythm\n");
+        for insight in &report.daypart_insights {
+            out.push_str(&format!(
+                "  {}: {:.0}% of human messages vs {:.0}% of the clock ({} messages)\n",
+                insight.label,
+                insight.share_percent,
+                insight.baseline_percent,
+                insight.human_messages
+            ));
+        }
+    }
+
+    out.push_str("\nLeading projects\n");
+    for row in report.projects.iter().take(5) {
         out.push_str(&format!(
-            "  {:>8}  {:>8}  {:>11}  {:>11.1}  {}\n",
+            "  {} · {} sessions · {} human messages · {:.1}h\n",
+            row.workspace_path,
             row.sessions,
             row.human_messages,
-            row.total_tokens
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "—".to_string()),
-            row.duration_secs as f64 / 3600.0,
-            row.workspace_path
+            row.duration_secs as f64 / 3_600.0
         ));
     }
-
-    out.push_str("\nProvider mix by month\n");
-    for point in report.provider_mix_by_month.iter().rev().take(20).rev() {
-        out.push_str(&format!(
-            "  {}  {:<16} {}\n",
-            point.month, point.name, point.sessions
-        ));
-    }
-    out.push_str("\nModels by month\n");
-    for point in report.model_mix_by_month.iter().rev().take(20).rev() {
-        out.push_str(&format!(
-            "  {}  {:<28} {}\n",
-            point.month, point.name, point.sessions
-        ));
-    }
-    out.push_str("\nRhythms (human messages)\n  hour  ");
-    for bucket in &report.rhythms.by_hour {
-        out.push_str(&format!("{}:{} ", bucket.label, bucket.human_messages));
-    }
-    out.push_str("\n  weekday  ");
-    for bucket in &report.rhythms.by_weekday {
-        out.push_str(&format!("{}:{} ", bucket.label, bucket.human_messages));
-    }
-    out.push('\n');
-    out.push_str("\nMost typed words and phrases\n");
-    for (label, terms) in [
-        ("words", &report.frequencies.unigrams),
-        ("bigrams", &report.frequencies.bigrams),
-        ("trigrams", &report.frequencies.trigrams),
-    ] {
-        out.push_str(&format!("  {label}: "));
-        for term in terms.iter().take(12) {
-            out.push_str(&format!("{} ({})  ", term.term, term.count));
+    if !report.frequencies.unigrams.is_empty() {
+        out.push_str("  Recurring terms: ");
+        for (index, term) in report.frequencies.unigrams.iter().take(6).enumerate() {
+            if index > 0 {
+                out.push_str(" · ");
+            }
+            out.push_str(&term.term);
         }
         out.push('\n');
     }
-    if let Some(topics) = &report.topics {
-        out.push_str(&format!(
-            "\nTopics — {} · {} of {} messages\n",
-            topics.version, topics.assigned_messages, topics.corpus_messages
-        ));
-        for topic in topics.topics.iter().take(15) {
-            out.push_str(&format!(
-                "  {:>6}  {:<36} #{}\n",
-                topic.messages, topic.label, topic.topic_id
-            ));
-        }
-        out.push_str("\nTopic prevalence by month\n");
-        for point in topics.by_month.iter().rev().take(20).rev() {
-            out.push_str(&format!(
-                "  {}  {:>5}  {}\n",
-                point.month, point.messages, point.label
-            ));
-        }
-        out.push_str("\nTopics by project\n");
-        for point in topics.by_project.iter().take(20) {
-            out.push_str(&format!(
-                "  {:>5}  {:<32} {}\n",
-                point.messages, point.label, point.workspace_path
-            ));
-        }
-    }
-    if let Some(sentiment) = &report.sentiment {
-        out.push_str(&format!(
-            "\nSentiment — {} · {} · {} of {} messages\n",
-            sentiment.annotator_version,
-            sentiment.model,
-            sentiment.annotated_messages,
-            sentiment.corpus_messages
-        ));
-        out.push_str("\nRecent weekly averages\n");
-        for point in sentiment.by_week.iter().rev().take(22).rev() {
-            out.push_str(&format!(
-                "  {}  {:<14} {:.2}  n={}\n",
-                point.week, point.axis, point.average, point.messages
-            ));
-        }
-        out.push_str("\nSentiment by project\n");
-        for point in sentiment.by_project.iter().take(22) {
-            out.push_str(&format!(
-                "  {:<14} {:.2}  n={:<6} {}\n",
-                point.axis, point.average, point.messages, point.workspace_path
-            ));
-        }
-        out.push_str("\nSentiment by local hour (00 / 06 / 12 / 18)\n");
-        for axis in crate::annotate::SENTIMENT_AXES {
-            out.push_str(&format!("  {axis:<14}"));
-            for hour in ["00", "06", "12", "18"] {
-                let average = sentiment
-                    .by_hour
-                    .iter()
-                    .find(|point| point.axis == axis && point.hour == hour)
-                    .map(|point| format!("{:.2}", point.average))
-                    .unwrap_or_else(|| "—".to_string());
-                out.push_str(&format!("  {hour}:{average}"));
-            }
-            out.push('\n');
-        }
+
+    if report.topics.as_ref().is_some_and(|topics| {
+        topics
+            .topics
+            .iter()
+            .any(|topic| topic.label != "miscellaneous")
+    }) {
+        out.push_str("\nTopics\n  Coherent topic data is ready for ranked integration.\n");
     }
     out
+}
+
+fn render_change(insight: &ChangeInsight) -> String {
+    let label = insight
+        .subject
+        .as_ref()
+        .map(|subject| format!("{} in {subject}", insight.metric))
+        .unwrap_or_else(|| insight.metric.clone());
+    match insight.change_percent {
+        Some(percent) if percent >= 0 => format!(
+            "{label} rose {percent}% · {} now vs {} before",
+            insight.current, insight.previous
+        ),
+        Some(percent) => format!(
+            "{label} fell {}% · {} now vs {} before",
+            percent.unsigned_abs(),
+            insight.current,
+            insight.previous
+        ),
+        None => format!(
+            "{label} is new · {} now vs none before",
+            insight.current
+        ),
+    }
 }
 
 #[cfg(test)]
