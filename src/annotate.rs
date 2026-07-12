@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +252,7 @@ struct AnnotationBatchResponse {
 #[derive(Debug, Deserialize)]
 struct AnnotationScores {
     id: String,
-    scores: HashMap<String, u8>,
+    scores: Vec<u8>,
 }
 
 pub fn annotate_messages(
@@ -314,14 +314,19 @@ pub fn annotate_messages(
             let input = inputs
                 .get(index)
                 .context("annotation response item ordinal was out of range")?;
-            rows.extend(SENTIMENT_AXES.map(|axis| MessageAnnotation {
-                item_id: input.item_id.clone(),
-                axis: axis.to_string(),
-                score: scores.scores[axis],
-                model: llm.model().to_string(),
-                annotator_version: options.annotator_version.clone(),
-                annotated_at,
-            }));
+            rows.extend(
+                SENTIMENT_AXES
+                    .iter()
+                    .enumerate()
+                    .map(|(score_index, axis)| MessageAnnotation {
+                        item_id: input.item_id.clone(),
+                        axis: (*axis).to_string(),
+                        score: scores.scores[score_index],
+                        model: llm.model().to_string(),
+                        annotator_version: options.annotator_version.clone(),
+                        annotated_at,
+                    }),
+            );
         }
         insert_annotations(store, &rows)?;
         annotated_messages += inputs.len();
@@ -339,7 +344,7 @@ pub fn annotate_messages(
 }
 
 fn sentiment_system_prompt() -> &'static str {
-    r#"Score each message independently from 1 to 5 on every axis. Use 3 for neutral, mixed, or unclear. Axes: happiness (negative/unhappy to positive/happy); excitement (calm/flat to enthusiastic/energized); frustration (unbothered to strongly frustrated); satisfaction (dissatisfied with results to pleased); curiosity (purely directive to exploratory/inquisitive); confidence (uncertain/confused to confident); urgency (leisurely to time-pressured); decisiveness (tentative to firmly decided); warmth (cold/transactional to warm/appreciative); momentum (stuck/blocked to flowing/making progress); playfulness (serious/literal to playful/humorous). Do not infer traits or mental health. Return JSON only: {"items":[{"id":"exact input id","scores":{"happiness":1,"excitement":1,"frustration":1,"satisfaction":1,"curiosity":1,"confidence":1,"urgency":1,"decisiveness":1,"warmth":1,"momentum":1,"playfulness":1}}]}."#
+    r#"Score each message independently from 1 to 5 on every axis. Use 3 for neutral, mixed, or unclear. Score array order: happiness (negative/unhappy to positive/happy); excitement (calm/flat to enthusiastic/energized); frustration (unbothered to strongly frustrated); satisfaction (dissatisfied with results to pleased); curiosity (purely directive to exploratory/inquisitive); confidence (uncertain/confused to confident); urgency (leisurely to time-pressured); decisiveness (tentative to firmly decided); warmth (cold/transactional to warm/appreciative); momentum (stuck/blocked to flowing/making progress); playfulness (serious/literal to playful/humorous). Do not infer traits or mental health. Return JSON only: {"items":[{"id":"exact input id","scores":[1,1,1,1,1,1,1,1,1,1,1]}]}."#
 }
 
 fn parse_annotation_response(
@@ -357,21 +362,10 @@ fn parse_annotation_response(
         if item.scores.len() != SENTIMENT_AXES.len() {
             bail!("annotation response must contain all 11 approved axes");
         }
-        for axis in SENTIMENT_AXES {
-            let score = item
-                .scores
-                .get(axis)
-                .with_context(|| format!("annotation response omitted {axis}"))?;
+        for (axis, score) in SENTIMENT_AXES.iter().zip(&item.scores) {
             if !(1..=5).contains(score) {
                 bail!("annotation score for {axis} must be between 1 and 5");
             }
-        }
-        if item
-            .scores
-            .keys()
-            .any(|axis| !SENTIMENT_AXES.contains(&axis.as_str()))
-        {
-            bail!("annotation response contained an unknown axis");
         }
     }
     if seen.len() != expected.len() {
@@ -573,10 +567,7 @@ mod tests {
                 .expect("prompt items")
                 .iter()
                 .map(|input| {
-                    let scores = SENTIMENT_AXES
-                        .into_iter()
-                        .map(|axis| (axis.to_string(), serde_json::json!(3)))
-                        .collect::<serde_json::Map<_, _>>();
+                    let scores = vec![3; SENTIMENT_AXES.len()];
                     serde_json::json!({"id": input["id"], "scores": scores})
                 })
                 .collect::<Vec<_>>();
@@ -692,11 +683,7 @@ mod tests {
 
     #[test]
     fn sentiment_response_requires_every_approved_axis() {
-        let mut scores = SENTIMENT_AXES
-            .into_iter()
-            .map(|axis| (axis.to_string(), serde_json::json!(3)))
-            .collect::<serde_json::Map<_, _>>();
-        scores.remove("playfulness");
+        let scores = vec![3; SENTIMENT_AXES.len() - 1];
         let response = serde_json::json!({"items": [{"id": "item", "scores": scores}]});
         let error = parse_annotation_response(&response.to_string(), &["item"])
             .expect_err("missing axis should fail");
