@@ -9856,6 +9856,53 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_config_and_explicit_consent_commands_parse() {
+        let config = Cli::try_parse_from([
+            "histo",
+            "config",
+            "enrichment",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            "https://api.anthropic.com",
+            "--api-key",
+            "test-key",
+            "--model",
+            "claude-test",
+        ])
+        .expect("parse enrichment config");
+        assert!(matches!(
+            config.command,
+            Command::Config {
+                command: ConfigCommand::Enrichment {
+                    provider: EnrichmentProviderArg::Anthropic,
+                    ..
+                }
+            }
+        ));
+
+        let enrich = Cli::try_parse_from([
+            "histo",
+            "enrich",
+            "sentiment",
+            "--limit",
+            "5",
+            "--yes",
+        ])
+        .expect("parse consent-gated sentiment enrichment");
+        assert!(matches!(
+            enrich.command,
+            Command::Enrich {
+                command: EnrichCommand::Sentiment {
+                    limit: Some(5),
+                    yes: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn lab_rebuild_subcommand_parses() {
         let cli = Cli::try_parse_from(["histo", "lab", "rebuild"]).expect("parse lab rebuild");
         assert!(matches!(

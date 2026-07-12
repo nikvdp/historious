@@ -711,6 +711,34 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_run_provenance_is_versioned_and_immutable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut preflight = EnrichmentPreflight {
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            destination: "https://example.test/v1/chat/completions".to_string(),
+            data_category: "human messages".to_string(),
+            record_count: 2,
+            max_excerpt_chars: 2_000,
+            estimated_tokens: 100,
+            estimated_cost: "unknown".to_string(),
+            logging_and_retention: "unknown".to_string(),
+            resumability: "yes".to_string(),
+            deletion: "delete command".to_string(),
+        };
+
+        record_enrichment_run(&store, "sentiment", "v1", &preflight)
+            .expect("record provenance");
+        record_enrichment_run(&store, "sentiment", "v1", &preflight)
+            .expect("repeat same provenance");
+        preflight.model = "different-model".to_string();
+        let error = record_enrichment_run(&store, "sentiment", "v1", &preflight)
+            .expect_err("version metadata must not change");
+        assert!(error.to_string().contains("different provider metadata"));
+    }
+
+    #[test]
     fn openai_response_content_and_base_urls_parse() {
         let response = serde_json::json!({
             "choices": [{"message": {"content": "{\"label\":\"Databases\"}"}}]
@@ -734,6 +762,46 @@ mod tests {
         assert!(retryable_status(429));
         assert!(retryable_status(503));
         assert!(!retryable_status(400));
+    }
+
+    #[test]
+    fn provider_wire_formats_normalize_json_content() {
+        let openai = openai_request("gpt-test", "system", "prompt");
+        assert_eq!(openai["model"], "gpt-test");
+        assert_eq!(openai["messages"][0]["role"], "system");
+        assert_eq!(openai["messages"][1]["content"], "prompt");
+        assert_eq!(openai["response_format"]["type"], "json_object");
+
+        let anthropic = anthropic_request("claude-test", "system", "prompt");
+        assert_eq!(anthropic["model"], "claude-test");
+        assert_eq!(anthropic["system"], "system");
+        assert_eq!(anthropic["messages"][0]["role"], "user");
+        assert_eq!(anthropic["messages"][0]["content"], "prompt");
+        let response = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"label\":\"Databases\"}"}]
+        });
+        assert_eq!(
+            anthropic_content(&response).expect("Anthropic content"),
+            "{\"label\":\"Databases\"}"
+        );
+        assert_eq!(
+            messages_url("https://api.anthropic.com".to_string()),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url("https://example.test/v1".to_string()),
+            "https://example.test/v1/messages"
+        );
+    }
+
+    #[test]
+    fn configured_client_refuses_partial_or_implicit_provider_settings() {
+        let error = match ConfiguredJsonLlm::from_config(&EnrichmentConfig::default()) {
+            Ok(_) => panic!("missing provider config must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("histo config enrichment"));
     }
 
     struct MockSentimentLlm {

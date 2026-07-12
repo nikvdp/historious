@@ -378,6 +378,42 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_config_is_explicit_complete_and_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let path = set_enrichment_config(
+            dir.path(),
+            EnrichmentProvider::Anthropic,
+            "https://api.anthropic.com",
+            "secret-test-key",
+            "claude-test",
+        )
+        .expect("write enrichment config");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert!(config.enrichment.configured());
+        assert_eq!(config.enrichment.provider, Some(EnrichmentProvider::Anthropic));
+        assert_eq!(config.enrichment.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(config.enrichment.api_key.as_deref(), Some("secret-test-key"));
+        assert_eq!(config.enrichment.model.as_deref(), Some("claude-test"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path).expect("metadata").permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn enrichment_config_never_uses_environment_fallbacks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+
+        assert!(!config.enrichment.configured());
+        assert!(config.enrichment.provider.is_none());
+        assert!(config.enrichment.api_key.is_none());
+    }
+
+    #[test]
     fn invalid_search_mode_in_config_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
