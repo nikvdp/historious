@@ -10865,6 +10865,37 @@ mod tests {
     }
 
     #[test]
+    fn bare_native_id_reports_pi_and_omp_ambiguity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(dir.path()).expect("open store");
+        let native_id = "019f4093-8804-7941-ade1-bf7e11481929";
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(&format!(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('session_pi', 'source_pi', 'machine', 'pi_agent',
+                       '2026-07-13T00-00-00-000Z_{native_id}', 'open', '{{}}', 'pi_hash'),
+                      ('session_omp', 'source_omp', 'machine', 'omp',
+                       '2026-07-13T01-00-00-000Z_{native_id}', 'open', '{{}}', 'omp_hash');
+                    "#
+                ))?;
+                Ok(())
+            })
+            .expect("insert native-id fixtures");
+
+        let error = resolve_session_target(&store, native_id)
+            .expect_err("shared pi and OMP native id should be ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous native session id"));
+        assert!(message.contains("omp:session_omp"));
+        assert!(message.contains("pi_agent:session_pi"));
+    }
+
+    #[test]
     fn show_valid_event_ref_does_not_trigger_fallback() {
         let (_dir, store) = fixture_store_with_viewer_ref();
 

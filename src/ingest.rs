@@ -3270,6 +3270,17 @@ mod tests {
         assert_eq!(pi.cached_input_tokens, Some(30));
         assert_eq!(pi.output_tokens, Some(12));
 
+        let omp = extract_session_usage(
+            "omp",
+            &[usage_event(json!({"message": {"model": "claude-sonnet", "usage": {
+                "input": 120, "cacheRead": 40, "output": 18
+            }}}))],
+        );
+        assert_eq!(omp.models, vec!["claude-sonnet"]);
+        assert_eq!(omp.input_tokens, Some(120));
+        assert_eq!(omp.cached_input_tokens, Some(40));
+        assert_eq!(omp.output_tokens, Some(18));
+
         let metadata = json!({
             "opencode_message_id": "msg_1",
             "opencode_model_id": "kimi-k2",
@@ -3522,6 +3533,182 @@ mod tests {
         assert_eq!(
             session_title("pi_agent", "pi-session-1", &lines, &native_titles).as_deref(),
             Some("Renamed Pi Session")
+        );
+    }
+
+    #[test]
+    fn omp_session_title_prefers_header_title() {
+        let native_titles = NativeTitleIndex::default();
+        let lines = vec![
+            parsed_line(
+                0,
+                json!({
+                    "type": "session",
+                    "id": "omp-session-1",
+                    "title": "Independent OMP Session",
+                    "cwd": "/tmp/repo"
+                }),
+                0,
+                1,
+            ),
+            parsed_line(
+                1,
+                json!({
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "fallback request"}]
+                    }
+                }),
+                0,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            session_title("omp", "omp-session-1", &lines, &native_titles).as_deref(),
+            Some("Independent OMP Session")
+        );
+    }
+
+    #[test]
+    fn omp_identity_qualifies_nested_transcripts_and_marks_forks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let session_dir = temp.path().join("sessions/-repo");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let main_stem = "2026-07-13T00-00-00-000Z_main-id";
+        let main_path = session_dir.join(format!("{main_stem}.jsonl"));
+        fs::write(&main_path, "").expect("main transcript");
+
+        let child_dir = session_dir.join(main_stem);
+        fs::create_dir_all(&child_dir).expect("child dir");
+        let child_path = child_dir.join("Reviewer.jsonl");
+        fs::write(&child_path, "").expect("child transcript");
+        let grandchild_dir = child_dir.join("Reviewer");
+        fs::create_dir_all(&grandchild_dir).expect("grandchild dir");
+        let grandchild_path = grandchild_dir.join("Helper.jsonl");
+
+        let child = omp_session_identity(&child_path, &[]);
+        assert_eq!(child.external_id, format!("{main_stem}/Reviewer"));
+        assert_eq!(child.parent_external_id.as_deref(), Some(main_stem));
+        assert_eq!(child.relationship, SessionRelationshipKind::Subagent);
+
+        let grandchild = omp_session_identity(&grandchild_path, &[]);
+        assert_eq!(
+            grandchild.external_id,
+            format!("{main_stem}/Reviewer/Helper")
+        );
+        assert_eq!(
+            grandchild.parent_external_id.as_deref(),
+            Some(format!("{main_stem}/Reviewer").as_str())
+        );
+        assert_eq!(grandchild.relationship, SessionRelationshipKind::Subagent);
+
+        let fork_lines = vec![parsed_line(
+            0,
+            json!({
+                "type": "session",
+                "id": "fork-id",
+                "parentSession": "main-id"
+            }),
+            0,
+            1,
+        )];
+        let fork_path = session_dir.join("2026-07-13T00-01-00-000Z_fork-id.jsonl");
+        let fork = omp_session_identity(&fork_path, &fork_lines);
+        assert_eq!(fork.parent_external_id.as_deref(), Some("main-id"));
+        assert_eq!(fork.relationship, SessionRelationshipKind::Fork);
+    }
+
+    #[test]
+    fn omp_profile_roots_and_overrides_are_scoped_without_duplicates() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let profiles = temp.path().join(".omp/profiles");
+        fs::create_dir_all(profiles.join("work/agent/sessions")).expect("profile sessions");
+        let mut paths = BTreeSet::new();
+
+        add_omp_profile_session_roots(&mut paths, &profiles, true);
+        add_omp_profile_session_roots(&mut paths, &profiles, true);
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&profiles.join("work/agent/sessions")));
+
+        let config_roots = BTreeSet::from([temp.path().join(".omp")]);
+        assert!(omp_agent_dir_is_recognizable(
+            &temp.path().join(".omp/profiles/work/agent"),
+            &config_roots
+        ));
+        let pi_override = temp.path().join(".pi/agent");
+        fs::create_dir_all(pi_override.join("sessions")).expect("pi sessions");
+        assert!(!omp_agent_dir_is_recognizable(
+            &pi_override,
+            &config_roots
+        ));
+    }
+
+    #[test]
+    fn pi_compatible_payloads_keep_pi_and_omp_sessions_independent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let log_path = temp.path().join("2026-07-13T00-00-00-000Z_shared-id.jsonl");
+        let lines = [
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": "shared-id",
+                "title": "OMP title",
+                "timestamp": "2026-07-13T00:00:00Z",
+                "cwd": "/tmp/repo"
+            }),
+            json!({
+                "type": "message",
+                "id": "message-1",
+                "parentId": null,
+                "timestamp": "2026-07-13T00:00:01Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "same transcript payload"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        fs::write(&log_path, lines).expect("write fixture");
+        let native_titles = NativeTitleIndex::default();
+
+        for kind in ["pi_agent", "omp"] {
+            let context = SourceSyncContext::new(&store);
+            prepare_file_import(
+                &context,
+                "machine_fixture",
+                kind,
+                &log_path,
+                &native_titles,
+            )
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("import compatible transcript");
+        }
+
+        let external_id = file_stem(&log_path);
+        let sessions = store
+            .sessions_by_external_id(&external_id)
+            .expect("sessions by external id");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.source_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["omp", "pi_agent"]
+        );
+        assert_ne!(sessions[0].id, sessions[1].id);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.source_kind == "omp")
+                .and_then(|session| session.title.as_deref()),
+            Some("OMP title")
         );
     }
 
@@ -4497,11 +4684,15 @@ mod tests {
     #[test]
     fn source_selection_matches_specific_sources_and_agent_logs_alias() {
         let codex = SourceSelection::single("codex").expect("codex selection");
+        let omp = SourceSelection::single("omp").expect("omp selection");
         let agent_logs = SourceSelection::single("agent_logs").expect("agent logs selection");
         let treechat = SourceSelection::single("treechat").expect("treechat selection");
 
         assert!(codex.matches_candidate("codex", "codex"));
+        assert!(omp.matches_candidate("omp", "omp"));
+        assert!(!omp.matches_candidate("pi_agent", "pi_agent"));
         assert!(agent_logs.matches_candidate("codex", "codex"));
+        assert!(agent_logs.matches_candidate("omp", "omp"));
         assert!(agent_logs.matches_candidate("opencode", "opencode"));
         assert!(treechat.matches_candidate("treechat", "treechat"));
         assert!(!agent_logs.matches_candidate("treechat", "treechat"));

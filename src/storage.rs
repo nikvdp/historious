@@ -9055,11 +9055,13 @@ mod tests {
     }
 
     #[test]
-    fn pi_native_id_resolves_timestamp_prefixed_external_id() {
+    fn pi_compatible_native_ids_resolve_pi_and_omp_sessions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let source = fixture_source("source_pi");
+        let omp_source = fixture_source("source_omp");
         let native_id = "019f4093-8804-7941-ade1-bf7e11481929";
+        let omp_native_id = "019f4093-8804-7941-ade1-bf7e11481930";
         let external_id = format!("2026-07-08T07-13-58-276Z_{}", native_id);
         let session = SessionRecord {
             id: "session_pi".to_string(),
@@ -9075,12 +9077,28 @@ mod tests {
             hash: stable_hash(&("session_pi", source.id.as_str(), "pi"))
                 .expect("session hash"),
         };
+        let omp_session = SessionRecord {
+            id: "session_omp".to_string(),
+            source_id: omp_source.id.clone(),
+            machine_id: "machine_a".to_string(),
+            source_kind: "omp".to_string(),
+            external_id: format!("2026-07-08T08-00-00-000Z_{omp_native_id}"),
+            title: Some("OMP session".to_string()),
+            status: "open".to_string(),
+            started_at: None,
+            updated_at: None,
+            metadata: json!({}),
+            hash: stable_hash(&("session_omp", omp_source.id.as_str(), "omp"))
+                .expect("OMP session hash"),
+        };
         store
             .import_records(&[
                 ArchiveRecord::Source(source),
+                ArchiveRecord::Source(omp_source),
                 ArchiveRecord::Session(session.clone()),
+                ArchiveRecord::Session(omp_session.clone()),
             ])
-            .expect("import pi session");
+            .expect("import pi-compatible sessions");
 
         // Exact external_id still works
         let exact = store
@@ -9096,6 +9114,30 @@ mod tests {
         assert_eq!(by_native.len(), 1);
         assert_eq!(by_native[0].id, "session_pi");
         assert_eq!(by_native[0].external_id, external_id);
+
+        let omp_by_native = store
+            .sessions_by_pi_native_id(omp_native_id)
+            .expect("OMP native id lookup");
+        assert_eq!(omp_by_native.len(), 1);
+        assert_eq!(omp_by_native[0].id, "session_omp");
+        assert_eq!(omp_by_native[0].source_kind, "omp");
+
+        let duplicate_native = SessionRecord {
+            id: "session_omp_duplicate_native".to_string(),
+            external_id: format!("2026-07-08T09-00-00-000Z_{native_id}"),
+            hash: stable_hash(&("session_omp_duplicate_native", native_id))
+                .expect("duplicate native hash"),
+            ..omp_session
+        };
+        store
+            .import_records(&[ArchiveRecord::Session(duplicate_native)])
+            .expect("import duplicate native id");
+        let ambiguous = store
+            .sessions_by_pi_native_id(native_id)
+            .expect("ambiguous native id lookup");
+        assert_eq!(ambiguous.len(), 2);
+        assert_eq!(ambiguous[0].source_kind, "omp");
+        assert_eq!(ambiguous[1].source_kind, "pi_agent");
 
         // Non-matching ID returns empty
         let misses = store

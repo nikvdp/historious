@@ -1628,6 +1628,72 @@ mod tests {
     }
 
     #[test]
+    fn omp_relationships_resolve_qualified_subagents_and_bare_forks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('omp_parent', 'source_parent', 'machine', 'omp',
+                       '2026-07-13T00-00-00-000Z_parent-id', 'open',
+                       '{"omp_parent_external_id":null,"omp_relationship":"none"}',
+                       'omp_parent_hash'),
+                      ('omp_subagent', 'source_subagent', 'machine', 'omp',
+                       '2026-07-13T00-00-00-000Z_parent-id/Reviewer', 'open',
+                       '{"omp_parent_external_id":"2026-07-13T00-00-00-000Z_parent-id","omp_relationship":"subagent"}',
+                       'omp_subagent_hash'),
+                      ('omp_fork', 'source_fork', 'machine', 'omp',
+                       '2026-07-13T00-01-00-000Z_fork-id', 'open',
+                       '{"omp_parent_external_id":"parent-id","omp_relationship":"fork"}',
+                       'omp_fork_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert OMP relationship fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild OMP relationships");
+        let relationships = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE session_id IN ('omp_subagent', 'omp_fork')
+                     ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load OMP relationships");
+
+        assert_eq!(relationships.len(), 2);
+        for relationship in &relationships {
+            assert_eq!(relationship.1, "omp_parent");
+            assert_eq!(relationship.2, "omp_parent");
+        }
+        assert_eq!(relationships[0].0, "omp_fork");
+        assert_eq!(relationships[0].3, "fork");
+        assert_eq!(relationships[0].4, "omp.parent_session");
+        assert_eq!(relationships[1].0, "omp_subagent");
+        assert_eq!(relationships[1].3, "subagent");
+        assert_eq!(relationships[1].4, "omp.artifact_path");
+    }
+
+    #[test]
     fn claude_subagent_path_resolves_to_the_parent_directory_session() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
