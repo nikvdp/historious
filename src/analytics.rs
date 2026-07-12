@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
-pub const MESSAGE_PROVENANCE_VERSION: u32 = 4;
+pub const MESSAGE_PROVENANCE_VERSION: u32 = 5;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 6;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
@@ -817,12 +817,25 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
             let mut stmt = conn.prepare(
                 "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
                         hi.text_hash, hi.occurred_at, s.metadata_json,
-                        COALESCE(sr.relationship, 'none')
+                        CASE
+                          WHEN eso.event_id IS NULL
+                           AND sr.relationship = 'subagent'
+                           AND parent_hi.id IS NOT NULL THEN 'none'
+                          ELSE COALESCE(sr.relationship, 'none')
+                        END
                  FROM history_items hi
                  JOIN sessions s ON s.id = hi.session_id
                  LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
                  LEFT JOIN session_relationships sr
                    ON sr.session_id = COALESCE(eso.session_id, hi.session_id)
+                 LEFT JOIN history_items parent_hi INDEXED BY idx_history_items_session_order
+                   ON eso.event_id IS NULL
+                  AND parent_hi.session_id = sr.parent_session_id
+                  AND parent_hi.ordinal = hi.ordinal
+                  AND parent_hi.subordinal = hi.subordinal
+                  AND parent_hi.tier = hi.tier
+                  AND parent_hi.kind = hi.kind
+                  AND parent_hi.text_hash = hi.text_hash
                  WHERE hi.rowid > ?1
                    AND hi.tier = 'conversation'
                    AND hi.kind IN ('user', 'assistant')
