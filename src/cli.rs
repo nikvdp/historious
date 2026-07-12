@@ -1054,7 +1054,7 @@ pub enum ReportSortArg {
     Duration,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReportWindowArg {
     #[value(name = "7")]
     Seven,
@@ -10202,6 +10202,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn report_comparison_window_selector_parses() {
+        for (value, expected) in [
+            ("7", ReportWindowArg::Seven),
+            ("14", ReportWindowArg::Fourteen),
+            ("28", ReportWindowArg::TwentyEight),
+            ("all", ReportWindowArg::All),
+        ] {
+            let cli = Cli::try_parse_from(["histo", "report", "--window", value])
+                .expect("parse report window");
+            match cli.command {
+                Command::Report { window, .. } => {
+                    assert_eq!(window, Some(expected));
+                }
+                _ => panic!("expected report command"),
+            }
+        }
     }
 
     #[test]

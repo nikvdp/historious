@@ -2175,7 +2175,9 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
         let rendered = render_terminal(&report);
-        assert!(rendered.contains("What changed · trailing 4 weeks vs prior 4 weeks"));
+        assert!(rendered.contains("What changed"));
+        assert!(!rendered.contains("now vs"));
+        assert!(!rendered.contains("before"));
         assert!(rendered.contains("Leading projects"));
         assert!(!rendered.contains("Provider mix by month"));
         assert!(!rendered.contains("Sentiment by local hour"));
@@ -2200,6 +2202,48 @@ mod tests {
         assert_eq!(filtered.totals.sessions, 1);
         assert_eq!(filtered.totals.human_turns, 0);
         assert_eq!(filtered.filters.project.as_deref(), Some("b"));
+
+        let unfiltered = compute(
+            &store,
+            &ReportOptions {
+                since: None,
+                project: None,
+                sort: ReportSort::Tokens,
+            },
+        )
+        .expect("compute unfiltered comparison report");
+        assert_eq!(
+            unfiltered
+                .comparisons
+                .iter()
+                .map(|window| window.days)
+                .collect::<Vec<_>>(),
+            vec![7, 14, 28]
+        );
+        for window in &unfiltered.comparisons {
+            let current_start = NaiveDate::parse_from_str(&window.current_start, "%Y-%m-%d")
+                .expect("current start");
+            let current_end = NaiveDate::parse_from_str(&window.current_end, "%Y-%m-%d")
+                .expect("current end");
+            let previous_start = NaiveDate::parse_from_str(&window.previous_start, "%Y-%m-%d")
+                .expect("previous start");
+            let previous_end = NaiveDate::parse_from_str(&window.previous_end, "%Y-%m-%d")
+                .expect("previous end");
+            assert_eq!((current_end - current_start).num_days(), i64::from(window.days - 1));
+            assert_eq!((previous_end - previous_start).num_days(), i64::from(window.days - 1));
+            assert_eq!(previous_end + ChronoDuration::days(1), current_start);
+            assert_eq!(window.metrics.len(), 3);
+        }
+        let default_tables = render_terminal_themed(&unfiltered, 80, false);
+        assert!(default_tables.contains("7 days"));
+        assert!(!default_tables.contains("14 days"));
+        assert!(default_tables.contains("28 days"));
+        assert!(default_tables.contains("current"));
+        assert!(default_tables.contains("previous"));
+        let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All);
+        assert!(all_tables.contains("14 days"));
+        let narrow_tables = render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven);
+        assert!(narrow_tables.lines().all(|line| line.chars().count() <= 40));
     }
 
     #[test]
