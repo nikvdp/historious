@@ -47,6 +47,7 @@ pub struct EnrichmentPreflight {
     pub logging_and_retention: String,
     pub resumability: String,
     pub deletion: String,
+    pub schema_description: String,
 }
 
 pub fn insert_annotations(store: &Store, annotations: &[MessageAnnotation]) -> Result<()> {
@@ -149,6 +150,12 @@ pub fn latest_annotations(store: &Store) -> Result<Vec<MessageAnnotation>> {
 
 pub trait JsonLlm: Sync {
     fn model(&self) -> &str;
+    fn provider(&self) -> &str {
+        "unknown"
+    }
+    fn destination(&self) -> &str {
+        "unknown"
+    }
     fn complete_json(&self, system: &str, prompt: &str) -> Result<String>;
 }
 
@@ -192,6 +199,14 @@ impl ConfiguredJsonLlm {
 impl JsonLlm for ConfiguredJsonLlm {
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn provider(&self) -> &str {
+        self.provider()
+    }
+
+    fn destination(&self) -> &str {
+        self.destination()
     }
 
     fn complete_json(&self, system: &str, prompt: &str) -> Result<String> {
@@ -333,8 +348,12 @@ pub fn sentiment_preflight(
             options.annotator_version
         ),
         deletion: format!(
-            "histo enrich delete --kind sentiment --version {}",
+            "histo enrich delete --kind sentiment --version {} --yes",
             options.annotator_version
+        ),
+        schema_description: format!(
+            "integer 1..5, where 3 is neutral/mixed/unclear, for axes: {}",
+            SENTIMENT_AXES.join(", ")
         ),
     })
 }
@@ -351,8 +370,9 @@ pub fn record_enrichment_run(
     store.with_conn(|conn| {
         conn.execute(
             "INSERT OR IGNORE INTO enrichment_runs
-             (kind, version, provider, model, destination, data_scope, max_excerpt_chars, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (kind, version, provider, model, destination, data_scope, max_excerpt_chars,
+              schema_description, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 kind,
                 version,
@@ -361,11 +381,13 @@ pub fn record_enrichment_run(
                 preflight.destination,
                 preflight.data_category,
                 preflight.max_excerpt_chars as i64,
+                preflight.schema_description,
                 Utc::now().to_rfc3339(),
             ],
         )?;
         let stored = conn.query_row(
-            "SELECT provider, model, destination, data_scope, max_excerpt_chars
+            "SELECT provider, model, destination, data_scope, max_excerpt_chars,
+                    schema_description
              FROM enrichment_runs WHERE kind = ?1 AND version = ?2",
             params![kind, version],
             |row| {
@@ -375,6 +397,7 @@ pub fn record_enrichment_run(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )?;
@@ -384,6 +407,7 @@ pub fn record_enrichment_run(
             preflight.destination.clone(),
             preflight.data_category.clone(),
             preflight.max_excerpt_chars as i64,
+            preflight.schema_description.clone(),
         );
         if stored != requested {
             bail!(
@@ -391,6 +415,60 @@ pub fn record_enrichment_run(
             );
         }
         Ok(())
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteEnrichmentOutcome {
+    pub kind: String,
+    pub version: String,
+    pub derived_rows: usize,
+}
+
+pub fn enrichment_row_count(store: &Store, kind: &str, version: &str) -> Result<usize> {
+    store.with_conn(|conn| {
+        let count = match kind {
+            "sentiment" => conn.query_row(
+                "SELECT COUNT(*) FROM message_annotations WHERE annotator_version = ?1",
+                params![version],
+                |row| row.get::<_, i64>(0),
+            )?,
+            "topics" => conn.query_row(
+                "SELECT COUNT(*) FROM topic_label_enrichments WHERE labeler_version = ?1",
+                params![version],
+                |row| row.get::<_, i64>(0),
+            )?,
+            _ => bail!("enrichment kind must be sentiment or topics"),
+        };
+        Ok(count as usize)
+    })
+}
+
+pub fn delete_enrichment(store: &Store, kind: &str, version: &str) -> Result<DeleteEnrichmentOutcome> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting enrichment deletion")?;
+        let derived_rows = match kind {
+            "sentiment" => tx.execute(
+                "DELETE FROM message_annotations WHERE annotator_version = ?1",
+                params![version],
+            )?,
+            "topics" => tx.execute(
+                "DELETE FROM topic_label_enrichments WHERE labeler_version = ?1",
+                params![version],
+            )?,
+            _ => bail!("enrichment kind must be sentiment or topics"),
+        };
+        tx.execute(
+            "DELETE FROM enrichment_runs WHERE kind = ?1 AND version = ?2",
+            params![kind, version],
+        )?;
+        tx.commit().context("committing enrichment deletion")?;
+        Ok(DeleteEnrichmentOutcome {
+            kind: kind.to_string(),
+            version: version.to_string(),
+            derived_rows,
+        })
     })
 }
 

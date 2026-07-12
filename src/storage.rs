@@ -5144,6 +5144,7 @@ fn migrate(conn: &Connection) -> Result<()> {
           destination TEXT NOT NULL,
           data_scope TEXT NOT NULL,
           max_excerpt_chars INTEGER NOT NULL,
+          schema_description TEXT NOT NULL,
           created_at TEXT NOT NULL,
           PRIMARY KEY (kind, version)
         );
@@ -5175,6 +5176,19 @@ fn migrate(conn: &Connection) -> Result<()> {
           labeler_version TEXT,
           labeled_at TEXT,
           PRIMARY KEY (version, topic_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS topic_label_enrichments (
+          topic_version TEXT NOT NULL,
+          topic_id INTEGER NOT NULL,
+          label TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          destination TEXT NOT NULL,
+          labeler_version TEXT NOT NULL,
+          data_scope TEXT NOT NULL,
+          labeled_at TEXT NOT NULL,
+          PRIMARY KEY (topic_version, topic_id, labeler_version)
         );
 
         CREATE TABLE IF NOT EXISTS topic_assignments (
@@ -5278,7 +5292,24 @@ fn migrate(conn: &Connection) -> Result<()> {
           USING vec0(embedding float[384]);
         ",
     )?;
+    ensure_column(
+        conn,
+        "enrichment_runs",
+        "schema_description",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     backfill_missing_session_activity(conn)?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
+    }
     Ok(())
 }
 

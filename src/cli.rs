@@ -905,6 +905,30 @@ pub enum EnrichCommand {
         #[arg(long, help = "Explicitly approve the displayed transmission without prompting")]
         yes: bool,
     },
+    /// Preview or remove one version of derived enrichment data.
+    Delete {
+        #[arg(long, value_enum)]
+        kind: EnrichmentKindArg,
+        #[arg(long)]
+        version: String,
+        #[arg(long, help = "Delete the selected derived rows after previewing the count")]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum EnrichmentKindArg {
+    Sentiment,
+    Topics,
+}
+
+impl EnrichmentKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sentiment => "sentiment",
+            Self::Topics => "topics",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2462,7 +2486,6 @@ impl Cli {
                 }
             },
             Command::Enrich { command } => {
-                let llm = crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
                 match command {
                     EnrichCommand::Sentiment {
                         limit,
@@ -2471,6 +2494,8 @@ impl Cli {
                         annotator_version,
                         yes,
                     } => {
+                        let llm =
+                            crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
                         if limit == Some(0) {
                             bail!("annotation limit must be greater than zero");
                         }
@@ -2505,6 +2530,8 @@ impl Cli {
                         labeler_version,
                         yes,
                     } => {
+                        let llm =
+                            crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
                         if limit == Some(0) {
                             bail!("topic label limit must be greater than zero");
                         }
@@ -2525,6 +2552,24 @@ impl Cli {
                             outcome.labeled,
                             outcome.skipped,
                             outcome.pending
+                        );
+                    }
+                    EnrichCommand::Delete { kind, version, yes } => {
+                        let kind = kind.as_str();
+                        let rows = crate::annotate::enrichment_row_count(&store, kind, &version)?;
+                        println!(
+                            "Enrichment deletion preview: {rows} derived {kind} rows for version {version}"
+                        );
+                        if !yes {
+                            bail!(
+                                "nothing deleted; rerun with `histo enrich delete --kind {kind} --version {version} --yes`"
+                            );
+                        }
+                        let outcome =
+                            crate::annotate::delete_enrichment(&store, kind, &version)?;
+                        println!(
+                            "Deleted {} derived {} rows for version {}",
+                            outcome.derived_rows, outcome.kind, outcome.version
                         );
                     }
                 }

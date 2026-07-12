@@ -793,7 +793,9 @@ pub fn topic_label_preflight(
         estimated_cost: "unknown; check the configured provider's current pricing".to_string(),
         logging_and_retention: "unknown; governed by the configured provider account".to_string(),
         resumability: format!("yes; completed labels for version {labeler_version} are skipped"),
-        deletion: format!("histo enrich delete --kind topics --version {labeler_version}"),
+        deletion: format!("histo enrich delete --kind topics --version {labeler_version} --yes"),
+        schema_description: "one additive 2-6 concrete-word label per coherent topic; local labels remain unchanged"
+            .to_string(),
     })
 }
 
@@ -836,7 +838,9 @@ pub fn label_topics(
             &version,
             topic_id,
             &label,
+            llm.provider(),
             llm.model(),
+            llm.destination(),
             labeler_version,
         )?;
         labeled += 1;
@@ -890,10 +894,12 @@ fn topic_count(store: &Store, version: &str) -> Result<usize> {
 fn unlabeled_topic_ids(store: &Store, version: &str, labeler_version: &str) -> Result<Vec<i64>> {
     store.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT topic_id FROM topics
-             WHERE version = ?1
-               AND (label IS NULL OR labeler_version IS NULL OR labeler_version != ?2)
-             ORDER BY size DESC, topic_id",
+            "SELECT t.topic_id FROM topics t
+             LEFT JOIN topic_label_enrichments e
+               ON e.topic_version = t.version AND e.topic_id = t.topic_id
+              AND e.labeler_version = ?2
+             WHERE t.version = ?1 AND e.topic_id IS NULL
+             ORDER BY t.size DESC, t.topic_id",
         )?;
         let rows = stmt.query_map(params![version, labeler_version], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1030,20 +1036,26 @@ fn store_topic_label(
     version: &str,
     topic_id: i64,
     label: &str,
+    provider: &str,
     model: &str,
+    destination: &str,
     labeler_version: &str,
 ) -> Result<()> {
     store.with_conn(|conn| {
         conn.execute(
-            "UPDATE topics
-             SET label = ?3, label_model = ?4, labeler_version = ?5, labeled_at = ?6
-             WHERE version = ?1 AND topic_id = ?2",
+            "INSERT OR IGNORE INTO topic_label_enrichments
+             (topic_version, topic_id, label, provider, model, destination, labeler_version,
+              data_scope, labeled_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 version,
                 topic_id,
                 label,
+                provider,
                 model,
+                destination,
                 labeler_version,
+                "representative human-authored messages and local topic terms",
                 Utc::now().to_rfc3339(),
             ],
         )?;
