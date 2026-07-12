@@ -99,6 +99,16 @@ pub(crate) fn resolve_session_relationship(
     session_metadata: &Value,
     _event_contents: &[&str],
 ) -> SessionRelationshipHint {
+    if source_kind == "claude_code" {
+        if let Some(parent_external_id) = claude_subagent_parent(session_metadata) {
+            return SessionRelationshipHint {
+                parent_external_id: Some(parent_external_id),
+                relationship: SessionRelationshipKind::Subagent,
+                rule: "claude.subagent_path",
+            };
+        }
+    }
+
     if source_kind == "opencode" {
         if let Some(parent_external_id) = session_metadata
             .get("opencode_parent_id")
@@ -124,6 +134,27 @@ pub(crate) fn resolve_session_relationship(
         relationship: SessionRelationshipKind::None,
         rule,
     }
+}
+
+fn claude_subagent_parent(session_metadata: &Value) -> Option<String> {
+    let path = Path::new(session_metadata.get("path")?.as_str()?);
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.starts_with("agent-") || path.parent()?.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    let parent_external_id = path.parent()?.parent()?.file_name()?.to_str()?;
+    is_uuid_text(parent_external_id).then(|| parent_external_id.to_string())
+}
+
+fn is_uuid_text(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 pub(crate) fn codex_subagent_paths(event_content: &str) -> Vec<String> {
