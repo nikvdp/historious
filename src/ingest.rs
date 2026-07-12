@@ -2943,6 +2943,29 @@ mod tests {
             classify_session("claude_code", &json!({}), &[desktop.as_str()]),
             SessionClass::Interactive
         );
+
+        let relationship = resolve_session_relationship(
+            "claude_code",
+            "agent-child",
+            &json!({
+                "path": "/logs/123e4567-e89b-12d3-a456-426614174000/subagents/agent-child.jsonl"
+            }),
+            &[],
+        );
+        assert_eq!(
+            relationship.parent_external_id.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(relationship.relationship, SessionRelationshipKind::Subagent);
+        assert_eq!(relationship.rule, "claude.subagent_path");
+
+        let unrelated = resolve_session_relationship(
+            "claude_code",
+            "regular",
+            &json!({"path": "/logs/regular.jsonl"}),
+            &[],
+        );
+        assert_eq!(unrelated.relationship, SessionRelationshipKind::None);
     }
 
     #[test]

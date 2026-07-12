@@ -1122,6 +1122,58 @@ mod tests {
     }
 
     #[test]
+    fn claude_subagent_path_resolves_to_the_parent_directory_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('claude_parent', 'source_parent', 'machine', 'claude_code',
+                       '123e4567-e89b-12d3-a456-426614174000', 'open',
+                       '{"path":"/logs/parent.jsonl"}', 'claude_parent_hash'),
+                      ('claude_child', 'source_child', 'machine', 'claude_code', 'agent-child',
+                       'open',
+                       '{"path":"/logs/123e4567-e89b-12d3-a456-426614174000/subagents/agent-child.jsonl"}',
+                       'claude_child_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert Claude path relationship fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild Claude relationships");
+        let relationship = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE session_id = 'claude_child'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .expect("load Claude path relationship");
+
+        assert_eq!(relationship.0, "claude_parent");
+        assert_eq!(relationship.1, "claude_parent");
+        assert_eq!(relationship.2, "subagent");
+        assert_eq!(relationship.3, "claude.subagent_path");
+    }
+
+    #[test]
     fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
