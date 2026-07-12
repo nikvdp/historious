@@ -1,10 +1,10 @@
 use crate::analytics;
 use crate::provenance;
 use crate::storage::Store;
-use anyhow::Result;
-use chrono::Utc;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
@@ -22,9 +22,9 @@ pub struct ReportOptions {
     pub sort: ReportSort,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageReport {
-    pub schema: &'static str,
+    pub schema: String,
     pub generated_at: String,
     pub contains_raw_text: bool,
     pub filters: ReportFilters,
@@ -41,14 +41,14 @@ pub struct UsageReport {
     pub sentiment: Option<SentimentSection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportFilters {
     pub since: Option<String>,
     pub project: Option<String>,
-    pub timezone: &'static str,
+    pub timezone: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReportTotals {
     pub sessions: u64,
     pub threads: u64,
@@ -60,14 +60,14 @@ pub struct ReportTotals {
     pub last_activity_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityPoint {
     pub bucket: String,
     pub sessions: u64,
     pub human_messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenPoint {
     pub day: String,
     pub input_tokens: i64,
@@ -75,7 +75,7 @@ pub struct TokenPoint {
     pub output_tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRow {
     pub workspace_path: String,
     pub sessions: u64,
@@ -85,39 +85,39 @@ pub struct ProjectRow {
     pub last_activity_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixPoint {
     pub month: String,
     pub name: String,
     pub sessions: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RhythmBucket {
     pub label: String,
     pub human_messages: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rhythms {
     pub by_hour: Vec<RhythmBucket>,
     pub by_weekday: Vec<RhythmBucket>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FrequencySection {
     pub unigrams: Vec<TermCount>,
     pub bigrams: Vec<TermCount>,
     pub trigrams: Vec<TermCount>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermCount {
     pub term: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSection {
     pub version: String,
     pub model_id: String,
@@ -128,14 +128,14 @@ pub struct TopicSection {
     pub by_project: Vec<TopicProject>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSummary {
     pub topic_id: i64,
     pub label: String,
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicPeriod {
     pub month: String,
     pub topic_id: i64,
@@ -143,7 +143,7 @@ pub struct TopicPeriod {
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicProject {
     pub workspace_path: String,
     pub topic_id: i64,
@@ -151,7 +151,7 @@ pub struct TopicProject {
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentSection {
     pub annotator_version: String,
     pub model: String,
@@ -162,7 +162,7 @@ pub struct SentimentSection {
     pub by_hour: Vec<SentimentHour>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentPeriod {
     pub week: String,
     pub axis: String,
@@ -170,7 +170,7 @@ pub struct SentimentPeriod {
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentProject {
     pub workspace_path: String,
     pub axis: String,
@@ -178,7 +178,7 @@ pub struct SentimentProject {
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentHour {
     pub hour: String,
     pub axis: String,
@@ -187,6 +187,83 @@ pub struct SentimentHour {
 }
 
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
+    if options.since.is_none() && options.project.is_none() {
+        let mut report = read_snapshot(store)?.context(
+            "report snapshot is unavailable; run `histo lab rebuild` before `histo report`",
+        )?;
+        sort_projects(&mut report.projects, options.sort);
+        let freshness = analytics::report_snapshot_freshness(store)?;
+        if freshness.stale {
+            report.warnings.push(format!(
+                "report snapshot is {} old and stale by {} event rows; run `histo lab rebuild`",
+                snapshot_age(&report.generated_at),
+                freshness.new_event_rows
+            ));
+        }
+        return Ok(report);
+    }
+    compute_live(store, options, true)
+}
+
+pub fn rebuild_snapshot(store: &Store) -> Result<()> {
+    let report = compute_live(
+        store,
+        &ReportOptions {
+            since: None,
+            project: None,
+            sort: ReportSort::Tokens,
+        },
+        false,
+    )?;
+    let report_json = serde_json::to_string(&report)?;
+    store.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO report_snapshot (singleton, report_json, generated_at)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+               report_json = excluded.report_json,
+               generated_at = excluded.generated_at",
+            params![report_json, report.generated_at],
+        )?;
+        Ok(())
+    })
+}
+
+fn read_snapshot(store: &Store) -> Result<Option<UsageReport>> {
+    let report_json = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT report_json FROM report_snapshot WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    report_json
+        .map(|json| serde_json::from_str(&json).context("reading report snapshot JSON"))
+        .transpose()
+}
+
+fn snapshot_age(generated_at: &str) -> String {
+    let Ok(generated_at) = DateTime::parse_from_rfc3339(generated_at) else {
+        return "an unknown amount of time".to_string();
+    };
+    let seconds = (Utc::now() - generated_at.with_timezone(&Utc))
+        .num_seconds()
+        .max(0);
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+fn compute_live(
+    store: &Store,
+    options: &ReportOptions,
+    include_projection_warnings: bool,
+) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
     let activity = report_activity(store, options.since.as_deref(), project_pattern.as_deref())?;
@@ -214,16 +291,20 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         report_topics(store, options.since.as_deref(), project_pattern.as_deref())?;
     let (sentiment, sentiment_warning) =
         report_sentiment(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let mut warnings = analytics::freshness(store)?
-        .into_iter()
-        .filter(|status| status.stale)
-        .map(|status| {
-            format!(
-                "{} is stale by {} event rows; run `histo lab rebuild`",
-                status.name, status.new_event_rows
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut warnings = if include_projection_warnings {
+        analytics::freshness(store)?
+            .into_iter()
+            .filter(|status| status.stale)
+            .map(|status| {
+                format!(
+                    "{} is stale by {} event rows; run `histo lab rebuild`",
+                    status.name, status.new_event_rows
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let missing_opencode: i64 = store.with_conn(|conn| {
         conn.query_row(
             "SELECT COUNT(*) FROM session_facts
@@ -246,13 +327,13 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     }
 
     Ok(UsageReport {
-        schema: "historious.report.v1",
+        schema: "historious.report.v1".to_string(),
         generated_at: Utc::now().to_rfc3339(),
         contains_raw_text: false,
         filters: ReportFilters {
             since: options.since.clone(),
             project: options.project.clone(),
-            timezone: "local",
+            timezone: "local".to_string(),
         },
         warnings,
         totals,

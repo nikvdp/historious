@@ -15,8 +15,10 @@ pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 7;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
+pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
+pub const REPORT_SNAPSHOT_VERSION: u32 = 1;
 
-const PROJECTIONS: [Projection; 3] = [
+const PROJECTIONS: [Projection; 4] = [
     Projection {
         name: SESSION_RELATIONSHIPS_PROJECTION,
         version: SESSION_RELATIONSHIPS_VERSION,
@@ -31,6 +33,11 @@ const PROJECTIONS: [Projection; 3] = [
         name: SESSION_FACTS_PROJECTION,
         version: SESSION_FACTS_VERSION,
         table: "session_facts",
+    },
+    Projection {
+        name: REPORT_SNAPSHOT_PROJECTION,
+        version: REPORT_SNAPSHOT_VERSION,
+        table: "report_snapshot",
     },
 ];
 
@@ -115,6 +122,10 @@ pub fn freshness(store: &Store) -> Result<Vec<ProjectionFreshness>> {
 
 pub fn is_stale(store: &Store) -> Result<bool> {
     Ok(freshness(store)?.iter().any(|status| status.stale))
+}
+
+pub fn report_snapshot_freshness(store: &Store) -> Result<ProjectionFreshness> {
+    projection_freshness(store, PROJECTIONS[3])
 }
 
 pub fn audit_provenance(
@@ -213,6 +224,7 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
         SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships(store),
         MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store),
         SESSION_FACTS_PROJECTION => rebuild_session_facts(store),
+        REPORT_SNAPSHOT_PROJECTION => crate::report::rebuild_snapshot(store),
         _ => clear_projection(store, projection),
     };
 

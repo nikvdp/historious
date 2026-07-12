@@ -5202,6 +5202,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_session_facts_source
           ON session_facts(source_kind);
 
+        CREATE TABLE IF NOT EXISTS report_snapshot (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          report_json TEXT NOT NULL,
+          generated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS source_status_counts (
           source_kind TEXT PRIMARY KEY,
           sessions INTEGER NOT NULL DEFAULT 0,
