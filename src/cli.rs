@@ -783,6 +783,10 @@ pub enum Command {
         sort: ReportSortArg,
         #[arg(long, help = "Print the reusable aggregate report model as JSON")]
         json: bool,
+        #[arg(long, help = "Print stable unstyled text without terminal color")]
+        plain: bool,
+        #[arg(long, value_enum, help = "Color output: auto, always, or never")]
+        color: Option<ColorArg>,
     },
     /// Read and update persistent Historious configuration.
     Config {
@@ -2697,6 +2701,8 @@ impl Cli {
                 project,
                 sort,
                 json,
+                plain,
+                color,
             } => {
                 let since = transport::parse_since_arg(since.as_deref())?
                     .map(|value| value.to_rfc3339());
@@ -2712,7 +2718,13 @@ impl Cli {
                     serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
                     println!();
                 } else {
-                    write_stdout(&report::render_terminal(&report))?;
+                    let no_color = plain || std::env::var_os("NO_COLOR").is_some();
+                    let color = should_color(no_color, color, robot);
+                    write_stdout(&report::render_terminal_themed(
+                        &report,
+                        terminal_columns(),
+                        color,
+                    ))?;
                 }
             }
             Command::Onboard { agents_md } => {
@@ -5770,7 +5782,7 @@ enum ThemeMode {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum StyleRole {
+pub(crate) enum StyleRole {
     Header,
     Section,
     Project,
@@ -5780,7 +5792,7 @@ enum StyleRole {
     Muted,
 }
 
-fn styled_role(text: &str, role: StyleRole, color: bool) -> String {
+pub(crate) fn styled_role(text: &str, role: StyleRole, color: bool) -> String {
     if !color {
         return text.to_string();
     }

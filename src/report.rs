@@ -1,4 +1,5 @@
 use crate::analytics;
+use crate::cli::{styled_role, StyleRole};
 use crate::provenance;
 use crate::storage::Store;
 use anyhow::{Context, Result};
@@ -1303,71 +1304,293 @@ fn nonnegative(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+pub(crate) fn sparkline(values: &[u64], width: usize) -> String {
+    let values = sampled_values(values, width);
+    let Some((&minimum, &maximum)) = values.iter().min().zip(values.iter().max()) else {
+        return String::new();
+    };
+    let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    values
+        .into_iter()
+        .map(|value| {
+            if minimum == maximum {
+                levels[3]
+            } else {
+                let index = (value - minimum) as usize * (levels.len() - 1)
+                    / (maximum - minimum) as usize;
+                levels[index]
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn horizontal_bar(value: f64, maximum: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let ratio = if maximum > 0.0 {
+        (value / maximum).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = (ratio * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+#[allow(dead_code)] // The enrichment ticket consumes this neutral sentiment primitive.
+pub(crate) fn neutral_bar(value: f64, maximum: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut cells = vec![' '; width];
+    let center = width / 2;
+    cells[center] = '│';
+    if maximum > 0.0 {
+        let reach = center.min(width.saturating_sub(center + 1));
+        let filled = ((value.abs() / maximum).clamp(0.0, 1.0) * reach as f64).round() as usize;
+        if value < 0.0 {
+            for cell in &mut cells[center.saturating_sub(filled)..center] {
+                *cell = '█';
+            }
+        } else {
+            for cell in &mut cells[center + 1..(center + 1 + filled).min(width)] {
+                *cell = '█';
+            }
+        }
+    }
+    cells.into_iter().collect()
+}
+
+pub(crate) fn compact_heatmap(values: &[u64], width: usize) -> String {
+    let values = sampled_values(values, width);
+    let maximum = values.iter().copied().max().unwrap_or(0);
+    let levels = ['·', '░', '▒', '▓', '█'];
+    values
+        .into_iter()
+        .map(|value| {
+            if maximum == 0 {
+                levels[0]
+            } else {
+                levels[value as usize * (levels.len() - 1) / maximum as usize]
+            }
+        })
+        .collect()
+}
+
+fn sampled_values(values: &[u64], width: usize) -> Vec<u64> {
+    if values.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let count = values.len().min(width);
+    (0..count)
+        .map(|index| values[index * values.len() / count])
+        .collect()
+}
+
+#[cfg(test)]
 pub fn render_terminal(report: &UsageReport) -> String {
+    render_terminal_themed(report, 80, false)
+}
+
+pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -> String {
+    let width = width.max(20);
     let mut out = String::new();
-    out.push_str("Historious report\n");
-    out.push_str(&format!(
-        "Period {} → {} · snapshot {} · local time\n",
-        report.totals.first_activity_at.as_deref().unwrap_or("unknown"),
-        report.totals.last_activity_at.as_deref().unwrap_or("unknown"),
-        report.generated_at
-    ));
+    out.push_str(&styled_role("Historious report", StyleRole::Header, color));
+    out.push('\n');
+    push_wrapped(
+        &mut out,
+        &format!(
+            "Period {} → {}",
+            report.totals.first_activity_at.as_deref().unwrap_or("unknown"),
+            report.totals.last_activity_at.as_deref().unwrap_or("unknown")
+        ),
+        width,
+        0,
+        StyleRole::Time,
+        color,
+    );
+    push_wrapped(
+        &mut out,
+        &format!("Snapshot {} · local time", report.generated_at),
+        width,
+        0,
+        StyleRole::Muted,
+        color,
+    );
     if report.filters.since.is_some() || report.filters.project.is_some() {
-        out.push_str(&format!(
-            "Filters · since {} · project {}\n",
-            report.filters.since.as_deref().unwrap_or("all time"),
-            report.filters.project.as_deref().unwrap_or("all projects")
-        ));
+        push_wrapped(
+            &mut out,
+            &format!(
+                "Filters · since {} · project {}",
+                report.filters.since.as_deref().unwrap_or("all time"),
+                report.filters.project.as_deref().unwrap_or("all projects")
+            ),
+            width,
+            0,
+            StyleRole::Muted,
+            color,
+        );
     }
     for warning in &report.warnings {
-        out.push_str(&format!("Note: {warning}\n"));
+        push_wrapped(
+            &mut out,
+            &format!("Note: {warning}"),
+            width,
+            0,
+            StyleRole::Muted,
+            color,
+        );
     }
 
-    out.push_str("\nActivity overview\n");
+    out.push('\n');
+    out.push_str(&styled_role("Activity overview", StyleRole::Section, color));
+    out.push('\n');
     out.push_str(&format!(
-        "  {} sessions · {} threads · {} human messages · {} agent messages\n",
-        report.totals.sessions,
-        report.totals.threads,
-        report.totals.human_messages,
-        report.totals.agent_messages
+        "  {} sessions · {} threads\n  {} human messages · {} agent messages\n",
+        styled_role(
+            &compact_number(report.totals.sessions),
+            StyleRole::Count,
+            color
+        ),
+        styled_role(
+            &compact_number(report.totals.threads),
+            StyleRole::Count,
+            color
+        ),
+        styled_role(
+            &compact_number(report.totals.human_messages),
+            StyleRole::Count,
+            color
+        ),
+        styled_role(
+            &compact_number(report.totals.agent_messages),
+            StyleRole::Count,
+            color
+        )
     ));
     for point in report.activity.iter().rev().take(6).rev() {
         out.push_str(&format!(
-            "  {:<10} {:>5} sessions · {:>6} human messages\n",
-            point.bucket, point.sessions, point.human_messages
+            "  {:<10} {:>5} sess · {:>6} msg\n",
+            point.bucket,
+            compact_number(point.sessions),
+            compact_number(point.human_messages)
         ));
     }
 
-    out.push_str("\nWhat changed · trailing 4 weeks vs prior 4 weeks\n");
+    let activity_values = report
+        .activity
+        .iter()
+        .rev()
+        .take(16)
+        .map(|point| point.human_messages)
+        .collect::<Vec<_>>();
+    let activity_values = activity_values.into_iter().rev().collect::<Vec<_>>();
+    if !activity_values.is_empty() {
+        let chart = sparkline(&activity_values, width.saturating_sub(12).min(48));
+        out.push_str(&format!(
+            "  {} {}\n",
+            styled_role("trend", StyleRole::Muted, color),
+            styled_role(&chart, StyleRole::Time, color)
+        ));
+    }
+
+    out.push('\n');
+    out.push_str(&styled_role("What changed", StyleRole::Section, color));
+    out.push('\n');
+    push_wrapped(
+        &mut out,
+        "trailing 4 weeks vs prior 4 weeks",
+        width,
+        2,
+        StyleRole::Muted,
+        color,
+    );
     if report.changes.is_empty() {
-        out.push_str("  No change cleared the sample and effect thresholds.\n");
+        push_wrapped(
+            &mut out,
+            "No change cleared the sample and effect thresholds.",
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
     } else {
         for insight in &report.changes {
-            out.push_str(&format!("  {}\n", render_change(insight)));
+            push_wrapped(
+                &mut out,
+                &render_change(insight, width),
+                width,
+                2,
+                StyleRole::Title,
+                color,
+            );
         }
     }
 
     if !report.daypart_insights.is_empty() {
-        out.push_str("\nWorking rhythm\n");
+        out.push('\n');
+        out.push_str(&styled_role("Working rhythm", StyleRole::Section, color));
+        out.push('\n');
+        let hour_values = report
+            .rhythms
+            .by_hour
+            .iter()
+            .map(|bucket| bucket.human_messages)
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "  {} {} {}\n",
+            styled_role("00", StyleRole::Time, color),
+            styled_role(
+                &compact_heatmap(&hour_values, width.saturating_sub(12).min(24)),
+                StyleRole::Count,
+                color
+            ),
+            styled_role("23", StyleRole::Time, color)
+        ));
         for insight in &report.daypart_insights {
-            out.push_str(&format!(
-                "  {}: {:.0}% of human messages vs {:.0}% of the clock ({} messages)\n",
-                insight.label,
-                insight.share_percent,
-                insight.baseline_percent,
-                insight.human_messages
-            ));
+            let bar_width = width.saturating_sub(42).clamp(8, 24);
+            let bar = styled_role(
+                &horizontal_bar(insight.share_percent, 100.0, bar_width),
+                StyleRole::Count,
+                color,
+            );
+            if width < 70 {
+                out.push_str(&format!(
+                    "  {} {:.0}% vs {:.0}% · {} msg\n    {}\n",
+                    styled_role(&insight.label, StyleRole::Time, color),
+                    insight.share_percent,
+                    insight.baseline_percent,
+                    compact_number(insight.human_messages),
+                    bar
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {:<13} {} {:>3.0}% vs {:>3.0}% · {} msg\n",
+                    styled_role(&insight.label, StyleRole::Time, color),
+                    bar,
+                    insight.share_percent,
+                    insight.baseline_percent,
+                    compact_number(insight.human_messages)
+                ));
+            }
         }
     }
 
-    out.push_str("\nLeading projects\n");
+    out.push('\n');
+    out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
+    out.push('\n');
     for row in report.projects.iter().take(5) {
+        let path = ellipsize_middle(&row.workspace_path, width.saturating_sub(2).max(10));
         out.push_str(&format!(
-            "  {} · {} sessions · {} human messages · {:.1}h\n",
-            row.workspace_path,
-            row.sessions,
-            row.human_messages,
-            row.duration_secs as f64 / 3_600.0
+            "  {}\n    {} sess · {} msg · {}\n",
+            styled_role(&path, StyleRole::Project, color),
+            styled_role(&compact_number(row.sessions), StyleRole::Count, color),
+            styled_role(&compact_number(row.human_messages), StyleRole::Count, color),
+            styled_role(
+                &format!("{}h", compact_number((row.duration_secs / 3_600).max(0) as u64)),
+                StyleRole::Muted,
+                color
+            )
         ));
     }
     if report.topics.as_ref().is_some_and(|topics| {
@@ -1381,27 +1604,104 @@ pub fn render_terminal(report: &UsageReport) -> String {
     out
 }
 
-fn render_change(insight: &ChangeInsight) -> String {
+fn ellipsize_middle(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let keep = width - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let start = value.chars().take(left).collect::<String>();
+    let end = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
+fn render_change(insight: &ChangeInsight, width: usize) -> String {
     let label = insight
         .subject
         .as_ref()
-        .map(|subject| format!("{} in {subject}", insight.metric))
+        .map(|subject| {
+            format!(
+                "{} in {}",
+                insight.metric,
+                ellipsize_middle(subject, width.saturating_sub(28).max(12))
+            )
+        })
         .unwrap_or_else(|| insight.metric.clone());
     match insight.change_percent {
         Some(percent) if percent >= 0 => format!(
             "{label} rose {percent}% · {} now vs {} before",
-            insight.current, insight.previous
+            compact_number(insight.current),
+            compact_number(insight.previous)
         ),
         Some(percent) => format!(
             "{label} fell {}% · {} now vs {} before",
             percent.unsigned_abs(),
-            insight.current,
-            insight.previous
+            compact_number(insight.current),
+            compact_number(insight.previous)
         ),
         None => format!(
             "{label} is new · {} now vs none before",
-            insight.current
+            compact_number(insight.current)
         ),
+    }
+}
+
+fn compact_number(value: u64) -> String {
+    for (threshold, suffix) in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")] {
+        if value >= threshold {
+            let scaled = value as f64 / threshold as f64;
+            return if scaled >= 10.0 {
+                format!("{scaled:.0}{suffix}")
+            } else {
+                format!("{scaled:.1}{suffix}")
+            };
+        }
+    }
+    value.to_string()
+}
+
+fn push_wrapped(
+    out: &mut String,
+    text: &str,
+    width: usize,
+    indent: usize,
+    role: StyleRole,
+    color: bool,
+) {
+    let prefix = " ".repeat(indent.min(width.saturating_sub(1)));
+    let budget = width.saturating_sub(prefix.len()).max(1);
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > budget {
+            out.push_str(&prefix);
+            out.push_str(&styled_role(&line, role, color));
+            out.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        if word.chars().count() > budget {
+            line.push_str(&ellipsize_middle(word, budget));
+        } else {
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push_str(&prefix);
+        out.push_str(&styled_role(&line, role, color));
+        out.push('\n');
     }
 }
 
