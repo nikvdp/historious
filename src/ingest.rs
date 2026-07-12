@@ -2792,6 +2792,21 @@ mod tests {
     }
 
     #[test]
+    fn extracts_codex_subagent_paths_from_embedded_and_structured_notifications() {
+        let embedded = r#"<subagent_notification>{"agent_path":"child-one"}</subagent_notification>"#;
+        assert_eq!(codex_subagent_paths(embedded), vec!["child-one"]);
+
+        let structured = json!({
+            "type": "message",
+            "content": "<subagent_notification>",
+            "payload": {"agent_path": "child-two"}
+        })
+        .to_string();
+        assert_eq!(codex_subagent_paths(&structured), vec!["child-two"]);
+        assert!(codex_subagent_paths(r#"{"agent_path":"not-a-notification"}"#).is_empty());
+    }
+
+    #[test]
     fn classifies_opencode_parent_sessions_as_subagents() {
         assert_eq!(
             classify_session(

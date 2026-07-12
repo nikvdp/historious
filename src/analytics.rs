@@ -992,6 +992,87 @@ mod tests {
     }
 
     #[test]
+    fn codex_notifications_link_children_and_surface_parent_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('parent_one', 'source_parent_one', 'machine', 'codex', 'parent-one',
+                       'open', '{}', 'parent_one_hash'),
+                      ('parent_two', 'source_parent_two', 'machine', 'codex', 'parent-two',
+                       'open', '{}', 'parent_two_hash'),
+                      ('child_single', 'source_child_single', 'machine', 'codex', 'child-single',
+                       'open', '{}', 'child_single_hash'),
+                      ('child_collision', 'source_child_collision', 'machine', 'codex',
+                       'child-collision', 'open', '{}', 'child_collision_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, metadata_json, hash)
+                    VALUES
+                      ('notify_single', 'parent_one', 'source_parent_one', 'machine', 'codex', 0,
+                       'message', 'user',
+                       '<subagent_notification>{"agent_path":"child-single"}</subagent_notification>',
+                       '{}', 'notify_single_hash'),
+                      ('notify_collision_first', 'parent_one', 'source_parent_one', 'machine',
+                       'codex', 1, 'message', 'user',
+                       '<subagent_notification>{"agent_path":"child-collision"}</subagent_notification>',
+                       '{}', 'notify_collision_first_hash'),
+                      ('notify_collision_second', 'parent_two', 'source_parent_two', 'machine',
+                       'codex', 0, 'message', 'user',
+                       '<subagent_notification>{"agent_path":"child-collision"}</subagent_notification>',
+                       '{}', 'notify_collision_second_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert Codex relationship fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild Codex relationships");
+        let rows = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE session_id LIKE 'child_%'
+                     ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load Codex relationships");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "child_collision");
+        assert_eq!(
+            (rows[0].1.as_str(), rows[0].2.as_str(), rows[0].3.as_str()),
+            ("parent_one", "parent_one", "subagent")
+        );
+        assert_eq!(rows[0].4, "codex.subagent_notification.collision");
+        assert_eq!(rows[1].0, "child_single");
+        assert_eq!(
+            (rows[1].1.as_str(), rows[1].2.as_str(), rows[1].3.as_str()),
+            ("parent_one", "parent_one", "subagent")
+        );
+        assert_eq!(rows[1].4, "codex.subagent_notification");
+    }
+
+    #[test]
     fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
