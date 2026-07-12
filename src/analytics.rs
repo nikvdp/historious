@@ -1446,6 +1446,103 @@ mod tests {
     }
 
     #[test]
+    fn codex_shared_prefix_links_forks_without_overriding_subagents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                for (session_id, external_id) in [
+                    ("fork_parent", "parent-external"),
+                    ("fork_child", "fork-external"),
+                    ("fork_subagent", "subagent-external"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO sessions
+                         (id, source_id, machine_id, source_kind, external_id, status,
+                          metadata_json, hash)
+                         VALUES (?1, ?2, 'machine', 'codex', ?3, 'open', '{}', ?4)",
+                        params![
+                            session_id,
+                            format!("source_{session_id}"),
+                            external_id,
+                            format!("{session_id}_hash")
+                        ],
+                    )?;
+                    for ordinal in 0..8 {
+                        conn.execute(
+                            "INSERT INTO events
+                             (id, session_id, source_id, machine_id, source_kind, ordinal,
+                              event_type, role, content, metadata_json, hash)
+                             VALUES (?1, ?2, ?3, 'machine', 'codex', ?4, 'message', 'user',
+                                     'shared', '{}', ?5)",
+                            params![
+                                format!("{session_id}_event_{ordinal}"),
+                                session_id,
+                                format!("source_{session_id}"),
+                                ordinal,
+                                format!("shared_hash_{ordinal}")
+                            ],
+                        )?;
+                    }
+                    conn.execute(
+                        "INSERT INTO events
+                         (id, session_id, source_id, machine_id, source_kind, ordinal,
+                          event_type, role, content, metadata_json, hash)
+                         VALUES (?1, ?2, ?3, 'machine', 'codex', 8, 'message', 'assistant',
+                                 'diverged', '{}', ?4)",
+                        params![
+                            format!("{session_id}_tail"),
+                            session_id,
+                            format!("source_{session_id}"),
+                            format!("{session_id}_tail_hash")
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO events
+                     (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                      role, content, metadata_json, hash)
+                     VALUES ('fork_notification', 'fork_parent', 'source_fork_parent', 'machine',
+                             'codex', 9, 'message', 'user', ?1, '{}', 'fork_notification_hash')",
+                    ["<subagent_notification>{\"agent_path\":\"subagent-external\"}</subagent_notification>"],
+                )?;
+                Ok(())
+            })
+            .expect("insert Codex fork fixtures");
+
+        rebuild_all(&store, |_, _, _| {}).expect("rebuild Codex fork relationships");
+        let rows = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, parent_session_id, relationship, rule
+                     FROM session_relationships
+                     WHERE session_id IN ('fork_child', 'fork_subagent')
+                     ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load Codex fork relationships");
+
+        assert_eq!(rows[0].0, "fork_child");
+        assert_eq!(rows[0].1, "fork_parent");
+        assert_eq!(rows[0].2, "fork");
+        assert_eq!(rows[0].3, "codex.shared_prefix");
+        assert_eq!(rows[1].0, "fork_subagent");
+        assert_eq!(rows[1].1, "fork_parent");
+        assert_eq!(rows[1].2, "subagent");
+        assert_eq!(rows[1].3, "codex.subagent_notification");
+    }
+
+    #[test]
     fn opencode_parent_metadata_resolves_to_the_native_parent_session() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
