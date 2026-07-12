@@ -282,14 +282,15 @@ pub fn annotate_messages(
         }
         let prompt_items = inputs
             .iter()
-            .map(|input| {
+            .enumerate()
+            .map(|(index, input)| {
                 let text = if input.usable == "strip_wrapper" {
                     crate::provenance::strip_human_wrapper(&input.text, &input.rule)
                 } else {
                     input.text.clone()
                 };
                 serde_json::json!({
-                    "id": input.item_id,
+                    "id": index.to_string(),
                     "message": text.chars().take(2_000).collect::<String>()
                 })
             })
@@ -298,25 +299,30 @@ pub fn annotate_messages(
             sentiment_system_prompt(),
             &Value::Array(prompt_items).to_string(),
         )?;
-        let expected_ids = inputs
-            .iter()
-            .map(|input| input.item_id.as_str())
+        let expected_ids = (0..inputs.len())
+            .map(|index| index.to_string())
             .collect::<Vec<_>>();
-        let scores = parse_annotation_response(&response, &expected_ids)?;
+        let expected_id_refs = expected_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let scores = parse_annotation_response(&response, &expected_id_refs)?;
         let annotated_at = Utc::now();
-        let rows = scores
-            .into_iter()
-            .flat_map(|scores| {
-                SENTIMENT_AXES.map(|axis| MessageAnnotation {
-                    item_id: scores.id.clone(),
-                    axis: axis.to_string(),
-                    score: scores.scores[axis],
-                    model: llm.model().to_string(),
-                    annotator_version: options.annotator_version.clone(),
-                    annotated_at,
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(inputs.len() * SENTIMENT_AXES.len());
+        for scores in scores {
+            let index = scores
+                .id
+                .parse::<usize>()
+                .context("annotation response item id was not an ordinal")?;
+            let input = inputs
+                .get(index)
+                .context("annotation response item ordinal was out of range")?;
+            rows.extend(SENTIMENT_AXES.map(|axis| MessageAnnotation {
+                item_id: input.item_id.clone(),
+                axis: axis.to_string(),
+                score: scores.scores[axis],
+                model: llm.model().to_string(),
+                annotator_version: options.annotator_version.clone(),
+                annotated_at,
+            }));
+        }
         insert_annotations(store, &rows)?;
         annotated_messages += inputs.len();
     }
