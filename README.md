@@ -2,11 +2,12 @@
 
 Your coding agents have a past. Historious makes it searchable.
 
-If you use Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, or similar tools,
-your machine already has a quiet archive of useful work: commands that worked,
-fixes that failed, decisions you made, error messages you chased, and threads you
-would absolutely reuse if you could find them. Historious indexes those local
-transcripts and gives you one command, `histo`, for searching them again.
+If you use Codex, Claude Code, OpenCode, pi, Oh My Pi (OMP), OpenClaw, Hermes, or
+similar tools, your machine already has a quiet archive of useful work: commands
+that worked, fixes that failed, decisions you made, error messages you chased,
+and threads you would absolutely reuse if you could find them. Historious indexes
+those local transcripts and gives you one command, `histo`, for searching them
+again.
 
 The point is agent memory without a hosted memory service. Search across
 projects, machines, and sessions; recover the exact thread where something
@@ -241,6 +242,7 @@ Useful export filters:
 
 ```bash
 histo export --jsonl --source codex
+histo export --jsonl --source omp
 histo export --jsonl --workspace /absolute/repo/path
 histo export --jsonl --session <session_id>
 histo export --jsonl --since 2026-06-01

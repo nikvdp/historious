@@ -126,6 +126,7 @@ Manifest storage applies to local append-style JSONL sources:
 - Codex JSONL sessions.
 - Claude Code JSONL project sessions.
 - pi JSONL agent sessions.
+- Oh My Pi (OMP) JSONL agent sessions, stored under the separate `omp` source kind.
 - OpenClaw JSONL sessions.
 - Hermes JSONL sessions.
 

@@ -10,7 +10,7 @@ pub struct PackagedSkill {
 
 const SEARCH_AGENT_HISTORY_HISTORIOUS: &str = r#"---
 name: search-agent-history-historious
-description: Search coding-agent conversation history with Historious across Codex, Claude Code, OpenCode, pi, OpenClaw, Hermes, and other indexed local agent logs; use Historious transcript retrieval for exact content and backend raw logs only as a stated last resort.
+description: Search coding-agent conversation history with Historious across Codex, Claude Code, OpenCode, pi, Oh My Pi (OMP), OpenClaw, Hermes, and other indexed local agent logs; use Historious transcript retrieval for exact content and backend raw logs only as a stated last resort.
 ---
 
 # Search Agent History With Historious
