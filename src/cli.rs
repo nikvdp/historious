@@ -897,6 +897,19 @@ pub enum LabCommand {
         #[arg(short = 'n', default_value_t = 20)]
         limit: usize,
     },
+    /// Score approved sentiment dimensions over human-authored messages.
+    Annotate {
+        #[arg(long, help = "Annotate at most this many incomplete messages")]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+        #[arg(long, default_value = "sentiment-v1")]
+        annotator_version: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, help = "Exact chat completions endpoint URL")]
+        url: Option<String>,
+    },
     /// Build local embeddings for topic analysis.
     Topics {
         #[command(subcommand)]
@@ -2461,6 +2474,36 @@ impl Cli {
                             println!("    {occurred_at}");
                         }
                     }
+                }
+                LabCommand::Annotate {
+                    limit,
+                    batch_size,
+                    annotator_version,
+                    model,
+                    url,
+                } => {
+                    if limit == Some(0) {
+                        bail!("annotation limit must be greater than zero");
+                    }
+                    let llm = crate::annotate::OpenAiJsonLlm::from_env(url, model)?;
+                    let outcome = crate::annotate::annotate_messages(
+                        &store,
+                        &llm,
+                        &crate::annotate::AnnotateOptions {
+                            limit,
+                            batch_size,
+                            annotator_version,
+                        },
+                    )?;
+                    println!(
+                        "Sentiment annotations {} ({}): {} messages, {} scores added, {} messages reused, {} pending",
+                        outcome.annotator_version,
+                        outcome.model,
+                        outcome.annotated_messages,
+                        outcome.scores_written,
+                        outcome.skipped_messages,
+                        outcome.pending_messages
+                    );
                 }
                 LabCommand::Topics {
                     command: TopicCommand::Embed { limit },
@@ -9661,6 +9704,36 @@ mod tests {
                     limit: 30,
                 }
             } if rule == "default.human"
+        ));
+    }
+
+    #[test]
+    fn lab_annotation_options_parse() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "lab",
+            "annotate",
+            "--limit",
+            "25",
+            "--batch-size",
+            "5",
+            "--annotator-version",
+            "mood-v2",
+            "--model",
+            "small-model",
+        ])
+        .expect("parse annotation command");
+        assert!(matches!(
+            cli.command,
+            Command::Lab {
+                command: LabCommand::Annotate {
+                    limit: Some(25),
+                    batch_size: 5,
+                    annotator_version,
+                    model: Some(model),
+                    url: None,
+                }
+            } if annotator_version == "mood-v2" && model == "small-model"
         ));
     }
 

@@ -2,7 +2,9 @@ use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Transaction, TransactionBehavior};
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +16,20 @@ pub struct MessageAnnotation {
     pub annotator_version: String,
     pub annotated_at: DateTime<Utc>,
 }
+
+pub const SENTIMENT_AXES: [&str; 11] = [
+    "happiness",
+    "excitement",
+    "frustration",
+    "satisfaction",
+    "curiosity",
+    "confidence",
+    "urgency",
+    "decisiveness",
+    "warmth",
+    "momentum",
+    "playfulness",
+];
 
 pub fn insert_annotations(store: &Store, annotations: &[MessageAnnotation]) -> Result<()> {
     for annotation in annotations {
@@ -136,11 +152,11 @@ impl OpenAiJsonLlm {
             .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
         let api_key = std::env::var("HISTO_LLM_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .context("set HISTO_LLM_API_KEY or OPENAI_API_KEY for LLM labeling")?;
+            .context("set HISTO_LLM_API_KEY or OPENAI_API_KEY for LLM requests")?;
         let model = model
             .or_else(|| std::env::var("HISTO_LLM_MODEL").ok())
             .or_else(|| std::env::var("OPENAI_MODEL").ok())
-            .context("set --model, HISTO_LLM_MODEL, or OPENAI_MODEL for LLM labeling")?;
+            .context("set --model, HISTO_LLM_MODEL, or OPENAI_MODEL for LLM requests")?;
         Ok(Self {
             url,
             api_key,
@@ -172,9 +188,7 @@ impl JsonLlm for OpenAiJsonLlm {
                     let value: Value = response.into_json().context("parsing LLM response")?;
                     return chat_content(&value).map(ToOwned::to_owned);
                 }
-                Err(ureq::Error::Status(status, _))
-                    if (status == 429 || status >= 500) && attempt < 3 =>
-                {
+                Err(ureq::Error::Status(status, _)) if retryable_status(status) && attempt < 3 => {
                     std::thread::sleep(Duration::from_secs(1 << attempt));
                 }
                 Err(error) => return Err(error).context("calling LLM labeling endpoint"),
@@ -182,6 +196,10 @@ impl JsonLlm for OpenAiJsonLlm {
         }
         unreachable!("retry loop returns on its final attempt")
     }
+}
+
+fn retryable_status(status: u16) -> bool {
+    status == 429 || status >= 500
 }
 
 fn chat_completions_url(base: String) -> String {
@@ -202,9 +220,245 @@ fn chat_content(value: &Value) -> Result<&str> {
         .context("LLM response did not include choices[0].message.content")
 }
 
+#[derive(Debug, Clone)]
+pub struct AnnotateOptions {
+    pub limit: Option<usize>,
+    pub batch_size: usize,
+    pub annotator_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotateOutcome {
+    pub model: String,
+    pub annotator_version: String,
+    pub annotated_messages: usize,
+    pub skipped_messages: usize,
+    pub scores_written: usize,
+    pub pending_messages: usize,
+}
+
+struct AnnotationInput {
+    item_id: String,
+    text: String,
+    rule: String,
+    usable: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotationBatchResponse {
+    items: Vec<AnnotationScores>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotationScores {
+    id: String,
+    scores: HashMap<String, u8>,
+}
+
+pub fn annotate_messages(
+    store: &Store,
+    llm: &dyn JsonLlm,
+    options: &AnnotateOptions,
+) -> Result<AnnotateOutcome> {
+    if options.batch_size == 0 {
+        bail!("annotation batch size must be greater than zero");
+    }
+    if options.annotator_version.trim().is_empty() {
+        bail!("annotator version must not be empty");
+    }
+    let total = annotatable_message_count(store)?;
+    let complete_before = complete_message_count(store, &options.annotator_version)?;
+    let rows_before = annotation_row_count(store, &options.annotator_version)?;
+    let target = options.limit.unwrap_or(usize::MAX);
+    let mut annotated_messages = 0;
+    while annotated_messages < target {
+        let inputs = missing_annotation_inputs(
+            store,
+            &options.annotator_version,
+            options.batch_size.min(target - annotated_messages),
+        )?;
+        if inputs.is_empty() {
+            break;
+        }
+        let prompt_items = inputs
+            .iter()
+            .map(|input| {
+                let text = if input.usable == "strip_wrapper" {
+                    crate::provenance::strip_human_wrapper(&input.text, &input.rule)
+                } else {
+                    input.text.clone()
+                };
+                serde_json::json!({
+                    "id": input.item_id,
+                    "message": text.chars().take(2_000).collect::<String>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = llm.complete_json(
+            sentiment_system_prompt(),
+            &Value::Array(prompt_items).to_string(),
+        )?;
+        let expected_ids = inputs
+            .iter()
+            .map(|input| input.item_id.as_str())
+            .collect::<Vec<_>>();
+        let scores = parse_annotation_response(&response, &expected_ids)?;
+        let annotated_at = Utc::now();
+        let rows = scores
+            .into_iter()
+            .flat_map(|scores| {
+                SENTIMENT_AXES.map(|axis| MessageAnnotation {
+                    item_id: scores.id.clone(),
+                    axis: axis.to_string(),
+                    score: scores.scores[axis],
+                    model: llm.model().to_string(),
+                    annotator_version: options.annotator_version.clone(),
+                    annotated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        insert_annotations(store, &rows)?;
+        annotated_messages += inputs.len();
+    }
+    let complete_after = complete_message_count(store, &options.annotator_version)?;
+    let rows_after = annotation_row_count(store, &options.annotator_version)?;
+    Ok(AnnotateOutcome {
+        model: llm.model().to_string(),
+        annotator_version: options.annotator_version.clone(),
+        annotated_messages,
+        skipped_messages: complete_before,
+        scores_written: rows_after.saturating_sub(rows_before),
+        pending_messages: total.saturating_sub(complete_after),
+    })
+}
+
+fn sentiment_system_prompt() -> &'static str {
+    r#"Score each message independently from 1 to 5 on every axis. Use 3 for neutral, mixed, or unclear. Axes: happiness (negative/unhappy to positive/happy); excitement (calm/flat to enthusiastic/energized); frustration (unbothered to strongly frustrated); satisfaction (dissatisfied with results to pleased); curiosity (purely directive to exploratory/inquisitive); confidence (uncertain/confused to confident); urgency (leisurely to time-pressured); decisiveness (tentative to firmly decided); warmth (cold/transactional to warm/appreciative); momentum (stuck/blocked to flowing/making progress); playfulness (serious/literal to playful/humorous). Do not infer traits or mental health. Return JSON only: {"items":[{"id":"exact input id","scores":{"happiness":1,"excitement":1,"frustration":1,"satisfaction":1,"curiosity":1,"confidence":1,"urgency":1,"decisiveness":1,"warmth":1,"momentum":1,"playfulness":1}}]}."#
+}
+
+fn parse_annotation_response(
+    response: &str,
+    expected_ids: &[&str],
+) -> Result<Vec<AnnotationScores>> {
+    let parsed: AnnotationBatchResponse =
+        serde_json::from_str(response).context("parsing sentiment annotation response")?;
+    let expected = expected_ids.iter().copied().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for item in &parsed.items {
+        if !expected.contains(item.id.as_str()) || !seen.insert(item.id.as_str()) {
+            bail!("annotation response contained an unexpected or duplicate item id");
+        }
+        if item.scores.len() != SENTIMENT_AXES.len() {
+            bail!("annotation response must contain all 11 approved axes");
+        }
+        for axis in SENTIMENT_AXES {
+            let score = item
+                .scores
+                .get(axis)
+                .with_context(|| format!("annotation response omitted {axis}"))?;
+            if !(1..=5).contains(score) {
+                bail!("annotation score for {axis} must be between 1 and 5");
+            }
+        }
+        if item
+            .scores
+            .keys()
+            .any(|axis| !SENTIMENT_AXES.contains(&axis.as_str()))
+        {
+            bail!("annotation response contained an unknown axis");
+        }
+    }
+    if seen.len() != expected.len() {
+        bail!("annotation response omitted one or more input messages");
+    }
+    Ok(parsed.items)
+}
+
+fn axes_sql() -> String {
+    SENTIMENT_AXES
+        .iter()
+        .map(|axis| format!("'{axis}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn annotatable_message_count(store: &Store) -> Result<usize> {
+    store.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM message_provenance
+             WHERE authored_by = 'human' AND sentiment_usable IN ('yes', 'strip_wrapper')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    })
+}
+
+fn complete_message_count(store: &Store, version: &str) -> Result<usize> {
+    store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT COUNT(*) FROM message_provenance p
+             WHERE p.authored_by = 'human' AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+               AND (SELECT COUNT(DISTINCT a.axis) FROM message_annotations a
+                    WHERE a.item_id = p.item_id AND a.annotator_version = ?1
+                      AND a.axis IN ({})) = {}",
+            axes_sql(),
+            SENTIMENT_AXES.len()
+        );
+        Ok(conn.query_row(&sql, params![version], |row| row.get::<_, i64>(0))? as usize)
+    })
+}
+
+fn annotation_row_count(store: &Store, version: &str) -> Result<usize> {
+    store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT COUNT(*) FROM message_annotations
+             WHERE annotator_version = ?1 AND axis IN ({})",
+            axes_sql()
+        );
+        Ok(conn.query_row(&sql, params![version], |row| row.get::<_, i64>(0))? as usize)
+    })
+}
+
+fn missing_annotation_inputs(
+    store: &Store,
+    version: &str,
+    limit: usize,
+) -> Result<Vec<AnnotationInput>> {
+    store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT hi.id, hi.text, p.rule, p.sentiment_usable
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             LEFT JOIN message_annotations a
+               ON a.item_id = p.item_id AND a.annotator_version = ?1
+              AND a.axis IN ({})
+             WHERE p.authored_by = 'human' AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+             GROUP BY hi.id
+             HAVING COUNT(DISTINCT a.axis) < {}
+             ORDER BY hi.rowid
+             LIMIT ?2",
+            axes_sql(),
+            SENTIMENT_AXES.len()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![version, limit as i64], |row| {
+            Ok(AnnotationInput {
+                item_id: row.get(0)?,
+                text: row.get(1)?,
+                rule: row.get(2)?,
+                usable: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     fn annotation(axis: &str, score: u8, version: &str, annotated_at: &str) -> MessageAnnotation {
         MessageAnnotation {
@@ -286,5 +540,160 @@ mod tests {
             chat_completions_url("http://localhost:4000/v1".to_string()),
             "http://localhost:4000/v1/chat/completions"
         );
+        assert!(retryable_status(429));
+        assert!(retryable_status(503));
+        assert!(!retryable_status(400));
+    }
+
+    struct MockSentimentLlm {
+        calls: AtomicUsize,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl JsonLlm for MockSentimentLlm {
+        fn model(&self) -> &str {
+            "mock-sentiment"
+        }
+
+        fn complete_json(&self, _system: &str, prompt: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.prompts
+                .lock()
+                .expect("prompts")
+                .push(prompt.to_string());
+            let inputs: Value = serde_json::from_str(prompt)?;
+            let items = inputs
+                .as_array()
+                .expect("prompt items")
+                .iter()
+                .map(|input| {
+                    let scores = SENTIMENT_AXES
+                        .into_iter()
+                        .map(|axis| (axis.to_string(), serde_json::json!(3)))
+                        .collect::<serde_json::Map<_, _>>();
+                    serde_json::json!({"id": input["id"], "scores": scores})
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({"items": items}).to_string())
+        }
+    }
+
+    #[test]
+    fn sentiment_pipeline_filters_strips_resumes_and_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('wrapped', 'event_1', 'session', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', '<image name="x"> useful caption', 'hash_1',
+                       1, 'required', '{}', 'item_hash_1'),
+                      ('plain', 'event_2', 'session', 'source', 'machine', 'codex', 1, 0,
+                       'conversation', 'user', 'plain human message', 'hash_2',
+                       1, 'required', '{}', 'item_hash_2'),
+                      ('agent', 'event_3', 'session', 'source', 'machine', 'codex', 2, 0,
+                       'conversation', 'user', 'agent text', 'hash_3',
+                       1, 'required', '{}', 'item_hash_3');
+
+                    INSERT INTO message_provenance
+                      (item_id, session_id, source_kind, authored_by, sentiment_usable, rule)
+                    VALUES
+                      ('wrapped', 'session', 'codex', 'human', 'strip_wrapper', 'tag.image'),
+                      ('plain', 'session', 'codex', 'human', 'yes', 'default.human'),
+                      ('agent', 'session', 'codex', 'agent', 'no', 'session.subagent');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert sentiment fixtures");
+        let llm = MockSentimentLlm {
+            calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
+        };
+
+        let first = annotate_messages(
+            &store,
+            &llm,
+            &AnnotateOptions {
+                limit: Some(1),
+                batch_size: 10,
+                annotator_version: "v1".to_string(),
+            },
+        )
+        .expect("annotate trial");
+        assert_eq!(
+            (
+                first.annotated_messages,
+                first.scores_written,
+                first.pending_messages
+            ),
+            (1, 11, 1)
+        );
+        let prompt = llm.prompts.lock().expect("prompts")[0].clone();
+        assert!(prompt.contains("useful caption"));
+        assert!(!prompt.contains("<image"));
+
+        let second = annotate_messages(
+            &store,
+            &llm,
+            &AnnotateOptions {
+                limit: None,
+                batch_size: 10,
+                annotator_version: "v1".to_string(),
+            },
+        )
+        .expect("resume annotation");
+        assert_eq!(
+            (
+                second.annotated_messages,
+                second.skipped_messages,
+                second.pending_messages
+            ),
+            (1, 1, 0)
+        );
+        let repeated = annotate_messages(
+            &store,
+            &llm,
+            &AnnotateOptions {
+                limit: None,
+                batch_size: 10,
+                annotator_version: "v1".to_string(),
+            },
+        )
+        .expect("repeat annotation");
+        assert_eq!(repeated.annotated_messages, 0);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+
+        let next_version = annotate_messages(
+            &store,
+            &llm,
+            &AnnotateOptions {
+                limit: None,
+                batch_size: 10,
+                annotator_version: "v2".to_string(),
+            },
+        )
+        .expect("annotate next version");
+        assert_eq!(next_version.scores_written, 22);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn sentiment_response_requires_every_approved_axis() {
+        let mut scores = SENTIMENT_AXES
+            .into_iter()
+            .map(|axis| (axis.to_string(), serde_json::json!(3)))
+            .collect::<serde_json::Map<_, _>>();
+        scores.remove("playfulness");
+        let response = serde_json::json!({"items": [{"id": "item", "scores": scores}]});
+        let error = parse_annotation_response(&response.to_string(), &["item"])
+            .expect_err("missing axis should fail");
+        assert!(error.to_string().contains("all 11 approved axes"));
     }
 }
