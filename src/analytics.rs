@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 8;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
-pub const SESSION_RELATIONSHIPS_VERSION: u32 = 6;
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 7;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
@@ -232,17 +232,18 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
 
     let sessions = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, machine_id, source_kind, external_id, metadata_json
+            "SELECT rowid, id, machine_id, source_kind, external_id, metadata_json
              FROM sessions
              ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(RelationshipSession {
-                session_id: row.get(0)?,
-                machine_id: row.get(1)?,
-                source_kind: row.get(2)?,
-                external_id: row.get(3)?,
-                metadata_json: row.get(4)?,
+                rowid: row.get(0)?,
+                session_id: row.get(1)?,
+                machine_id: row.get(2)?,
+                source_kind: row.get(3)?,
+                external_id: row.get(4)?,
+                metadata_json: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -350,6 +351,15 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         parents.insert(session.session_id.clone(), parent_session_id.clone());
         hints.push((hint, parent_session_id));
     }
+    let fork_parents = codex_fork_parents(store, &sessions, &hints)?;
+    for (session, (hint, parent_session_id)) in sessions.iter().zip(hints.iter_mut()) {
+        if let Some(fork_parent_id) = fork_parents.get(&session.session_id) {
+            *parent_session_id = Some(fork_parent_id.clone());
+            hint.relationship = ingest::SessionRelationshipKind::Fork;
+            hint.rule = "codex.shared_prefix";
+            parents.insert(session.session_id.clone(), Some(fork_parent_id.clone()));
+        }
+    }
     for relationship in &inline_relationships {
         parents.insert(
             relationship.session_id.clone(),
@@ -390,6 +400,103 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         insert_event_session_overrides_batch(store, batch)?;
     }
     Ok(())
+}
+
+fn codex_fork_parents(
+    store: &Store,
+    sessions: &[RelationshipSession],
+    hints: &[(ingest::SessionRelationshipHint, Option<String>)],
+) -> Result<HashMap<String, String>> {
+    const MIN_SHARED_EVENTS: usize = 8;
+
+    let candidates = sessions
+        .iter()
+        .zip(hints)
+        .filter(|(session, (hint, _))| {
+            session.source_kind == "codex"
+                && hint.relationship == ingest::SessionRelationshipKind::None
+        })
+        .map(|(session, _)| session)
+        .collect::<Vec<_>>();
+    let mut groups = HashMap::<(String, Vec<String>), Vec<&RelationshipSession>>::new();
+    for session in candidates {
+        let prefix = session_event_hashes(store, &session.session_id, MIN_SHARED_EVENTS + 1)?;
+        if prefix.len() <= MIN_SHARED_EVENTS {
+            continue;
+        }
+        groups
+            .entry((
+                session.machine_id.clone(),
+                prefix[..MIN_SHARED_EVENTS].to_vec(),
+            ))
+            .or_default()
+            .push(session);
+    }
+
+    let mut parents = HashMap::new();
+    for mut group in groups.into_values().filter(|group| group.len() > 1) {
+        group.sort_by_key(|session| session.rowid);
+        let mut hashes = HashMap::new();
+        for session in &group {
+            hashes.insert(
+                session.session_id.as_str(),
+                session_event_hashes(store, &session.session_id, i64::MAX as usize)?,
+            );
+        }
+        for (child_index, child) in group.iter().enumerate().skip(1) {
+            let child_hashes = &hashes[child.session_id.as_str()];
+            let mut best_parent = None;
+            let mut best_length = 0;
+            let mut tied = false;
+            for parent in &group[..child_index] {
+                if parent.external_id == child.external_id {
+                    continue;
+                }
+                let parent_hashes = &hashes[parent.session_id.as_str()];
+                let shared = parent_hashes
+                    .iter()
+                    .zip(child_hashes)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if shared < MIN_SHARED_EVENTS
+                    || shared == parent_hashes.len()
+                    || shared == child_hashes.len()
+                {
+                    continue;
+                }
+                if shared > best_length {
+                    best_parent = Some(parent.session_id.clone());
+                    best_length = shared;
+                    tied = false;
+                } else if shared == best_length {
+                    tied = true;
+                }
+            }
+            if !tied {
+                if let Some(parent_id) = best_parent {
+                    parents.insert(child.session_id.clone(), parent_id);
+                }
+            }
+        }
+    }
+    Ok(parents)
+}
+
+fn session_event_hashes(store: &Store, session_id: &str, limit: usize) -> Result<Vec<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT hash
+             FROM events INDEXED BY idx_events_session_ordinal
+             WHERE session_id = ?1
+             ORDER BY ordinal
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit.min(i64::MAX as usize) as i64], |row| {
+            row.get(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
 }
 
 fn claude_inline_relationships(
@@ -580,6 +687,7 @@ fn insert_session_relationships_batch(
 }
 
 struct RelationshipSession {
+    rowid: i64,
     session_id: String,
     machine_id: String,
     source_kind: String,
