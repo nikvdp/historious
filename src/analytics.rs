@@ -867,6 +867,84 @@ mod tests {
     }
 
     #[test]
+    fn session_relationships_rebuilds_provider_defaults_idempotently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('session_codex', 'source_codex', 'machine', 'codex', 'codex', 'open',
+                       '{}', 'session_codex_hash'),
+                      ('session_pi', 'source_pi', 'machine', 'pi_agent', 'pi', 'open',
+                       '{}', 'session_pi_hash'),
+                      ('session_hermes', 'source_hermes', 'machine', 'hermes', 'hermes', 'open',
+                       '{}', 'session_hermes_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert session relationship fixtures");
+
+        for _ in 0..2 {
+            rebuild_all(&store, |_, _, _| {}).expect("rebuild relationships");
+        }
+        let rows = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships
+                     ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load session relationships");
+
+        assert_eq!(rows.len(), 3);
+        for (session_id, parent_session_id, root_session_id, relationship, _) in &rows {
+            assert_eq!(parent_session_id, &None);
+            assert_eq!(root_session_id, session_id);
+            assert_eq!(relationship, "none");
+        }
+        assert_eq!(rows[0].4, "default.none");
+        assert_eq!(rows[1].4, "hermes.capture_gap");
+        assert_eq!(rows[2].4, "pi_agent.capture_gap");
+    }
+
+    #[test]
+    fn relationship_roots_walk_parent_chains_and_reject_cycles() {
+        let parents = HashMap::from([
+            ("root".to_string(), None),
+            ("child".to_string(), Some("root".to_string())),
+            ("grandchild".to_string(), Some("child".to_string())),
+        ]);
+        assert_eq!(
+            root_session_id("grandchild", &parents).expect("resolve root"),
+            "root"
+        );
+
+        let cycle = HashMap::from([
+            ("one".to_string(), Some("two".to_string())),
+            ("two".to_string(), Some("one".to_string())),
+        ]);
+        assert!(root_session_id("one", &cycle).is_err());
+    }
+
+    #[test]
     fn duplicate_templates_must_repeat_across_workspaces_not_only_forks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -1092,9 +1170,13 @@ mod tests {
         rebuild_all(&store, |_, _, _| {}).expect("rebuild projections");
         assert!(!is_stale(&store).expect("freshness after rebuild"));
         let statuses = freshness(&store).expect("projection statuses");
-        assert_eq!(statuses.len(), 2);
-        assert_eq!(statuses[0].stored_version, Some(MESSAGE_PROVENANCE_VERSION));
-        assert_eq!(statuses[1].stored_version, Some(SESSION_FACTS_VERSION));
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(
+            statuses[0].stored_version,
+            Some(SESSION_RELATIONSHIPS_VERSION)
+        );
+        assert_eq!(statuses[1].stored_version, Some(MESSAGE_PROVENANCE_VERSION));
+        assert_eq!(statuses[2].stored_version, Some(SESSION_FACTS_VERSION));
 
         insert_event(&store, "event-2", 2);
         let statuses = freshness(&store).expect("stale projection statuses");
@@ -1106,7 +1188,7 @@ mod tests {
 
         let bumped = Projection {
             version: MESSAGE_PROVENANCE_VERSION + 1,
-            ..PROJECTIONS[0]
+            ..PROJECTIONS[1]
         };
         assert!(
             projection_freshness(&store, bumped)
