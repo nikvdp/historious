@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub embedder: EmbedderConfig,
     pub default_search_mode: SearchMode,
     pub sources: SourceConfigs,
+    pub enrichment: EnrichmentConfig,
 }
 
 impl AppConfig {
@@ -33,6 +34,7 @@ impl AppConfig {
             embedder,
             default_search_mode: file_config.search.default_mode,
             sources: file_config.sources,
+            enrichment: file_config.enrichment,
         })
     }
 }
@@ -47,6 +49,41 @@ struct FileConfig {
     embeddings: EmbeddingsConfig,
     #[serde(default)]
     sources: SourceConfigs,
+    #[serde(default)]
+    enrichment: EnrichmentConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrichmentProvider {
+    Openai,
+    Anthropic,
+}
+
+impl EnrichmentProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EnrichmentConfig {
+    pub provider: Option<EnrichmentProvider>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+}
+
+impl EnrichmentConfig {
+    pub fn configured(&self) -> bool {
+        self.provider.is_some()
+            && self.base_url.as_ref().is_some_and(|value| !value.trim().is_empty())
+            && self.api_key.as_ref().is_some_and(|value| !value.trim().is_empty())
+            && self.model.as_ref().is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,6 +162,46 @@ pub fn set_treechat_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
     set_config_bool(data_dir, &["sources", "treechat", "enabled"], enabled)
 }
 
+pub fn set_enrichment_config(
+    data_dir: &Path,
+    provider: EnrichmentProvider,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<PathBuf> {
+    for (name, value) in [("base URL", base_url), ("API key", api_key), ("model", model)] {
+        if value.trim().is_empty() {
+            anyhow::bail!("enrichment {name} must not be empty");
+        }
+    }
+    let values = [
+        ("provider", provider.as_str()),
+        ("base_url", base_url.trim()),
+        ("api_key", api_key.trim()),
+        ("model", model.trim()),
+    ];
+    let mut path = config_path(data_dir);
+    for (key, value) in values {
+        path = set_config_string(data_dir, &["enrichment", key], value)?;
+    }
+    restrict_config_permissions(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn restrict_config_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_config_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn set_config_bool(data_dir: &Path, path_parts: &[&str], enabled: bool) -> Result<PathBuf> {
     set_config_value(data_dir, path_parts, toml::Value::Boolean(enabled))
 }
@@ -182,6 +259,7 @@ fn load_file_config(data_dir: &Path) -> Result<FileConfig> {
             search: SearchConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             sources: SourceConfigs::default(),
+            enrichment: EnrichmentConfig::default(),
         });
     }
     let text = std::fs::read_to_string(&path)

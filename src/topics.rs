@@ -757,6 +757,46 @@ pub struct TopicLabelOutcome {
     pub pending: usize,
 }
 
+pub fn topic_label_preflight(
+    store: &Store,
+    llm: &crate::annotate::ConfiguredJsonLlm,
+    labeler_version: &str,
+    limit: Option<usize>,
+) -> Result<crate::annotate::EnrichmentPreflight> {
+    let version = current_topic_version(store)?;
+    let silhouette = topic_run_silhouette(store, &version)?;
+    if silhouette < MIN_TOPIC_SILHOUETTE {
+        bail!(
+            "topic run scored {silhouette:.4}, below the {MIN_TOPIC_SILHOUETTE:.2} coherence bar; keeping its local miscellaneous label"
+        );
+    }
+    let ids = unlabeled_topic_ids(store, &version, labeler_version)?
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
+    let mut excerpt_chars = 0usize;
+    for topic_id in &ids {
+        excerpt_chars += topic_representatives(store, &version, *topic_id, 5)?
+            .iter()
+            .map(|text| text.chars().count())
+            .sum::<usize>();
+    }
+    Ok(crate::annotate::EnrichmentPreflight {
+        provider: llm.provider().to_string(),
+        model: llm.model().to_string(),
+        destination: llm.destination().to_string(),
+        data_category: "representative human-authored messages and local terms for topic labeling"
+            .to_string(),
+        record_count: ids.len(),
+        max_excerpt_chars: 800,
+        estimated_tokens: excerpt_chars.saturating_add(ids.len() * 300) / 4,
+        estimated_cost: "unknown; check the configured provider's current pricing".to_string(),
+        logging_and_retention: "unknown; governed by the configured provider account".to_string(),
+        resumability: format!("yes; completed labels for version {labeler_version} are skipped"),
+        deletion: format!("histo enrich delete --kind topics --version {labeler_version}"),
+    })
+}
+
 pub fn label_topics(
     store: &Store,
     llm: &dyn JsonLlm,

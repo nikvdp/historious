@@ -1,3 +1,4 @@
+use crate::config::{EnrichmentConfig, EnrichmentProvider};
 use crate::storage::Store;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -30,6 +31,23 @@ pub const SENTIMENT_AXES: [&str; 11] = [
     "momentum",
     "playfulness",
 ];
+
+pub const SENTIMENT_EXCERPT_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichmentPreflight {
+    pub provider: String,
+    pub model: String,
+    pub destination: String,
+    pub data_category: String,
+    pub record_count: usize,
+    pub max_excerpt_chars: usize,
+    pub estimated_tokens: usize,
+    pub estimated_cost: String,
+    pub logging_and_retention: String,
+    pub resumability: String,
+    pub deletion: String,
+}
 
 pub fn insert_annotations(store: &Store, annotations: &[MessageAnnotation]) -> Result<()> {
     for annotation in annotations {
@@ -134,68 +152,98 @@ pub trait JsonLlm: Sync {
     fn complete_json(&self, system: &str, prompt: &str) -> Result<String>;
 }
 
-pub struct OpenAiJsonLlm {
+pub struct ConfiguredJsonLlm {
+    provider: EnrichmentProvider,
     url: String,
     api_key: String,
     model: String,
 }
 
-impl OpenAiJsonLlm {
-    pub fn from_env(url: Option<String>, model: Option<String>) -> Result<Self> {
-        let url = url
-            .or_else(|| std::env::var("HISTO_LLM_URL").ok())
-            .or_else(|| {
-                std::env::var("OPENAI_BASE_URL")
-                    .ok()
-                    .map(chat_completions_url)
-            })
-            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
-        let api_key = std::env::var("HISTO_LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .context("set HISTO_LLM_API_KEY or OPENAI_API_KEY for LLM requests")?;
-        let model = model
-            .or_else(|| std::env::var("HISTO_LLM_MODEL").ok())
-            .or_else(|| std::env::var("OPENAI_MODEL").ok())
-            .context("set --model, HISTO_LLM_MODEL, or OPENAI_MODEL for LLM requests")?;
+impl ConfiguredJsonLlm {
+    pub fn from_config(config: &EnrichmentConfig) -> Result<Self> {
+        if !config.configured() {
+            bail!(
+                "enrichment provider is not configured; run `histo config enrichment --provider <openai|anthropic> --base-url <url> --api-key <key> --model <model>`"
+            );
+        }
+        let provider = config.provider.expect("checked provider");
+        let base_url = config.base_url.as_ref().expect("checked URL").clone();
+        let url = match provider {
+            EnrichmentProvider::Openai => chat_completions_url(base_url),
+            EnrichmentProvider::Anthropic => messages_url(base_url),
+        };
         Ok(Self {
+            provider,
             url,
-            api_key,
-            model,
+            api_key: config.api_key.as_ref().expect("checked API key").clone(),
+            model: config.model.as_ref().expect("checked model").clone(),
         })
+    }
+
+    pub fn provider(&self) -> &'static str {
+        self.provider.as_str()
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.url
     }
 }
 
-impl JsonLlm for OpenAiJsonLlm {
+impl JsonLlm for ConfiguredJsonLlm {
     fn model(&self) -> &str {
         &self.model
     }
 
     fn complete_json(&self, system: &str, prompt: &str) -> Result<String> {
         for attempt in 0..4 {
-            let result = ureq::post(&self.url)
-                .set("Authorization", &format!("Bearer {}", self.api_key))
-                .set("Content-Type", "application/json")
-                .send_json(serde_json::json!({
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "response_format": {"type": "json_object"}
-                }));
+            let result = match self.provider {
+                EnrichmentProvider::Openai => ureq::post(&self.url)
+                    .set("Authorization", &format!("Bearer {}", self.api_key))
+                    .set("Content-Type", "application/json")
+                    .send_json(openai_request(&self.model, system, prompt)),
+                EnrichmentProvider::Anthropic => ureq::post(&self.url)
+                    .set("x-api-key", &self.api_key)
+                    .set("anthropic-version", "2023-06-01")
+                    .set("Content-Type", "application/json")
+                    .send_json(anthropic_request(&self.model, system, prompt)),
+            };
             match result {
                 Ok(response) => {
                     let value: Value = response.into_json().context("parsing LLM response")?;
-                    return chat_content(&value).map(ToOwned::to_owned);
+                    return match self.provider {
+                        EnrichmentProvider::Openai => chat_content(&value),
+                        EnrichmentProvider::Anthropic => anthropic_content(&value),
+                    }
+                    .map(ToOwned::to_owned);
                 }
                 Err(ureq::Error::Status(status, _)) if retryable_status(status) && attempt < 3 => {
                     std::thread::sleep(Duration::from_secs(1 << attempt));
                 }
-                Err(error) => return Err(error).context("calling LLM labeling endpoint"),
+                Err(error) => return Err(error).context("calling enrichment endpoint"),
             }
         }
         unreachable!("retry loop returns on its final attempt")
     }
+}
+
+fn openai_request(model: &str, system: &str, prompt: &str) -> Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"}
+    })
+}
+
+fn anthropic_request(model: &str, system: &str, prompt: &str) -> Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "system": system,
+        "messages": [{"role": "user", "content": prompt}]
+    })
 }
 
 fn retryable_status(status: u16) -> bool {
@@ -213,11 +261,29 @@ fn chat_completions_url(base: String) -> String {
     }
 }
 
+fn messages_url(base: String) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
 fn chat_content(value: &Value) -> Result<&str> {
     value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .context("LLM response did not include choices[0].message.content")
+}
+
+fn anthropic_content(value: &Value) -> Result<&str> {
+    value
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .context("Anthropic response did not include content[0].text")
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +302,96 @@ pub struct AnnotateOutcome {
     pub skipped_messages: usize,
     pub scores_written: usize,
     pub pending_messages: usize,
+}
+
+pub fn sentiment_preflight(
+    store: &Store,
+    llm: &ConfiguredJsonLlm,
+    options: &AnnotateOptions,
+) -> Result<EnrichmentPreflight> {
+    let inputs = missing_annotation_inputs(
+        store,
+        &options.annotator_version,
+        options.limit.unwrap_or(usize::MAX),
+    )?;
+    let excerpt_chars = inputs
+        .iter()
+        .map(|input| input.text.chars().count().min(SENTIMENT_EXCERPT_CHARS))
+        .sum::<usize>();
+    Ok(EnrichmentPreflight {
+        provider: llm.provider().to_string(),
+        model: llm.model().to_string(),
+        destination: llm.destination().to_string(),
+        data_category: "human-authored coding-agent messages for sentiment scoring".to_string(),
+        record_count: inputs.len(),
+        max_excerpt_chars: SENTIMENT_EXCERPT_CHARS,
+        estimated_tokens: excerpt_chars.saturating_add(inputs.len() * 300) / 4,
+        estimated_cost: "unknown; check the configured provider's current pricing".to_string(),
+        logging_and_retention: "unknown; governed by the configured provider account".to_string(),
+        resumability: format!(
+            "yes; completed records for version {} are skipped",
+            options.annotator_version
+        ),
+        deletion: format!(
+            "histo enrich delete --kind sentiment --version {}",
+            options.annotator_version
+        ),
+    })
+}
+
+pub fn record_enrichment_run(
+    store: &Store,
+    kind: &str,
+    version: &str,
+    preflight: &EnrichmentPreflight,
+) -> Result<()> {
+    if kind.trim().is_empty() || version.trim().is_empty() {
+        bail!("enrichment kind and version must not be empty");
+    }
+    store.with_conn(|conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO enrichment_runs
+             (kind, version, provider, model, destination, data_scope, max_excerpt_chars, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                kind,
+                version,
+                preflight.provider,
+                preflight.model,
+                preflight.destination,
+                preflight.data_category,
+                preflight.max_excerpt_chars as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let stored = conn.query_row(
+            "SELECT provider, model, destination, data_scope, max_excerpt_chars
+             FROM enrichment_runs WHERE kind = ?1 AND version = ?2",
+            params![kind, version],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let requested = (
+            preflight.provider.clone(),
+            preflight.model.clone(),
+            preflight.destination.clone(),
+            preflight.data_category.clone(),
+            preflight.max_excerpt_chars as i64,
+        );
+        if stored != requested {
+            bail!(
+                "enrichment version {version} already belongs to different provider metadata; choose a new version"
+            );
+        }
+        Ok(())
+    })
 }
 
 struct AnnotationInput {
@@ -363,7 +519,7 @@ fn request_annotation_batch(
             };
             serde_json::json!({
                 "id": index.to_string(),
-                "message": text.chars().take(2_000).collect::<String>()
+                "message": text.chars().take(SENTIMENT_EXCERPT_CHARS).collect::<String>()
             })
         })
         .collect::<Vec<_>>();

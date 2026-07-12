@@ -788,6 +788,11 @@ pub enum Command {
         #[arg(long, value_enum, help = "Color output: auto, always, or never")]
         color: Option<ColorArg>,
     },
+    /// Send explicitly approved local data to a configured enrichment provider.
+    Enrich {
+        #[command(subcommand)]
+        command: EnrichCommand,
+    },
     /// Read and update persistent Historious configuration.
     Config {
         #[command(subcommand)]
@@ -863,6 +868,58 @@ pub enum ConfigCommand {
         #[arg(value_enum, default_value_t = ConfigSourceState::Status)]
         state: ConfigSourceState,
     },
+    /// Set the dedicated provider used only by explicit `histo enrich` commands.
+    Enrichment {
+        #[arg(long, value_enum)]
+        provider: EnrichmentProviderArg,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnrichCommand {
+    /// Score human-authored messages after showing a transmission preflight.
+    Sentiment {
+        #[arg(long, help = "Annotate at most this many incomplete messages")]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long, default_value = "sentiment-v1")]
+        annotator_version: String,
+        #[arg(long, help = "Explicitly approve the displayed transmission without prompting")]
+        yes: bool,
+    },
+    /// Add provider-generated labels over coherent local topic clusters.
+    Topics {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = "topic-label-v1")]
+        labeler_version: String,
+        #[arg(long, help = "Explicitly approve the displayed transmission without prompting")]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum EnrichmentProviderArg {
+    Openai,
+    Anthropic,
+}
+
+impl From<EnrichmentProviderArg> for crate::config::EnrichmentProvider {
+    fn from(value: EnrichmentProviderArg) -> Self {
+        match value {
+            EnrichmentProviderArg::Openai => Self::Openai,
+            EnrichmentProviderArg::Anthropic => Self::Anthropic,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2404,6 +2461,74 @@ impl Cli {
                     }
                 }
             },
+            Command::Enrich { command } => {
+                let llm = crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
+                match command {
+                    EnrichCommand::Sentiment {
+                        limit,
+                        batch_size,
+                        concurrency,
+                        annotator_version,
+                        yes,
+                    } => {
+                        if limit == Some(0) {
+                            bail!("annotation limit must be greater than zero");
+                        }
+                        let options = crate::annotate::AnnotateOptions {
+                            limit,
+                            batch_size,
+                            concurrency,
+                            annotator_version,
+                        };
+                        let preflight =
+                            crate::annotate::sentiment_preflight(&store, &llm, &options)?;
+                        approve_enrichment(&preflight, yes)?;
+                        crate::annotate::record_enrichment_run(
+                            &store,
+                            "sentiment",
+                            &options.annotator_version,
+                            &preflight,
+                        )?;
+                        let outcome = crate::annotate::annotate_messages(&store, &llm, &options)?;
+                        println!(
+                            "Sentiment annotations {} ({}): {} messages, {} scores added, {} messages reused, {} pending",
+                            outcome.annotator_version,
+                            outcome.model,
+                            outcome.annotated_messages,
+                            outcome.scores_written,
+                            outcome.skipped_messages,
+                            outcome.pending_messages
+                        );
+                    }
+                    EnrichCommand::Topics {
+                        limit,
+                        labeler_version,
+                        yes,
+                    } => {
+                        if limit == Some(0) {
+                            bail!("topic label limit must be greater than zero");
+                        }
+                        let preflight =
+                            topics::topic_label_preflight(&store, &llm, &labeler_version, limit)?;
+                        approve_enrichment(&preflight, yes)?;
+                        crate::annotate::record_enrichment_run(
+                            &store,
+                            "topics",
+                            &labeler_version,
+                            &preflight,
+                        )?;
+                        let outcome = topics::label_topics(&store, &llm, &labeler_version, limit)?;
+                        println!(
+                            "Topic labels {} ({}): {} added, {} reused, {} pending",
+                            outcome.version,
+                            outcome.model,
+                            outcome.labeled,
+                            outcome.skipped,
+                            outcome.pending
+                        );
+                    }
+                }
+            }
             Command::Lab { command } => match command {
                 LabCommand::Rebuild => {
                     let mut last_completed = 0;
@@ -2482,36 +2607,14 @@ impl Cli {
                     }
                 }
                 LabCommand::Annotate {
-                    limit,
-                    batch_size,
-                    concurrency,
-                    annotator_version,
-                    model,
-                    url,
+                    limit: _,
+                    batch_size: _,
+                    concurrency: _,
+                    annotator_version: _,
+                    model: _,
+                    url: _,
                 } => {
-                    if limit == Some(0) {
-                        bail!("annotation limit must be greater than zero");
-                    }
-                    let llm = crate::annotate::OpenAiJsonLlm::from_env(url, model)?;
-                    let outcome = crate::annotate::annotate_messages(
-                        &store,
-                        &llm,
-                        &crate::annotate::AnnotateOptions {
-                            limit,
-                            batch_size,
-                            concurrency,
-                            annotator_version,
-                        },
-                    )?;
-                    println!(
-                        "Sentiment annotations {} ({}): {} messages, {} scores added, {} messages reused, {} pending",
-                        outcome.annotator_version,
-                        outcome.model,
-                        outcome.annotated_messages,
-                        outcome.scores_written,
-                        outcome.skipped_messages,
-                        outcome.pending_messages
-                    );
+                    bail!("`histo lab annotate` is disabled; use consent-gated `histo enrich sentiment`");
                 }
                 LabCommand::Topics {
                     command: TopicCommand::Embed { limit },
@@ -2592,26 +2695,13 @@ impl Cli {
                 LabCommand::Topics {
                     command:
                         TopicCommand::Label {
-                            limit,
-                            labeler_version,
-                            model,
-                            url,
+                            limit: _,
+                            labeler_version: _,
+                            model: _,
+                            url: _,
                         },
                 } => {
-                    if limit == Some(0) {
-                        bail!("topic label limit must be greater than zero");
-                    }
-                    let llm = crate::annotate::OpenAiJsonLlm::from_env(url, model)?;
-                    let outcome =
-                        topics::label_topics(&store, &llm, &labeler_version, limit)?;
-                    println!(
-                        "Topic labels {} ({}): {} added, {} reused, {} pending",
-                        outcome.version,
-                        outcome.model,
-                        outcome.labeled,
-                        outcome.skipped,
-                        outcome.pending
-                    );
+                    bail!("`histo lab topics label` is disabled; use consent-gated `histo enrich topics`");
                 }
             },
             Command::Daemon {
@@ -2765,6 +2855,7 @@ impl Command {
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
             Command::Report { .. } => "report",
+            Command::Enrich { .. } => "enrich",
             Command::Config { .. } => "config",
             Command::Maintenance { .. } => "maintenance",
             Command::Lab { .. } => "lab",
@@ -2838,6 +2929,10 @@ struct ConfigOutput {
     machine_id: String,
     embeddings_enabled: bool,
     treechat_enabled: bool,
+    enrichment_configured: bool,
+    enrichment_provider: Option<String>,
+    enrichment_base_url: Option<String>,
+    enrichment_model: Option<String>,
 }
 
 fn run_config_command(
@@ -2896,6 +2991,26 @@ fn run_config_command(
                 print_config_output(&output);
             }
         }
+        ConfigCommand::Enrichment {
+            provider,
+            base_url,
+            api_key,
+            model,
+        } => {
+            let path = crate::config::set_enrichment_config(
+                &data_dir,
+                provider.into(),
+                &base_url,
+                &api_key,
+                &model,
+            )?;
+            let output = config_output(&data_dir, &path)?;
+            if robot {
+                crate::output::write_success("config enrichment", output, Default::default())?;
+            } else {
+                print_config_output(&output);
+            }
+        }
     }
     Ok(())
 }
@@ -2908,6 +3023,13 @@ fn config_output(data_dir: &std::path::Path, path: &std::path::Path) -> Result<C
         machine_id: config.machine_id,
         embeddings_enabled: !config.embedder.is_disabled(),
         treechat_enabled: config.sources.treechat.enabled,
+        enrichment_configured: config.enrichment.configured(),
+        enrichment_provider: config
+            .enrichment
+            .provider
+            .map(|provider| provider.as_str().to_string()),
+        enrichment_base_url: config.enrichment.base_url,
+        enrichment_model: config.enrichment.model,
     })
 }
 
@@ -2917,6 +3039,55 @@ fn print_config_output(output: &ConfigOutput) {
     println!("machine_id={}", output.machine_id);
     println!("embeddings.enabled={}", output.embeddings_enabled);
     println!("sources.treechat.enabled={}", output.treechat_enabled);
+    println!("enrichment.configured={}", output.enrichment_configured);
+    println!(
+        "enrichment.provider={}",
+        output.enrichment_provider.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "enrichment.base_url={}",
+        output.enrichment_base_url.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "enrichment.model={}",
+        output.enrichment_model.as_deref().unwrap_or("unset")
+    );
+}
+
+fn approve_enrichment(
+    preflight: &crate::annotate::EnrichmentPreflight,
+    yes: bool,
+) -> Result<()> {
+    println!("Enrichment transmission preflight");
+    println!("  provider: {}", preflight.provider);
+    println!("  model: {}", preflight.model);
+    println!("  destination: {}", preflight.destination);
+    println!("  data: {}", preflight.data_category);
+    println!("  records: {}", preflight.record_count);
+    println!("  max excerpt: {} characters", preflight.max_excerpt_chars);
+    println!("  estimated tokens: {}", preflight.estimated_tokens);
+    println!("  estimated cost: {}", preflight.estimated_cost);
+    println!(
+        "  provider logging/retention: {}",
+        preflight.logging_and_retention
+    );
+    println!("  resumable: {}", preflight.resumability);
+    println!("  delete derived data: {}", preflight.deletion);
+    if yes {
+        println!("  approval: explicit --yes");
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("enrichment not approved; rerun interactively or pass explicit --yes");
+    }
+    print!("Transmit this data? Type YES to continue: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "YES" {
+        bail!("enrichment declined; no data was transmitted");
+    }
+    Ok(())
 }
 
 fn run_skill_command(command: SkillCommand) -> Result<()> {

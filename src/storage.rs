@@ -5136,6 +5136,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_annotations_version_axis_score
           ON message_annotations(annotator_version, axis, score);
 
+        CREATE TABLE IF NOT EXISTS enrichment_runs (
+          kind TEXT NOT NULL,
+          version TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          destination TEXT NOT NULL,
+          data_scope TEXT NOT NULL,
+          max_excerpt_chars INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (kind, version)
+        );
+
         CREATE TABLE IF NOT EXISTS topic_runs (
           version TEXT PRIMARY KEY,
           algorithm_version INTEGER NOT NULL,
