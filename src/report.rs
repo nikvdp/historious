@@ -1905,6 +1905,16 @@ mod tests {
     }
 
     #[test]
+    fn shareable_labels_strip_paths_and_exact_counts_stay_distinct() {
+        assert_eq!(project_label("/Users/example/Code/project-alpha"), "project-alpha");
+        assert_eq!(project_label(r"C:\\Users\\example\\Code\\project-beta"), "project-beta");
+        assert_eq!(project_label("/repo/trailing/"), "trailing");
+        assert_eq!(exact_number(32_919), "32,919");
+        assert_eq!(exact_number(33_245), "33,245");
+        assert_ne!(exact_number(32_919), exact_number(33_245));
+    }
+
+    #[test]
     fn frequency_tokenizer_removes_code_urls_paths_and_punctuation() {
         let tokens = tokenize_frequency_text(
             "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
@@ -2023,9 +2033,11 @@ mod tests {
         assert_eq!(report.totals.sessions, 2);
         assert_eq!(report.totals.threads, 1);
         assert_eq!(report.totals.events, 3);
-        assert_eq!(report.totals.human_messages, 2);
-        assert_eq!(report.totals.agent_messages, 1);
-        assert_eq!(report.projects[0].workspace_path, "/repo/a");
+        assert_eq!(report.totals.human_turns, 2);
+        assert_eq!(report.totals.assistant_turns, 0);
+        assert_eq!(report.totals.delegated_turns, 1);
+        assert_eq!(report.totals.harness_turns, 0);
+        assert_eq!(report.projects[0].project, "a");
         assert_eq!(report.projects[0].total_tokens, Some(150));
         assert_eq!(report.tokens_by_session_end_date.len(), 2);
         assert_eq!(
@@ -2054,6 +2066,10 @@ mod tests {
         assert!(rendered.contains("Leading projects"));
         assert!(!rendered.contains("Provider mix by month"));
         assert!(!rendered.contains("Sentiment by local hour"));
+        assert!(!rendered.contains("/repo/"));
+        let json = serde_json::to_string(&report).expect("serialize shareable report");
+        assert!(!json.contains("/repo/"));
+        assert!(json.contains("\"project\":\"a\""));
         let narrow = render_terminal_themed(&report, 40, false);
         assert!(narrow.lines().all(|line| line.chars().count() <= 40));
         assert!(!narrow.contains('\x1b'));
@@ -2069,7 +2085,8 @@ mod tests {
         )
         .expect("compute filtered report");
         assert_eq!(filtered.totals.sessions, 1);
-        assert_eq!(filtered.totals.human_messages, 0);
+        assert_eq!(filtered.totals.human_turns, 0);
+        assert_eq!(filtered.filters.project.as_deref(), Some("b"));
     }
 
     #[test]
@@ -2126,7 +2143,7 @@ mod tests {
         assert_eq!(topics.version, "complete");
         assert_eq!(topics.assigned_messages, 2);
         assert_eq!(topics.by_month[0].month, "2026-05");
-        assert_eq!(topics.by_project[0].workspace_path, "/repo/gail");
+        assert_eq!(topics.by_project[0].project, "project-alpha");
 
         store
             .with_conn(|conn| {
@@ -2246,7 +2263,7 @@ mod tests {
         assert!(sentiment
             .by_project
             .iter()
-            .any(|row| row.workspace_path == "/repo/gail" && row.average == 2.0));
+            .any(|row| row.project == "project-alpha" && row.average == 2.0));
         assert!(sentiment
             .by_hour
             .iter()
@@ -2260,6 +2277,6 @@ mod tests {
         assert!(filtered
             .by_project
             .iter()
-            .all(|row| row.workspace_path == "/repo/gail"));
+            .all(|row| row.project == "project-alpha"));
     }
 }
