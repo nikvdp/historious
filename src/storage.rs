@@ -5097,6 +5097,21 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_provenance_author_time
           ON message_provenance(authored_by, occurred_at);
 
+        CREATE TABLE IF NOT EXISTS session_relationships (
+          session_id TEXT PRIMARY KEY,
+          parent_session_id TEXT,
+          root_session_id TEXT NOT NULL,
+          relationship TEXT NOT NULL CHECK (relationship IN ('subagent', 'fork', 'none')),
+          rule TEXT NOT NULL,
+          resolved_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_relationships_parent
+          ON session_relationships(parent_session_id);
+
+        CREATE INDEX IF NOT EXISTS idx_session_relationships_root
+          ON session_relationships(root_session_id);
+
         CREATE TABLE IF NOT EXISTS message_annotations (
           item_id TEXT NOT NULL,
           axis TEXT NOT NULL,

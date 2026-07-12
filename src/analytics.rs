@@ -1,7 +1,7 @@
 use crate::ingest::{self, SessionClass};
 use crate::provenance;
 use crate::storage::Store;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -10,10 +10,17 @@ use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 3;
+pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 1;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 
-const PROJECTIONS: [Projection; 2] = [
+const PROJECTIONS: [Projection; 3] = [
+    Projection {
+        name: SESSION_RELATIONSHIPS_PROJECTION,
+        version: SESSION_RELATIONSHIPS_VERSION,
+        table: "session_relationships",
+    },
     Projection {
         name: MESSAGE_PROVENANCE_PROJECTION,
         version: MESSAGE_PROVENANCE_VERSION,
@@ -202,6 +209,7 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
     set_projection_building(store, projection, input_rowid)?;
 
     let result = match projection.name {
+        SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships(store),
         MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store),
         SESSION_FACTS_PROJECTION => rebuild_session_facts(store),
         _ => clear_projection(store, projection),
@@ -216,10 +224,155 @@ fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
     }
 }
 
+fn rebuild_session_relationships(store: &Store) -> Result<()> {
+    let projection = PROJECTIONS[0];
+    clear_projection(store, projection)?;
+
+    let sessions = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, machine_id, source_kind, external_id, metadata_json
+             FROM sessions
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RelationshipSession {
+                session_id: row.get(0)?,
+                machine_id: row.get(1)?,
+                source_kind: row.get(2)?,
+                external_id: row.get(3)?,
+                metadata_json: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let session_ids = sessions
+        .iter()
+        .map(|session| {
+            (
+                (
+                    session.machine_id.clone(),
+                    session.source_kind.clone(),
+                    session.external_id.clone(),
+                ),
+                session.session_id.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut hints = Vec::with_capacity(sessions.len());
+    let mut parents = HashMap::with_capacity(sessions.len());
+    for session in &sessions {
+        let metadata = serde_json::from_str::<Value>(&session.metadata_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let event_contents = session_event_contents(store, &session.session_id, None)?;
+        let event_contents = event_contents
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let hint = ingest::resolve_session_relationship(
+            &session.source_kind,
+            &session.external_id,
+            &metadata,
+            &event_contents,
+        );
+        let parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
+            session_ids
+                .get(&(
+                    session.machine_id.clone(),
+                    session.source_kind.clone(),
+                    external_id.clone(),
+                ))
+                .cloned()
+        });
+        parents.insert(session.session_id.clone(), parent_session_id.clone());
+        hints.push((hint, parent_session_id));
+    }
+
+    let resolved_at = Utc::now().to_rfc3339();
+    let rows = sessions
+        .into_iter()
+        .zip(hints)
+        .map(|(session, (hint, parent_session_id))| {
+            Ok(SessionRelationshipRow {
+                root_session_id: root_session_id(&session.session_id, &parents)?,
+                session_id: session.session_id,
+                parent_session_id,
+                relationship: hint.relationship.as_str(),
+                rule: hint.rule,
+                resolved_at: resolved_at.as_str(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for batch in rows.chunks(500) {
+        insert_session_relationships_batch(store, batch)?;
+    }
+    Ok(())
+}
+
+fn root_session_id(session_id: &str, parents: &HashMap<String, Option<String>>) -> Result<String> {
+    let mut current = session_id;
+    let mut visited = HashSet::new();
+    while let Some(parent) = parents.get(current).and_then(Option::as_deref) {
+        if !visited.insert(current) {
+            bail!("cycle in session relationships at {current}");
+        }
+        current = parent;
+    }
+    Ok(current.to_string())
+}
+
+fn insert_session_relationships_batch(
+    store: &Store,
+    rows: &[SessionRelationshipRow<'_>],
+) -> Result<()> {
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting session relationships batch")?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO session_relationships
+                 (session_id, parent_session_id, root_session_id, relationship, rule, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for row in rows {
+                stmt.execute(params![
+                    row.session_id,
+                    row.parent_session_id,
+                    row.root_session_id,
+                    row.relationship,
+                    row.rule,
+                    row.resolved_at,
+                ])?;
+            }
+        }
+        tx.commit()
+            .context("committing session relationships batch")
+    })
+}
+
+struct RelationshipSession {
+    session_id: String,
+    machine_id: String,
+    source_kind: String,
+    external_id: String,
+    metadata_json: String,
+}
+
+struct SessionRelationshipRow<'a> {
+    session_id: String,
+    parent_session_id: Option<String>,
+    root_session_id: String,
+    relationship: &'a str,
+    rule: &'a str,
+    resolved_at: &'a str,
+}
+
 fn rebuild_session_facts(store: &Store) -> Result<()> {
     const BATCH_SIZE: i64 = 500;
 
-    clear_projection(store, PROJECTIONS[1])?;
+    clear_projection(store, PROJECTIONS[2])?;
     let mut last_rowid = 0i64;
     loop {
         let batch = store.with_conn(|conn| {
@@ -407,7 +560,7 @@ fn clear_projection(store: &Store, projection: Projection) -> Result<()> {
 fn rebuild_message_provenance(store: &Store) -> Result<()> {
     const BATCH_SIZE: i64 = 10_000;
 
-    clear_projection(store, PROJECTIONS[0])?;
+    clear_projection(store, PROJECTIONS[1])?;
     let repeated_templates = repeated_template_hashes(store)?;
     let mut session_classes = HashMap::new();
     let mut last_rowid = 0i64;

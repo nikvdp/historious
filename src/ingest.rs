@@ -68,6 +68,49 @@ impl SessionClass {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRelationshipKind {
+    Subagent,
+    Fork,
+    None,
+}
+
+impl SessionRelationshipKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Subagent => "subagent",
+            Self::Fork => "fork",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionRelationshipHint {
+    pub parent_external_id: Option<String>,
+    pub relationship: SessionRelationshipKind,
+    pub rule: &'static str,
+}
+
+pub(crate) fn resolve_session_relationship(
+    source_kind: &str,
+    _session_external_id: &str,
+    _session_metadata: &Value,
+    _event_contents: &[&str],
+) -> SessionRelationshipHint {
+    let rule = match source_kind {
+        "pi_agent" => "pi_agent.capture_gap",
+        "hermes" => "hermes.capture_gap",
+        _ => "default.none",
+    };
+    SessionRelationshipHint {
+        parent_external_id: None,
+        relationship: SessionRelationshipKind::None,
+        rule,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UsageEvent {
     pub content: String,
