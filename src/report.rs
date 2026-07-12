@@ -69,9 +69,14 @@ pub struct ReportTotals {
     pub sessions: u64,
     pub threads: u64,
     pub events: u64,
-    pub human_messages: u64,
-    pub agent_messages: u64,
-    pub harness_messages: u64,
+    #[serde(alias = "human_messages")]
+    pub human_turns: u64,
+    #[serde(default)]
+    pub assistant_turns: u64,
+    #[serde(alias = "agent_messages")]
+    pub delegated_turns: u64,
+    #[serde(alias = "harness_messages")]
+    pub harness_turns: u64,
     pub first_activity_at: Option<String>,
     pub last_activity_at: Option<String>,
 }
@@ -102,7 +107,9 @@ pub struct TokenPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRow {
-    pub workspace_path: String,
+    pub project: String,
+    #[serde(skip)]
+    workspace_path: String,
     pub sessions: u64,
     pub human_messages: u64,
     pub total_tokens: Option<i64>,
@@ -189,7 +196,7 @@ pub struct TopicPeriod {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicProject {
-    pub workspace_path: String,
+    pub project: String,
     pub topic_id: i64,
     pub label: String,
     pub messages: u64,
@@ -216,7 +223,7 @@ pub struct SentimentPeriod {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentProject {
-    pub workspace_path: String,
+    pub project: String,
     pub axis: String,
     pub average: f64,
     pub messages: u64,
@@ -385,7 +392,7 @@ fn compute_live(
         contains_raw_text: false,
         filters: ReportFilters {
             since: options.since.clone(),
-            project: options.project.clone(),
+            project: options.project.as_deref().map(project_label),
             timezone: "local".to_string(),
         },
         warnings,
@@ -514,7 +521,7 @@ fn report_sentiment(
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![version, since, project], |row| {
             Ok(SentimentProject {
-                workspace_path: row.get(0)?,
+                project: project_label(&row.get::<_, String>(0)?),
                 axis: row.get(1)?,
                 average: row.get(2)?,
                 messages: nonnegative(row.get(3)?),
@@ -682,7 +689,7 @@ fn report_topics(
         )?;
         let rows = stmt.query_map(params![version, since, project], |row| {
             Ok(TopicProject {
-                workspace_path: row.get(0)?,
+                project: project_label(&row.get::<_, String>(0)?),
                 topic_id: row.get(1)?,
                 label: row.get(2)?,
                 messages: nonnegative(row.get(3)?),
@@ -940,7 +947,8 @@ fn report_totals(
             "WITH provenance_counts AS (
                SELECT session_id,
                       SUM(authored_by = 'human') AS human_messages,
-                      SUM(authored_by = 'agent') AS agent_messages,
+                      SUM(authored_by = 'assistant') AS assistant_messages,
+                      SUM(authored_by = 'agent') AS delegated_messages,
                       SUM(authored_by = 'harness') AS harness_messages
                FROM message_provenance
                GROUP BY session_id
@@ -950,7 +958,8 @@ fn report_totals(
                     COALESCE(SUM(event_count), 0),
                     MIN(first_event_at), MAX(last_event_at),
                     COALESCE(SUM(pc.human_messages), 0),
-                    COALESCE(SUM(pc.agent_messages), 0),
+                    COALESCE(SUM(pc.assistant_messages), 0),
+                    COALESCE(SUM(pc.delegated_messages), 0),
                     COALESCE(SUM(pc.harness_messages), 0)
              FROM session_facts sf
              LEFT JOIN provenance_counts pc ON pc.session_id = sf.session_id
@@ -964,9 +973,10 @@ fn report_totals(
                     events: nonnegative(row.get(2)?),
                     first_activity_at: row.get(3)?,
                     last_activity_at: row.get(4)?,
-                    human_messages: nonnegative(row.get(5)?),
-                    agent_messages: nonnegative(row.get(6)?),
-                    harness_messages: nonnegative(row.get(7)?),
+                    human_turns: nonnegative(row.get(5)?),
+                    assistant_turns: nonnegative(row.get(6)?),
+                    delegated_turns: nonnegative(row.get(7)?),
+                    harness_turns: nonnegative(row.get(8)?),
                 })
             },
         )
@@ -1135,7 +1145,7 @@ fn report_changes(
         push_change(
             &mut project_ranked,
             "project human messages",
-            Some(workspace_path),
+            Some(project_label(&workspace_path)),
             current,
             previous,
         );
@@ -1240,8 +1250,10 @@ fn report_projects(
              GROUP BY sf.workspace_path",
         )?;
         let rows = stmt.query_map(params![since, project], |row| {
+            let workspace_path = row.get::<_, String>(0)?;
             Ok(ProjectRow {
-                workspace_path: row.get(0)?,
+                project: project_label(&workspace_path),
+                workspace_path,
                 sessions: nonnegative(row.get(1)?),
                 human_messages: nonnegative(row.get(2)?),
                 total_tokens: row.get::<_, Option<i64>>(3)?.map(|value| value.max(0)),
@@ -1253,6 +1265,15 @@ fn report_projects(
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     })
+}
+
+fn project_label(workspace_path: &str) -> String {
+    let trimmed = workspace_path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn report_mix(
@@ -1529,7 +1550,7 @@ pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -
     out.push_str(&styled_role("Activity overview", StyleRole::Section, color));
     out.push('\n');
     out.push_str(&format!(
-        "  {} sessions · {} threads\n  {} human messages · {} agent messages\n",
+        "  {} sessions · {} threads\n  {} human turns · {} assistant turns\n  {} delegated turns · {} harness/context turns\n",
         styled_role(
             &compact_number(report.totals.sessions),
             StyleRole::Count,
@@ -1541,12 +1562,22 @@ pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -
             color
         ),
         styled_role(
-            &compact_number(report.totals.human_messages),
+            &exact_number(report.totals.human_turns),
             StyleRole::Count,
             color
         ),
         styled_role(
-            &compact_number(report.totals.agent_messages),
+            &exact_number(report.totals.assistant_turns),
+            StyleRole::Count,
+            color
+        ),
+        styled_role(
+            &exact_number(report.totals.delegated_turns),
+            StyleRole::Count,
+            color
+        ),
+        styled_role(
+            &exact_number(report.totals.harness_turns),
             StyleRole::Count,
             color
         )
@@ -1663,10 +1694,10 @@ pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
     out.push('\n');
     for row in report.projects.iter().take(5) {
-        let path = ellipsize_middle(&row.workspace_path, width.saturating_sub(2).max(10));
+        let project = ellipsize_middle(&row.project, width.saturating_sub(2).max(10));
         out.push_str(&format!(
             "  {}\n    {} sess · {} msg · {}\n",
-            styled_role(&path, StyleRole::Project, color),
+            styled_role(&project, StyleRole::Project, color),
             styled_role(&compact_number(row.sessions), StyleRole::Count, color),
             styled_role(&compact_number(row.human_messages), StyleRole::Count, color),
             styled_role(
@@ -1769,6 +1800,18 @@ fn compact_number(value: u64) -> String {
         }
     }
     value.to_string()
+}
+
+fn exact_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 fn push_wrapped(
