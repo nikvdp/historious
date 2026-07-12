@@ -280,7 +280,7 @@ pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) ->
                     output = output.saturating_add(json_i64(usage.get("output_tokens")));
                 }
             }
-            "pi_agent" => {
+            "pi_agent" | "omp" => {
                 let Some(value) = content.as_ref() else {
                     continue;
                 };
@@ -1101,7 +1101,13 @@ fn selected_treechat_source(selection: &SourceSelection) -> Option<&'static str>
 fn is_local_transcript_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "codex" | "claude_code" | "pi_agent" | "openclaw" | "hermes" | "opencode"
+        "codex"
+            | "claude_code"
+            | "pi_agent"
+            | "omp"
+            | "openclaw"
+            | "hermes"
+            | "opencode"
     )
 }
 
@@ -1238,6 +1244,10 @@ fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
             }],
         },
         LocalTranscriptSource {
+            kind: "omp",
+            roots: omp_session_roots(&home),
+        },
+        LocalTranscriptSource {
             kind: "openclaw",
             roots: vec![SourceRoot {
                 path: home.join(".openclaw"),
@@ -1259,6 +1269,68 @@ fn local_transcript_sources() -> Vec<LocalTranscriptSource> {
             }],
         },
     ]
+}
+
+fn omp_session_roots(home: &Path) -> Vec<SourceRoot> {
+    let mut paths = BTreeSet::new();
+    let mut config_roots = BTreeSet::from([home.join(".omp")]);
+    if let Some(config_dir) = std::env::var_os("PI_CONFIG_DIR") {
+        config_roots.insert(home.join(config_dir));
+    }
+
+    for config_root in &config_roots {
+        paths.insert(config_root.join("agent/sessions"));
+        add_omp_profile_session_roots(&mut paths, &config_root.join("profiles"), true);
+    }
+
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+        let xdg_root = PathBuf::from(xdg_data_home).join("omp");
+        paths.insert(xdg_root.join("sessions"));
+        add_omp_profile_session_roots(&mut paths, &xdg_root.join("profiles"), false);
+    }
+
+    if let Some(agent_dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        let agent_dir = PathBuf::from(agent_dir);
+        if omp_agent_dir_is_recognizable(&agent_dir, &config_roots) {
+            paths.insert(agent_dir.join("sessions"));
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| SourceRoot {
+            path,
+            extensions: &["jsonl"],
+        })
+        .collect()
+}
+
+fn add_omp_profile_session_roots(
+    paths: &mut BTreeSet<PathBuf>,
+    profiles_root: &Path,
+    agent_subdir: bool,
+) {
+    let Ok(profiles) = fs::read_dir(profiles_root) else {
+        return;
+    };
+    for profile in profiles.flatten() {
+        if profile.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            let profile_root = profile.path();
+            paths.insert(if agent_subdir {
+                profile_root.join("agent/sessions")
+            } else {
+                profile_root.join("sessions")
+            });
+        }
+    }
+}
+
+fn omp_agent_dir_is_recognizable(agent_dir: &Path, config_roots: &BTreeSet<PathBuf>) -> bool {
+    agent_dir.join("agent.db").exists()
+        || agent_dir.join("history.db").exists()
+        || config_roots
+            .iter()
+            .any(|config_root| agent_dir.starts_with(config_root))
 }
 
 fn opencode_checkpoint_cursor(path: &Path) -> Result<String> {
@@ -1960,8 +2032,18 @@ fn session_title(
 fn inline_session_title(kind: &str, lines: &[ParsedLine]) -> Option<String> {
     match kind {
         "pi_agent" => pi_session_info_title(lines),
+        "omp" => omp_session_header_title(lines).or_else(|| pi_session_info_title(lines)),
         _ => None,
     }
+}
+
+fn omp_session_header_title(lines: &[ParsedLine]) -> Option<String> {
+    lines
+        .iter()
+        .find(|line| line.event_type == "session")
+        .and_then(|line| string_at(&line.value, &["title"]))
+        .and_then(|title| normalized_nonempty_title(&title))
+        .filter(|title| !is_rejected_title_content(title))
 }
 
 fn pi_session_info_title(lines: &[ParsedLine]) -> Option<String> {
