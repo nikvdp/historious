@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
-pub const MESSAGE_PROVENANCE_VERSION: u32 = 6;
+pub const MESSAGE_PROVENANCE_VERSION: u32 = 7;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 6;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
@@ -809,6 +809,7 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
 
     clear_projection(store, PROJECTIONS[1])?;
     let repeated_templates = repeated_template_hashes(store)?;
+    let inherited_parent_items = inherited_parent_items(store)?;
     let mut session_classes = HashMap::new();
     let mut last_rowid = 0i64;
 
@@ -817,19 +818,8 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
             let mut stmt = conn.prepare(
                 "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
                         hi.text_hash, hi.occurred_at, s.metadata_json,
-                        CASE
-                          WHEN eso.event_id IS NULL
-                           AND sr.relationship = 'subagent'
-                           AND EXISTS (
-                             SELECT 1
-                             FROM history_items parent_hi INDEXED BY idx_history_items_session_order
-                             WHERE parent_hi.session_id = sr.parent_session_id
-                               AND parent_hi.tier = hi.tier
-                               AND parent_hi.kind = hi.kind
-                               AND parent_hi.text_hash = hi.text_hash
-                           ) THEN 'none'
-                          ELSE COALESCE(sr.relationship, 'none')
-                        END
+                        COALESCE(sr.relationship, 'none'),
+                        eso.event_id IS NOT NULL
                  FROM history_items hi
                  JOIN sessions s ON s.id = hi.session_id
                  LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
@@ -853,6 +843,7 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
                     occurred_at: row.get(7)?,
                     session_metadata: row.get(8)?,
                     relationship: row.get(9)?,
+                    event_session_overridden: row.get(10)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -879,11 +870,23 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
                 session_classes.insert(input.session_id.clone(), class);
                 class
             };
+            let relationship = if !input.event_session_overridden
+                && input.relationship == "subagent"
+                && inherited_parent_items.contains(&(
+                    input.session_id.clone(),
+                    input.message_kind.clone(),
+                    input.text_hash.clone(),
+                ))
+            {
+                "none"
+            } else {
+                input.relationship.as_str()
+            };
             let classification = provenance::classify_message(
                 &input.text,
                 &input.message_kind,
                 repeated_templates.contains(&input.text_hash),
-                &input.relationship,
+                relationship,
                 session_class,
             );
             rows.push(ProvenanceRow {
@@ -899,6 +902,26 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
         insert_provenance_batch(store, &rows)?;
     }
     Ok(())
+}
+
+fn inherited_parent_items(store: &Store) -> Result<HashSet<(String, String, String)>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT sr.session_id, hi.kind, hi.text_hash
+             FROM session_relationships sr
+             JOIN history_items hi INDEXED BY idx_history_items_session_order
+               ON hi.session_id = sr.parent_session_id
+             WHERE sr.relationship = 'subagent'
+               AND sr.parent_session_id IS NOT NULL
+               AND hi.tier = 'conversation'
+               AND hi.kind IN ('user', 'assistant')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(Into::into)
+    })
 }
 
 fn repeated_template_hashes(store: &Store) -> Result<HashSet<String>> {
@@ -994,6 +1017,7 @@ struct ProvenanceInput {
     occurred_at: Option<String>,
     session_metadata: String,
     relationship: String,
+    event_session_overridden: bool,
 }
 
 struct ProvenanceRow<'a> {
