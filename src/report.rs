@@ -1408,6 +1408,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ranked_changes_and_dayparts_suppress_weak_patterns() {
+        let mut ranked = Vec::new();
+        push_change(&mut ranked, "weak sample", None, 11, 10);
+        push_change(&mut ranked, "weak effect", None, 110, 100);
+        push_change(&mut ranked, "strong effect", None, 150, 100);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].1.metric, "strong effect");
+        assert_eq!(ranked[0].1.change_percent, Some(50));
+
+        let dayparts = report_dayparts(&Rhythms {
+            by_hour: vec![
+                RhythmBucket {
+                    label: "00".to_string(),
+                    human_messages: 10,
+                },
+                RhythmBucket {
+                    label: "09".to_string(),
+                    human_messages: 100,
+                },
+            ],
+            by_weekday: Vec::new(),
+        });
+        assert_eq!(
+            dayparts
+                .iter()
+                .map(|bucket| bucket.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["night", "early morning", "morning", "afternoon", "evening"]
+        );
+        let insights = select_daypart_insights(&dayparts);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].label, "morning");
+        assert!(insights[0].share_percent > insights[0].baseline_percent);
+    }
+
+    #[test]
     fn frequency_tokenizer_removes_code_urls_paths_and_punctuation() {
         let tokens = tokenize_frequency_text(
             "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
@@ -1529,6 +1565,11 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
+        let rendered = render_terminal(&report);
+        assert!(rendered.contains("What changed · trailing 4 weeks vs prior 4 weeks"));
+        assert!(rendered.contains("Leading projects"));
+        assert!(!rendered.contains("Provider mix by month"));
+        assert!(!rendered.contains("Sentiment by local hour"));
 
         let filtered = compute(
             &store,
