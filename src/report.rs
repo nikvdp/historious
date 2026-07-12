@@ -84,7 +84,8 @@ pub struct ReportTotals {
 pub struct ActivityPoint {
     pub bucket: String,
     pub sessions: u64,
-    pub human_messages: u64,
+    #[serde(alias = "human_messages")]
+    pub human_turns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1022,18 +1023,20 @@ fn report_activity(
 ) -> Result<Vec<ActivityPoint>> {
     store.with_conn(|conn| {
         let mut values = BTreeMap::<String, (u64, u64)>::new();
-        let bucket = "CASE WHEN first_event_at >= datetime('now', '-56 days')
-                           THEN date(first_event_at, 'localtime')
-                           ELSE strftime('%Y-W%W', first_event_at, 'localtime') END";
-        let sql = format!(
-            "SELECT {bucket}, COUNT(*) FROM session_facts sf
+        let today = Local::now().date_naive();
+        let start = today - ChronoDuration::days(364);
+        for offset in 0..365 {
+            values.insert((start + ChronoDuration::days(offset)).to_string(), (0, 0));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT date(first_event_at, 'localtime'), COUNT(*) FROM session_facts sf
              WHERE first_event_at IS NOT NULL
                AND (?1 IS NULL OR last_event_at >= ?1)
                AND (?2 IS NULL OR workspace_path LIKE ?2)
+               AND date(first_event_at, 'localtime') >= ?3
              GROUP BY 1"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        )?;
+        let rows = stmt.query_map(params![since, project, start.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, nonnegative(row.get(1)?)))
         })?;
         for row in rows {
@@ -1042,47 +1045,32 @@ fn report_activity(
         }
 
         let mut stmt = conn.prepare(
-            "SELECT CASE WHEN hi.occurred_at >= datetime('now', '-56 days')
-                         THEN date(hi.occurred_at, 'localtime')
-                         ELSE strftime('%Y-W%W', hi.occurred_at, 'localtime') END,
-                    COUNT(*)
+            "SELECT date(hi.occurred_at, 'localtime'), COUNT(*)
              FROM message_provenance p
              JOIN history_items hi ON hi.id = p.item_id
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human' AND hi.occurred_at IS NOT NULL
                AND (?1 IS NULL OR hi.occurred_at >= ?1)
                AND (?2 IS NULL OR sf.workspace_path LIKE ?2)
+               AND date(hi.occurred_at, 'localtime') >= ?3
              GROUP BY 1",
         )?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        let rows = stmt.query_map(params![since, project, start.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, nonnegative(row.get(1)?)))
         })?;
         for row in rows {
             let (label, messages) = row?;
             values.entry(label).or_default().1 = messages;
         }
-        let mut activity = values
+        Ok(values
             .into_iter()
-            .map(|(bucket, (sessions, human_messages))| ActivityPoint {
+            .map(|(bucket, (sessions, human_turns))| ActivityPoint {
                 bucket,
                 sessions,
-                human_messages,
+                human_turns,
             })
-            .collect::<Vec<_>>();
-        activity.sort_by_key(|point| activity_bucket_order(&point.bucket));
-        Ok(activity)
+            .collect())
     })
-}
-
-fn activity_bucket_order(bucket: &str) -> i32 {
-    if let Ok(day) = NaiveDate::parse_from_str(bucket, "%Y-%m-%d") {
-        return day.year() * 400 + day.ordinal() as i32;
-    }
-    bucket
-        .split_once("-W")
-        .and_then(|(year, week)| year.parse::<i32>().ok().zip(week.parse::<i32>().ok()))
-        .map(|(year, week)| year * 400 + week * 7)
-        .unwrap_or(i32::MIN)
 }
 
 fn report_comparisons(
@@ -1469,26 +1457,6 @@ fn nonnegative(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-pub(crate) fn sparkline(values: &[u64], width: usize) -> String {
-    let values = sampled_values(values, width);
-    let Some((&minimum, &maximum)) = values.iter().min().zip(values.iter().max()) else {
-        return String::new();
-    };
-    let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    values
-        .into_iter()
-        .map(|value| {
-            if minimum == maximum {
-                levels[3]
-            } else {
-                let index = (value - minimum) as usize * (levels.len() - 1)
-                    / (maximum - minimum) as usize;
-                levels[index]
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn horizontal_bar(value: f64, maximum: f64, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1653,31 +1621,7 @@ pub fn render_terminal_window(
             color
         )
     ));
-    for point in report.activity.iter().rev().take(6).rev() {
-        out.push_str(&format!(
-            "  {:<10} {:>5} sess · {:>6} msg\n",
-            point.bucket,
-            compact_number(point.sessions),
-            compact_number(point.human_messages)
-        ));
-    }
-
-    let activity_values = report
-        .activity
-        .iter()
-        .rev()
-        .take(16)
-        .map(|point| point.human_messages)
-        .collect::<Vec<_>>();
-    let activity_values = activity_values.into_iter().rev().collect::<Vec<_>>();
-    if !activity_values.is_empty() {
-        let chart = sparkline(&activity_values, width.saturating_sub(12).min(48));
-        out.push_str(&format!(
-            "  {} {}\n",
-            styled_role("trend", StyleRole::Muted, color),
-            styled_role(&chart, StyleRole::Time, color)
-        ));
-    }
+    render_activity_calendar(&mut out, &report.activity, width, color);
 
     out.push('\n');
     out.push_str(&styled_role("What changed", StyleRole::Section, color));
@@ -1794,6 +1738,95 @@ pub fn render_terminal_window(
         out.push_str("\nTopics\n  Coherent topic data is ready for ranked integration.\n");
     }
     out
+}
+
+fn render_activity_calendar(
+    out: &mut String,
+    activity: &[ActivityPoint],
+    width: usize,
+    color: bool,
+) {
+    let counts = activity
+        .iter()
+        .filter_map(|point| {
+            NaiveDate::parse_from_str(&point.bucket, "%Y-%m-%d")
+                .ok()
+                .map(|day| (day, point.human_turns))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let Some(data_end) = counts.keys().next_back().copied() else {
+        return;
+    };
+    let weeks = (width.saturating_sub(4) / 2).clamp(8, 52);
+    let days_until_saturday = 6 - i64::from(data_end.weekday().num_days_from_sunday());
+    let calendar_end = data_end + ChronoDuration::days(days_until_saturday);
+    let calendar_start = calendar_end - ChronoDuration::days((weeks * 7 - 1) as i64);
+    let positives = counts
+        .iter()
+        .filter(|(day, count)| **day >= calendar_start && **day <= data_end && **count > 0)
+        .map(|(_, count)| *count)
+        .collect::<Vec<_>>();
+    let mut positives = positives;
+    positives.sort_unstable();
+
+    let mut months = vec![' '; weeks * 2];
+    for week in 0..weeks {
+        let sunday = calendar_start + ChronoDuration::days((week * 7) as i64);
+        let marker = (0..7)
+            .map(|offset| sunday + ChronoDuration::days(offset))
+            .find(|day| day.day() == 1)
+            .or_else(|| (week == 0).then_some(sunday));
+        if let Some(day) = marker {
+            let label = day.format("%b").to_string();
+            for (offset, character) in label.chars().enumerate() {
+                if let Some(slot) = months.get_mut(week * 2 + offset) {
+                    *slot = character;
+                }
+            }
+        }
+    }
+    out.push_str("    ");
+    out.extend(months);
+    out.push('\n');
+
+    for (weekday, label) in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        .into_iter()
+        .enumerate()
+    {
+        out.push_str(label);
+        out.push(' ');
+        let mut cells = String::with_capacity(weeks * 2);
+        for week in 0..weeks {
+            let day = calendar_start + ChronoDuration::days((week * 7 + weekday) as i64);
+            if day > data_end {
+                cells.push_str("  ");
+                continue;
+            }
+            let count = counts.get(&day).copied().unwrap_or(0);
+            cells.push(calendar_glyph(count, &positives));
+            cells.push(' ');
+        }
+        out.push_str(&styled_role(&cells, StyleRole::Count, color));
+        out.push('\n');
+    }
+    if width < 50 {
+        out.push_str("  Less ·░▒▓█ More\n");
+    } else {
+        out.push_str("  Less · ░ ▒ ▓ █ More · human turns/day\n");
+    }
+}
+
+fn calendar_glyph(count: u64, positive_counts: &[u64]) -> char {
+    if count == 0 || positive_counts.is_empty() {
+        return '·';
+    }
+    let rank = positive_counts.partition_point(|value| *value <= count);
+    match ((rank * 4 + positive_counts.len() - 1) / positive_counts.len()).clamp(1, 4) {
+        1 => '░',
+        2 => '▒',
+        3 => '▓',
+        _ => '█',
+    }
 }
 
 fn ellipsize_middle(value: &str, width: usize) -> String {
