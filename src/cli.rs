@@ -903,6 +903,8 @@ pub enum LabCommand {
         limit: Option<usize>,
         #[arg(long, default_value_t = 10)]
         batch_size: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
         #[arg(long, default_value = "sentiment-v1")]
         annotator_version: String,
         #[arg(long)]
@@ -2478,6 +2480,7 @@ impl Cli {
                 LabCommand::Annotate {
                     limit,
                     batch_size,
+                    concurrency,
                     annotator_version,
                     model,
                     url,
@@ -2492,6 +2495,7 @@ impl Cli {
                         &crate::annotate::AnnotateOptions {
                             limit,
                             batch_size,
+                            concurrency,
                             annotator_version,
                         },
                     )?;
@@ -9717,6 +9721,8 @@ mod tests {
             "25",
             "--batch-size",
             "5",
+            "--concurrency",
+            "3",
             "--annotator-version",
             "mood-v2",
             "--model",
@@ -9729,6 +9735,7 @@ mod tests {
                 command: LabCommand::Annotate {
                     limit: Some(25),
                     batch_size: 5,
+                    concurrency: 3,
                     annotator_version,
                     model: Some(model),
                     url: None,

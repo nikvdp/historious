@@ -1,5 +1,5 @@
 use crate::storage::Store;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::Deserialize;
@@ -129,7 +129,7 @@ pub fn latest_annotations(store: &Store) -> Result<Vec<MessageAnnotation>> {
         .collect()
 }
 
-pub trait JsonLlm {
+pub trait JsonLlm: Sync {
     fn model(&self) -> &str;
     fn complete_json(&self, system: &str, prompt: &str) -> Result<String>;
 }
@@ -224,6 +224,7 @@ fn chat_content(value: &Value) -> Result<&str> {
 pub struct AnnotateOptions {
     pub limit: Option<usize>,
     pub batch_size: usize,
+    pub concurrency: usize,
     pub annotator_version: String,
 }
 
@@ -263,6 +264,9 @@ pub fn annotate_messages(
     if options.batch_size == 0 {
         bail!("annotation batch size must be greater than zero");
     }
+    if options.concurrency == 0 {
+        bail!("annotation concurrency must be greater than zero");
+    }
     if options.annotator_version.trim().is_empty() {
         bail!("annotator version must not be empty");
     }
@@ -272,64 +276,65 @@ pub fn annotate_messages(
     let target = options.limit.unwrap_or(usize::MAX);
     let mut annotated_messages = 0;
     while annotated_messages < target {
-        let inputs = missing_annotation_inputs(
-            store,
-            &options.annotator_version,
-            options.batch_size.min(target - annotated_messages),
-        )?;
+        let round_limit = options
+            .batch_size
+            .saturating_mul(options.concurrency)
+            .min(target - annotated_messages);
+        let inputs = missing_annotation_inputs(store, &options.annotator_version, round_limit)?;
         if inputs.is_empty() {
             break;
         }
-        let prompt_items = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| {
-                let text = if input.usable == "strip_wrapper" {
-                    crate::provenance::strip_human_wrapper(&input.text, &input.rule)
-                } else {
-                    input.text.clone()
-                };
-                serde_json::json!({
-                    "id": index.to_string(),
-                    "message": text.chars().take(2_000).collect::<String>()
+        let batch_results = std::thread::scope(|scope| {
+            let handles = inputs
+                .chunks(options.batch_size)
+                .map(|batch| scope.spawn(move || request_annotation_batch(llm, batch)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow!("sentiment annotation worker panicked")))
                 })
-            })
-            .collect::<Vec<_>>();
-        let response = llm.complete_json(
-            sentiment_system_prompt(),
-            &Value::Array(prompt_items).to_string(),
-        )?;
-        let expected_ids = (0..inputs.len())
-            .map(|index| index.to_string())
-            .collect::<Vec<_>>();
-        let expected_id_refs = expected_ids.iter().map(String::as_str).collect::<Vec<_>>();
-        let scores = parse_annotation_response(&response, &expected_id_refs)?;
+                .collect::<Vec<_>>()
+        });
         let annotated_at = Utc::now();
         let mut rows = Vec::with_capacity(inputs.len() * SENTIMENT_AXES.len());
-        for scores in scores {
-            let index = scores
-                .id
-                .parse::<usize>()
-                .context("annotation response item id was not an ordinal")?;
-            let input = inputs
-                .get(index)
-                .context("annotation response item ordinal was out of range")?;
-            rows.extend(
-                SENTIMENT_AXES
-                    .iter()
-                    .enumerate()
-                    .map(|(score_index, axis)| MessageAnnotation {
-                        item_id: input.item_id.clone(),
-                        axis: (*axis).to_string(),
-                        score: scores.scores[score_index],
-                        model: llm.model().to_string(),
-                        annotator_version: options.annotator_version.clone(),
-                        annotated_at,
-                    }),
-            );
+        let mut completed_in_round = 0;
+        let mut first_error = None;
+        for (batch, result) in inputs.chunks(options.batch_size).zip(batch_results) {
+            match result {
+                Ok(scores) => {
+                    for scores in scores {
+                        let index = scores
+                            .id
+                            .parse::<usize>()
+                            .context("annotation response item id was not an ordinal")?;
+                        let input = batch
+                            .get(index)
+                            .context("annotation response item ordinal was out of range")?;
+                        rows.extend(SENTIMENT_AXES.iter().enumerate().map(
+                            |(score_index, axis)| MessageAnnotation {
+                                item_id: input.item_id.clone(),
+                                axis: (*axis).to_string(),
+                                score: scores.scores[score_index],
+                                model: llm.model().to_string(),
+                                annotator_version: options.annotator_version.clone(),
+                                annotated_at,
+                            },
+                        ));
+                    }
+                    completed_in_round += batch.len();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
         insert_annotations(store, &rows)?;
-        annotated_messages += inputs.len();
+        annotated_messages += completed_in_round;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
     }
     let complete_after = complete_message_count(store, &options.annotator_version)?;
     let rows_after = annotation_row_count(store, &options.annotator_version)?;
@@ -341,6 +346,36 @@ pub fn annotate_messages(
         scores_written: rows_after.saturating_sub(rows_before),
         pending_messages: total.saturating_sub(complete_after),
     })
+}
+
+fn request_annotation_batch(
+    llm: &dyn JsonLlm,
+    inputs: &[AnnotationInput],
+) -> Result<Vec<AnnotationScores>> {
+    let prompt_items = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let text = if input.usable == "strip_wrapper" {
+                crate::provenance::strip_human_wrapper(&input.text, &input.rule)
+            } else {
+                input.text.clone()
+            };
+            serde_json::json!({
+                "id": index.to_string(),
+                "message": text.chars().take(2_000).collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = llm.complete_json(
+        sentiment_system_prompt(),
+        &Value::Array(prompt_items).to_string(),
+    )?;
+    let expected_ids = (0..inputs.len())
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>();
+    let expected_id_refs = expected_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    parse_annotation_response(&response, &expected_id_refs)
 }
 
 fn sentiment_system_prompt() -> &'static str {
@@ -547,6 +582,8 @@ mod tests {
 
     struct MockSentimentLlm {
         calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
         prompts: Mutex<Vec<String>>,
     }
 
@@ -557,6 +594,9 @@ mod tests {
 
         fn complete_json(&self, _system: &str, prompt: &str) -> Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
             self.prompts
                 .lock()
                 .expect("prompts")
@@ -571,6 +611,7 @@ mod tests {
                     serde_json::json!({"id": input["id"], "scores": scores})
                 })
                 .collect::<Vec<_>>();
+            self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(serde_json::json!({"items": items}).to_string())
         }
     }
@@ -594,6 +635,9 @@ mod tests {
                       ('plain', 'event_2', 'session', 'source', 'machine', 'codex', 1, 0,
                        'conversation', 'user', 'plain human message', 'hash_2',
                        1, 'required', '{}', 'item_hash_2'),
+                      ('plain_2', 'event_4', 'session', 'source', 'machine', 'codex', 2, 0,
+                       'conversation', 'user', 'another human message', 'hash_4',
+                       1, 'required', '{}', 'item_hash_4'),
                       ('agent', 'event_3', 'session', 'source', 'machine', 'codex', 2, 0,
                        'conversation', 'user', 'agent text', 'hash_3',
                        1, 'required', '{}', 'item_hash_3');
@@ -603,6 +647,7 @@ mod tests {
                     VALUES
                       ('wrapped', 'session', 'codex', 'human', 'strip_wrapper', 'tag.image'),
                       ('plain', 'session', 'codex', 'human', 'yes', 'default.human'),
+                      ('plain_2', 'session', 'codex', 'human', 'yes', 'default.human'),
                       ('agent', 'session', 'codex', 'agent', 'no', 'session.subagent');
                     "#,
                 )?;
@@ -611,6 +656,8 @@ mod tests {
             .expect("insert sentiment fixtures");
         let llm = MockSentimentLlm {
             calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
             prompts: Mutex::new(Vec::new()),
         };
 
@@ -620,6 +667,7 @@ mod tests {
             &AnnotateOptions {
                 limit: Some(1),
                 batch_size: 10,
+                concurrency: 1,
                 annotator_version: "v1".to_string(),
             },
         )
@@ -630,7 +678,7 @@ mod tests {
                 first.scores_written,
                 first.pending_messages
             ),
-            (1, 11, 1)
+            (1, 11, 2)
         );
         let prompt = llm.prompts.lock().expect("prompts")[0].clone();
         assert!(prompt.contains("useful caption"));
@@ -641,7 +689,8 @@ mod tests {
             &llm,
             &AnnotateOptions {
                 limit: None,
-                batch_size: 10,
+                batch_size: 1,
+                concurrency: 2,
                 annotator_version: "v1".to_string(),
             },
         )
@@ -652,33 +701,36 @@ mod tests {
                 second.skipped_messages,
                 second.pending_messages
             ),
-            (1, 1, 0)
+            (2, 1, 0)
         );
+        assert_eq!(llm.max_active.load(Ordering::SeqCst), 2);
         let repeated = annotate_messages(
             &store,
             &llm,
             &AnnotateOptions {
                 limit: None,
                 batch_size: 10,
+                concurrency: 1,
                 annotator_version: "v1".to_string(),
             },
         )
         .expect("repeat annotation");
         assert_eq!(repeated.annotated_messages, 0);
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 3);
 
         let next_version = annotate_messages(
             &store,
             &llm,
             &AnnotateOptions {
                 limit: None,
-                batch_size: 10,
+                batch_size: 1,
+                concurrency: 2,
                 annotator_version: "v2".to_string(),
             },
         )
         .expect("annotate next version");
-        assert_eq!(next_version.scores_written, 22);
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(next_version.scores_written, 33);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 6);
     }
 
     #[test]
