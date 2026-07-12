@@ -1641,10 +1641,14 @@ mod tests {
                        'message', 'user',
                        '<subagent_notification>{"agent_path":"sub"}</subagent_notification>',
                        '{}', 'event_notification_hash'),
+                      ('event_parent_copy', 'session_parent', 'source', 'machine', 'codex', 1,
+                       'message', 'user', 'inherited human turn', '{}', 'event_parent_copy_hash'),
                       ('event_meta', 'session_sub', 'source', 'machine', 'codex', 0, 'session_meta',
                        NULL, '{"payload":{"thread_source":"subagent"}}', '{}', 'event_meta_hash'),
                       ('event_sub', 'session_sub', 'source', 'machine', 'codex', 1, 'message',
-                       'user', 'please review this', '{}', 'event_sub_hash'),
+                       'user', 'inherited human turn', '{}', 'event_sub_hash'),
+                      ('event_sub_divergent', 'session_sub', 'source', 'machine', 'codex', 2,
+                       'message', 'user', 'child task prompt', '{}', 'event_sub_divergent_hash'),
                       ('event_heuristic_meta', 'session_heuristic', 'source', 'machine', 'codex', 0,
                        'session_meta', NULL, '{"payload":{"thread_source":"subagent"}}',
                        '{}', 'event_heuristic_meta_hash'),
@@ -1662,8 +1666,15 @@ mod tests {
                        subordinal, tier, kind, text, text_hash, lexical_indexable, semantic_policy,
                        metadata_json, hash)
                     VALUES
+                      ('item_parent_copy', 'event_parent_copy', 'session_parent', 'source',
+                       'machine', 'codex', 1, 0, 'conversation', 'user', 'inherited human turn',
+                       'hash_inherited', 1, 'required', '{}', 'item_parent_copy_hash'),
                       ('item_sub', 'event_sub', 'session_sub', 'source', 'machine', 'codex', 1,
-                       0, 'conversation', 'user', 'please review this', 'hash_sub', 1, 'required', '{}', 'item_sub_hash'),
+                       0, 'conversation', 'user', 'inherited human turn', 'hash_inherited',
+                       1, 'required', '{}', 'item_sub_hash'),
+                      ('item_sub_divergent', 'event_sub_divergent', 'session_sub', 'source',
+                       'machine', 'codex', 2, 0, 'conversation', 'user', 'child task prompt',
+                       'hash_divergent', 1, 'required', '{}', 'item_sub_divergent_hash'),
                       ('item_heuristic', 'event_heuristic_user', 'session_heuristic', 'source',
                        'machine', 'codex', 1, 0, 'conversation', 'user', 'real human turn',
                        'hash_heuristic', 1, 'required', '{}', 'item_heuristic_hash'),
@@ -1701,7 +1712,7 @@ mod tests {
             })
             .expect("load provenance rows");
 
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 7);
         assert_eq!(
             rows[0],
             (
@@ -1718,8 +1729,11 @@ mod tests {
         assert_eq!(rows[2].3, "default.human");
         assert_eq!(rows[3].1, "human");
         assert_eq!(rows[3].2, "strip_wrapper");
-        assert_eq!(rows[4].1, "agent");
-        assert_eq!(rows[4].3, "relationship.subagent");
+        assert_eq!(rows[4].1, "human");
+        assert_eq!(rows[5].1, "human");
+        assert_eq!(rows[5].3, "default.human");
+        assert_eq!(rows[6].1, "agent");
+        assert_eq!(rows[6].3, "relationship.subagent");
     }
 
     #[test]
