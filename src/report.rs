@@ -38,6 +38,7 @@ pub struct UsageReport {
     pub rhythms: Rhythms,
     pub frequencies: FrequencySection,
     pub topics: Option<TopicSection>,
+    pub sentiment: Option<SentimentSection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +151,41 @@ pub struct TopicProject {
     pub messages: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentSection {
+    pub annotator_version: String,
+    pub model: String,
+    pub annotated_messages: u64,
+    pub corpus_messages: u64,
+    pub by_week: Vec<SentimentPeriod>,
+    pub by_project: Vec<SentimentProject>,
+    pub by_hour: Vec<SentimentHour>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentPeriod {
+    pub week: String,
+    pub axis: String,
+    pub average: f64,
+    pub messages: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentProject {
+    pub workspace_path: String,
+    pub axis: String,
+    pub average: f64,
+    pub messages: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentHour {
+    pub hour: String,
+    pub axis: String,
+    pub average: f64,
+    pub messages: u64,
+}
+
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
@@ -176,6 +212,8 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
     let (topics, topic_warning) =
         report_topics(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let (sentiment, sentiment_warning) =
+        report_sentiment(store, options.since.as_deref(), project_pattern.as_deref())?;
     let mut warnings = analytics::freshness(store)?
         .into_iter()
         .filter(|status| status.stale)
@@ -203,6 +241,9 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     if let Some(warning) = topic_warning {
         warnings.push(warning);
     }
+    if let Some(warning) = sentiment_warning {
+        warnings.push(warning);
+    }
 
     Ok(UsageReport {
         schema: "historious.report.v1",
@@ -223,6 +264,175 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
         rhythms,
         frequencies,
         topics,
+        sentiment,
+    })
+}
+
+fn sentiment_axes_sql() -> String {
+    crate::annotate::SENTIMENT_AXES
+        .iter()
+        .map(|axis| format!("'{axis}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn report_sentiment(
+    store: &Store,
+    since: Option<&str>,
+    project: Option<&str>,
+) -> Result<(Option<SentimentSection>, Option<String>)> {
+    let corpus_messages: i64 = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_provenance
+             WHERE authored_by = 'human' AND sentiment_usable IN ('yes', 'strip_wrapper')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })?;
+    let axes = sentiment_axes_sql();
+    let complete = store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT a.annotator_version, MIN(a.model), COUNT(DISTINCT a.item_id), MAX(a.annotated_at)
+             FROM message_annotations a
+             JOIN message_provenance p ON p.item_id = a.item_id
+             WHERE p.authored_by = 'human' AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+               AND a.axis IN ({axes})
+             GROUP BY a.annotator_version
+             HAVING COUNT(*) = ?1 AND COUNT(DISTINCT a.item_id) = ?2
+             ORDER BY MAX(a.annotated_at) DESC
+             LIMIT 1"
+        );
+        conn.query_row(
+            &sql,
+            params![
+                corpus_messages * crate::annotate::SENTIMENT_AXES.len() as i64,
+                corpus_messages
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    let Some((version, model, annotated_messages)) = complete else {
+        let latest = store.with_conn(|conn| {
+            let sql = format!(
+                "SELECT annotator_version, COUNT(DISTINCT item_id)
+                 FROM message_annotations WHERE axis IN ({axes})
+                 GROUP BY annotator_version ORDER BY MAX(annotated_at) DESC LIMIT 1"
+            );
+            conn.query_row(&sql, [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+            .map_err(Into::into)
+        })?;
+        let warning = latest.map_or_else(
+            || "sentiment is unavailable; run `histo lab annotate`".to_string(),
+            |(version, count)| {
+                format!(
+                    "sentiment version {version} has {count} of {corpus_messages} messages; resume `histo lab annotate`"
+                )
+            },
+        );
+        return Ok((None, Some(warning)));
+    };
+    let by_week = sentiment_periods(store, &version, since, project, "%Y-%W", "week")?
+        .into_iter()
+        .map(|(week, axis, average, messages)| SentimentPeriod {
+            week,
+            axis,
+            average,
+            messages,
+        })
+        .collect();
+    let by_hour = sentiment_periods(store, &version, since, project, "%H", "hour")?
+        .into_iter()
+        .map(|(hour, axis, average, messages)| SentimentHour {
+            hour,
+            axis,
+            average,
+            messages,
+        })
+        .collect();
+    let by_project = store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT COALESCE(sf.workspace_path, 'unknown'), a.axis, AVG(a.score), COUNT(*)
+             FROM message_annotations a
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN session_facts sf ON sf.session_id = hi.session_id
+             WHERE a.annotator_version = ?1 AND a.axis IN ({})
+               AND (?2 IS NULL OR hi.occurred_at >= ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY sf.workspace_path, a.axis
+             ORDER BY COUNT(*) DESC, sf.workspace_path, a.axis",
+            sentiment_axes_sql()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![version, since, project], |row| {
+            Ok(SentimentProject {
+                workspace_path: row.get(0)?,
+                axis: row.get(1)?,
+                average: row.get(2)?,
+                messages: nonnegative(row.get(3)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    Ok((
+        Some(SentimentSection {
+            annotator_version: version,
+            model,
+            annotated_messages: nonnegative(annotated_messages),
+            corpus_messages: nonnegative(corpus_messages),
+            by_week,
+            by_project,
+            by_hour,
+        }),
+        None,
+    ))
+}
+
+fn sentiment_periods(
+    store: &Store,
+    version: &str,
+    since: Option<&str>,
+    project: Option<&str>,
+    format: &str,
+    label: &str,
+) -> Result<Vec<(String, String, f64, u64)>> {
+    store.with_conn(|conn| {
+        let sql = format!(
+            "SELECT strftime('{format}', hi.occurred_at, 'localtime'), a.axis,
+                    AVG(a.score), COUNT(*)
+             FROM message_annotations a
+             JOIN history_items hi ON hi.id = a.item_id
+             JOIN session_facts sf ON sf.session_id = hi.session_id
+             WHERE a.annotator_version = ?1 AND a.axis IN ({})
+               AND hi.occurred_at IS NOT NULL
+               AND (?2 IS NULL OR hi.occurred_at >= ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY 1, a.axis ORDER BY 1, a.axis",
+            sentiment_axes_sql()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![version, since, project], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                nonnegative(row.get(3)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| anyhow::anyhow!("reading sentiment by {label}: {error}"))
     })
 }
 
@@ -885,6 +1095,43 @@ pub fn render_terminal(report: &UsageReport) -> String {
             ));
         }
     }
+    if let Some(sentiment) = &report.sentiment {
+        out.push_str(&format!(
+            "\nSentiment — {} · {} · {} of {} messages\n",
+            sentiment.annotator_version,
+            sentiment.model,
+            sentiment.annotated_messages,
+            sentiment.corpus_messages
+        ));
+        out.push_str("\nRecent weekly averages\n");
+        for point in sentiment.by_week.iter().rev().take(22).rev() {
+            out.push_str(&format!(
+                "  {}  {:<14} {:.2}  n={}\n",
+                point.week, point.axis, point.average, point.messages
+            ));
+        }
+        out.push_str("\nSentiment by project\n");
+        for point in sentiment.by_project.iter().take(22) {
+            out.push_str(&format!(
+                "  {:<14} {:.2}  n={:<6} {}\n",
+                point.axis, point.average, point.messages, point.workspace_path
+            ));
+        }
+        out.push_str("\nSentiment by local hour (00 / 06 / 12 / 18)\n");
+        for axis in crate::annotate::SENTIMENT_AXES {
+            out.push_str(&format!("  {axis:<14}"));
+            for hour in ["00", "06", "12", "18"] {
+                let average = sentiment
+                    .by_hour
+                    .iter()
+                    .find(|point| point.axis == axis && point.hour == hour)
+                    .map(|point| format!("{:.2}", point.average))
+                    .unwrap_or_else(|| "—".to_string());
+                out.push_str(&format!("  {hour}:{average}"));
+            }
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -999,6 +1246,11 @@ mod tests {
         assert_eq!(report.provider_mix_by_month[0].name, "codex");
         assert_eq!(report.model_mix_by_month.len(), 2);
         assert!(report.topics.is_none());
+        assert!(report.sentiment.is_none());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sentiment is unavailable")));
 
         let filtered = compute(
             &store,
@@ -1091,5 +1343,98 @@ mod tests {
         let (topics, warning) = report_topics(&store, None, None).expect("incomplete topics");
         assert!(topics.is_none());
         assert!(warning.expect("warning").contains("1 of 2 labels"));
+    }
+
+    #[test]
+    fn sentiment_report_uses_latest_complete_version_and_shared_dimensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO session_facts (session_id, source_kind, workspace_path)
+                    VALUES ('session_a', 'codex', '/repo/project-alpha'),
+                           ('session_b', 'codex', '/repo/project-beta');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('item_a', 'event_a', 'session_a', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', 'a', 'hash_a', '2026-05-01T01:00:00Z',
+                       1, 'required', '{}', 'item_hash_a'),
+                      ('item_b', 'event_b', 'session_b', 'source', 'machine', 'codex', 0, 0,
+                       'conversation', 'user', 'b', 'hash_b', '2026-05-08T13:00:00Z',
+                       1, 'required', '{}', 'item_hash_b');
+
+                    INSERT INTO message_provenance
+                      (item_id, session_id, source_kind, authored_by, sentiment_usable, rule)
+                    VALUES
+                      ('item_a', 'session_a', 'codex', 'human', 'yes', 'default.human'),
+                      ('item_b', 'session_b', 'codex', 'human', 'yes', 'default.human');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert sentiment report fixtures");
+        let first_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let second_time = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let complete = [(&"item_a", 2u8), (&"item_b", 4u8)]
+            .into_iter()
+            .flat_map(|(item_id, score)| {
+                crate::annotate::SENTIMENT_AXES.map(|axis| crate::annotate::MessageAnnotation {
+                    item_id: (*item_id).to_string(),
+                    axis: axis.to_string(),
+                    score,
+                    model: "complete-model".to_string(),
+                    annotator_version: "complete-v1".to_string(),
+                    annotated_at: first_time,
+                })
+            })
+            .collect::<Vec<_>>();
+        crate::annotate::insert_annotations(&store, &complete).expect("insert complete scores");
+        let incomplete =
+            crate::annotate::SENTIMENT_AXES.map(|axis| crate::annotate::MessageAnnotation {
+                item_id: "item_a".to_string(),
+                axis: axis.to_string(),
+                score: 5,
+                model: "newer-model".to_string(),
+                annotator_version: "incomplete-v2".to_string(),
+                annotated_at: second_time,
+            });
+        crate::annotate::insert_annotations(&store, &incomplete).expect("insert incomplete scores");
+
+        let (sentiment, warning) = report_sentiment(&store, None, None).expect("sentiment report");
+        let sentiment = sentiment.expect("complete sentiment version");
+        assert!(warning.is_none());
+        assert_eq!(sentiment.annotator_version, "complete-v1");
+        assert_eq!(sentiment.annotated_messages, 2);
+        assert_eq!(sentiment.by_week.len(), 22);
+        assert_eq!(sentiment.by_project.len(), 22);
+        assert_eq!(sentiment.by_hour.len(), 22);
+        assert!(sentiment
+            .by_project
+            .iter()
+            .any(|row| row.workspace_path == "/repo/gail" && row.average == 2.0));
+        assert!(sentiment
+            .by_hour
+            .iter()
+            .any(|row| row.average == 4.0 && row.messages == 1));
+
+        let (filtered, _) =
+            report_sentiment(&store, None, Some("%gail%")).expect("filtered sentiment report");
+        let filtered = filtered.expect("filtered sentiment");
+        assert_eq!(filtered.by_week.len(), 11);
+        assert_eq!(filtered.by_project.len(), 11);
+        assert!(filtered
+            .by_project
+            .iter()
+            .all(|row| row.workspace_path == "/repo/gail"));
     }
 }
