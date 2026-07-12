@@ -1341,8 +1341,8 @@ mod tests {
                       ('claude_parent', 'source_parent', 'machine', 'claude_code',
                        '123e4567-e89b-12d3-a456-426614174000', 'open',
                        '{"path":"/logs/parent.jsonl"}', 'claude_parent_hash'),
-                      ('claude_child', 'source_child', 'machine', 'claude_code', 'agent-child',
-                       'open',
+                      ('claude_child', 'source_child', 'machine', 'claude_code',
+                       '123e4567-e89b-12d3-a456-426614174000', 'open',
                        '{"path":"/logs/123e4567-e89b-12d3-a456-426614174000/subagents/agent-child.jsonl"}',
                        'claude_child_hash');
                     "#,
