@@ -1589,7 +1589,7 @@ pub fn render_terminal_window(
     out.push_str(&styled_role("Activity overview", StyleRole::Section, color));
     out.push('\n');
     out.push_str(&format!(
-        "  {} sessions · {} threads\n  {} human turns · {} assistant turns\n  {} delegated turns · {} harness/context turns\n",
+        "  {} sessions · {} threads\n",
         styled_role(
             &compact_number(report.totals.sessions),
             StyleRole::Count,
@@ -1599,28 +1599,32 @@ pub fn render_terminal_window(
             &compact_number(report.totals.threads),
             StyleRole::Count,
             color
-        ),
-        styled_role(
-            &exact_number(report.totals.human_turns),
-            StyleRole::Count,
-            color
-        ),
-        styled_role(
-            &exact_number(report.totals.assistant_turns),
-            StyleRole::Count,
-            color
-        ),
-        styled_role(
-            &exact_number(report.totals.delegated_turns),
-            StyleRole::Count,
-            color
-        ),
-        styled_role(
-            &exact_number(report.totals.harness_turns),
-            StyleRole::Count,
-            color
         )
     ));
+    push_wrapped(
+        &mut out,
+        &format!(
+            "{} human turns · {} assistant turns",
+            exact_number(report.totals.human_turns),
+            exact_number(report.totals.assistant_turns)
+        ),
+        width,
+        2,
+        StyleRole::Count,
+        color,
+    );
+    push_wrapped(
+        &mut out,
+        &format!(
+            "{} delegated turns · {} harness/context turns",
+            exact_number(report.totals.delegated_turns),
+            exact_number(report.totals.harness_turns)
+        ),
+        width,
+        2,
+        StyleRole::Count,
+        color,
+    );
     render_activity_calendar(&mut out, &report.activity, width, color);
 
     out.push('\n');
