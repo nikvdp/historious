@@ -1854,11 +1854,11 @@ fn render_comparison_table(
             comparison.previous_start,
             comparison.previous_end
         ));
-        out.push_str("  metric                    current   previous    change\n");
+        out.push_str("  metric                        current   previous    change\n");
         for row in comparison.metrics.iter().chain(&comparison.project_changes) {
             out.push_str(&format!(
-                "  {:<24} {:>9}  {:>9}  {:>8}\n",
-                comparison_row_label(row, 24),
+                "  {:<28} {:>9}  {:>9}  {:>8}\n",
+                comparison_row_label(row, 28),
                 comparison_value(row),
                 previous_value(row),
                 change_value(row)
