@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const BATCH_SIZE: usize = 64;
-const TOPIC_CLUSTER_ALGORITHM_VERSION: u32 = 1;
+const TOPIC_CLUSTER_ALGORITHM_VERSION: u32 = 2;
+const MIN_TOPIC_SILHOUETTE: f64 = 0.18;
+const MISC_TOPIC_LABEL: &str = "miscellaneous";
+const MISC_TOPIC_LABELER_VERSION: &str = "coherence-gate-v1";
 
 #[derive(Debug, Clone)]
 pub struct TopicEmbeddingOutcome {
@@ -248,6 +251,7 @@ pub struct ClusterOutcome {
     pub silhouette: f64,
     pub candidates: Vec<ClusterCandidate>,
     pub reused: bool,
+    pub demoted: bool,
 }
 
 #[cfg(feature = "analytics-topics")]
@@ -267,8 +271,6 @@ pub fn cluster(
         }
     }
 
-    let version = format!("topics_{}", Uuid::new_v4().simple());
-    start_cluster_run(store, &version, &dataset)?;
     let sample = sample_points(&dataset.points, DEFAULT_SEMANTIC_DIMS, options.sample_size);
     let sample_count = sample.len() / DEFAULT_SEMANTIC_DIMS;
     let candidates = candidate_ks(options)
@@ -301,26 +303,39 @@ pub fn cluster(
     let best = scores
         .iter()
         .max_by(|left, right| left.silhouette.total_cmp(&right.silhouette))
-        .expect("non-empty candidates");
-    let model = fit_kmeans_minibatch(&dataset.points, best.k)?;
-    let assignments = model
-        .predict(&dataset.points)
-        .context("assigning topic corpus")?;
+        .expect("non-empty candidates")
+        .clone();
+    let demoted = best.silhouette < MIN_TOPIC_SILHOUETTE;
+    let (selected_k, centroids, assignments) = if demoted {
+        (
+            1,
+            mean_centroid(&dataset.points, DEFAULT_SEMANTIC_DIMS),
+            vec![0; dataset.item_ids.len()],
+        )
+    } else {
+        let model = fit_kmeans_minibatch(&dataset.points, best.k)?;
+        let assignments = model
+            .predict(&dataset.points)
+            .context("assigning topic corpus")?;
+        (best.k, model.centroids().to_vec(), assignments)
+    };
     let distances = assigned_distances(
         &dataset.points,
         DEFAULT_SEMANTIC_DIMS,
-        model.centroids(),
+        &centroids,
         &assignments,
     );
+    let version = format!("topics_{}", Uuid::new_v4().simple());
+    start_cluster_run(store, &version, &dataset)?;
     persist_cluster_run(
         store,
         &version,
         &dataset,
-        model.centroids(),
+        &centroids,
         &assignments,
         &distances,
         &scores,
-        best.k,
+        selected_k,
         best.silhouette,
     )?;
     prune_topic_versions(store)?;
@@ -328,10 +343,11 @@ pub fn cluster(
     Ok(ClusterOutcome {
         version,
         item_count: dataset.item_ids.len(),
-        selected_k: best.k,
+        selected_k,
         silhouette: best.silhouette,
         candidates: scores,
         reused: false,
+        demoted,
     })
 }
 
@@ -501,7 +517,7 @@ fn centroid_silhouette(
         let mut own_distance = 0.0;
         let mut nearest_other = f32::INFINITY;
         for (topic_id, centroid) in centroids.chunks_exact(dims).take(k).enumerate() {
-            let distance = squared_distance(point, centroid);
+            let distance = squared_distance(point, centroid).sqrt();
             if topic_id == own {
                 own_distance = distance;
             } else {
@@ -529,6 +545,22 @@ fn assigned_distances(
             squared_distance(point, &centroids[topic_id * dims..(topic_id + 1) * dims]).sqrt()
         })
         .collect()
+}
+
+fn mean_centroid(points: &[f32], dims: usize) -> Vec<f32> {
+    let mut centroid = vec![0.0; dims];
+    let count = points.len() / dims;
+    for point in points.chunks_exact(dims) {
+        for (mean, value) in centroid.iter_mut().zip(point) {
+            *mean += value;
+        }
+    }
+    if count > 0 {
+        for value in &mut centroid {
+            *value /= count as f32;
+        }
+    }
+    centroid
 }
 
 fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
@@ -621,6 +653,19 @@ fn persist_cluster_run(
                 Utc::now().to_rfc3339(),
             ],
         )?;
+        if silhouette < MIN_TOPIC_SILHOUETTE {
+            tx.execute(
+                "UPDATE topics
+                 SET label = ?2, label_model = 'local', labeler_version = ?3, labeled_at = ?4
+                 WHERE version = ?1",
+                params![
+                    version,
+                    MISC_TOPIC_LABEL,
+                    MISC_TOPIC_LABELER_VERSION,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
         tx.commit().context("committing topic cluster write")
     })
 }
@@ -663,6 +708,7 @@ fn completed_cluster_for_input(
                 silhouette,
                 candidates: serde_json::from_str(&candidates)?,
                 reused: false,
+                demoted: silhouette < MIN_TOPIC_SILHOUETTE,
             })
         },
     )
@@ -718,6 +764,12 @@ pub fn label_topics(
     limit: Option<usize>,
 ) -> Result<TopicLabelOutcome> {
     let version = current_topic_version(store)?;
+    let silhouette = topic_run_silhouette(store, &version)?;
+    if silhouette < MIN_TOPIC_SILHOUETTE {
+        bail!(
+            "topic run scored {silhouette:.4}, below the {MIN_TOPIC_SILHOUETTE:.2} coherence bar; keeping its local miscellaneous label"
+        );
+    }
     let pending_before = unlabeled_topic_ids(store, &version, labeler_version)?;
     let total = topic_count(store, &version)?;
     let terms = distinctive_topic_terms(store, &version)?;
@@ -763,14 +815,25 @@ fn current_topic_version(store: &Store) -> Result<String> {
     store.with_conn(|conn| {
         conn.query_row(
             "SELECT version FROM topic_runs
-             WHERE status = 'completed'
+             WHERE status = 'completed' AND algorithm_version = ?1
              ORDER BY completed_at DESC
              LIMIT 1",
-            [],
+            params![TOPIC_CLUSTER_ALGORITHM_VERSION],
             |row| row.get(0),
         )
         .optional()?
-        .context("no completed topic version; run `histo lab topics cluster`")
+        .context("no current completed topic version; run `histo lab topics cluster`")
+    })
+}
+
+fn topic_run_silhouette(store: &Store, version: &str) -> Result<f64> {
+    store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT silhouette_score FROM topic_runs WHERE version = ?1",
+            params![version],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     })
 }
 

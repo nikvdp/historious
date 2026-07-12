@@ -2566,14 +2566,24 @@ impl Cli {
                             );
                         }
                     }
-                    println!(
-                        "Topic clustering {}: {} messages, k={}, silhouette {:.4}{}",
-                        outcome.version,
-                        outcome.item_count,
-                        outcome.selected_k,
-                        outcome.silhouette,
-                        if outcome.reused { " (reused)" } else { "" }
-                    );
+                    if outcome.demoted {
+                        println!(
+                            "Topic clustering {}: {} messages, silhouette {:.4}; below the 0.18 coherence bar, stored as miscellaneous{}",
+                            outcome.version,
+                            outcome.item_count,
+                            outcome.silhouette,
+                            if outcome.reused { " (reused)" } else { "" }
+                        );
+                    } else {
+                        println!(
+                            "Topic clustering {}: {} messages, k={}, silhouette {:.4}{}",
+                            outcome.version,
+                            outcome.item_count,
+                            outcome.selected_k,
+                            outcome.silhouette,
+                            if outcome.reused { " (reused)" } else { "" }
+                        );
+                    }
                 }
                 LabCommand::Topics {
                     command:
