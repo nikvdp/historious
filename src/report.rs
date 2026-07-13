@@ -2141,6 +2141,57 @@ mod tests {
     }
 
     #[test]
+    fn comparison_tables_follow_themed_hierarchy() {
+        let comparison = ComparisonWindow {
+            days: 7,
+            current_start: "2026-07-07".to_string(),
+            current_end: "2026-07-13".to_string(),
+            previous_start: "2026-06-30".to_string(),
+            previous_end: "2026-07-06".to_string(),
+            metrics: vec![change_row("sessions", None, 288, 206)],
+            project_changes: vec![change_row(
+                "human turns",
+                Some("kittylitter".to_string()),
+                212,
+                12,
+            )],
+        };
+
+        let mut plain = String::new();
+        render_comparison_table(&mut plain, &comparison, 80, false);
+        assert!(plain.contains("project shifts · human turns\n  kittylitter"));
+        assert!(!plain.contains("kittylitter · human turns"));
+        assert!(!plain.contains('\x1b'));
+
+        let mut narrow = String::new();
+        render_comparison_table(&mut narrow, &comparison, 40, false);
+        assert!(narrow.lines().all(|line| line.chars().count() <= 40));
+
+        let mut colored = String::new();
+        render_comparison_table(&mut colored, &comparison, 80, true);
+        assert!(colored.contains(&styled_role(
+            "2026-07-07–2026-07-13 vs 2026-06-30–2026-07-06",
+            StyleRole::Time,
+            true,
+        )));
+        assert!(colored.contains(&styled_role(
+            &format!("{:<28}", "sessions"),
+            StyleRole::Title,
+            true,
+        )));
+        assert!(colored.contains(&styled_role(
+            &format!("{:<28}", "kittylitter"),
+            StyleRole::Project,
+            true,
+        )));
+        assert!(colored.contains(&styled_role(
+            &format!("{:>8}", "+40%"),
+            StyleRole::Count,
+            true,
+        )));
+    }
+
+    #[test]
     fn contribution_calendar_uses_quantiles_and_stays_width_bounded() {
         let positive = vec![1, 2, 3, 100];
         assert_eq!(calendar_glyph(0, &positive), '·');
@@ -2395,6 +2446,7 @@ mod tests {
         assert!(default_tables.contains("28 days"));
         assert!(default_tables.contains("current"));
         assert!(default_tables.contains("previous"));
+        assert!(default_tables.contains("\n\n  28 days"));
         let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All);
         assert!(all_tables.contains("14 days"));
         let narrow_tables = render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven);
