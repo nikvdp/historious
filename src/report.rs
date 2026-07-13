@@ -1645,7 +1645,10 @@ pub fn render_terminal_window(
             color,
         );
     } else {
-        for comparison in selected {
+        for (index, comparison) in selected.into_iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
             render_comparison_table(&mut out, comparison, width, color);
         }
     }
@@ -1863,44 +1866,132 @@ fn render_comparison_table(
 ) {
     out.push_str(&format!(
         "  {}\n",
-        styled_role(&format!("{} days", comparison.days), StyleRole::Title, color)
+        styled_role(
+            &format!("{} days", comparison.days),
+            StyleRole::Title,
+            color
+        )
     ));
     if width < 64 {
-        out.push_str(&format!(
-            "  {}–{}\n  vs {}–{}\n",
-            comparison.current_start,
-            comparison.current_end,
-            comparison.previous_start,
-            comparison.previous_end
+        out.push_str("  ");
+        out.push_str(&styled_role(
+            &format!("{}–{}", comparison.current_start, comparison.current_end),
+            StyleRole::Time,
+            color,
         ));
-        for row in comparison.metrics.iter().chain(&comparison.project_changes) {
-            let label = comparison_row_label(row, width.saturating_sub(2));
-            out.push_str(&format!(
-                "  {}\n    cur {} · prev {} · {}\n",
-                styled_role(&label, StyleRole::Time, color),
-                comparison_value(row),
-                previous_value(row),
-                change_value(row)
-            ));
+        out.push_str("\n  ");
+        out.push_str(&styled_role(
+            &format!(
+                "vs {}–{}",
+                comparison.previous_start, comparison.previous_end
+            ),
+            StyleRole::Muted,
+            color,
+        ));
+        out.push('\n');
+        for row in &comparison.metrics {
+            render_comparison_row(out, row, width, color);
         }
+        render_project_changes(out, &comparison.project_changes, width, color);
     } else {
-        out.push_str(&format!(
-            "  {}–{} vs {}–{}\n",
-            comparison.current_start,
-            comparison.current_end,
-            comparison.previous_start,
-            comparison.previous_end
+        out.push_str("  ");
+        out.push_str(&styled_role(
+            &format!(
+                "{}–{} vs {}–{}",
+                comparison.current_start,
+                comparison.current_end,
+                comparison.previous_start,
+                comparison.previous_end
+            ),
+            StyleRole::Time,
+            color,
         ));
-        out.push_str("  metric                        current   previous    change\n");
-        for row in comparison.metrics.iter().chain(&comparison.project_changes) {
-            out.push_str(&format!(
-                "  {:<28} {:>9}  {:>9}  {:>8}\n",
-                comparison_row_label(row, 28),
-                comparison_value(row),
-                previous_value(row),
-                change_value(row)
-            ));
+        out.push('\n');
+        out.push_str("  ");
+        out.push_str(&styled_role(
+            "metric                        current   previous    change",
+            StyleRole::Title,
+            color,
+        ));
+        out.push('\n');
+        for row in &comparison.metrics {
+            render_comparison_row(out, row, width, color);
         }
+        render_project_changes(out, &comparison.project_changes, width, color);
+    }
+}
+
+fn render_project_changes(out: &mut String, rows: &[ChangeInsight], width: usize, color: bool) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push('\n');
+    out.push_str("  ");
+    out.push_str(&styled_role(
+        "project shifts · human turns",
+        StyleRole::Muted,
+        color,
+    ));
+    out.push('\n');
+    for row in rows {
+        render_comparison_row(out, row, width, color);
+    }
+}
+
+fn render_comparison_row(out: &mut String, row: &ChangeInsight, width: usize, color: bool) {
+    let label = comparison_row_label(
+        row,
+        if width < 64 {
+            width.saturating_sub(2)
+        } else {
+            28
+        },
+    );
+    let label_role = if row.subject.is_some() {
+        StyleRole::Project
+    } else {
+        StyleRole::Title
+    };
+    if width < 64 {
+        out.push_str("  ");
+        out.push_str(&styled_role(&label, label_role, color));
+        out.push_str("\n    ");
+        out.push_str(&styled_role("cur", StyleRole::Muted, color));
+        out.push(' ');
+        out.push_str(&styled_role(
+            &comparison_value(row),
+            StyleRole::Count,
+            color,
+        ));
+        out.push_str(" · ");
+        out.push_str(&styled_role("prev", StyleRole::Muted, color));
+        out.push(' ');
+        out.push_str(&styled_role(&previous_value(row), StyleRole::Count, color));
+        out.push_str(" · ");
+        out.push_str(&styled_role(&change_value(row), StyleRole::Count, color));
+        out.push('\n');
+    } else {
+        out.push_str("  ");
+        out.push_str(&styled_role(&format!("{label:<28}"), label_role, color));
+        out.push(' ');
+        out.push_str(&styled_role(
+            &format!("{:>9}", comparison_value(row)),
+            StyleRole::Count,
+            color,
+        ));
+        out.push_str("  ");
+        out.push_str(&styled_role(
+            &format!("{:>9}", previous_value(row)),
+            StyleRole::Count,
+            color,
+        ));
+        out.push_str("  ");
+        out.push_str(&styled_role(
+            &format!("{:>8}", change_value(row)),
+            StyleRole::Count,
+            color,
+        ));
+        out.push('\n');
     }
 }
 
@@ -1908,7 +1999,7 @@ fn comparison_row_label(row: &ChangeInsight, width: usize) -> String {
     let label = row
         .subject
         .as_ref()
-        .map(|subject| format!("{subject} · {}", row.metric))
+        .cloned()
         .unwrap_or_else(|| row.metric.clone());
     ellipsize_middle(&label, width)
 }
