@@ -797,6 +797,8 @@ pub enum Command {
         sort: ReportSortArg,
         #[arg(long, help = "Print the reusable aggregate report model as JSON")]
         json: bool,
+        #[arg(long, help = "Show primary-model share and monthly composition")]
+        models: bool,
         #[arg(long, help = "Print stable unstyled text without terminal color")]
         plain: bool,
         #[arg(long, value_enum, help = "Color output: auto, always, or never")]
@@ -2878,6 +2880,7 @@ impl Cli {
                 sort,
                 json,
                 plain,
+                models,
                 color,
                 window,
             } => {
@@ -2903,6 +2906,7 @@ impl Cli {
                         terminal_columns(),
                         color,
                         window.into(),
+                        models,
                     ))?;
                 }
             }
@@ -10225,6 +10229,7 @@ mod tests {
             "--sort",
             "messages",
             "--json",
+            "--models",
         ])
         .expect("parse report");
         assert!(matches!(
@@ -10235,6 +10240,7 @@ mod tests {
                 project: Some(project),
                 sort: ReportSortArg::Messages,
                 json: true,
+                models: true,
                 ..
             } if after == "2026-06-01" && before == "3 days ago" && project == "example-project"
         ));

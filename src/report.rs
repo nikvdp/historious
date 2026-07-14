@@ -1607,7 +1607,7 @@ pub fn render_terminal(report: &UsageReport) -> String {
 
 #[cfg(test)]
 pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -> String {
-    render_terminal_window(report, width, color, ReportWindow::Default)
+    render_terminal_window(report, width, color, ReportWindow::Default, false)
 }
 
 pub fn render_terminal_window(
@@ -1615,6 +1615,7 @@ pub fn render_terminal_window(
     width: usize,
     color: bool,
     window: ReportWindow,
+    show_models: bool,
 ) -> String {
     let width = width.max(20);
     let mut out = String::new();
@@ -1786,6 +1787,10 @@ pub fn render_terminal_window(
         }
     }
 
+    if show_models {
+        render_model_usage(&mut out, &report.model_mix_by_month, width, color);
+    }
+
     out.push('\n');
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
     out.push('\n');
@@ -1829,6 +1834,261 @@ pub fn render_terminal_window(
         out.push_str("\nTopics\n  Coherent topic data is ready for ranked integration.\n");
     }
     out
+}
+
+#[derive(Debug)]
+struct ModelSlice {
+    name: String,
+    sessions: u64,
+    other: bool,
+}
+
+fn model_slices(points: &[MixPoint]) -> Vec<ModelSlice> {
+    let mut totals = HashMap::<&str, u64>::new();
+    for point in points.iter().filter(|point| point.sessions > 0) {
+        *totals.entry(&point.name).or_default() += point.sessions;
+    }
+    let mut slices = totals
+        .into_iter()
+        .map(|(name, sessions)| ModelSlice {
+            name: name.to_string(),
+            sessions,
+            other: false,
+        })
+        .collect::<Vec<_>>();
+    slices.sort_by(|left, right| {
+        right
+            .sessions
+            .cmp(&left.sessions)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if slices.len() > 5 {
+        let sessions = slices.drain(4..).map(|slice| slice.sessions).sum();
+        slices.push(ModelSlice {
+            name: "other models".to_string(),
+            sessions,
+            other: true,
+        });
+    }
+    slices
+}
+
+fn model_style(index: usize) -> (&'static str, StyleRole) {
+    match index {
+        0 => ("█", StyleRole::Header),
+        1 => ("▓", StyleRole::Section),
+        2 => ("▒", StyleRole::Project),
+        3 => ("░", StyleRole::Count),
+        _ => ("·", StyleRole::Muted),
+    }
+}
+
+fn slice_at(slices: &[ModelSlice], position: u64) -> usize {
+    let mut cumulative = 0;
+    for (index, slice) in slices.iter().enumerate() {
+        cumulative += slice.sessions;
+        if position < cumulative {
+            return index;
+        }
+    }
+    slices.len().saturating_sub(1)
+}
+
+fn render_model_usage(
+    out: &mut String,
+    points: &[MixPoint],
+    width: usize,
+    color: bool,
+) {
+    out.push('\n');
+    out.push_str(&styled_role("Model usage", StyleRole::Section, color));
+    out.push('\n');
+    let slices = model_slices(points);
+    if slices.is_empty() {
+        push_wrapped(
+            out,
+            "No primary-model data is available for this report.",
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        return;
+    }
+
+    push_wrapped(
+        out,
+        "Primary model by session",
+        width,
+        2,
+        StyleRole::Muted,
+        color,
+    );
+    render_model_donut(out, &slices, width, color);
+    render_model_legend(out, &slices, width, color);
+    render_monthly_model_mix(out, points, &slices, width, color);
+}
+
+fn render_model_donut(out: &mut String, slices: &[ModelSlice], width: usize, color: bool) {
+    const CHART_WIDTH: usize = 19;
+    const CHART_HEIGHT: usize = 9;
+    let total = slices.iter().map(|slice| slice.sessions).sum::<u64>();
+    let exact_total = exact_number(total);
+    let total_label = if exact_total.chars().count() <= 9 {
+        exact_total
+    } else {
+        compact_number(total)
+    };
+    let indent = usize::from(width > CHART_WIDTH);
+    for y in 0..CHART_HEIGHT {
+        let center_label = match y {
+            4 => Some((total_label.as_str(), StyleRole::Count)),
+            5 => Some(("sessions", StyleRole::Muted)),
+            _ => None,
+        };
+        let label_start = center_label
+            .map(|(label, _)| (CHART_WIDTH - label.chars().count()) / 2)
+            .unwrap_or(CHART_WIDTH);
+        let mut row = " ".repeat(indent);
+        let mut x = 0;
+        while x < CHART_WIDTH {
+            if let Some((label, role)) = center_label {
+                if x == label_start {
+                    row.push_str(&styled_role(label, role, color));
+                    x += label.chars().count();
+                    continue;
+                }
+            }
+            let dx = (x as f64 - 9.0) / 2.0;
+            let dy = y as f64 - 4.0;
+            let radius = dx.hypot(dy);
+            if (2.25..=4.25).contains(&radius) {
+                let angle = (dx.atan2(-dy) + std::f64::consts::TAU)
+                    % std::f64::consts::TAU;
+                let position = ((angle / std::f64::consts::TAU) * total as f64)
+                    .floor()
+                    .min((total - 1) as f64) as u64;
+                let index = slice_at(slices, position);
+                let (glyph, role) = model_style(index);
+                row.push_str(&styled_role(glyph, role, color));
+            } else {
+                row.push(' ');
+            }
+            x += 1;
+        }
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+}
+
+fn render_model_legend(out: &mut String, slices: &[ModelSlice], width: usize, color: bool) {
+    let total = slices.iter().map(|slice| slice.sessions).sum::<u64>() as f64;
+    for (index, slice) in slices.iter().enumerate() {
+        let (glyph, role) = model_style(index);
+        let detail = format!(
+            "{} session{} · {:.1}%",
+            exact_number(slice.sessions),
+            if slice.sessions == 1 { "" } else { "s" },
+            slice.sessions as f64 * 100.0 / total
+        );
+        if width < 60 {
+            out.push_str("  ");
+            out.push_str(&styled_role(glyph, role, color));
+            out.push(' ');
+            out.push_str(&styled_role(
+                &ellipsize_middle(&slice.name, width.saturating_sub(4).max(1)),
+                role,
+                color,
+            ));
+            out.push('\n');
+            push_wrapped(out, &detail, width, 4, StyleRole::Count, color);
+        } else {
+            let detail_width = detail.chars().count() + 2;
+            let name_width = width.saturating_sub(detail_width + 4).max(1);
+            out.push_str("  ");
+            out.push_str(&styled_role(glyph, role, color));
+            out.push(' ');
+            out.push_str(&styled_role(
+                &format!(
+                    "{:<name_width$}",
+                    ellipsize_middle(&slice.name, name_width)
+                ),
+                role,
+                color,
+            ));
+            out.push_str("  ");
+            out.push_str(&styled_role(&detail, StyleRole::Count, color));
+            out.push('\n');
+        }
+    }
+}
+
+fn render_monthly_model_mix(
+    out: &mut String,
+    points: &[MixPoint],
+    slices: &[ModelSlice],
+    width: usize,
+    color: bool,
+) {
+    let other = slices.iter().position(|slice| slice.other);
+    let mut months = BTreeMap::<&str, Vec<u64>>::new();
+    for point in points.iter().filter(|point| point.sessions > 0) {
+        let index = slices
+            .iter()
+            .position(|slice| !slice.other && slice.name == point.name)
+            .or(other);
+        if let Some(index) = index {
+            months
+                .entry(&point.month)
+                .or_insert_with(|| vec![0; slices.len()])[index] += point.sessions;
+        }
+    }
+    let skipped = months.len().saturating_sub(12);
+    push_wrapped(
+        out,
+        "Monthly composition",
+        width,
+        2,
+        StyleRole::Title,
+        color,
+    );
+    for (month, counts) in months.into_iter().skip(skipped) {
+        let total = counts.iter().sum::<u64>();
+        let total_label = format!("{} sess", compact_number(total));
+        let bar_width = width
+            .saturating_sub(11 + total_label.chars().count())
+            .clamp(1, 48);
+        out.push_str("  ");
+        out.push_str(&styled_role(month, StyleRole::Time, color));
+        out.push(' ');
+        for cell in 0..bar_width {
+            let position = (((cell as u128 * 2 + 1) * total as u128)
+                / (bar_width as u128 * 2)) as u64;
+            let mut cumulative = 0;
+            let index = counts
+                .iter()
+                .position(|count| {
+                    cumulative += count;
+                    position < cumulative
+                })
+                .unwrap_or_else(|| counts.len().saturating_sub(1));
+            let (glyph, role) = model_style(index);
+            out.push_str(&styled_role(glyph, role, color));
+        }
+        out.push(' ');
+        out.push_str(&styled_role(&total_label, StyleRole::Count, color));
+        out.push('\n');
+    }
+    if skipped > 0 {
+        push_wrapped(
+            out,
+            &format!("{skipped} earlier months remain in JSON output"),
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+    }
 }
 
 fn render_activity_calendar(
@@ -2225,6 +2485,72 @@ mod tests {
     }
 
     #[test]
+    fn model_usage_reconciles_pie_totals_and_monthly_composition() {
+        let point = |month: &str, name: &str, sessions| MixPoint {
+            month: month.to_string(),
+            name: name.to_string(),
+            sessions,
+        };
+        let points = vec![
+            point("2026-01", "alpha", 50),
+            point("2026-01", "beta", 40),
+            point("2026-01", "gamma", 30),
+            point("2026-01", "delta", 20),
+            point("2026-01", "epsilon", 10),
+            point("2026-01", "zeta", 5),
+            point("2026-02", "alpha", 20),
+            point("2026-02", "beta", 30),
+            point("2026-02", "gamma", 10),
+            point("2026-02", "delta", 10),
+            point("2026-02", "epsilon", 5),
+            point("2026-02", "zeta", 5),
+        ];
+        let slices = model_slices(&points);
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma", "delta", "other models"]
+        );
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.sessions)
+                .collect::<Vec<_>>(),
+            vec![70, 70, 40, 30, 25]
+        );
+        assert_eq!(slices.iter().map(|slice| slice.sessions).sum::<u64>(), 235);
+
+        let mut plain = String::new();
+        render_model_usage(&mut plain, &points, 80, false);
+        assert!(plain.contains("Model usage"));
+        assert!(plain.contains("235"));
+        assert_eq!(plain.matches("70 sessions · 29.8%").count(), 2);
+        assert!(plain.contains("other models"));
+        assert!(plain.contains("25 sessions · 10.6%"));
+        assert!(plain.find("2026-01") < plain.find("2026-02"));
+        assert!(!plain.contains('\x1b'));
+
+        for width in [20, 40, 80] {
+            let mut narrow = String::new();
+            render_model_usage(&mut narrow, &points, width, false);
+            let overlong = narrow
+                .lines()
+                .filter(|line| line.chars().count() > width)
+                .collect::<Vec<_>>();
+            assert!(overlong.is_empty(), "width {width}: {overlong:?}");
+        }
+        let mut colored = String::new();
+        render_model_usage(&mut colored, &points, 80, true);
+        assert!(colored.contains("\x1b["));
+
+        let mut empty = String::new();
+        render_model_usage(&mut empty, &[], 40, false);
+        assert!(empty.contains("No primary-model data is available"));
+    }
+
+    #[test]
     fn comparison_tables_follow_themed_hierarchy() {
         let comparison = ComparisonWindow {
             days: 7,
@@ -2476,6 +2802,7 @@ mod tests {
         assert!(rendered.contains("What changed"));
         assert!(!rendered.contains("now vs"));
         assert!(rendered.contains("Leading projects"));
+        assert!(!rendered.contains("Model usage"));
         assert!(!rendered.contains("Provider mix by month"));
         assert!(!rendered.contains("Sentiment by local hour"));
         assert!(!rendered.contains("/repo/"));
@@ -2486,6 +2813,18 @@ mod tests {
         assert!(narrow.lines().all(|line| line.chars().count() <= 40));
         assert!(!narrow.contains('\x1b'));
         assert!(render_terminal_themed(&report, 80, true).contains("\x1b["));
+        let with_models =
+            render_terminal_window(&report, 80, false, ReportWindow::Default, true);
+        assert!(with_models.contains("Model usage"));
+        assert!(with_models.contains("gpt-5.4"));
+        assert!(with_models.contains("gpt-5.5"));
+        assert_eq!(with_models.matches("1 session · 50.0%").count(), 2);
+        let narrow_models =
+            render_terminal_window(&report, 40, false, ReportWindow::Default, true);
+        assert!(narrow_models
+            .lines()
+            .all(|line| line.chars().count() <= 40));
+        assert!(!narrow_models.contains('\x1b'));
 
         let bounded = compute(
             &store,
@@ -2576,9 +2915,10 @@ mod tests {
         assert!(default_tables.contains("current"));
         assert!(default_tables.contains("previous"));
         assert!(default_tables.contains("\n\n  28 days"));
-        let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All);
+        let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All, false);
         assert!(all_tables.contains("14 days"));
-        let narrow_tables = render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven);
+        let narrow_tables =
+            render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven, false);
         assert!(narrow_tables.lines().all(|line| line.chars().count() <= 40));
     }
 
