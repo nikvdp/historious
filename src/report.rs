@@ -26,7 +26,8 @@ pub enum ReportSort {
 
 #[derive(Debug, Clone)]
 pub struct ReportOptions {
-    pub since: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
     pub project: Option<String>,
     pub sort: ReportSort,
 }
@@ -58,7 +59,10 @@ pub struct UsageReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportFilters {
-    pub since: Option<String>,
+    #[serde(alias = "since")]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
     pub project: Option<String>,
     pub timezone: String,
 }
@@ -270,7 +274,7 @@ pub struct SentimentHour {
 }
 
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
-    if options.since.is_none() && options.project.is_none() {
+    if options.after.is_none() && options.before.is_none() && options.project.is_none() {
         let mut report = read_snapshot(store)?.context(
             "report snapshot is unavailable; run `histo lab rebuild` before `histo report`",
         )?;
@@ -292,7 +296,8 @@ pub fn rebuild_snapshot(store: &Store) -> Result<()> {
     let report = compute_live(
         store,
         &ReportOptions {
-            since: None,
+            after: None,
+            before: None,
             project: None,
             sort: ReportSort::Tokens,
         },
@@ -348,41 +353,83 @@ fn compute_live(
     include_projection_warnings: bool,
 ) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
-    let totals = report_totals(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let activity = report_activity(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let comparisons = report_comparisons(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let tokens_by_session_end_date =
-        report_tokens(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let mut projects =
-        report_projects(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let totals = report_totals(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let activity = report_activity(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let comparisons = report_comparisons(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let tokens_by_session_end_date = report_tokens(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let mut projects = report_projects(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
     sort_projects(&mut projects, options.sort);
     let provider_mix_by_month = report_mix(
         store,
         "sf.source_kind",
-        options.since.as_deref(),
+        options.after.as_deref(),
+        options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
     let model_mix_by_month = report_mix(
         store,
         "sf.primary_model",
-        options.since.as_deref(),
+        options.after.as_deref(),
+        options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
-    let rhythms = report_rhythms(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let rhythms = report_rhythms(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
     let dayparts = report_dayparts(&rhythms);
     let daypart_insights = select_daypart_insights(&dayparts);
-    let (frequencies, project_terms) =
-        report_frequencies(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let (frequencies, project_terms) = report_frequencies(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
     for project in &mut projects {
         project.terms = project_terms
             .get(&project.workspace_path)
             .cloned()
             .unwrap_or_default();
     }
-    let (topics, topic_warning) =
-        report_topics(store, options.since.as_deref(), project_pattern.as_deref())?;
-    let (sentiment, sentiment_warning) =
-        report_sentiment(store, options.since.as_deref(), project_pattern.as_deref())?;
+    let (topics, topic_warning) = report_topics(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let (sentiment, sentiment_warning) = report_sentiment(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
     let mut warnings = if include_projection_warnings {
         analytics::freshness(store)?
             .into_iter()
@@ -423,7 +470,8 @@ fn compute_live(
         generated_at: Utc::now().to_rfc3339(),
         contains_raw_text: false,
         filters: ReportFilters {
-            since: options.since.clone(),
+            after: options.after.clone(),
+            before: options.before.clone(),
             project: options.project.as_deref().map(project_label),
             timezone: "local".to_string(),
         },
@@ -454,7 +502,8 @@ fn sentiment_axes_sql() -> String {
 
 fn report_sentiment(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<(Option<SentimentSection>, Option<String>)> {
     let corpus_messages: i64 = store.with_conn(|conn| {
@@ -519,7 +568,7 @@ fn report_sentiment(
         );
         return Ok((None, Some(warning)));
     };
-    let by_week = sentiment_periods(store, &version, since, project, "%Y-%W", "week")?
+    let by_week = sentiment_periods(store, &version, after, before, project, "%Y-%W", "week")?
         .into_iter()
         .map(|(week, axis, average, messages)| SentimentPeriod {
             week,
@@ -528,7 +577,7 @@ fn report_sentiment(
             messages,
         })
         .collect();
-    let by_hour = sentiment_periods(store, &version, since, project, "%H", "hour")?
+    let by_hour = sentiment_periods(store, &version, after, before, project, "%H", "hour")?
         .into_iter()
         .map(|(hour, axis, average, messages)| SentimentHour {
             hour,
@@ -545,13 +594,14 @@ fn report_sentiment(
              JOIN session_facts sf ON sf.session_id = hi.session_id
              WHERE a.annotator_version = ?1 AND a.axis IN ({})
                AND (?2 IS NULL OR hi.occurred_at >= ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND (?3 IS NULL OR hi.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
              GROUP BY sf.workspace_path, a.axis
              ORDER BY COUNT(*) DESC, sf.workspace_path, a.axis",
             sentiment_axes_sql()
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![version, since, project], |row| {
+        let rows = stmt.query_map(params![version, after, before, project], |row| {
             Ok(SentimentProject {
                 project: project_label(&row.get::<_, String>(0)?),
                 axis: row.get(1)?,
@@ -579,7 +629,8 @@ fn report_sentiment(
 fn sentiment_periods(
     store: &Store,
     version: &str,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
     format: &str,
     label: &str,
@@ -594,12 +645,13 @@ fn sentiment_periods(
              WHERE a.annotator_version = ?1 AND a.axis IN ({})
                AND hi.occurred_at IS NOT NULL
                AND (?2 IS NULL OR hi.occurred_at >= ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND (?3 IS NULL OR hi.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
              GROUP BY 1, a.axis ORDER BY 1, a.axis",
             sentiment_axes_sql()
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![version, since, project], |row| {
+        let rows = stmt.query_map(params![version, after, before, project], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -614,7 +666,8 @@ fn sentiment_periods(
 
 fn report_topics(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<(Option<TopicSection>, Option<String>)> {
     let Some((version, model_id, corpus_messages, selected_k, silhouette)) = store.with_conn(|conn| {
@@ -669,11 +722,12 @@ fn report_topics(
              JOIN session_facts sf ON sf.session_id = hi.session_id
              WHERE a.version = ?1
                AND (?2 IS NULL OR hi.occurred_at >= ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND (?3 IS NULL OR hi.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
              GROUP BY a.topic_id, t.label
              ORDER BY COUNT(*) DESC, a.topic_id",
         )?;
-        let rows = stmt.query_map(params![version, since, project], |row| {
+        let rows = stmt.query_map(params![version, after, before, project], |row| {
             Ok(TopicSummary {
                 topic_id: row.get(0)?,
                 label: row.get(1)?,
@@ -692,10 +746,11 @@ fn report_topics(
              JOIN session_facts sf ON sf.session_id = hi.session_id
              WHERE a.version = ?1 AND hi.occurred_at IS NOT NULL
                AND (?2 IS NULL OR hi.occurred_at >= ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND (?3 IS NULL OR hi.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
              GROUP BY 1, a.topic_id, t.label ORDER BY 1, COUNT(*) DESC",
         )?;
-        let rows = stmt.query_map(params![version, since, project], |row| {
+        let rows = stmt.query_map(params![version, after, before, project], |row| {
             Ok(TopicPeriod {
                 month: row.get(0)?,
                 topic_id: row.get(1)?,
@@ -715,11 +770,12 @@ fn report_topics(
              JOIN session_facts sf ON sf.session_id = hi.session_id
              WHERE a.version = ?1
                AND (?2 IS NULL OR hi.occurred_at >= ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND (?3 IS NULL OR hi.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
              GROUP BY sf.workspace_path, a.topic_id, t.label
              ORDER BY COUNT(*) DESC, sf.workspace_path, a.topic_id",
         )?;
-        let rows = stmt.query_map(params![version, since, project], |row| {
+        let rows = stmt.query_map(params![version, after, before, project], |row| {
             Ok(TopicProject {
                 project: project_label(&row.get::<_, String>(0)?),
                 topic_id: row.get(1)?,
@@ -747,7 +803,8 @@ fn report_topics(
 
 fn report_frequencies(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<(FrequencySection, HashMap<String, Vec<TermCount>>)> {
     let messages = store.with_conn(|conn| {
@@ -760,9 +817,10 @@ fn report_frequencies(
              WHERE p.authored_by = 'human'
                AND p.sentiment_usable IN ('yes', 'strip_wrapper')
                AND (?1 IS NULL OR hi.occurred_at >= ?1)
-               AND (?2 IS NULL OR sf.workspace_path LIKE ?2)",
+               AND (?2 IS NULL OR hi.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
         )?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        let rows = stmt.query_map(params![after, before, project], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -971,7 +1029,8 @@ pub(crate) fn english_stopwords() -> HashSet<&'static str> {
 
 fn report_totals(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<ReportTotals> {
     store.with_conn(|conn| {
@@ -983,6 +1042,8 @@ fn report_totals(
                       SUM(authored_by = 'agent') AS delegated_messages,
                       SUM(authored_by = 'harness') AS harness_messages
                FROM message_provenance
+               WHERE (?1 IS NULL OR occurred_at >= ?1)
+                 AND (?2 IS NULL OR occurred_at < ?2)
                GROUP BY session_id
              )
              SELECT COUNT(*),
@@ -996,8 +1057,9 @@ fn report_totals(
              FROM session_facts sf
              LEFT JOIN provenance_counts pc ON pc.session_id = sf.session_id
              WHERE (?1 IS NULL OR sf.last_event_at >= ?1)
-               AND (?2 IS NULL OR sf.workspace_path LIKE ?2)",
-            params![since, project],
+               AND (?2 IS NULL OR sf.first_event_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
+            params![after, before, project],
             |row| {
                 Ok(ReportTotals {
                     sessions: nonnegative(row.get(0)?),
@@ -1018,7 +1080,8 @@ fn report_totals(
 
 fn report_activity(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<ActivityPoint>> {
     store.with_conn(|conn| {
@@ -1031,12 +1094,13 @@ fn report_activity(
         let mut stmt = conn.prepare(
             "SELECT date(first_event_at, 'localtime'), COUNT(*) FROM session_facts sf
              WHERE first_event_at IS NOT NULL
-               AND (?1 IS NULL OR last_event_at >= ?1)
-               AND (?2 IS NULL OR workspace_path LIKE ?2)
-               AND date(first_event_at, 'localtime') >= ?3
+               AND (?1 IS NULL OR first_event_at >= ?1)
+               AND (?2 IS NULL OR first_event_at < ?2)
+               AND (?3 IS NULL OR workspace_path LIKE ?3)
+               AND date(first_event_at, 'localtime') >= ?4
              GROUP BY 1"
         )?;
-        let rows = stmt.query_map(params![since, project, start.to_string()], |row| {
+        let rows = stmt.query_map(params![after, before, project, start.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, nonnegative(row.get(1)?)))
         })?;
         for row in rows {
@@ -1051,11 +1115,12 @@ fn report_activity(
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human' AND hi.occurred_at IS NOT NULL
                AND (?1 IS NULL OR hi.occurred_at >= ?1)
-               AND (?2 IS NULL OR sf.workspace_path LIKE ?2)
-               AND date(hi.occurred_at, 'localtime') >= ?3
+               AND (?2 IS NULL OR hi.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               AND date(hi.occurred_at, 'localtime') >= ?4
              GROUP BY 1",
         )?;
-        let rows = stmt.query_map(params![since, project, start.to_string()], |row| {
+        let rows = stmt.query_map(params![after, before, project, start.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, nonnegative(row.get(1)?)))
         })?;
         for row in rows {
@@ -1075,10 +1140,11 @@ fn report_activity(
 
 fn report_comparisons(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<ComparisonWindow>> {
-    if since.is_some() {
+    if after.is_some() || before.is_some() {
         return Ok(Vec::new());
     }
     let today = Local::now().date_naive();
@@ -1244,7 +1310,8 @@ fn push_change(
 
 fn report_tokens(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<TokenPoint>> {
     store.with_conn(|conn| {
@@ -1256,10 +1323,11 @@ fn report_tokens(
              FROM session_facts sf
              WHERE last_event_at IS NOT NULL
                AND (?1 IS NULL OR last_event_at >= ?1)
-               AND (?2 IS NULL OR workspace_path LIKE ?2)
+               AND (?2 IS NULL OR last_event_at < ?2)
+               AND (?3 IS NULL OR workspace_path LIKE ?3)
              GROUP BY 1 ORDER BY 1",
         )?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        let rows = stmt.query_map(params![after, before, project], |row| {
             Ok(TokenPoint {
                 day: row.get(0)?,
                 input_tokens: row.get::<_, i64>(1)?.max(0),
@@ -1274,7 +1342,8 @@ fn report_tokens(
 
 fn report_projects(
     store: &Store,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<ProjectRow>> {
     store.with_conn(|conn| {
@@ -1283,6 +1352,8 @@ fn report_projects(
                SELECT session_id, COUNT(*) AS human_messages
                FROM message_provenance
                WHERE authored_by = 'human'
+                 AND (?1 IS NULL OR occurred_at >= ?1)
+                 AND (?2 IS NULL OR occurred_at < ?2)
                GROUP BY session_id
              )
              SELECT COALESCE(sf.workspace_path, 'unknown'), COUNT(*),
@@ -1295,10 +1366,11 @@ fn report_projects(
              FROM session_facts sf
              LEFT JOIN human_counts hc ON hc.session_id = sf.session_id
              WHERE (?1 IS NULL OR last_event_at >= ?1)
-               AND (?2 IS NULL OR workspace_path LIKE ?2)
+               AND (?2 IS NULL OR first_event_at < ?2)
+               AND (?3 IS NULL OR workspace_path LIKE ?3)
              GROUP BY sf.workspace_path",
         )?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        let rows = stmt.query_map(params![after, before, project], |row| {
             let workspace_path = row.get::<_, String>(0)?;
             Ok(ProjectRow {
                 project: project_label(&workspace_path),
@@ -1328,7 +1400,8 @@ fn project_label(workspace_path: &str) -> String {
 fn report_mix(
     store: &Store,
     dimension: &str,
-    since: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<MixPoint>> {
     store.with_conn(|conn| {
@@ -1337,12 +1410,13 @@ fn report_mix(
              FROM session_facts sf
              WHERE sf.first_event_at IS NOT NULL AND {dimension} IS NOT NULL
                AND trim({dimension}) != ''
-               AND (?1 IS NULL OR sf.last_event_at >= ?1)
-               AND (?2 IS NULL OR sf.workspace_path LIKE ?2)
+               AND (?1 IS NULL OR sf.first_event_at >= ?1)
+               AND (?2 IS NULL OR sf.first_event_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
              GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since, project], |row| {
+        let rows = stmt.query_map(params![after, before, project], |row| {
             Ok(MixPoint {
                 month: row.get(0)?,
                 name: row.get(1)?,
@@ -1354,7 +1428,12 @@ fn report_mix(
     })
 }
 
-fn report_rhythms(store: &Store, since: Option<&str>, project: Option<&str>) -> Result<Rhythms> {
+fn report_rhythms(
+    store: &Store,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<&str>,
+) -> Result<Rhythms> {
     store.with_conn(|conn| {
         let query = |format: &str| -> Result<Vec<RhythmBucket>> {
             let sql = format!(
@@ -1364,11 +1443,12 @@ fn report_rhythms(store: &Store, since: Option<&str>, project: Option<&str>) -> 
                  JOIN session_facts sf ON sf.session_id = p.session_id
                  WHERE p.authored_by = 'human' AND hi.occurred_at IS NOT NULL
                    AND (?1 IS NULL OR hi.occurred_at >= ?1)
-                   AND (?2 IS NULL OR sf.workspace_path LIKE ?2)
+                   AND (?2 IS NULL OR hi.occurred_at < ?2)
+                   AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
                  GROUP BY 1 ORDER BY 1"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![since, project], |row| {
+            let rows = stmt.query_map(params![after, before, project], |row| {
                 Ok(RhythmBucket {
                     label: row.get(0)?,
                     human_messages: nonnegative(row.get(1)?),
@@ -1560,12 +1640,16 @@ pub fn render_terminal_window(
         StyleRole::Muted,
         color,
     );
-    if report.filters.since.is_some() || report.filters.project.is_some() {
+    if report.filters.after.is_some()
+        || report.filters.before.is_some()
+        || report.filters.project.is_some()
+    {
         push_wrapped(
             &mut out,
             &format!(
-                "Filters · since {} · project {}",
-                report.filters.since.as_deref().unwrap_or("all time"),
+                "Filters · after {} · before {} · project {}",
+                report.filters.after.as_deref().unwrap_or("all time"),
+                report.filters.before.as_deref().unwrap_or("now"),
                 report.filters.project.as_deref().unwrap_or("all projects")
             ),
             width,
@@ -2234,6 +2318,17 @@ mod tests {
     }
 
     #[test]
+    fn report_filters_read_legacy_since_snapshots() {
+        let filters = serde_json::from_str::<ReportFilters>(
+            r#"{"since":"2026-06-01T00:00:00Z","project":null,"timezone":"local"}"#,
+        )
+        .expect("legacy report filters");
+
+        assert_eq!(filters.after.as_deref(), Some("2026-06-01T00:00:00Z"));
+        assert!(filters.before.is_none());
+    }
+
+    #[test]
     fn frequency_tokenizer_removes_code_urls_paths_and_punctuation() {
         let tokens = tokenize_frequency_text(
             "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
@@ -2340,7 +2435,8 @@ mod tests {
         let report = compute(
             &store,
             &ReportOptions {
-                since: Some("2026-06-01T00:00:00+00:00".to_string()),
+                after: Some("2026-06-01T00:00:00+00:00".to_string()),
+                before: None,
                 project: None,
                 sort: ReportSort::Tokens,
             },
@@ -2348,11 +2444,11 @@ mod tests {
         .expect("compute report");
 
         assert!(!report.contains_raw_text);
-        assert_eq!(report.generated_at, snapshot_generated_at);
+        assert_ne!(report.generated_at, snapshot_generated_at);
         assert_eq!(report.totals.sessions, 2);
         assert_eq!(report.totals.threads, 1);
         assert_eq!(report.totals.events, 3);
-        assert_eq!(report.totals.human_turns, 2);
+        assert_eq!(report.totals.human_turns, 1);
         assert_eq!(report.totals.assistant_turns, 0);
         assert_eq!(report.totals.delegated_turns, 1);
         assert_eq!(report.totals.harness_turns, 0);
@@ -2376,14 +2472,9 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("sentiment is unavailable")));
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
         let rendered = render_terminal(&report);
         assert!(rendered.contains("What changed"));
         assert!(!rendered.contains("now vs"));
-        assert!(!rendered.contains("before"));
         assert!(rendered.contains("Leading projects"));
         assert!(!rendered.contains("Provider mix by month"));
         assert!(!rendered.contains("Sentiment by local hour"));
@@ -2396,10 +2487,42 @@ mod tests {
         assert!(!narrow.contains('\x1b'));
         assert!(render_terminal_themed(&report, 80, true).contains("\x1b["));
 
+        let bounded = compute(
+            &store,
+            &ReportOptions {
+                after: Some("2026-06-02T00:00:00+00:00".to_string()),
+                before: Some("2026-06-03T00:00:00+00:00".to_string()),
+                project: None,
+                sort: ReportSort::Tokens,
+            },
+        )
+        .expect("compute bounded report");
+        assert_eq!(bounded.totals.sessions, 1);
+        assert_eq!(bounded.totals.events, 1);
+        assert_eq!(bounded.totals.human_turns, 0);
+        assert_eq!(bounded.totals.delegated_turns, 1);
+        assert_eq!(bounded.projects[0].project, "b");
+        assert_eq!(bounded.tokens_by_session_end_date.len(), 1);
+        assert_eq!(bounded.model_mix_by_month[0].name, "gpt-5.5");
+        assert!(bounded.comparisons.is_empty());
+        assert_eq!(
+            bounded.filters.after.as_deref(),
+            Some("2026-06-02T00:00:00+00:00")
+        );
+        assert_eq!(
+            bounded.filters.before.as_deref(),
+            Some("2026-06-03T00:00:00+00:00")
+        );
+        let bounded_terminal = render_terminal(&bounded);
+        assert!(bounded_terminal.contains("Filters · after"));
+        assert!(bounded_terminal.contains("2026-06-02T00:00:00+00:00"));
+        assert!(bounded_terminal.contains("2026-06-03T00:00:00+00:00"));
+
         let filtered = compute(
             &store,
             &ReportOptions {
-                since: None,
+                after: None,
+                before: None,
                 project: Some("/repo/b".to_string()),
                 sort: ReportSort::Messages,
             },
@@ -2412,12 +2535,18 @@ mod tests {
         let unfiltered = compute(
             &store,
             &ReportOptions {
-                since: None,
+                after: None,
+                before: None,
                 project: None,
                 sort: ReportSort::Tokens,
             },
         )
         .expect("compute unfiltered comparison report");
+        assert_eq!(unfiltered.generated_at, snapshot_generated_at);
+        assert!(unfiltered
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
         assert_eq!(
             unfiltered
                 .comparisons
@@ -2501,7 +2630,7 @@ mod tests {
             })
             .expect("insert topic report fixtures");
 
-        let (topics, warning) = report_topics(&store, None, None).expect("topic report");
+        let (topics, warning) = report_topics(&store, None, None, None).expect("topic report");
         let topics = topics.expect("completed topics");
         assert!(warning.is_none());
         assert_eq!(topics.version, "complete");
@@ -2528,7 +2657,8 @@ mod tests {
                 Ok(())
             })
             .expect("insert incomplete labels");
-        let (topics, warning) = report_topics(&store, None, None).expect("incomplete topics");
+        let (topics, warning) =
+            report_topics(&store, None, None, None).expect("incomplete topics");
         assert!(topics.is_none());
         assert!(warning.expect("warning").contains("1 of 2 labels"));
 
@@ -2546,7 +2676,8 @@ mod tests {
                 Ok(())
             })
             .expect("insert demoted topics");
-        let (topics, warning) = report_topics(&store, None, None).expect("demoted topics");
+        let (topics, warning) =
+            report_topics(&store, None, None, None).expect("demoted topics");
         assert!(topics.is_none());
         assert!(warning.is_none());
     }
@@ -2616,7 +2747,8 @@ mod tests {
             });
         crate::annotate::insert_annotations(&store, &incomplete).expect("insert incomplete scores");
 
-        let (sentiment, warning) = report_sentiment(&store, None, None).expect("sentiment report");
+        let (sentiment, warning) =
+            report_sentiment(&store, None, None, None).expect("sentiment report");
         let sentiment = sentiment.expect("complete sentiment version");
         assert!(warning.is_none());
         assert_eq!(sentiment.annotator_version, "complete-v1");
@@ -2633,8 +2765,8 @@ mod tests {
             .iter()
             .any(|row| row.average == 4.0 && row.messages == 1));
 
-        let (filtered, _) =
-            report_sentiment(&store, None, Some("%gail%")).expect("filtered sentiment report");
+        let (filtered, _) = report_sentiment(&store, None, None, Some("%project-alpha%"))
+            .expect("filtered sentiment report");
         let filtered = filtered.expect("filtered sentiment");
         assert_eq!(filtered.by_week.len(), 11);
         assert_eq!(filtered.by_project.len(), 11);

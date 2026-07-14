@@ -775,8 +775,22 @@ pub enum Command {
     },
     /// Summarize agent usage, projects, models, and working rhythms.
     Report {
-        #[arg(long, help = "Only include activity at or after this date or timestamp")]
-        since: Option<String>,
+        #[arg(
+            long,
+            help = "Only include activity at or after a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            help = "Only include activity before a date or time, like 2026-04-20 or \"3 days ago\""
+        )]
+        before: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["after", "before"],
+            help = "Only include activity from today"
+        )]
+        today: bool,
         #[arg(long, help = "Only include workspace paths containing this text")]
         project: Option<String>,
         #[arg(long, value_enum, default_value_t = ReportSortArg::Tokens)]
@@ -2857,7 +2871,9 @@ impl Cli {
                 }
             }
             Command::Report {
-                since,
+                after,
+                before,
+                today,
                 project,
                 sort,
                 json,
@@ -2865,12 +2881,13 @@ impl Cli {
                 color,
                 window,
             } => {
-                let since = transport::parse_since_arg(since.as_deref())?
-                    .map(|value| value.to_rfc3339());
+                let (after, before) =
+                    search_time_bounds(today, after.as_deref(), before.as_deref())?;
                 let report = report::compute(
                     &store,
                     &report::ReportOptions {
-                        since,
+                        after: after.map(|value| value.to_rfc3339()),
+                        before: before.map(|value| value.to_rfc3339()),
                         project,
                         sort: sort.into(),
                     },
@@ -10199,8 +10216,10 @@ mod tests {
         let cli = Cli::try_parse_from([
             "histo",
             "report",
-            "--since",
+            "--after",
             "2026-06-01",
+            "--before",
+            "3 days ago",
             "--project",
             "example-project",
             "--sort",
@@ -10211,13 +10230,25 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Report {
-                since: Some(since),
+                after: Some(after),
+                before: Some(before),
                 project: Some(project),
                 sort: ReportSortArg::Messages,
                 json: true,
                 ..
-            } if since == "2026-06-01" && project == "sme-os"
+            } if after == "2026-06-01" && before == "3 days ago" && project == "example-project"
         ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["histo", "report", "--today"])
+                .expect("parse today's report")
+                .command,
+            Command::Report { today: true, .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["histo", "report", "--today", "--after", "yesterday"])
+                .is_err()
+        );
     }
 
     #[test]
