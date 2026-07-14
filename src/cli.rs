@@ -10618,6 +10618,58 @@ mod tests {
     }
 
     #[test]
+    fn tail_refresh_resolves_unindexed_omp_native_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let session_id = "019f5fc4-6d1b-7000-bcc4-c1c68ff5d104";
+        let log_path = dir
+            .path()
+            .join(format!("2026-07-14T08-35-36-347Z_{session_id}.jsonl"));
+        std::fs::write(
+            &log_path,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{session_id}\",\"title\":\"Live OMP session\",\"cwd\":\"/tmp/repo\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"tail me\"}}]}}}}\n"
+            ),
+        )
+        .expect("write OMP log");
+
+        let resolved = resolve_tail_session_with_refresh(&store, session_id, || {
+            let stats = ingest::update_source_path_with_progress_and_cancel(
+                &store,
+                "machine_tail",
+                "omp",
+                &log_path,
+                |_| {},
+                || false,
+            )?;
+            refresh_tail_history_items(&store, &stats.delta.touched_events)
+        })
+        .expect("resolve tail target after refresh");
+
+        let session = store
+            .session_by_id(&resolved)
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(session.source_kind, "omp");
+        assert!(session.external_id.ends_with(session_id));
+        assert!(store
+            .history_items_for_transcript_session(&resolved)
+            .expect("history items")
+            .is_some());
+    }
+
+    #[test]
+    fn tail_skips_refresh_for_indexed_session() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        let resolved = resolve_tail_session_with_refresh(&store, "session_view", || {
+            panic!("indexed tail target should not refresh providers")
+        })
+        .expect("resolve indexed tail target");
+
+        assert_eq!(resolved, "session_view");
+    }
+
+    #[test]
     fn transcript_target_resolves_recent_ref_to_containing_session() {
         let (_dir, store) = fixture_store_with_viewer_ref();
         let ref_id = store
