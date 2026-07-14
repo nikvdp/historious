@@ -7958,22 +7958,32 @@ async fn run_transcript_tail(
 }
 
 fn resolve_tail_session(store: &Store, config: &AppConfig, target: &str) -> Result<String> {
+    resolve_tail_session_with_refresh(store, target, || {
+        let stats = ingest::update_local_with_progress_and_cancel(
+            store,
+            &config.machine_id,
+            ingest::UpdateOptions {
+                max_files: None,
+                source_selection: ingest::SourceSelection::single("agent_logs")?,
+                sources: config.sources.clone(),
+            },
+            |_| {},
+            tail_cancelled,
+        )?;
+        refresh_tail_history_items(store, &stats.delta.touched_events)
+    })
+}
+
+fn resolve_tail_session_with_refresh(
+    store: &Store,
+    target: &str,
+    refresh: impl FnOnce() -> Result<()>,
+) -> Result<String> {
     if tail_target_is_indexed(store, target)? {
         return resolve_transcript_target(store, target, None, None).map(|(session, _)| session);
     }
 
-    let stats = ingest::update_local_with_progress_and_cancel(
-        store,
-        &config.machine_id,
-        ingest::UpdateOptions {
-            max_files: None,
-            source_selection: ingest::SourceSelection::single("agent_logs")?,
-            sources: config.sources.clone(),
-        },
-        |_| {},
-        tail_cancelled,
-    )?;
-    refresh_tail_history_items(store, &stats.delta.touched_events)?;
+    refresh()?;
     resolve_transcript_target(store, target, None, None).map(|(session, _)| session)
 }
 
