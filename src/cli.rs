@@ -7900,7 +7900,7 @@ async fn run_transcript_tail(
     }
     install_tail_sigint_handler();
     let interval = Duration::from_secs_f64(interval_secs);
-    let (session, _) = resolve_transcript_target(store, target, None, None)?;
+    let session = resolve_tail_session(store, config, target)?;
     let session_record = store
         .session_by_id(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
@@ -7955,6 +7955,32 @@ async fn run_transcript_tail(
         append_tail_updates(store, &session, &mut last_cursor, color, verbose)?;
     }
     Ok(())
+}
+
+fn resolve_tail_session(store: &Store, config: &AppConfig, target: &str) -> Result<String> {
+    if tail_target_is_indexed(store, target)? {
+        return resolve_transcript_target(store, target, None, None).map(|(session, _)| session);
+    }
+
+    let stats = ingest::update_local_with_progress_and_cancel(
+        store,
+        &config.machine_id,
+        ingest::UpdateOptions {
+            max_files: None,
+            source_selection: ingest::SourceSelection::single("agent_logs")?,
+            sources: config.sources.clone(),
+        },
+        |_| {},
+        tail_cancelled,
+    )?;
+    refresh_tail_history_items(store, &stats.delta.touched_events)?;
+    resolve_transcript_target(store, target, None, None).map(|(session, _)| session)
+}
+
+fn tail_target_is_indexed(store: &Store, target: &str) -> Result<bool> {
+    Ok(resolve_session_target(store, target)?.is_some()
+        || store.event_by_id(target)?.is_some()
+        || store.event_id_for_recent_ref(target)?.is_some())
 }
 
 fn tail_initial_context(
