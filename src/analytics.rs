@@ -2122,7 +2122,9 @@ mod tests {
             })
             .expect("insert provenance fixtures");
 
-        rebuild_all(&store, |_, _, _| {}).expect("rebuild provenance");
+        let mut rebuild_progress = Vec::new();
+        rebuild_all_with_progress(&store, |event| rebuild_progress.push(event))
+            .expect("rebuild provenance");
         let rows = store
             .with_conn(|conn| {
                 let mut stmt = conn.prepare(
@@ -2142,6 +2144,35 @@ mod tests {
                     .map_err(Into::into)
             })
             .expect("load provenance rows");
+
+        let provenance_details = rebuild_progress
+            .iter()
+            .filter_map(|event| match event {
+                RebuildProgress::Detail {
+                    projection,
+                    detail,
+                    ..
+                } if *projection == MESSAGE_PROVENANCE_PROJECTION => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(provenance_details.contains(&"clearing previous provenance rows"));
+        assert!(provenance_details.contains(&"finding repeated message templates"));
+        assert!(provenance_details.contains(&"loading inherited parent messages"));
+        let classified = provenance_details
+            .iter()
+            .filter_map(|detail| {
+                detail
+                    .strip_prefix("classifying ")?
+                    .strip_suffix(" messages")?
+                    .split_once('/')?
+                    .0
+                    .parse::<usize>()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(classified, vec![0, 7]);
+        assert!(classified.windows(2).all(|window| window[0] <= window[1]));
 
         assert_eq!(rows.len(), 7);
         assert_eq!(
