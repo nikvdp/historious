@@ -793,6 +793,18 @@ pub enum Command {
         today: bool,
         #[arg(long, help = "Only include workspace paths containing this text")]
         project: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "no_update",
+            help = "Refresh report analytics even when the stored snapshot is current"
+        )]
+        update: bool,
+        #[arg(
+            long,
+            conflicts_with = "update",
+            help = "Do not refresh missing or stale report analytics"
+        )]
+        no_update: bool,
         #[arg(long, value_enum, default_value_t = ReportSortArg::Tokens)]
         sort: ReportSortArg,
         #[arg(long, help = "Print the reusable aggregate report model as JSON")]
@@ -2873,6 +2885,8 @@ impl Cli {
                 before,
                 today,
                 project,
+                update,
+                no_update,
                 sort,
                 json,
                 plain,
@@ -2882,6 +2896,7 @@ impl Cli {
             } => {
                 let (after, before) =
                     search_time_bounds(today, after.as_deref(), before.as_deref())?;
+                refresh_report_for_command(&store, update, no_update, json || robot)?;
                 let report = report::compute(
                     &store,
                     &report::ReportOptions {
@@ -5363,6 +5378,16 @@ fn report_refresh_mode(report: &analytics::ReportRefreshOutcome) -> &'static str
     }
 }
 
+fn report_progress_detail(event: &analytics::ReportRefreshProgress) -> String {
+    format!(
+        "{} {}/{}: {}",
+        event.phase,
+        format_count(event.completed),
+        format_count(event.total),
+        event.detail
+    )
+}
+
 fn prior_hash_progress_detail(completed: usize, total: usize) -> String {
     format!(
         "capturing prior message templates {}/{}",
@@ -5382,6 +5407,77 @@ fn report_completion_detail(report: &analytics::ReportRefreshOutcome) -> String 
     } else {
         "report refresh skipped: snapshot already current".to_string()
     }
+}
+
+fn refresh_report_for_command(
+    store: &Store,
+    force: bool,
+    skip: bool,
+    machine_output: bool,
+) -> Result<()> {
+    if skip {
+        return Ok(());
+    }
+
+    let status = if force {
+        None
+    } else {
+        Some(analytics::report_refresh_status(store)?)
+    };
+    if status.is_some_and(|status| !status.stale && !status.snapshot_missing) {
+        return Ok(());
+    }
+
+    let force_full_rebuild = force || status.is_some_and(|status| status.snapshot_missing);
+    let outcome = if machine_output {
+        write_machine_progress(
+            "report",
+            "refresh",
+            "checking report analytics".to_string(),
+            serde_json::json!({ "status": "starting" }),
+        );
+        let outcome = analytics::refresh_report_on_demand_with_progress(
+            store,
+            force_full_rebuild,
+            |event| {
+                write_machine_progress(
+                    "report",
+                    "refresh",
+                    event.detail.clone(),
+                    report_progress_payload(&event),
+                );
+            },
+        )?;
+        write_machine_progress(
+            "report",
+            "refresh",
+            report_completion_detail(&outcome),
+            serde_json::json!({
+                "status": if outcome.refreshed { "refreshed" } else { "current" },
+                "mode": report_refresh_mode(&outcome),
+                "affected_sessions": outcome.affected_sessions,
+                "affected_events": outcome.affected_events,
+            }),
+        );
+        outcome
+    } else {
+        let progress = ProgressUi::new();
+        let mut phase = progress.phase("Refreshing report");
+        let outcome = analytics::refresh_report_on_demand_with_progress(
+            store,
+            force_full_rebuild,
+            |event| phase.update(report_progress_detail(&event)),
+        )?;
+        phase.finish(report_completion_detail(&outcome));
+        outcome
+    };
+
+    let refreshed = analytics::report_refresh_status(store)?;
+    if refreshed.stale || refreshed.snapshot_missing {
+        bail!("report analytics remain stale after refresh");
+    }
+    debug_assert!(outcome.refreshed || !force_full_rebuild);
+    Ok(())
 }
 
 fn write_update_progress(phase: &'static str, detail: String, data: serde_json::Value) {
@@ -10619,6 +10715,83 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn report_update_controls_parse_and_conflict() {
+        assert!(matches!(
+            Cli::try_parse_from(["histo", "report", "--update"])
+                .expect("parse forced report update")
+                .command,
+            Command::Report {
+                update: true,
+                no_update: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["histo", "report", "--no-update"])
+                .expect("parse skipped report update")
+                .command,
+            Command::Report {
+                update: false,
+                no_update: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "histo",
+            "report",
+            "--update",
+            "--no-update"
+        ])
+        .is_err());
+    }
+    #[test]
+    fn report_refresh_controls_build_missing_and_preserve_current_snapshot() {
+        let skipped_dir = tempfile::tempdir().expect("skipped tempdir");
+        let skipped_store = Store::open(skipped_dir.path()).expect("open skipped store");
+        refresh_report_for_command(&skipped_store, false, true, false)
+            .expect("skip missing report refresh");
+        assert!(
+            analytics::report_refresh_status(&skipped_store)
+                .expect("skipped report status")
+                .snapshot_missing
+        );
+
+        let automatic_dir = tempfile::tempdir().expect("automatic tempdir");
+        let automatic_store = Store::open(automatic_dir.path()).expect("open automatic store");
+        refresh_report_for_command(&automatic_store, false, false, false)
+            .expect("build missing report snapshot");
+        let status = analytics::report_refresh_status(&automatic_store)
+            .expect("automatic report status");
+        assert!(!status.stale);
+        assert!(!status.snapshot_missing);
+        let generated_at = automatic_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load generated timestamp");
+
+        refresh_report_for_command(&automatic_store, false, false, false)
+            .expect("keep current report snapshot");
+        let unchanged_at = automatic_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("reload generated timestamp");
+        assert_eq!(unchanged_at, generated_at);
+    }
+
 
     #[test]
     fn report_plain_and_color_controls_parse() {

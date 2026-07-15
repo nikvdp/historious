@@ -276,13 +276,13 @@ pub struct SentimentHour {
 pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     if options.after.is_none() && options.before.is_none() && options.project.is_none() {
         let mut report = read_snapshot(store)?.context(
-            "report snapshot is unavailable; run `histo lab rebuild` before `histo report`",
+            "report snapshot is unavailable; run `histo report --update` to build it",
         )?;
         sort_projects(&mut report.projects, options.sort);
         let freshness = analytics::report_snapshot_freshness(store)?;
         if freshness.stale {
             report.warnings.push(format!(
-                "report snapshot is {} old and stale by {} event rows; run `histo lab rebuild`",
+                "report snapshot is {} old and stale by {} event rows; run `histo report --update`",
                 snapshot_age(&report.generated_at),
                 freshness.new_event_rows
             ));

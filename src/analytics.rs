@@ -78,6 +78,12 @@ pub(crate) struct ReportRefreshProgress {
     pub total: usize,
     pub detail: String,
 }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReportRefreshStatus {
+    pub stale: bool,
+    pub snapshot_missing: bool,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct AuditCount {
@@ -200,6 +206,41 @@ pub fn is_stale(store: &Store) -> Result<bool> {
 pub fn report_snapshot_freshness(store: &Store) -> Result<ProjectionFreshness> {
     projection_freshness(store, PROJECTIONS[3])
 }
+pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus> {
+    store.with_conn(|conn| {
+        let input_rowid = max_event_rowid(conn)?;
+        let mut stale = false;
+        for projection in PROJECTIONS {
+            let stored = conn
+                .query_row(
+                    "SELECT status, input_high_watermark
+                     FROM projection_status
+                     WHERE projection_name = ?1",
+                    params![projection.name],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let state = stored
+                .as_ref()
+                .and_then(|(_, state)| serde_json::from_str::<ProjectionState>(state).ok());
+            stale |= stored.as_ref().map(|(status, _)| status.as_str()) != Some("ready")
+                || state.as_ref().map(|state| state.version) != Some(projection.version)
+                || state
+                    .as_ref()
+                    .is_none_or(|state| input_rowid > state.input_rowid);
+        }
+        let snapshot_missing = conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM report_snapshot WHERE singleton = 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(ReportRefreshStatus {
+            stale,
+            snapshot_missing,
+        })
+    })
+}
+
 
 pub(crate) fn report_refresh_prior_hashes(
     store: &Store,
@@ -256,6 +297,36 @@ pub(crate) fn refresh_report_after_update_with_prior_hashes(
     store: &Store,
     delta: &ImportDelta,
     prior_candidate_hashes: &HashSet<String>,
+    progress: impl FnMut(ReportRefreshProgress),
+) -> Result<ReportRefreshOutcome> {
+    refresh_report_with_progress(
+        store,
+        delta,
+        prior_candidate_hashes,
+        false,
+        progress,
+    )
+}
+
+pub(crate) fn refresh_report_on_demand_with_progress(
+    store: &Store,
+    force: bool,
+    progress: impl FnMut(ReportRefreshProgress),
+) -> Result<ReportRefreshOutcome> {
+    refresh_report_with_progress(
+        store,
+        &ImportDelta::default(),
+        &HashSet::new(),
+        force,
+        progress,
+    )
+}
+
+fn refresh_report_with_progress(
+    store: &Store,
+    delta: &ImportDelta,
+    prior_candidate_hashes: &HashSet<String>,
+    force_full_rebuild: bool,
     mut progress: impl FnMut(ReportRefreshProgress),
 ) -> Result<ReportRefreshOutcome> {
     let statuses = freshness(store)?;
@@ -264,7 +335,8 @@ pub(crate) fn refresh_report_after_update_with_prior_hashes(
         && delta.inserted_events.is_empty()
         && delta.touched_events.is_empty()
         && delta.repaired_events.is_empty();
-    if statuses.iter().all(|status| !status.stale)
+    if !force_full_rebuild
+        && statuses.iter().all(|status| !status.stale)
         && (delta_empty || !delta.repaired_events.is_empty())
     {
         return Ok(ReportRefreshOutcome {
@@ -276,11 +348,12 @@ pub(crate) fn refresh_report_after_update_with_prior_hashes(
     }
 
     let captured_input_rowid = store.with_conn(max_event_rowid)?;
-    let invalid_state = statuses.iter().any(|status| {
-        status.status.as_deref() != Some("ready")
-            || status.stored_version != Some(status.version)
-            || (status.stale && status.new_event_rows == 0)
-    });
+    let invalid_state = force_full_rebuild
+        || statuses.iter().any(|status| {
+            status.status.as_deref() != Some("ready")
+                || status.stored_version != Some(status.version)
+                || (status.stale && status.new_event_rows == 0)
+        });
     let mut event_ids = delta
         .inserted_events
         .iter()
@@ -3192,6 +3265,54 @@ mod tests {
         assert_eq!(snapshot_report(&store).generated_at, generated_at);
         assert_projections_current(&store);
     }
+    #[test]
+    fn forced_on_demand_report_refresh_rebuilds_current_snapshot() {
+        let (_dir, store) = current_refresh_store();
+        let mut progress = Vec::new();
+
+        let outcome = refresh_report_on_demand_with_progress(&store, true, |event| {
+            progress.push((event.completed, event.total));
+        })
+        .expect("force current report refresh");
+
+        assert!(outcome.refreshed);
+        assert!(outcome.full_rebuild);
+        assert!(!progress.is_empty());
+        assert_eq!(progress.last(), Some(&(progress[0].1, progress[0].1)));
+        assert_projections_current(&store);
+    }
+    #[test]
+    fn report_refresh_status_tracks_empty_current_and_stale_stores() {
+        let empty_dir = tempfile::tempdir().expect("empty tempdir");
+        let empty_store = Store::open(empty_dir.path()).expect("open empty store");
+        let empty = report_refresh_status(&empty_store).expect("empty refresh status");
+        assert!(empty.stale);
+        assert!(empty.snapshot_missing);
+
+        let (_dir, store) = current_refresh_store();
+        let current = report_refresh_status(&store).expect("current refresh status");
+        assert!(!current.stale);
+        assert!(!current.snapshot_missing);
+
+        append_target_turn(&store);
+        let stale = report_refresh_status(&store).expect("stale refresh status");
+        assert!(stale.stale);
+        assert!(!stale.snapshot_missing);
+
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM report_snapshot", [])?;
+                Ok(())
+            })
+            .expect("remove snapshot");
+        assert!(
+            report_refresh_status(&store)
+                .expect("missing snapshot status")
+                .snapshot_missing
+        );
+    }
+
+
 
     #[test]
     fn repaired_delta_skips_a_report_snapshot_already_rebuilt_by_repair() {
