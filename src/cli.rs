@@ -10731,6 +10731,59 @@ mod tests {
     }
 
     #[test]
+    fn repaired_events_rebuild_claude_relationship_analytics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('claude_parent', 'source', 'machine', 'claude_code', 'parent',
+                       'open', '{"path":"/logs/parent.jsonl"}', 'parent_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, metadata_json, hash)
+                    VALUES
+                      ('task', 'claude_parent', 'source', 'machine', 'claude_code', 0,
+                       'assistant', 'assistant', 'task',
+                       '{"claude_relationship":{"uuid":"task","parent_uuid":null,"is_sidechain":false,"task_tool_use":true}}',
+                       'task_hash'),
+                      ('sidechain', 'claude_parent', 'source', 'machine', 'claude_code', 1,
+                       'user', 'user', 'delegated request',
+                       '{"claude_relationship":{"uuid":"sidechain","parent_uuid":"task","is_sidechain":true,"task_tool_use":false}}',
+                       'sidechain_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert repaired Claude fixture");
+        let mut delta = crate::storage::ImportDelta::default();
+        delta.repaired_events.push("sidechain".to_string());
+        let mut progress = Vec::new();
+
+        rebuild_analytics_after_event_repairs(&store, &delta, |detail| progress.push(detail))
+            .expect("rebuild repaired analytics");
+
+        let overrides = store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM event_session_overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(Into::into)
+            })
+            .expect("count repaired overrides");
+        assert_eq!(overrides, 1);
+        assert!(progress
+            .iter()
+            .any(|detail| detail.contains("repairing 1 existing events")));
+    }
+
+    #[test]
     fn transcript_target_resolves_recent_ref_to_containing_session() {
         let (_dir, store) = fixture_store_with_viewer_ref();
         let ref_id = store

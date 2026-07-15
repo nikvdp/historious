@@ -4234,6 +4234,160 @@ mod tests {
     }
 
     #[test]
+    fn claude_checkpoint_upgrade_repairs_inline_relationships_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(temp.path()).expect("open store");
+        let project_dir = temp.path().join("-tmp-claude-project");
+        fs::create_dir_all(&project_dir).expect("create Claude project dir");
+        let log_path = project_dir.join("claude-parent.jsonl");
+        let external_id = "123e4567-e89b-12d3-a456-426614174000";
+        let lines = [
+            json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": "Task", "id": "toolu_task"}]
+                },
+                "uuid": "task",
+                "sessionId": external_id
+            }),
+            json!({
+                "parentUuid": "task",
+                "isSidechain": true,
+                "type": "user",
+                "message": {"role": "user", "content": "delegated request"},
+                "uuid": "sidechain-root",
+                "sessionId": external_id
+            }),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        fs::write(&log_path, lines).expect("write Claude log");
+        let metadata = fs::metadata(&log_path).expect("Claude log metadata");
+        let candidate = SourceCandidate {
+            adapter_kind: "claude_code",
+            kind: "claude_code".to_string(),
+            identity: log_path.to_string_lossy().to_string(),
+            path: Some(log_path.clone()),
+            modified: 0,
+            size: Some(metadata.len()),
+            mtime_ms: file_mtime_ms(&metadata),
+        };
+        let adapter = LocalTranscriptAdapter {
+            kind: "claude_code",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let context = SourceSyncContext::new(&store);
+        let mut old_import = prepare_file_import(
+            &context,
+            "machine_fixture",
+            "claude_code",
+            &log_path,
+            &NativeTitleIndex::default(),
+        )
+        .expect("prepare new Claude import");
+        let generated_relationships = old_import
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                ArchiveRecord::Event(event) => event.metadata.get("claude_relationship"),
+                _ => None,
+            })
+            .count();
+        assert_eq!(generated_relationships, 2);
+
+        for record in &mut old_import.records {
+            if let ArchiveRecord::Event(event) = record {
+                event
+                    .metadata
+                    .as_object_mut()
+                    .expect("event metadata")
+                    .remove("claude_relationship");
+            }
+        }
+        old_import.commit(&store).expect("commit v1-style import");
+        let old_cursor = local_transcript_checkpoint_cursor(
+            "codex",
+            &log_path,
+            candidate.size,
+            candidate.mtime_ms,
+        )
+        .expect("v1 checkpoint");
+        store
+            .upsert_source_checkpoint(
+                "claude_code",
+                &candidate.identity,
+                Some(&old_cursor),
+                &json!({"strategy": "file_metadata_v1"}),
+            )
+            .expect("store v1 checkpoint");
+        let session = store
+            .sessions_by_external_id(external_id)
+            .expect("load Claude session")
+            .pop()
+            .expect("Claude session exists");
+        let old_events = store
+            .events_for_session(&session.id)
+            .expect("load v1 events");
+        let old_ids = old_events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        assert!(old_events
+            .iter()
+            .all(|event| event.metadata.get("claude_relationship").is_none()));
+        assert!(!adapter
+            .is_current(&context, &candidate)
+            .expect("v1 checkpoint must be stale"));
+
+        let repaired = adapter
+            .prepare_import(&context, "machine_fixture", &candidate)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("repair Claude import");
+        let repaired_events = store
+            .events_for_session(&session.id)
+            .expect("load repaired events");
+        let repaired_ids = repaired_events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(repaired.inserted, 0);
+        assert_eq!(repaired.delta.repaired_events.len(), 2);
+        assert_eq!(repaired_ids, old_ids);
+        assert_eq!(repaired_events.len(), old_events.len());
+        assert!(repaired_events
+            .iter()
+            .all(|event| event.metadata.get("claude_relationship").is_some()));
+        assert!(adapter
+            .is_current(&SourceSyncContext::new(&store), &candidate)
+            .expect("v2 checkpoint must be current"));
+
+        crate::analytics::rebuild_all(&store, |_, _, _| {})
+            .expect("rebuild repaired relationships");
+        let (overrides, sidechains) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM event_session_overrides", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM session_relationships
+                         WHERE rule = 'claude.inline_sidechain'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .expect("load repaired relationship projection");
+        assert_eq!(overrides, 1);
+        assert_eq!(sidechains, 1);
+    }
+
+    #[test]
     fn local_transcript_adapter_uses_cached_source_file_status() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
