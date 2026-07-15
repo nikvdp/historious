@@ -3264,7 +3264,8 @@ struct UpdateOutput {
     ingest: ingest::UpdateStats,
     sources: Vec<SourceDeltaOutput>,
     search_index: SearchIndexOutput,
-    report: analytics::ReportRefreshOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<analytics::ReportRefreshOutcome>,
     embeddings: search::EmbeddingRefresh,
 }
 
@@ -3702,22 +3703,26 @@ fn run_update_once_machine(
         }),
     );
 
-    let prior_report_hashes = analytics::report_refresh_prior_hashes(
-        store,
-        &ingest.delta,
-        |completed, total| {
-            let detail = prior_hash_progress_detail(completed, total);
-            write_update_progress(
-                "report",
-                detail,
-                serde_json::json!({
-                    "status": "preparing",
-                    "completed": completed,
-                    "total": total,
-                }),
-            );
-        },
-    )?;
+    let prior_report_hashes = if repair {
+        Some(analytics::report_refresh_prior_hashes(
+            store,
+            &ingest.delta,
+            |completed, total| {
+                let detail = prior_hash_progress_detail(completed, total);
+                write_update_progress(
+                    "report",
+                    detail,
+                    serde_json::json!({
+                        "status": "preparing",
+                        "completed": completed,
+                        "total": total,
+                    }),
+                );
+            },
+        )?)
+    } else {
+        None
+    };
     let projected = refresh_search_after_update_with_progress(
         store,
         &ingest.delta,
@@ -3740,28 +3745,33 @@ fn run_update_once_machine(
         }),
     );
 
-    let report = analytics::refresh_report_after_update_with_prior_hashes(
-        store,
-        &ingest.delta,
-        &prior_report_hashes,
-        |event| {
-            write_update_progress(
-                "report",
-                event.detail.clone(),
-                report_progress_payload(&event),
-            );
-        },
-    )?;
-    write_update_progress(
-        "report",
-        report_completion_detail(&report),
-        serde_json::json!({
-            "status": if report.refreshed { "refreshed" } else { "skipped" },
-            "mode": report_refresh_mode(&report),
-            "affected_sessions": report.affected_sessions,
-            "affected_events": report.affected_events,
-        }),
-    );
+    let report = if let Some(prior_report_hashes) = &prior_report_hashes {
+        let report = analytics::refresh_report_after_update_with_prior_hashes(
+            store,
+            &ingest.delta,
+            prior_report_hashes,
+            |event| {
+                write_update_progress(
+                    "report",
+                    event.detail.clone(),
+                    report_progress_payload(&event),
+                );
+            },
+        )?;
+        write_update_progress(
+            "report",
+            report_completion_detail(&report),
+            serde_json::json!({
+                "status": if report.refreshed { "refreshed" } else { "skipped" },
+                "mode": report_refresh_mode(&report),
+                "affected_sessions": report.affected_sessions,
+                "affected_events": report.affected_events,
+            }),
+        );
+        Some(report)
+    } else {
+        None
+    };
 
     let embeddings = if config.embedder.is_disabled() {
         search::EmbeddingRefresh::disabled()
@@ -3830,11 +3840,15 @@ fn run_update_once_human(
     progress.finish_ingest();
 
     progress.start_search_data(repair, config.embedder.is_disabled());
-    let prior_report_hashes = analytics::report_refresh_prior_hashes(
-        store,
-        &ingest.delta,
-        |completed, total| progress.report_preparation(completed, total),
-    )?;
+    let prior_report_hashes = if repair {
+        Some(analytics::report_refresh_prior_hashes(
+            store,
+            &ingest.delta,
+            |completed, total| progress.report_preparation(completed, total),
+        )?)
+    } else {
+        None
+    };
     let projected = refresh_search_after_update_with_progress(
         store,
         &ingest.delta,
@@ -3846,13 +3860,18 @@ fn run_update_once_human(
     )?;
     progress.finish_search_index(projected);
 
-    let report = analytics::refresh_report_after_update_with_prior_hashes(
-        store,
-        &ingest.delta,
-        &prior_report_hashes,
-        |event| progress.report_event(&event),
-    )?;
-    progress.finish_report(&report);
+    let report = if let Some(prior_report_hashes) = &prior_report_hashes {
+        let report = analytics::refresh_report_after_update_with_prior_hashes(
+            store,
+            &ingest.delta,
+            prior_report_hashes,
+            |event| progress.report_event(&event),
+        )?;
+        progress.finish_report(&report);
+        Some(report)
+    } else {
+        None
+    };
 
     let embeddings = if config.embedder.is_disabled() {
         let embeddings = search::EmbeddingRefresh::disabled();
@@ -4008,7 +4027,6 @@ fn refresh_search_after_update_with_progress(
         }
         progress("checking source status counts".to_string());
         store.seed_source_status_counts_approximate_if_empty()?;
-        rebuild_analytics_after_event_repairs(store, delta, &mut progress)?;
         Ok(indexed)
     }
 }
@@ -4648,7 +4666,9 @@ fn print_update_output(output: &UpdateOutput, color: bool) {
     );
     print_source_delta_summary(&output.sources, color);
     print_search_summary(output.search_index.indexed_events, color);
-    print_report_summary(&output.report, color);
+    if let Some(report) = &output.report {
+        print_report_summary(report, color);
+    }
     print_embedding_summary(&output.embeddings, color);
 }
 
@@ -5343,16 +5363,6 @@ fn report_refresh_mode(report: &analytics::ReportRefreshOutcome) -> &'static str
     }
 }
 
-fn report_progress_detail(event: &analytics::ReportRefreshProgress) -> String {
-    format!(
-        "{} {}/{}: {}",
-        event.phase,
-        format_count(event.completed),
-        format_count(event.total),
-        event.detail
-    )
-}
-
 fn prior_hash_progress_detail(completed: usize, total: usize) -> String {
     format!(
         "capturing prior message templates {}/{}",
@@ -5839,13 +5849,15 @@ impl UpdateProgressView {
                 ..Default::default()
             },
         );
-        self.data_rows.insert(
-            "report".to_string(),
-            UpdateDataProgress {
-                state: "waiting",
-                ..Default::default()
-            },
-        );
+        if repair {
+            self.data_rows.insert(
+                "report".to_string(),
+                UpdateDataProgress {
+                    state: "waiting",
+                    ..Default::default()
+                },
+            );
+        }
         self.data_rows.insert(
             "vectors".to_string(),
             UpdateDataProgress {
@@ -9658,15 +9670,6 @@ async fn run_daemon(
             format_count(stats.errors)
         ));
 
-        let mut report_prepare = progress.phase("Preparing report refresh");
-        let prior_report_hashes = analytics::report_refresh_prior_hashes(
-            store,
-            &stats.delta,
-            |completed, total| {
-                report_prepare.update(prior_hash_progress_detail(completed, total));
-            },
-        )?;
-        report_prepare.finish("prior message templates captured".to_string());
         let mut index = progress.phase("Updating search index");
         let projected = refresh_search_after_update_with_progress(
             store,
@@ -9678,15 +9681,6 @@ async fn run_daemon(
             },
         )?;
         index.finish(format!("{} events indexed", format_count(projected)));
-
-        let mut report_progress = progress.phase("Refreshing report");
-        let report = analytics::refresh_report_after_update_with_prior_hashes(
-            store,
-            &stats.delta,
-            &prior_report_hashes,
-            |event| report_progress.update(report_progress_detail(&event)),
-        )?;
-        report_progress.finish(report_completion_detail(&report));
 
         let embeddings = if embedder_config.is_disabled() {
             search::EmbeddingRefresh::disabled()
@@ -9710,7 +9704,7 @@ async fn run_daemon(
                 search_index: SearchIndexOutput {
                     indexed_events: projected,
                 },
-                report,
+                report: None,
                 embeddings,
             },
             std::io::stdout().is_terminal(),
@@ -9856,10 +9850,36 @@ mod tests {
     }
 
     #[test]
-    fn update_progress_report_row_is_ordered_bounded_and_reports_outcomes() {
+    fn default_update_progress_omits_report_work() {
         let mut view = UpdateProgressView::new();
         view.interactive = false;
         view.start_search_data(false, false);
+
+        assert!(!view.data_rows.contains_key("report"));
+        assert_eq!(
+            view.lines()
+                .iter()
+                .skip(1)
+                .map(|line| line.split_whitespace().next().expect("row label"))
+                .collect::<Vec<_>>(),
+            vec!["search", "history", "vectors"]
+        );
+        let output = UpdateOutput {
+            ingest: ingest::UpdateStats::default(),
+            sources: Vec::new(),
+            search_index: SearchIndexOutput { indexed_events: 0 },
+            report: None,
+            embeddings: search::EmbeddingRefresh::disabled(),
+        };
+        let value = serde_json::to_value(output).expect("serialize default update output");
+        assert!(value.get("report").is_none());
+    }
+
+    #[test]
+    fn update_progress_report_row_is_ordered_bounded_and_reports_outcomes() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.start_search_data(true, false);
         view.last_emit = Instant::now() - Duration::from_secs(1);
         let previous_emit = view.last_emit;
         view.report_preparation(0, 10_742);
@@ -11100,6 +11120,41 @@ mod tests {
         assert!(progress
             .iter()
             .any(|detail| detail.contains("repairing 1 existing events")));
+    }
+
+    #[test]
+    fn ordinary_update_does_not_resume_analytics_repair() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        analytics::rebuild_all(&store, |_, _, _| {}).expect("seed fresh analytics");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE projection_status
+                     SET status = 'building'
+                     WHERE projection_name = ?1",
+                    [analytics::MESSAGE_PROVENANCE_PROJECTION],
+                )?;
+                Ok(())
+            })
+            .expect("mark provenance interrupted");
+        let mut progress = Vec::new();
+
+        refresh_search_after_update_with_progress(
+            &store,
+            &crate::storage::ImportDelta::default(),
+            false,
+            true,
+            |detail| progress.push(detail),
+        )
+        .expect("run ordinary search refresh");
+
+        let provenance = analytics::freshness(&store)
+            .expect("projection freshness")
+            .into_iter()
+            .find(|status| status.name == analytics::MESSAGE_PROVENANCE_PROJECTION)
+            .expect("provenance status");
+        assert!(provenance.building);
+        assert!(!progress.iter().any(|detail| detail.contains("classif")));
     }
 
     #[test]
