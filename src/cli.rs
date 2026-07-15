@@ -3963,13 +3963,24 @@ fn rebuild_analytics_after_event_repairs(
     delta: &crate::storage::ImportDelta,
     mut progress: impl FnMut(String),
 ) -> Result<()> {
-    if delta.repaired_events.is_empty() {
+    let repair_pending = analytics::freshness(store)?.into_iter().any(|status| {
+        status.building
+            || status
+                .stored_version
+                .is_some_and(|version| version != status.version)
+            || (status.stale && status.stored_version.is_some() && status.new_event_rows == 0)
+    });
+    if delta.repaired_events.is_empty() && !repair_pending {
         return Ok(());
     }
-    progress(format!(
-        "rebuilding analytics after repairing {} existing events",
-        format_count(delta.repaired_events.len())
-    ));
+    if delta.repaired_events.is_empty() {
+        progress("resuming incomplete analytics repair".to_string());
+    } else {
+        progress(format!(
+            "rebuilding analytics after repairing {} existing events",
+            format_count(delta.repaired_events.len())
+        ));
+    }
     analytics::rebuild_all_with_progress(store, |event| {
         progress(analytics_rebuild_progress_detail(event));
     })?;
