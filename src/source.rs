@@ -206,7 +206,6 @@ impl PreparedImport {
                     _ => None,
                 }),
             )?;
-            stats.delta.touched_events.extend(repaired.iter().cloned());
             stats.delta.repaired_events.extend(repaired);
         }
         for raw_manifest in &self.raw_manifests {
