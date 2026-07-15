@@ -2115,8 +2115,8 @@ dependencies = [
 
 [[package]]
 name = "mdvi"
-version = "0.6.8"
-source = "git+https://github.com/nikvdp/mdvi.git#6a0aa60e7e82f2f399c8f24df953f5b376e7cf02"
+version = "0.6.10"
+source = "git+https://github.com/nikvdp/mdvi.git#a15fd43bf42abf0e5215c59e9c03ffd788a6d063"
 dependencies = [
  "anyhow",
  "arboard",
