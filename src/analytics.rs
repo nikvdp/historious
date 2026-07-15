@@ -1,7 +1,7 @@
 use crate::archive::stable_id;
 use crate::ingest::{self, SessionClass};
 use crate::provenance;
-use crate::storage::Store;
+use crate::storage::{ImportDelta, Store};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -53,12 +53,30 @@ pub struct ProjectionFreshness {
     pub name: &'static str,
     pub stale: bool,
     pub building: bool,
+    #[serde(skip)]
+    pub(crate) status: Option<String>,
     pub version: u32,
     pub stored_version: Option<u32>,
     pub input_rowid: i64,
     pub stored_input_rowid: Option<i64>,
     pub new_event_rows: u64,
     pub row_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReportRefreshOutcome {
+    pub refreshed: bool,
+    pub full_rebuild: bool,
+    pub affected_sessions: usize,
+    pub affected_events: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReportRefreshProgress {
+    pub phase: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +201,309 @@ pub fn report_snapshot_freshness(store: &Store) -> Result<ProjectionFreshness> {
     projection_freshness(store, PROJECTIONS[3])
 }
 
+pub(crate) fn report_refresh_prior_hashes(
+    store: &Store,
+    delta: &ImportDelta,
+) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT text_hash FROM history_items
+             WHERE event_id = ?1 AND tier = 'conversation' AND kind = 'user'
+               AND length(text) > 200",
+        )?;
+        let mut hashes = HashSet::new();
+        for event_id in delta.touched_events.iter().chain(&delta.repaired_events) {
+            let rows = stmt.query_map([event_id], |row| row.get::<_, String>(0))?;
+            for hash in rows {
+                hashes.insert(hash?);
+            }
+        }
+        Ok(hashes)
+    })
+}
+
+pub(crate) fn refresh_report_after_update_with_progress(
+    store: &Store,
+    delta: &ImportDelta,
+    progress: impl FnMut(ReportRefreshProgress),
+) -> Result<ReportRefreshOutcome> {
+    refresh_report_after_update_with_prior_hashes(store, delta, &HashSet::new(), progress)
+}
+
+pub(crate) fn refresh_report_after_update_with_prior_hashes(
+    store: &Store,
+    delta: &ImportDelta,
+    prior_candidate_hashes: &HashSet<String>,
+    mut progress: impl FnMut(ReportRefreshProgress),
+) -> Result<ReportRefreshOutcome> {
+    let statuses = freshness(store)?;
+    let delta_empty = delta.inserted_sessions.is_empty()
+        && delta.touched_sessions.is_empty()
+        && delta.inserted_events.is_empty()
+        && delta.touched_events.is_empty()
+        && delta.repaired_events.is_empty();
+    if statuses.iter().all(|status| !status.stale)
+        && (delta_empty || !delta.repaired_events.is_empty())
+    {
+        return Ok(ReportRefreshOutcome {
+            refreshed: false,
+            full_rebuild: false,
+            affected_sessions: 0,
+            affected_events: 0,
+        });
+    }
+
+    let captured_input_rowid = store.with_conn(max_event_rowid)?;
+    let invalid_state = statuses.iter().any(|status| {
+        status.status.as_deref() != Some("ready")
+            || status.stored_version != Some(status.version)
+            || (status.stale && status.new_event_rows == 0)
+    });
+    let mut event_ids = delta
+        .inserted_events
+        .iter()
+        .chain(&delta.touched_events)
+        .chain(&delta.repaired_events)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut session_ids = delta
+        .inserted_sessions
+        .iter()
+        .chain(&delta.touched_sessions)
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    if invalid_state {
+        event_ids = all_event_ids(store, captured_input_rowid)?;
+        session_ids = all_session_ids(store)?;
+    } else if statuses.iter().any(|status| status.stale) {
+        let catch_up_after = statuses
+            .iter()
+            .filter_map(|status| status.stored_input_rowid)
+            .min()
+            .unwrap_or(0);
+        let catch_up = events_after_watermark(store, catch_up_after, captured_input_rowid)?;
+        for (event_id, session_id) in catch_up {
+            event_ids.insert(event_id);
+            session_ids.insert(session_id);
+        }
+    }
+    session_ids.extend(session_ids_for_events(store, &event_ids)?);
+
+    let relationship_fallback = invalid_state
+        || !delta.inserted_sessions.is_empty()
+        || relationship_sensitive_scope(store, &session_ids, &event_ids)?;
+    let mut provenance_sessions = if invalid_state || relationship_fallback {
+        all_session_ids(store)?
+    } else {
+        widen_provenance_sessions(store, &session_ids, prior_candidate_hashes)?
+    };
+    if provenance_sessions.is_empty() {
+        provenance_sessions.extend(session_ids.iter().cloned());
+    }
+    let affected_sessions = session_ids.union(&provenance_sessions).count();
+
+    let relationship_work = if relationship_fallback {
+        all_session_ids(store)?.len().max(1)
+    } else {
+        1
+    };
+    let fact_work = session_ids.len().max(1);
+    let provenance_work = provenance_message_count(store, &provenance_sessions)?.max(1);
+    let report_work = 15 + total_conversation_messages(store)?;
+    let total = relationship_work + fact_work + provenance_work + report_work;
+    let mut completed = 0usize;
+
+    progress(ReportRefreshProgress {
+        phase: "relationship",
+        completed,
+        total,
+        detail: if relationship_fallback {
+            "rebuilding relationship-sensitive inputs".to_string()
+        } else {
+            "advancing unchanged relationships".to_string()
+        },
+    });
+    if relationship_fallback {
+        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || {
+            rebuild_session_relationships_with_progress(store, |processed, relationship_total| {
+                completed = processed.min(relationship_work);
+                progress(ReportRefreshProgress {
+                    phase: "relationship",
+                    completed,
+                    total,
+                    detail: format!(
+                        "resolved {processed}/{relationship_total} session relationships"
+                    ),
+                });
+            })
+        })?;
+    } else {
+        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || Ok(()))?;
+    }
+    completed = relationship_work;
+    progress(ReportRefreshProgress {
+        phase: "relationship",
+        completed,
+        total,
+        detail: "relationships ready".to_string(),
+    });
+
+    let facts_start = completed;
+    progress(ReportRefreshProgress {
+        phase: "session_facts",
+        completed,
+        total,
+        detail: format!("refreshing {} affected sessions", session_ids.len()),
+    });
+    run_projection_refresh(store, PROJECTIONS[2], captured_input_rowid, || {
+        if invalid_state {
+            rebuild_session_facts_with_progress(store, |processed| {
+                completed = facts_start + processed.min(fact_work);
+                progress(ReportRefreshProgress {
+                    phase: "session_facts",
+                    completed,
+                    total,
+                    detail: format!("refreshed {processed}/{} session facts", session_ids.len()),
+                });
+            })
+        } else {
+            refresh_session_facts_scoped(store, &session_ids, |processed| {
+                completed = facts_start + processed;
+                progress(ReportRefreshProgress {
+                    phase: "session_facts",
+                    completed,
+                    total,
+                    detail: format!("refreshed {processed}/{} session facts", session_ids.len()),
+                });
+            })
+        }
+    })?;
+    completed = facts_start + fact_work;
+    progress(ReportRefreshProgress {
+        phase: "session_facts",
+        completed,
+        total,
+        detail: "session facts ready".to_string(),
+    });
+
+    let provenance_start = completed;
+    progress(ReportRefreshProgress {
+        phase: "provenance",
+        completed,
+        total,
+        detail: format!("classifying {provenance_work} affected messages"),
+    });
+    run_projection_refresh(store, PROJECTIONS[1], captured_input_rowid, || {
+        if relationship_fallback {
+            rebuild_message_provenance(store, |detail| {
+                if let Some(processed) = classified_message_progress(&detail) {
+                    completed = provenance_start + processed.min(provenance_work);
+                }
+                progress(ReportRefreshProgress {
+                    phase: "provenance",
+                    completed,
+                    total,
+                    detail,
+                });
+            })
+        } else {
+            refresh_message_provenance_scoped(
+                store,
+                &provenance_sessions,
+                prior_candidate_hashes,
+                |processed| {
+                    completed = provenance_start + processed.min(provenance_work);
+                    progress(ReportRefreshProgress {
+                        phase: "provenance",
+                        completed,
+                        total,
+                        detail: format!(
+                            "classified {processed}/{provenance_work} affected messages"
+                        ),
+                    });
+                },
+            )
+        }
+    })?;
+    completed = provenance_start + provenance_work;
+    progress(ReportRefreshProgress {
+        phase: "provenance",
+        completed,
+        total,
+        detail: "provenance ready".to_string(),
+    });
+
+    let report_start = completed;
+    set_projection_building(store, PROJECTIONS[3], captured_input_rowid)?;
+    let report_result = crate::report::rebuild_snapshot_with_progress(store, |event| {
+        let scaled = event
+            .completed
+            .saturating_mul(report_work)
+            / event.total.max(1);
+        completed = completed
+            .max(report_start + scaled)
+            .min(report_start + report_work);
+        progress(ReportRefreshProgress {
+            phase: "report_snapshot",
+            completed,
+            total,
+            detail: event.detail,
+        });
+    });
+    match report_result {
+        Ok(()) => set_projection_ready(store, PROJECTIONS[3], captured_input_rowid)?,
+        Err(error) => {
+            let _ = set_projection_failed(
+                store,
+                PROJECTIONS[3],
+                captured_input_rowid,
+                &error.to_string(),
+            );
+            return Err(error);
+        }
+    }
+    completed = total;
+    progress(ReportRefreshProgress {
+        phase: "report_snapshot",
+        completed,
+        total,
+        detail: "report snapshot ready".to_string(),
+    });
+
+    Ok(ReportRefreshOutcome {
+        refreshed: true,
+        full_rebuild: invalid_state || relationship_fallback,
+        affected_sessions,
+        affected_events: event_ids.len(),
+    })
+}
+
+fn run_projection_refresh(
+    store: &Store,
+    projection: Projection,
+    input_rowid: i64,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    set_projection_building(store, projection, input_rowid)?;
+    match action() {
+        Ok(()) => set_projection_ready(store, projection, input_rowid),
+        Err(error) => {
+            let _ = set_projection_failed(store, projection, input_rowid, &error.to_string());
+            Err(error)
+        }
+    }
+}
+
+fn classified_message_progress(detail: &str) -> Option<usize> {
+    detail
+        .strip_prefix("classifying ")?
+        .split_once('/')?
+        .0
+        .parse()
+        .ok()
+}
+
 pub fn audit_provenance(
     store: &Store,
     bucket: Option<&str>,
@@ -297,6 +618,13 @@ fn rebuild_projection(
 }
 
 fn rebuild_session_relationships(store: &Store) -> Result<()> {
+    rebuild_session_relationships_with_progress(store, |_, _| {})
+}
+
+fn rebuild_session_relationships_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<()> {
     let projection = PROJECTIONS[0];
     clear_projection(store, projection)?;
     clear_event_session_overrides(store)?;
@@ -369,7 +697,8 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
     let mut parents = HashMap::with_capacity(sessions.len());
     let mut inline_relationships = Vec::new();
     let mut event_overrides = Vec::new();
-    for session in &sessions {
+    let total = sessions.len();
+    for (index, session) in sessions.iter().enumerate() {
         let metadata = serde_json::from_str::<Value>(&session.metadata_json)
             .unwrap_or_else(|_| serde_json::json!({}));
         let event_contents = session_event_contents(store, &session.session_id, None)?;
@@ -410,6 +739,7 @@ fn rebuild_session_relationships(store: &Store) -> Result<()> {
         }
         parents.insert(session.session_id.clone(), parent_session_id.clone());
         hints.push((hint, parent_session_id));
+        progress(index + 1, total);
     }
     let fork_parents = codex_fork_parents(store, &sessions, &hints)?;
     for (session, (hint, parent_session_id)) in sessions.iter().zip(hints.iter_mut()) {
@@ -819,11 +1149,235 @@ struct EventSessionOverride {
     session_id: String,
 }
 
+fn all_event_ids(store: &Store, through_rowid: i64) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id FROM events WHERE rowid <= ?1")?;
+        let rows = stmt.query_map([through_rowid], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(Into::into)
+    })
+}
+
+fn all_session_ids(store: &Store) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(Into::into)
+    })
+}
+
+fn events_after_watermark(
+    store: &Store,
+    after_rowid: i64,
+    through_rowid: i64,
+) -> Result<Vec<(String, String)>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id FROM events
+             WHERE rowid > ?1 AND rowid <= ?2
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![after_rowid, through_rowid], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
+fn session_ids_for_events(
+    store: &Store,
+    event_ids: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT session_id FROM events WHERE id = ?1")?;
+        let mut session_ids = HashSet::new();
+        for event_id in event_ids {
+            if let Some(session_id) = stmt
+                .query_row([event_id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                session_ids.insert(session_id);
+            }
+        }
+        Ok(session_ids)
+    })
+}
+
+fn relationship_sensitive_scope(
+    store: &Store,
+    session_ids: &HashSet<String>,
+    event_ids: &HashSet<String>,
+) -> Result<bool> {
+    store.with_conn(|conn| {
+        let mut session_stmt = conn.prepare(
+            "SELECT s.source_kind, s.external_id, s.metadata_json,
+                    sr.relationship, sr.rule, parent.external_id
+             FROM sessions s
+             LEFT JOIN session_relationships sr ON sr.session_id = s.id
+             LEFT JOIN sessions parent ON parent.id = sr.parent_session_id
+             WHERE s.id = ?1",
+        )?;
+        for session_id in session_ids {
+            let stored = session_stmt
+                .query_row([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .optional()?;
+            let Some((source_kind, external_id, metadata_json, relationship, rule, parent)) =
+                stored
+            else {
+                continue;
+            };
+            if matches!(source_kind.as_str(), "codex" | "claude_code") {
+                return Ok(true);
+            }
+            if matches!(source_kind.as_str(), "opencode" | "omp") {
+                let metadata = serde_json::from_str::<Value>(&metadata_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let hint = ingest::resolve_session_relationship(
+                    &source_kind,
+                    &external_id,
+                    &metadata,
+                    &[],
+                );
+                let parent_matches = match hint.parent_external_id.as_deref() {
+                    None => parent.is_none(),
+                    Some(expected) => parent.as_deref().is_some_and(|actual| {
+                        actual == expected || (source_kind == "omp" && actual.ends_with(expected))
+                    }),
+                };
+                if relationship.as_deref() != Some(hint.relationship.as_str())
+                    || rule.as_deref() != Some(hint.rule)
+                    || !parent_matches
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        let mut event_stmt = conn.prepare("SELECT source_kind FROM events WHERE id = ?1")?;
+        for event_id in event_ids {
+            let source_kind = event_stmt
+                .query_row([event_id], |row| row.get::<_, String>(0))
+                .optional()?;
+            if source_kind
+                .as_deref()
+                .is_some_and(|kind| matches!(kind, "codex" | "claude_code"))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
+
+fn widen_provenance_sessions(
+    store: &Store,
+    touched: &HashSet<String>,
+    prior_candidate_hashes: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut affected = touched.clone();
+        let edges = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, parent_session_id
+                 FROM session_relationships
+                 WHERE parent_session_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        loop {
+            let before = affected.len();
+            for (child, parent) in &edges {
+                if affected.contains(child) || affected.contains(parent) {
+                    affected.insert(child.clone());
+                    affected.insert(parent.clone());
+                }
+            }
+            if affected.len() == before {
+                break;
+            }
+        }
+
+        let mut hash_stmt = conn.prepare(
+            "SELECT DISTINCT text_hash FROM history_items
+             WHERE session_id = ?1 AND tier = 'conversation' AND kind = 'user'
+               AND length(text) > 200",
+        )?;
+        let mut touched_candidate_hashes = prior_candidate_hashes.clone();
+        for session_id in touched {
+            let hashes = hash_stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+            for hash in hashes {
+                touched_candidate_hashes.insert(hash?);
+            }
+        }
+        let mut sessions_stmt = conn.prepare(
+            "SELECT DISTINCT session_id FROM history_items WHERE text_hash = ?1",
+        )?;
+        for hash in touched_candidate_hashes {
+            let sessions = sessions_stmt.query_map([hash], |row| row.get::<_, String>(0))?;
+            for session_id in sessions {
+                affected.insert(session_id?);
+            }
+        }
+        Ok(affected)
+    })
+}
+
+fn provenance_message_count(store: &Store, session_ids: &HashSet<String>) -> Result<usize> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM history_items
+             WHERE session_id = ?1 AND tier = 'conversation'
+               AND kind IN ('user', 'assistant')",
+        )?;
+        let mut total = 0usize;
+        for session_id in session_ids {
+            let count = stmt.query_row([session_id], |row| row.get::<_, i64>(0))?;
+            total = total.saturating_add(count.max(0) as usize);
+        }
+        Ok(total)
+    })
+}
+
+fn total_conversation_messages(store: &Store) -> Result<usize> {
+    store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM history_items
+             WHERE tier = 'conversation' AND kind IN ('user', 'assistant')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(Into::into)
+    })
+}
+
+
 fn rebuild_session_facts(store: &Store) -> Result<()> {
+    rebuild_session_facts_with_progress(store, |_| {})
+}
+
+fn rebuild_session_facts_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(usize),
+) -> Result<()> {
     const BATCH_SIZE: i64 = 500;
 
     clear_projection(store, PROJECTIONS[2])?;
     let mut last_rowid = 0i64;
+    let mut processed = 0usize;
     loop {
         let batch = store.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -897,6 +1451,89 @@ fn rebuild_session_facts(store: &Store) -> Result<()> {
             });
         }
         insert_session_facts_batch(store, &rows)?;
+        processed += rows.len();
+        progress(processed);
+    }
+    Ok(())
+}
+
+fn refresh_session_facts_scoped(
+    store: &Store,
+    session_ids: &HashSet<String>,
+    mut progress: impl FnMut(usize),
+) -> Result<()> {
+    let mut session_ids = session_ids.iter().collect::<Vec<_>>();
+    session_ids.sort_unstable();
+    let mut processed = 0usize;
+    for batch in session_ids.chunks(500) {
+        let mut rows = Vec::with_capacity(batch.len());
+        for session_id in batch {
+            let input = store.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT s.rowid, s.id, s.source_kind, s.metadata_json,
+                            COALESCE(sa.event_count,
+                              (SELECT COUNT(*) FROM events e WHERE e.session_id = s.id)),
+                            COALESCE(sa.first_event_at, s.started_at),
+                            COALESCE(sa.last_event_at, s.updated_at),
+                            (SELECT COUNT(*) FROM history_items hi
+                             WHERE hi.session_id = s.id AND hi.tier = 'conversation'
+                               AND hi.kind = 'user')
+                     FROM sessions s
+                     LEFT JOIN session_activity sa ON sa.session_id = s.id
+                     WHERE s.id = ?1",
+                    [session_id.as_str()],
+                    |row| {
+                        Ok(SessionFactInput {
+                            rowid: row.get(0)?,
+                            session_id: row.get(1)?,
+                            source_kind: row.get(2)?,
+                            metadata_json: row.get(3)?,
+                            event_count: row.get::<_, i64>(4)?.max(0),
+                            first_event_at: row.get(5)?,
+                            last_event_at: row.get(6)?,
+                            user_message_count: row.get::<_, i64>(7)?.max(0),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
+            })?;
+            let Some(input) = input else {
+                continue;
+            };
+            let metadata = serde_json::from_str::<Value>(&input.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let events = session_usage_events(store, &input.session_id)?;
+            let event_contents = events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>();
+            let session_class =
+                ingest::classify_session(&input.source_kind, &metadata, &event_contents);
+            let usage = ingest::extract_session_usage(&input.source_kind, &events);
+            rows.push(SessionFactRow {
+                session_id: input.session_id,
+                source_kind: input.source_kind,
+                workspace_path: workspace_path(&metadata),
+                session_class: session_class.as_str(),
+                models_json: serde_json::to_string(&usage.models)?,
+                primary_model: usage.primary_model,
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                event_count: input.event_count,
+                user_message_count: input.user_message_count,
+                duration_secs: duration_secs(
+                    input.first_event_at.as_deref(),
+                    input.last_event_at.as_deref(),
+                ),
+                first_event_at: input.first_event_at,
+                last_event_at: input.last_event_at,
+            });
+        }
+        insert_session_facts_batch(store, &rows)?;
+        processed += batch.len();
+        progress(processed);
     }
     Ok(())
 }
@@ -945,7 +1582,21 @@ fn insert_session_facts_batch(store: &Store, rows: &[SessionFactRow<'_>]) -> Res
                  (session_id, source_kind, workspace_path, session_class, models_json,
                   primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
                   user_message_count, first_event_at, last_event_at, duration_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   source_kind = excluded.source_kind,
+                   workspace_path = excluded.workspace_path,
+                   session_class = excluded.session_class,
+                   models_json = excluded.models_json,
+                   primary_model = excluded.primary_model,
+                   input_tokens = excluded.input_tokens,
+                   cached_input_tokens = excluded.cached_input_tokens,
+                   output_tokens = excluded.output_tokens,
+                   event_count = excluded.event_count,
+                   user_message_count = excluded.user_message_count,
+                   first_event_at = excluded.first_event_at,
+                   last_event_at = excluded.last_event_at,
+                   duration_secs = excluded.duration_secs",
             )?;
             for row in rows {
                 stmt.execute(params![
@@ -1004,6 +1655,236 @@ fn clear_projection(store: &Store, projection: Projection) -> Result<()> {
             .context("starting analytics projection batch")?;
         tx.execute(&format!("DELETE FROM {}", projection.table), [])?;
         tx.commit().context("committing analytics projection batch")
+    })
+}
+
+fn repeated_template_hashes_scoped(
+    store: &Store,
+    session_ids: &HashSet<String>,
+    prior_candidate_hashes: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    store.with_conn(|conn| {
+        let mut candidate_stmt = conn.prepare(
+            "SELECT DISTINCT text_hash FROM history_items
+             WHERE session_id = ?1 AND tier = 'conversation' AND kind = 'user'
+               AND length(text) > 200",
+        )?;
+        let mut candidates = prior_candidate_hashes.clone();
+        for session_id in session_ids {
+            let hashes = candidate_stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+            for hash in hashes {
+                candidates.insert(hash?);
+            }
+        }
+        let mut threshold_stmt = conn.prepare(
+            "SELECT COUNT(DISTINCT hi.session_id),
+                    COUNT(DISTINCT COALESCE(
+                      json_extract(s.metadata_json, '$.workspace_path'),
+                      json_extract(s.metadata_json, '$.path')
+                    ))
+             FROM history_items hi
+             JOIN sessions s ON s.id = hi.session_id
+             WHERE hi.text_hash = ?1 AND hi.tier = 'conversation'
+               AND hi.kind = 'user' AND length(hi.text) > 200",
+        )?;
+        let mut repeated = HashSet::new();
+        for hash in candidates {
+            let (sessions, workspaces) = threshold_stmt.query_row([hash.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            if sessions > 3 && workspaces > 3 {
+                repeated.insert(hash);
+            }
+        }
+        Ok(repeated)
+    })
+}
+
+fn inherited_parent_items_scoped(
+    store: &Store,
+    session_ids: &HashSet<String>,
+) -> Result<HashSet<(String, String, String)>> {
+    store.with_conn(|conn| {
+        let mut edge_stmt = conn.prepare(
+            "SELECT session_id, parent_session_id
+             FROM session_relationships
+             WHERE relationship = 'subagent' AND parent_session_id IS NOT NULL
+               AND (session_id = ?1 OR parent_session_id = ?1)",
+        )?;
+        let mut edges = HashSet::new();
+        for session_id in session_ids {
+            let rows = edge_stmt.query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for edge in rows {
+                edges.insert(edge?);
+            }
+        }
+        let mut parent_stmt = conn.prepare(
+            "SELECT kind, text_hash FROM history_items
+             WHERE session_id = ?1 AND tier = 'conversation'
+               AND kind IN ('user', 'assistant')",
+        )?;
+        let mut by_parent = HashMap::<String, Vec<(String, String)>>::new();
+        for parent_id in edges.iter().map(|(_, parent)| parent).collect::<HashSet<_>>() {
+            let rows = parent_stmt.query_map([parent_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            by_parent.insert(
+                parent_id.to_string(),
+                rows.collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        let mut inherited = HashSet::new();
+        for (child_id, parent_id) in edges {
+            if let Some(items) = by_parent.get(&parent_id) {
+                for (kind, text_hash) in items {
+                    inherited.insert((child_id.clone(), kind.clone(), text_hash.clone()));
+                }
+            }
+        }
+        Ok(inherited)
+    })
+}
+
+fn refresh_message_provenance_scoped(
+    store: &Store,
+    session_ids: &HashSet<String>,
+    prior_candidate_hashes: &HashSet<String>,
+    mut progress: impl FnMut(usize),
+) -> Result<()> {
+    let repeated_templates =
+        repeated_template_hashes_scoped(store, session_ids, prior_candidate_hashes)?;
+    let inherited_parent_items = inherited_parent_items_scoped(store, session_ids)?;
+    let mut session_classes = HashMap::new();
+    let mut sorted_session_ids = session_ids.iter().cloned().collect::<Vec<_>>();
+    sorted_session_ids.sort_unstable();
+
+    let mut processed = 0usize;
+    let mut projected = Vec::new();
+    for session_id in &sorted_session_ids {
+        let inputs = store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
+                        hi.text_hash, hi.occurred_at, s.metadata_json,
+                        COALESCE(sr.relationship, 'none'), eso.event_id IS NOT NULL
+                 FROM history_items hi
+                 JOIN sessions s ON s.id = hi.session_id
+                 LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
+                 LEFT JOIN session_relationships sr
+                   ON sr.session_id = COALESCE(eso.session_id, hi.session_id)
+                 WHERE hi.session_id = ?1
+                   AND hi.tier = 'conversation'
+                   AND hi.kind IN ('user', 'assistant')
+                 ORDER BY hi.rowid",
+            )?;
+            let rows = stmt.query_map([session_id.as_str()], |row| {
+                Ok(ProvenanceInput {
+                    rowid: row.get(0)?,
+                    item_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    message_kind: row.get(4)?,
+                    text: row.get(5)?,
+                    text_hash: row.get(6)?,
+                    occurred_at: row.get(7)?,
+                    session_metadata: row.get(8)?,
+                    relationship: row.get(9)?,
+                    event_session_overridden: row.get(10)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })?;
+        for input in inputs {
+            let session_class = if let Some(class) = session_classes.get(&input.session_id) {
+                *class
+            } else {
+                let metadata = serde_json::from_str::<Value>(&input.session_metadata)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let class = classify_stored_session(
+                    store,
+                    &input.session_id,
+                    &input.source_kind,
+                    &metadata,
+                )?;
+                session_classes.insert(input.session_id.clone(), class);
+                class
+            };
+            let relationship = if !input.event_session_overridden
+                && input.relationship == "subagent"
+                && inherited_parent_items.contains(&(
+                    input.session_id.clone(),
+                    input.message_kind.clone(),
+                    input.text_hash.clone(),
+                ))
+            {
+                "none"
+            } else {
+                input.relationship.as_str()
+            };
+            let classification = provenance::classify_message(
+                &input.text,
+                &input.message_kind,
+                repeated_templates.contains(&input.text_hash),
+                relationship,
+                session_class,
+            );
+            projected.push(ProvenanceRow {
+                item_id: input.item_id,
+                session_id: input.session_id,
+                source_kind: input.source_kind,
+                authored_by: classification.authored_by,
+                sentiment_usable: classification.sentiment_usable,
+                rule: classification.rule,
+                occurred_at: input.occurred_at,
+            });
+            processed += 1;
+            if processed % 500 == 0 {
+                progress(processed);
+            }
+        }
+    }
+    if processed % 500 != 0 {
+        progress(processed);
+    }
+
+    store.with_conn(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting scoped provenance replacement")?;
+        {
+            let mut delete =
+                tx.prepare("DELETE FROM message_provenance WHERE session_id = ?1")?;
+            for session_id in &sorted_session_ids {
+                delete.execute([session_id.as_str()])?;
+            }
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO message_provenance
+                 (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                   session_id = excluded.session_id,
+                   source_kind = excluded.source_kind,
+                   authored_by = excluded.authored_by,
+                   sentiment_usable = excluded.sentiment_usable,
+                   rule = excluded.rule,
+                   occurred_at = excluded.occurred_at",
+            )?;
+            for row in &projected {
+                insert.execute(params![
+                    row.item_id,
+                    row.session_id,
+                    row.source_kind,
+                    row.authored_by,
+                    row.sentiment_usable,
+                    row.rule,
+                    row.occurred_at,
+                ])?;
+            }
+        }
+        tx.commit().context("committing scoped provenance replacement")
     })
 }
 
@@ -1233,7 +2114,14 @@ fn insert_provenance_batch(store: &Store, rows: &[ProvenanceRow<'_>]) -> Result<
             let mut stmt = tx.prepare(
                 "INSERT INTO message_provenance
                  (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                   session_id = excluded.session_id,
+                   source_kind = excluded.source_kind,
+                   authored_by = excluded.authored_by,
+                   sentiment_usable = excluded.sentiment_usable,
+                   rule = excluded.rule,
+                   occurred_at = excluded.occurred_at",
             )?;
             for row in rows {
                 stmt.execute(params![
@@ -1309,6 +2197,7 @@ fn projection_freshness(store: &Store, projection: Projection) -> Result<Project
             name: projection.name,
             stale,
             building,
+            status: status.map(ToOwned::to_owned),
             version: projection.version,
             stored_version: state.as_ref().map(|state| state.version),
             input_rowid,
@@ -2196,6 +3085,421 @@ mod tests {
         assert_eq!(rows[5].3, "default.human");
         assert_eq!(rows[6].1, "agent");
         assert_eq!(rows[6].3, "relationship.subagent");
+    }
+
+    #[test]
+    fn incremental_report_refresh_updates_only_the_touched_session() {
+        let (_dir, store) = current_refresh_store();
+        let delta = append_target_turn(&store);
+        let mut progress = Vec::new();
+
+        let outcome = refresh_report_after_update_with_progress(&store, &delta, |event| {
+            progress.push((event.completed, event.total));
+        })
+        .expect("refresh scoped report projections");
+
+        assert!(outcome.refreshed);
+        assert!(!outcome.full_rebuild);
+        assert_eq!(outcome.affected_sessions, 1);
+        assert_eq!(outcome.affected_events, 1);
+        assert!(!progress.is_empty());
+        assert!(progress
+            .windows(2)
+            .all(|window| window[0].0 <= window[1].0 && window[0].1 <= window[1].1));
+        assert!(progress.iter().all(|(completed, total)| completed <= total));
+        assert_eq!(progress.last(), Some(&(progress[0].1, progress[0].1)));
+
+        let (target_facts, untouched_facts, provenance_count, new_author) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT event_count, user_message_count FROM session_facts
+                         WHERE session_id = 'session_target'",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )?,
+                    conn.query_row(
+                        "SELECT event_count, user_message_count FROM session_facts
+                         WHERE session_id = 'session_untouched'",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )?,
+                    conn.query_row("SELECT COUNT(*) FROM message_provenance", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT authored_by FROM message_provenance
+                         WHERE item_id = 'target_item_2'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                ))
+            })
+            .expect("load incrementally refreshed projections");
+        assert_eq!(target_facts, (2, 2));
+        assert_eq!(untouched_facts, (1, 1));
+        assert_eq!(provenance_count, 3);
+        assert_eq!(new_author, "human");
+
+        let report = snapshot_report(&store);
+        assert_eq!(report.totals.sessions, 2);
+        assert_eq!(report.totals.events, 3);
+        assert_eq!(report.totals.human_turns, 3);
+        assert_projections_current(&store);
+    }
+
+    #[test]
+    fn empty_delta_leaves_a_current_report_snapshot_unchanged() {
+        let (_dir, store) = current_refresh_store();
+        let delta = append_target_turn(&store);
+        refresh_report_after_update_with_progress(&store, &delta, |_| {})
+            .expect("perform initial scoped refresh");
+        let generated_at = snapshot_report(&store).generated_at;
+
+        let outcome = refresh_report_after_update_with_progress(
+            &store,
+            &ImportDelta::default(),
+            |_| {},
+        )
+        .expect("skip current report refresh");
+
+        assert!(!outcome.refreshed);
+        assert!(!outcome.full_rebuild);
+        assert_eq!(outcome.affected_sessions, 0);
+        assert_eq!(outcome.affected_events, 0);
+        assert_eq!(snapshot_report(&store).generated_at, generated_at);
+        assert_projections_current(&store);
+    }
+
+    #[test]
+    fn repaired_delta_skips_a_report_snapshot_already_rebuilt_by_repair() {
+        let (_dir, store) = current_refresh_store();
+        let generated_at = snapshot_report(&store).generated_at;
+        let delta = ImportDelta {
+            repaired_events: vec!["target_event_1".to_string()],
+            touched_sessions: vec!["session_target".to_string()],
+            ..ImportDelta::default()
+        };
+
+        let outcome = refresh_report_after_update_with_progress(&store, &delta, |_| {})
+            .expect("skip duplicate repaired report refresh");
+
+        assert!(!outcome.refreshed);
+        assert_eq!(snapshot_report(&store).generated_at, generated_at);
+        assert_projections_current(&store);
+    }
+
+    #[test]
+    fn empty_delta_catches_up_a_snapshot_stale_by_a_later_event() {
+        let (_dir, store) = current_refresh_store();
+        append_target_turn(&store);
+        let stale = freshness(&store).expect("load stale projection statuses");
+        assert!(stale.iter().all(|status| status.stale));
+        assert!(stale.iter().all(|status| status.new_event_rows == 1));
+
+        let outcome = refresh_report_after_update_with_progress(
+            &store,
+            &ImportDelta::default(),
+            |_| {},
+        )
+        .expect("catch up stale report without import delta");
+
+        assert!(outcome.refreshed);
+        assert!(!outcome.full_rebuild);
+        assert_eq!(outcome.affected_sessions, 1);
+        assert_eq!(outcome.affected_events, 1);
+        let report = snapshot_report(&store);
+        assert_eq!(report.totals.events, 3);
+        assert_eq!(report.totals.human_turns, 3);
+        assert_projections_current(&store);
+    }
+
+    #[test]
+    fn failed_projection_forces_a_complete_report_refresh() {
+        let (_dir, store) = current_refresh_store();
+        let failed_at = store
+            .with_conn(max_event_rowid)
+            .expect("load projection watermark");
+        set_projection_failed(
+            &store,
+            PROJECTIONS[1],
+            failed_at,
+            "fixture projection failure",
+        )
+        .expect("mark provenance projection failed");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM session_facts WHERE session_id = 'session_untouched'",
+                    [],
+                )?;
+                conn.execute(
+                    "DELETE FROM message_provenance WHERE session_id = 'session_untouched'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("make partial projections observable");
+        let delta = append_target_turn(&store);
+
+        let outcome = refresh_report_after_update_with_progress(&store, &delta, |_| {})
+            .expect("fall back to complete report refresh");
+
+        assert!(outcome.refreshed);
+        assert!(outcome.full_rebuild);
+        assert_eq!(outcome.affected_sessions, 2);
+        assert_eq!(outcome.affected_events, 3);
+        let (fact_count, provenance_count) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM session_facts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM message_provenance", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .expect("load fully restored projections");
+        assert_eq!(fact_count, 2);
+        assert_eq!(provenance_count, 3);
+        let report = snapshot_report(&store);
+        assert_eq!(report.totals.sessions, 2);
+        assert_eq!(report.totals.events, 3);
+        assert_eq!(report.totals.human_turns, 3);
+        assert_projections_current(&store);
+    }
+
+    #[test]
+    fn scoped_refresh_reclassifies_peers_when_a_template_hash_disappears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let template = "shared generated template ".repeat(12);
+        store
+            .with_conn(|conn| {
+                for index in 0..4 {
+                    let session_id = format!("template_session_{index}");
+                    let event_id = format!("template_event_{index}");
+                    let item_id = format!("template_item_{index}");
+                    conn.execute(
+                        "INSERT INTO sessions
+                         (id, source_id, machine_id, source_kind, external_id, status,
+                          metadata_json, hash)
+                         VALUES (?1, 'source', 'machine', 'hermes', ?1, 'open', ?2, ?3)",
+                        params![
+                            session_id,
+                            format!(r#"{{"workspace_path":"/repo/{index}"}}"#),
+                            format!("template_session_hash_{index}")
+                        ],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO events
+                         (id, session_id, source_id, machine_id, source_kind, ordinal,
+                          event_type, role, content, occurred_at, metadata_json, hash)
+                         VALUES (?1, ?2, 'source', 'machine', 'hermes', 0, 'message', 'user',
+                                 ?3, '2026-07-12T00:00:00Z', '{}', ?4)",
+                        params![
+                            event_id,
+                            session_id,
+                            template,
+                            format!("template_event_hash_{index}")
+                        ],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO session_activity
+                         (session_id, event_count, first_event_at, last_event_at)
+                         VALUES (?1, 1, '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
+                        [session_id.as_str()],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO history_items
+                         (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                          subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                          semantic_policy, metadata_json, hash)
+                         VALUES (?1, ?2, ?3, 'source', 'machine', 'hermes', 0, 0,
+                                 'conversation', 'user', ?4, 'shared_template_hash',
+                                 '2026-07-12T00:00:00Z', 1, 'required', '{}', ?5)",
+                        params![
+                            item_id,
+                            event_id,
+                            session_id,
+                            template,
+                            format!("template_item_hash_{index}")
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("insert repeated template fixtures");
+        rebuild_all(&store, |_, _, _| {}).expect("seed repeated template projections");
+
+        let delta = ImportDelta {
+            touched_events: vec!["template_event_0".to_string()],
+            touched_sessions: vec!["template_session_0".to_string()],
+            ..ImportDelta::default()
+        };
+        let prior_hashes = report_refresh_prior_hashes(&store, &delta)
+            .expect("capture replaced template hashes");
+        assert_eq!(prior_hashes, HashSet::from(["shared_template_hash".to_string()]));
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM history_items WHERE event_id = 'template_event_0'",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO history_items
+                     (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                      subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                      semantic_policy, metadata_json, hash)
+                     VALUES ('replacement_item', 'template_event_0', 'template_session_0',
+                             'source', 'machine', 'hermes', 0, 0, 'conversation', 'user',
+                             'short human message', 'replacement_hash',
+                             '2026-07-12T00:00:00Z', 1, 'required', '{}', 'replacement_item_hash')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("replace derived history item");
+
+        let outcome = refresh_report_after_update_with_prior_hashes(
+            &store,
+            &delta,
+            &prior_hashes,
+            |_| {},
+        )
+        .expect("refresh removed template peers");
+        assert!(!outcome.full_rebuild);
+        assert_eq!(outcome.affected_sessions, 4);
+        let authors = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT authored_by FROM message_provenance ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load reclassified provenance");
+        assert_eq!(authors, vec!["human"; 4]);
+        assert_projections_current(&store);
+    }
+
+    fn current_refresh_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       started_at, updated_at, metadata_json, hash)
+                    VALUES
+                      ('session_target', 'source', 'machine', 'hermes', 'target', 'open',
+                       '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z',
+                       '{"workspace_path":"/repo/target"}', 'session_target_hash'),
+                      ('session_untouched', 'source', 'machine', 'hermes', 'untouched', 'open',
+                       '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z',
+                       '{"workspace_path":"/repo/untouched"}', 'session_untouched_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, occurred_at, metadata_json, hash)
+                    VALUES
+                      ('target_event_1', 'session_target', 'source', 'machine', 'hermes', 0,
+                       'message', 'user', 'target question one', '2026-07-12T00:00:00Z',
+                       '{}', 'target_event_hash_1'),
+                      ('untouched_event_1', 'session_untouched', 'source', 'machine', 'hermes', 0,
+                       'message', 'user', 'untouched question', '2026-07-12T00:00:00Z',
+                       '{}', 'untouched_event_hash_1');
+
+                    INSERT INTO session_activity
+                      (session_id, event_count, first_event_at, last_event_at)
+                    VALUES
+                      ('session_target', 1, '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z'),
+                      ('session_untouched', 1, '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('target_item_1', 'target_event_1', 'session_target', 'source', 'machine',
+                       'hermes', 0, 0, 'conversation', 'user', 'target question one',
+                       'target_text_hash_1', '2026-07-12T00:00:00Z', 1, 'required', '{}',
+                       'target_item_hash_1'),
+                      ('untouched_item_1', 'untouched_event_1', 'session_untouched', 'source',
+                       'machine', 'hermes', 0, 0, 'conversation', 'user', 'untouched question',
+                       'untouched_text_hash_1', '2026-07-12T00:00:00Z', 1, 'required', '{}',
+                       'untouched_item_hash_1');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert report refresh fixtures");
+        rebuild_all(&store, |_, _, _| {}).expect("seed current report projections");
+        (dir, store)
+    }
+
+    fn append_target_turn(store: &Store) -> ImportDelta {
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, occurred_at, metadata_json, hash)
+                    VALUES
+                      ('target_event_2', 'session_target', 'source', 'machine', 'hermes', 1,
+                       'message', 'user', 'target question two', '2026-07-12T00:01:00Z',
+                       '{}', 'target_event_hash_2');
+
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    VALUES
+                      ('target_item_2', 'target_event_2', 'session_target', 'source', 'machine',
+                       'hermes', 1, 0, 'conversation', 'user', 'target question two',
+                       'target_text_hash_2', '2026-07-12T00:01:00Z', 1, 'required', '{}',
+                       'target_item_hash_2');
+
+                    UPDATE session_activity
+                    SET event_count = 2, last_event_at = '2026-07-12T00:01:00Z'
+                    WHERE session_id = 'session_target';
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("append target event and history item");
+        ImportDelta {
+            inserted_events: vec!["target_event_2".to_string()],
+            touched_sessions: vec!["session_target".to_string()],
+            ..ImportDelta::default()
+        }
+    }
+
+    fn snapshot_report(store: &Store) -> crate::report::UsageReport {
+        let json = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT report_json FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load report snapshot JSON");
+        serde_json::from_str(&json).expect("parse report snapshot JSON")
+    }
+
+    fn assert_projections_current(store: &Store) {
+        let statuses = freshness(store).expect("load current projection statuses");
+        assert!(statuses.iter().all(|status| !status.stale));
+        assert!(statuses
+            .iter()
+            .all(|status| status.stored_input_rowid == Some(status.input_rowid)));
     }
 
     #[test]

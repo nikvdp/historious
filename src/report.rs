@@ -293,7 +293,23 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
 }
 
 pub fn rebuild_snapshot(store: &Store) -> Result<()> {
-    let report = compute_live(
+    rebuild_snapshot_with_progress(store, |_| {})
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReportSnapshotProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub detail: String,
+}
+
+
+
+pub(crate) fn rebuild_snapshot_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(ReportSnapshotProgress),
+) -> Result<()> {
+    let report = compute_live_with_progress(
         store,
         &ReportOptions {
             after: None,
@@ -302,7 +318,20 @@ pub fn rebuild_snapshot(store: &Store) -> Result<()> {
             sort: ReportSort::Tokens,
         },
         false,
+        |event| {
+            progress(ReportSnapshotProgress {
+                completed: event.completed,
+                total: event.total + 2,
+                detail: event.detail,
+            });
+        },
     )?;
+    let total = 15 + frequency_message_count(store, None, None, None)?;
+    progress(ReportSnapshotProgress {
+        completed: total - 1,
+        total,
+        detail: "serializing report snapshot".to_string(),
+    });
     let report_json = serde_json::to_string(&report)?;
     store.with_conn(|conn| {
         conn.execute(
@@ -314,7 +343,13 @@ pub fn rebuild_snapshot(store: &Store) -> Result<()> {
             params![report_json, report.generated_at],
         )?;
         Ok(())
-    })
+    })?;
+    progress(ReportSnapshotProgress {
+        completed: total,
+        total,
+        detail: "stored report snapshot".to_string(),
+    });
+    Ok(())
 }
 
 fn read_snapshot(store: &Store) -> Result<Option<UsageReport>> {
@@ -352,31 +387,51 @@ fn compute_live(
     options: &ReportOptions,
     include_projection_warnings: bool,
 ) -> Result<UsageReport> {
+    compute_live_with_progress(store, options, include_projection_warnings, |_| {})
+}
+
+fn compute_live_with_progress(
+    store: &Store,
+    options: &ReportOptions,
+    include_projection_warnings: bool,
+    mut progress: impl FnMut(ReportSnapshotProgress),
+) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
+    let mut frequency_messages = frequency_message_count(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    let mut total = 13 + frequency_messages;
     let totals = report_totals(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 1, total, detail: "computed totals".to_string() });
     let activity = report_activity(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 2, total, detail: "computed activity".to_string() });
     let comparisons = report_comparisons(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 3, total, detail: "computed comparisons".to_string() });
     let tokens_by_session_end_date = report_tokens(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 4, total, detail: "computed token usage".to_string() });
     let mut projects = report_projects(
         store,
         options.after.as_deref(),
@@ -384,6 +439,7 @@ fn compute_live(
         project_pattern.as_deref(),
     )?;
     sort_projects(&mut projects, options.sort);
+    progress(ReportSnapshotProgress { completed: 5, total, detail: "computed projects".to_string() });
     let provider_mix_by_month = report_mix(
         store,
         "sf.source_kind",
@@ -391,6 +447,7 @@ fn compute_live(
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 6, total, detail: "computed provider mix".to_string() });
     let model_mix_by_month = report_mix(
         store,
         "sf.primary_model",
@@ -398,6 +455,7 @@ fn compute_live(
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 7, total, detail: "computed model mix".to_string() });
     let rhythms = report_rhythms(
         store,
         options.after.as_deref(),
@@ -406,11 +464,21 @@ fn compute_live(
     )?;
     let dayparts = report_dayparts(&rhythms);
     let daypart_insights = select_daypart_insights(&dayparts);
+    progress(ReportSnapshotProgress { completed: 8, total, detail: "computed rhythms and dayparts".to_string() });
     let (frequencies, project_terms) = report_frequencies(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
+        |processed, actual_total, detail| {
+            frequency_messages = frequency_messages.max(actual_total);
+            total = total.max(13 + actual_total);
+            progress(ReportSnapshotProgress {
+                completed: 9 + processed,
+                total,
+                detail,
+            });
+        },
     )?;
     for project in &mut projects {
         project.terms = project_terms
@@ -424,12 +492,14 @@ fn compute_live(
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 10 + frequency_messages, total, detail: "computed topics".to_string() });
     let (sentiment, sentiment_warning) = report_sentiment(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    progress(ReportSnapshotProgress { completed: 11 + frequency_messages, total, detail: "computed sentiment".to_string() });
     let mut warnings = if include_projection_warnings {
         analytics::freshness(store)?
             .into_iter()
@@ -464,8 +534,9 @@ fn compute_live(
     if let Some(warning) = sentiment_warning {
         warnings.push(warning);
     }
+    progress(ReportSnapshotProgress { completed: 12 + frequency_messages, total, detail: "computed report warnings".to_string() });
 
-    Ok(UsageReport {
+    let report = UsageReport {
         schema: "historious.report.v1".to_string(),
         generated_at: Utc::now().to_rfc3339(),
         contains_raw_text: false,
@@ -489,7 +560,9 @@ fn compute_live(
         frequencies,
         topics,
         sentiment,
-    })
+    };
+    progress(ReportSnapshotProgress { completed: total, total, detail: "assembled report snapshot".to_string() });
+    Ok(report)
 }
 
 fn sentiment_axes_sql() -> String {
@@ -801,11 +874,38 @@ fn report_topics(
     ))
 }
 
+
+fn frequency_message_count(
+    store: &Store,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<&str>,
+) -> Result<usize> {
+    store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human'
+               AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+               AND (?1 IS NULL OR hi.occurred_at >= ?1)
+               AND (?2 IS NULL OR hi.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
+            params![after, before, project],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(Into::into)
+    })
+}
+
 fn report_frequencies(
     store: &Store,
     after: Option<&str>,
     before: Option<&str>,
     project: Option<&str>,
+    mut progress: impl FnMut(usize, usize, String),
 ) -> Result<(FrequencySection, HashMap<String, Vec<TermCount>>)> {
     let messages = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -831,6 +931,8 @@ fn report_frequencies(
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     })?;
+    let total = messages.len();
+    progress(0, total, format!("loaded {total} frequency messages"));
 
     let stopwords = english_stopwords();
     let mut unigrams = HashMap::new();
@@ -838,7 +940,7 @@ fn report_frequencies(
     let mut trigrams = HashMap::new();
     let project_noise = project_noise_words();
     let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
-    for (text, usable, rule, workspace_path) in messages {
+    for (index, (text, usable, rule, workspace_path)) in messages.into_iter().enumerate() {
         let text = if usable == "strip_wrapper" {
             provenance::strip_human_wrapper(&text, &rule)
         } else {
@@ -879,6 +981,14 @@ fn report_frequencies(
             {
                 increment_capped(&mut trigrams, &mut message_trigrams, window.join(" "));
             }
+        }
+        let processed = index + 1;
+        if processed == total || processed % 100 == 0 {
+            progress(
+                processed,
+                total,
+                format!("tokenized {processed}/{total} frequency messages"),
+            );
         }
     }
     Ok((
