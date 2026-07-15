@@ -1464,25 +1464,31 @@ fn report_rhythms(
     })
 }
 
+fn hourly_activity_values(rhythms: &Rhythms) -> [u64; 24] {
+    let mut values = [0u64; 24];
+    for bucket in &rhythms.by_hour {
+        let Ok(hour) = bucket.label.parse::<usize>() else {
+            continue;
+        };
+        if let Some(value) = values.get_mut(hour) {
+            *value = value.saturating_add(bucket.human_messages);
+        }
+    }
+    values
+}
+
 fn report_dayparts(rhythms: &Rhythms) -> Vec<DaypartBucket> {
-    let definitions = [
-        ("night", 8u64),
-        ("early morning", 4),
-        ("morning", 3),
-        ("afternoon", 5),
-        ("evening", 4),
-    ];
-    let mut counts = [0u64; 5];
+    let definitions = [("morning", 12u64), ("afternoon", 5), ("evening", 7)];
+    let mut counts = [0u64; 3];
     for bucket in &rhythms.by_hour {
         let Ok(hour) = bucket.label.parse::<u8>() else {
             continue;
         };
         let index = match hour {
-            5..=8 => 1,
-            9..=11 => 2,
-            12..=16 => 3,
-            17..=20 => 4,
-            _ => 0,
+            0..=11 => 0,
+            12..=16 => 1,
+            17..=23 => 2,
+            _ => continue,
         };
         counts[index] += bucket.human_messages;
     }
@@ -1577,7 +1583,7 @@ pub(crate) fn neutral_bar(value: f64, maximum: f64, width: usize) -> String {
 pub(crate) fn compact_heatmap(values: &[u64], width: usize) -> String {
     let values = sampled_values(values, width);
     let maximum = values.iter().copied().max().unwrap_or(0);
-    let levels = ['·', '░', '▒', '▓', '█'];
+    let levels = ['░', '▒', '▓', '█'];
     values
         .into_iter()
         .map(|value| {
@@ -1598,6 +1604,91 @@ fn sampled_values(values: &[u64], width: usize) -> Vec<u64> {
     (0..count)
         .map(|index| values[index * values.len() / count])
         .collect()
+}
+
+fn hour_axis(width: usize) -> String {
+    if width >= 24 {
+        "00   06    12    18   23".to_string()
+    } else if width >= 4 {
+        format!("00{}23", " ".repeat(width - 4))
+    } else {
+        String::new()
+    }
+}
+
+fn push_working_hours_row(
+    out: &mut String,
+    label: &str,
+    chart: &str,
+    detail: Option<&str>,
+    color: bool,
+) {
+    const LABEL_WIDTH: usize = 20;
+    out.push_str("  ");
+    out.push_str(&styled_role(label, StyleRole::Time, color));
+    out.push_str(&" ".repeat(LABEL_WIDTH.saturating_sub(label.chars().count())));
+    out.push_str(&styled_role(chart, StyleRole::Count, color));
+    if let Some(detail) = detail {
+        out.push_str("  ");
+        out.push_str(&styled_role(detail, StyleRole::Count, color));
+    }
+    out.push('\n');
+}
+
+fn render_working_hours(
+    out: &mut String,
+    rhythms: &Rhythms,
+    dayparts: &[DaypartBucket],
+    width: usize,
+    color: bool,
+) {
+    const LABEL_WIDTH: usize = 20;
+    const CHART_WIDTH: usize = 24;
+    let chart_width = width.saturating_sub(4).min(CHART_WIDTH);
+    let values = hourly_activity_values(rhythms);
+    let heatmap = compact_heatmap(&values, chart_width);
+
+    out.push_str(&styled_role("Working hours", StyleRole::Section, color));
+    out.push('\n');
+    if width >= 64 {
+        out.push_str(&" ".repeat(2 + LABEL_WIDTH));
+        out.push_str(&styled_role(&hour_axis(chart_width), StyleRole::Time, color));
+        out.push('\n');
+        push_working_hours_row(out, "by hour", &heatmap, None, color);
+        for bucket in dayparts {
+            let bar = horizontal_bar(bucket.share_percent, 100.0, chart_width);
+            let detail = format!(
+                "{:.0}% · {} msg",
+                bucket.share_percent,
+                compact_number(bucket.human_messages)
+            );
+            push_working_hours_row(out, &bucket.label, &bar, Some(&detail), color);
+        }
+    } else {
+        push_wrapped(out, "by hour", width, 2, StyleRole::Time, color);
+        out.push_str("    ");
+        out.push_str(&styled_role(&hour_axis(chart_width), StyleRole::Time, color));
+        out.push('\n');
+        out.push_str("    ");
+        out.push_str(&styled_role(&heatmap, StyleRole::Count, color));
+        out.push('\n');
+        for bucket in dayparts {
+            let detail = format!(
+                "{} {:.0}% · {} msg",
+                bucket.label,
+                bucket.share_percent,
+                compact_number(bucket.human_messages)
+            );
+            push_wrapped(out, &detail, width, 2, StyleRole::Time, color);
+            out.push_str("    ");
+            out.push_str(&styled_role(
+                &horizontal_bar(bucket.share_percent, 100.0, chart_width),
+                StyleRole::Count,
+                color,
+            ));
+            out.push('\n');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1738,53 +1829,15 @@ pub fn render_terminal_window(
         }
     }
 
-    if !report.daypart_insights.is_empty() {
+    if !report.rhythms.by_hour.is_empty() {
         out.push('\n');
-        out.push_str(&styled_role("Working rhythm", StyleRole::Section, color));
-        out.push('\n');
-        let hour_values = report
-            .rhythms
-            .by_hour
-            .iter()
-            .map(|bucket| bucket.human_messages)
-            .collect::<Vec<_>>();
-        out.push_str(&format!(
-            "  {} {} {}\n",
-            styled_role("00", StyleRole::Time, color),
-            styled_role(
-                &compact_heatmap(&hour_values, width.saturating_sub(12).min(24)),
-                StyleRole::Count,
-                color
-            ),
-            styled_role("23", StyleRole::Time, color)
-        ));
-        for insight in &report.daypart_insights {
-            let bar_width = width.saturating_sub(42).clamp(8, 24);
-            let bar = styled_role(
-                &horizontal_bar(insight.share_percent, 100.0, bar_width),
-                StyleRole::Count,
-                color,
-            );
-            if width < 70 {
-                out.push_str(&format!(
-                    "  {} {:.0}% vs {:.0}% · {} msg\n    {}\n",
-                    styled_role(&insight.label, StyleRole::Time, color),
-                    insight.share_percent,
-                    insight.baseline_percent,
-                    compact_number(insight.human_messages),
-                    bar
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  {:<13} {} {:>3.0}% vs {:>3.0}% · {} msg\n",
-                    styled_role(&insight.label, StyleRole::Time, color),
-                    bar,
-                    insight.share_percent,
-                    insight.baseline_percent,
-                    compact_number(insight.human_messages)
-                ));
-            }
-        }
+        render_working_hours(
+            &mut out,
+            &report.rhythms,
+            &report.dayparts,
+            width,
+            color,
+        );
     }
 
     if show_models {
@@ -2465,12 +2518,93 @@ mod tests {
                 .iter()
                 .map(|bucket| bucket.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["night", "early morning", "morning", "afternoon", "evening"]
+            vec!["morning", "afternoon", "evening"]
         );
         let insights = select_daypart_insights(&dayparts);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].label, "morning");
         assert!(insights[0].share_percent > insights[0].baseline_percent);
+    }
+
+    #[test]
+    fn working_hours_aligns_dense_hourly_and_daypart_charts() {
+        let rhythms = Rhythms {
+            by_hour: (0..24)
+                .map(|hour| RhythmBucket {
+                    label: format!("{hour:02}"),
+                    human_messages: hour,
+                })
+                .collect(),
+            by_weekday: Vec::new(),
+        };
+        let dayparts = vec![
+            DaypartBucket {
+                label: "morning".to_string(),
+                human_messages: 9_000,
+                share_percent: 27.0,
+                baseline_percent: 50.0,
+            },
+            DaypartBucket {
+                label: "afternoon".to_string(),
+                human_messages: 16_000,
+                share_percent: 48.0,
+                baseline_percent: 21.0,
+            },
+            DaypartBucket {
+                label: "evening".to_string(),
+                human_messages: 8_500,
+                share_percent: 25.0,
+                baseline_percent: 29.0,
+            },
+        ];
+
+        let mut output = String::new();
+        render_working_hours(&mut output, &rhythms, &dayparts, 80, false);
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "Working hours");
+        assert_eq!(
+            lines[1].chars().skip(22).collect::<String>(),
+            "00   06    12    18   23"
+        );
+        for line in &lines[2..] {
+            assert_eq!(line.chars().skip(22).take(24).count(), 24);
+        }
+        assert_eq!(
+            lines[2].chars().skip(22).take(24).collect::<String>(),
+            "░░░░░░░░▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓█"
+        );
+        assert!(lines[3].starts_with("  morning"));
+        assert!(lines[4].starts_with("  afternoon"));
+        assert!(lines[5].starts_with("  evening"));
+        assert!(!output.contains(" vs "));
+
+        let mut narrow = String::new();
+        render_working_hours(&mut narrow, &rhythms, &dayparts, 40, false);
+        assert!(narrow.lines().all(|line| line.chars().count() <= 40));
+    }
+
+    #[test]
+    fn hourly_activity_preserves_missing_hour_positions() {
+        let values = hourly_activity_values(&Rhythms {
+            by_hour: vec![
+                RhythmBucket {
+                    label: "23".to_string(),
+                    human_messages: 5,
+                },
+                RhythmBucket {
+                    label: "06".to_string(),
+                    human_messages: 2,
+                },
+                RhythmBucket {
+                    label: "24".to_string(),
+                    human_messages: 99,
+                },
+            ],
+            by_weekday: Vec::new(),
+        });
+        assert_eq!(values[6], 2);
+        assert_eq!(values[23], 5);
+        assert_eq!(values.iter().sum::<u64>(), 7);
     }
 
     #[test]
@@ -2481,7 +2615,7 @@ mod tests {
         assert!(neutral_bar(0.0, 1.0, 9).contains('│'));
 
         assert_eq!(compact_heatmap(&[], 8), "");
-        assert!(compact_heatmap(&[0, 1, 2, 3, 4], 3).chars().count() <= 3);
+        assert_eq!(compact_heatmap(&[0, 1, 2, 3], 4), "░▒▓█");
     }
 
     #[test]
