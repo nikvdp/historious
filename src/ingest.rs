@@ -20,6 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use walkdir::WalkDir;
 
+const CLAUDE_CODE_CHECKPOINT_STRATEGY: &str = "claude_code_jsonl_v2";
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateStats {
     pub files_seen: usize,
@@ -1422,8 +1424,13 @@ fn local_transcript_checkpoint_cursor(
     if kind == "opencode" {
         return opencode_checkpoint_cursor(path);
     }
+    let strategy = if kind == "claude_code" {
+        CLAUDE_CODE_CHECKPOINT_STRATEGY
+    } else {
+        "file_metadata_v1"
+    };
     Ok(format!(
-        "file_metadata_v1:{}:{}",
+        "{strategy}:{}:{}",
         size.map(|size| size.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         mtime_ms
@@ -1442,10 +1449,10 @@ fn local_transcript_checkpoint_upsert(
         .with_context(|| format!("source candidate {} has no path", candidate.identity))?;
     let cursor =
         local_transcript_checkpoint_cursor(kind, path, candidate.size, candidate.mtime_ms)?;
-    let strategy = if kind == "opencode" {
-        "sqlite_file_trio_metadata_v1"
-    } else {
-        "file_metadata_v1"
+    let strategy = match kind {
+        "opencode" => "sqlite_file_trio_metadata_v1",
+        "claude_code" => CLAUDE_CODE_CHECKPOINT_STRATEGY,
+        _ => "file_metadata_v1",
     };
     Ok(SourceCheckpointUpsert {
         source_kind: kind.to_string(),
@@ -1579,7 +1586,12 @@ fn prepare_file_import(
             hash: line_hash,
         }));
     }
-    Ok(PreparedImport::archive(vec![source_upsert], records))
+    let prepared = PreparedImport::archive(vec![source_upsert], records);
+    Ok(if kind == "claude_code" {
+        prepared.with_existing_event_metadata_refresh()
+    } else {
+        prepared
+    })
 }
 
 fn omp_session_identity(path: &Path, lines: &[ParsedLine]) -> OmpSessionIdentity {

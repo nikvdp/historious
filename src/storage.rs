@@ -62,6 +62,7 @@ pub struct ImportDelta {
     pub touched_paths: Vec<String>,
     pub touched_sessions: Vec<String>,
     pub touched_events: Vec<String>,
+    pub repaired_events: Vec<String>,
     pub touched_search_units: Vec<String>,
     pub touched_embeddings: Vec<String>,
     pub source_counts: BTreeMap<String, SourceDeltaCounts>,
@@ -93,6 +94,7 @@ impl ImportDelta {
         extend_unique(&mut self.touched_paths, other.touched_paths);
         extend_unique(&mut self.touched_sessions, other.touched_sessions);
         extend_unique(&mut self.touched_events, other.touched_events);
+        extend_unique(&mut self.repaired_events, other.repaired_events);
         extend_unique(&mut self.touched_search_units, other.touched_search_units);
         extend_unique(&mut self.touched_embeddings, other.touched_embeddings);
         for (source_kind, counts) in other.source_counts {
@@ -872,6 +874,30 @@ impl Store {
             self.compact_append_raw_artifacts_for_paths(&stats.delta.touched_paths)?;
         }
         Ok(stats)
+    }
+
+    pub fn refresh_event_metadata<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a EventRecord>,
+    ) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                let mut stmt = tx.prepare(
+                    "UPDATE events
+                     SET metadata_json = json_patch(metadata_json, ?2)
+                     WHERE id = ?1
+                       AND hash = ?3
+                       AND metadata_json != json_patch(metadata_json, ?2)",
+                )?;
+                let mut repaired = Vec::new();
+                for event in events {
+                    if stmt.execute(params![event.id, event.metadata.to_string(), event.hash])? > 0 {
+                        repaired.push(event.id.clone());
+                    }
+                }
+                Ok(repaired)
+            })
+        })
     }
 
     #[allow(dead_code)]

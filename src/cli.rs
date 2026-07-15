@@ -3857,6 +3857,7 @@ fn refresh_search_after_update_with_progress(
         })?;
         progress("refreshing source status counts".to_string());
         store.refresh_source_status_counts_exact()?;
+        rebuild_analytics_after_event_repairs(store, delta, &mut progress)?;
         Ok(indexed)
     } else {
         let search_event_ids = delta.search_index_event_ids();
@@ -3956,8 +3957,31 @@ fn refresh_search_after_update_with_progress(
         }
         progress("checking source status counts".to_string());
         store.seed_source_status_counts_approximate_if_empty()?;
+        rebuild_analytics_after_event_repairs(store, delta, &mut progress)?;
         Ok(indexed)
     }
+}
+
+fn rebuild_analytics_after_event_repairs(
+    store: &Store,
+    delta: &crate::storage::ImportDelta,
+    mut progress: impl FnMut(String),
+) -> Result<()> {
+    if delta.repaired_events.is_empty() {
+        return Ok(());
+    }
+    progress(format!(
+        "rebuilding analytics after repairing {} existing events",
+        format_count(delta.repaired_events.len())
+    ));
+    analytics::rebuild_all(store, |name, completed, total| {
+        progress(format!(
+            "rebuilt {name} ({}/{})",
+            format_count(completed),
+            format_count(total)
+        ));
+    })?;
+    Ok(())
 }
 
 fn refresh_search_index_repair_with_progress(

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 8;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
-pub const SESSION_RELATIONSHIPS_VERSION: u32 = 7;
+pub const SESSION_RELATIONSHIPS_VERSION: u32 = 8;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";

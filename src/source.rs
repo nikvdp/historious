@@ -143,6 +143,7 @@ pub struct PreparedImport {
     pub records: Vec<ArchiveRecord>,
     pub raw_manifests: Vec<PreparedRawManifest>,
     pub checkpoints: Vec<SourceCheckpointUpsert>,
+    refresh_existing_event_metadata: bool,
     pub mode: PreparedImportMode,
 }
 
@@ -153,6 +154,7 @@ impl PreparedImport {
             records,
             raw_manifests: Vec::new(),
             checkpoints: Vec::new(),
+            refresh_existing_event_metadata: false,
             mode: PreparedImportMode::Archive,
         }
     }
@@ -163,6 +165,7 @@ impl PreparedImport {
             records,
             raw_manifests: Vec::new(),
             checkpoints: Vec::new(),
+            refresh_existing_event_metadata: false,
             mode: PreparedImportMode::Full,
         }
     }
@@ -178,6 +181,11 @@ impl PreparedImport {
         self
     }
 
+    pub fn with_existing_event_metadata_refresh(mut self) -> Self {
+        self.refresh_existing_event_metadata = true;
+        self
+    }
+
     pub fn commit(self, store: &Store) -> Result<ImportStats> {
         for source in &self.source_upserts {
             store.upsert_source(
@@ -187,10 +195,20 @@ impl PreparedImport {
                 source.path.as_deref(),
             )?;
         }
-        let stats = match self.mode {
+        let mut stats = match self.mode {
             PreparedImportMode::Archive => store.import_archive_records(&self.records)?,
             PreparedImportMode::Full => store.import_records(&self.records)?,
         };
+        if self.refresh_existing_event_metadata {
+            let repaired = store.refresh_event_metadata(
+                self.records.iter().filter_map(|record| match record {
+                    ArchiveRecord::Event(event) => Some(event),
+                    _ => None,
+                }),
+            )?;
+            stats.delta.touched_events.extend(repaired.iter().cloned());
+            stats.delta.repaired_events.extend(repaired);
+        }
         for raw_manifest in &self.raw_manifests {
             for object in &raw_manifest.objects {
                 store.insert_raw_object(object)?;
