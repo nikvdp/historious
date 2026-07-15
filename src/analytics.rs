@@ -99,15 +99,70 @@ struct ProjectionState {
     row_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RebuildProgress {
+    Started {
+        projection: &'static str,
+        completed: usize,
+        total: usize,
+    },
+    Detail {
+        projection: &'static str,
+        completed: usize,
+        total: usize,
+        detail: String,
+    },
+    Completed {
+        projection: &'static str,
+        completed: usize,
+        total: usize,
+    },
+}
+
+#[allow(dead_code)]
 pub fn rebuild_all(
     store: &Store,
     mut progress: impl FnMut(&'static str, usize, usize),
 ) -> Result<Vec<ProjectionFreshness>> {
+    rebuild_all_with_progress(store, |event| match event {
+        RebuildProgress::Started {
+            projection,
+            completed,
+            total,
+        }
+        | RebuildProgress::Completed {
+            projection,
+            completed,
+            total,
+        } => progress(projection, completed, total),
+        RebuildProgress::Detail { .. } => {}
+    })
+}
+
+pub(crate) fn rebuild_all_with_progress(
+    store: &Store,
+    mut progress: impl FnMut(RebuildProgress),
+) -> Result<Vec<ProjectionFreshness>> {
     let total = PROJECTIONS.len();
     for (index, projection) in PROJECTIONS.iter().copied().enumerate() {
-        progress(projection.name, index, total);
-        rebuild_projection(store, projection)?;
-        progress(projection.name, index + 1, total);
+        progress(RebuildProgress::Started {
+            projection: projection.name,
+            completed: index,
+            total,
+        });
+        rebuild_projection(store, projection, |detail| {
+            progress(RebuildProgress::Detail {
+                projection: projection.name,
+                completed: index,
+                total,
+                detail,
+            });
+        })?;
+        progress(RebuildProgress::Completed {
+            projection: projection.name,
+            completed: index + 1,
+            total,
+        });
     }
     freshness(store)
 }
@@ -216,13 +271,17 @@ fn collapsed_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn rebuild_projection(store: &Store, projection: Projection) -> Result<()> {
+fn rebuild_projection(
+    store: &Store,
+    projection: Projection,
+    mut progress: impl FnMut(String),
+) -> Result<()> {
     let input_rowid = store.with_conn(max_event_rowid)?;
     set_projection_building(store, projection, input_rowid)?;
 
     let result = match projection.name {
         SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships(store),
-        MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store),
+        MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store, &mut progress),
         SESSION_FACTS_PROJECTION => rebuild_session_facts(store),
         REPORT_SNAPSHOT_PROJECTION => crate::report::rebuild_snapshot(store),
         _ => clear_projection(store, projection),
@@ -948,15 +1007,30 @@ fn clear_projection(store: &Store, projection: Projection) -> Result<()> {
     })
 }
 
-fn rebuild_message_provenance(store: &Store) -> Result<()> {
-    const BATCH_SIZE: i64 = 10_000;
+fn rebuild_message_provenance(store: &Store, mut progress: impl FnMut(String)) -> Result<()> {
+    const BATCH_SIZE: i64 = 1_000;
 
+    progress("clearing previous provenance rows".to_string());
     clear_projection(store, PROJECTIONS[1])?;
+    progress("finding repeated message templates".to_string());
     let repeated_templates = repeated_template_hashes(store)?;
+    progress("loading inherited parent messages".to_string());
     let inherited_parent_items = inherited_parent_items(store)?;
+    let total_messages = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM history_items
+             WHERE tier = 'conversation'
+               AND kind IN ('user', 'assistant')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(Into::into)
+    })?;
     let mut session_classes = HashMap::new();
     let mut last_rowid = 0i64;
-
+    let mut processed = 0usize;
+    progress(format!("classifying {processed}/{total_messages} messages"));
     loop {
         let batch = store.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -998,6 +1072,7 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
         }
         last_rowid = batch.last().expect("non-empty provenance batch").rowid;
 
+        let batch_len = batch.len();
         let mut rows = Vec::with_capacity(batch.len());
         for input in batch {
             let session_class = if let Some(class) = session_classes.get(&input.session_id) {
@@ -1044,6 +1119,8 @@ fn rebuild_message_provenance(store: &Store) -> Result<()> {
             });
         }
         insert_provenance_batch(store, &rows)?;
+        processed += batch_len;
+        progress(format!("classifying {processed}/{total_messages} messages"));
     }
     Ok(())
 }

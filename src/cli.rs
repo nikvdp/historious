@@ -2617,12 +2617,8 @@ impl Cli {
             }
             Command::Lab { command } => match command {
                 LabCommand::Rebuild => {
-                    let mut last_completed = 0;
-                    let statuses = analytics::rebuild_all(&store, |name, completed, total| {
-                        if completed > last_completed {
-                            println!("Rebuilt {name} ({completed}/{total})");
-                            last_completed = completed;
-                        }
+                    let statuses = analytics::rebuild_all_with_progress(&store, |event| {
+                        println!("{}", analytics_rebuild_progress_detail(event));
                     })?;
                     if analytics::is_stale(&store)? {
                         bail!("analytics projections remain stale after rebuild");
@@ -3974,14 +3970,43 @@ fn rebuild_analytics_after_event_repairs(
         "rebuilding analytics after repairing {} existing events",
         format_count(delta.repaired_events.len())
     ));
-    analytics::rebuild_all(store, |name, completed, total| {
-        progress(format!(
-            "rebuilt {name} ({}/{})",
-            format_count(completed),
-            format_count(total)
-        ));
+    analytics::rebuild_all_with_progress(store, |event| {
+        progress(analytics_rebuild_progress_detail(event));
     })?;
     Ok(())
+}
+
+fn analytics_rebuild_progress_detail(event: analytics::RebuildProgress) -> String {
+    match event {
+        analytics::RebuildProgress::Started {
+            projection,
+            completed,
+            total,
+        } => format!(
+            "starting {projection} ({}/{} complete)",
+            format_count(completed),
+            format_count(total)
+        ),
+        analytics::RebuildProgress::Detail {
+            projection,
+            completed,
+            total,
+            detail,
+        } => format!(
+            "{projection}: {detail} ({}/{} complete)",
+            format_count(completed),
+            format_count(total)
+        ),
+        analytics::RebuildProgress::Completed {
+            projection,
+            completed,
+            total,
+        } => format!(
+            "rebuilt {projection} ({}/{})",
+            format_count(completed),
+            format_count(total)
+        ),
+    }
 }
 
 fn refresh_search_index_repair_with_progress(
