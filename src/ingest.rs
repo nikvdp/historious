@@ -4357,6 +4357,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(repaired.inserted, 0);
         assert_eq!(repaired.delta.repaired_events.len(), 2);
+        assert!(repaired.delta.touched_events.is_empty());
+        assert!(repaired.delta.search_index_event_ids().is_empty());
         assert_eq!(repaired_ids, old_ids);
         assert_eq!(repaired_events.len(), old_events.len());
         assert!(repaired_events
