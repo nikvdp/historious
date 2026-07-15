@@ -10820,6 +10820,39 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_analytics_repair_resumes_without_new_event_repairs() {
+        let (_dir, store) = fixture_store_with_viewer_ref();
+        analytics::rebuild_all(&store, |_, _, _| {}).expect("seed fresh analytics");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE projection_status
+                     SET status = 'building'
+                     WHERE projection_name = ?1",
+                    [analytics::MESSAGE_PROVENANCE_PROJECTION],
+                )?;
+                Ok(())
+            })
+            .expect("mark provenance interrupted");
+        let delta = crate::storage::ImportDelta::default();
+        let mut progress = Vec::new();
+
+        rebuild_analytics_after_event_repairs(&store, &delta, |detail| progress.push(detail))
+            .expect("resume interrupted analytics");
+
+        assert!(!analytics::is_stale(&store).expect("fresh resumed analytics"));
+        assert!(progress
+            .iter()
+            .any(|detail| detail == "resuming incomplete analytics repair"));
+        let mut fresh_progress = Vec::new();
+        rebuild_analytics_after_event_repairs(&store, &delta, |detail| {
+            fresh_progress.push(detail)
+        })
+        .expect("skip fresh analytics");
+        assert!(fresh_progress.is_empty());
+    }
+
+    #[test]
     fn transcript_target_resolves_recent_ref_to_containing_session() {
         let (_dir, store) = fixture_store_with_viewer_ref();
         let ref_id = store
