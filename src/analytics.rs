@@ -204,19 +204,40 @@ pub fn report_snapshot_freshness(store: &Store) -> Result<ProjectionFreshness> {
 pub(crate) fn report_refresh_prior_hashes(
     store: &Store,
     delta: &ImportDelta,
+    mut progress: impl FnMut(usize, usize),
 ) -> Result<HashSet<String>> {
+    let mut event_ids = delta
+        .touched_events
+        .iter()
+        .chain(&delta.repaired_events)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    event_ids.sort_unstable();
+    event_ids.dedup();
+    let total = event_ids.len();
+    if total == 0 {
+        return Ok(HashSet::new());
+    }
+    progress(0, total);
+
     store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT text_hash FROM history_items
-             WHERE event_id = ?1 AND tier = 'conversation' AND kind = 'user'
-               AND length(text) > 200",
-        )?;
         let mut hashes = HashSet::new();
-        for event_id in delta.touched_events.iter().chain(&delta.repaired_events) {
-            let rows = stmt.query_map([event_id], |row| row.get::<_, String>(0))?;
+        let mut processed = 0;
+        for batch in event_ids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT text_hash FROM history_items
+                 WHERE event_id IN ({placeholders})
+                   AND tier = 'conversation' AND kind = 'user' AND length(text) > 200"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter().copied()), |row| {
+                row.get::<_, String>(0)
+            })?;
             for hash in rows {
                 hashes.insert(hash?);
             }
+            processed += batch.len();
+            progress(processed, total);
         }
         Ok(hashes)
     })
@@ -3339,7 +3360,7 @@ mod tests {
             touched_sessions: vec!["template_session_0".to_string()],
             ..ImportDelta::default()
         };
-        let prior_hashes = report_refresh_prior_hashes(&store, &delta)
+        let prior_hashes = report_refresh_prior_hashes(&store, &delta, |_, _| {})
             .expect("capture replaced template hashes");
         assert_eq!(prior_hashes, HashSet::from(["shared_template_hash".to_string()]));
         store
@@ -3384,6 +3405,34 @@ mod tests {
             .expect("load reclassified provenance");
         assert_eq!(authors, vec!["human"; 4]);
         assert_projections_current(&store);
+    }
+
+    #[test]
+    fn prior_hash_capture_reports_batched_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let delta = ImportDelta {
+            touched_events: (0..10_742).map(|index| format!("event_{index}")).collect(),
+            repaired_events: vec!["event_0".to_string()],
+            ..ImportDelta::default()
+        };
+        let mut progress = Vec::new();
+
+        let hashes = report_refresh_prior_hashes(&store, &delta, |completed, total| {
+            progress.push((completed, total));
+        })
+        .expect("capture prior hashes in batches");
+
+        assert!(hashes.is_empty());
+        assert_eq!(progress.first(), Some(&(0, 10_742)));
+        assert_eq!(progress.last(), Some(&(10_742, 10_742)));
+        assert_eq!(progress.len(), 23);
+        assert!(progress.windows(2).all(|window| {
+            window[0].0 < window[1].0
+                && window[1].0 - window[0].0 <= 500
+                && window[0].1 == 10_742
+                && window[1].1 == 10_742
+        }));
     }
 
     fn current_refresh_store() -> (tempfile::TempDir, Store) {

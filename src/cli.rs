@@ -3702,7 +3702,22 @@ fn run_update_once_machine(
         }),
     );
 
-    let prior_report_hashes = analytics::report_refresh_prior_hashes(store, &ingest.delta)?;
+    let prior_report_hashes = analytics::report_refresh_prior_hashes(
+        store,
+        &ingest.delta,
+        |completed, total| {
+            let detail = prior_hash_progress_detail(completed, total);
+            write_update_progress(
+                "report",
+                detail,
+                serde_json::json!({
+                    "status": "preparing",
+                    "completed": completed,
+                    "total": total,
+                }),
+            );
+        },
+    )?;
     let projected = refresh_search_after_update_with_progress(
         store,
         &ingest.delta,
@@ -3815,7 +3830,11 @@ fn run_update_once_human(
     progress.finish_ingest();
 
     progress.start_search_data(repair, config.embedder.is_disabled());
-    let prior_report_hashes = analytics::report_refresh_prior_hashes(store, &ingest.delta)?;
+    let prior_report_hashes = analytics::report_refresh_prior_hashes(
+        store,
+        &ingest.delta,
+        |completed, total| progress.report_preparation(completed, total),
+    )?;
     let projected = refresh_search_after_update_with_progress(
         store,
         &ingest.delta,
@@ -5334,6 +5353,14 @@ fn report_progress_detail(event: &analytics::ReportRefreshProgress) -> String {
     )
 }
 
+fn prior_hash_progress_detail(completed: usize, total: usize) -> String {
+    format!(
+        "capturing prior message templates {}/{}",
+        format_count(completed),
+        format_count(total)
+    )
+}
+
 fn report_completion_detail(report: &analytics::ReportRefreshOutcome) -> String {
     if report.refreshed {
         format!(
@@ -5836,6 +5863,16 @@ impl UpdateProgressView {
             },
         );
         self.render(true);
+    }
+
+    fn report_preparation(&mut self, completed: usize, total: usize) {
+        self.phase = UpdateDisplayPhase::SearchData;
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        row.state = "preparing";
+        row.current = Some(completed);
+        row.total = Some(total);
+        row.detail = prior_hash_progress_detail(completed, total);
+        self.render(completed == 0);
     }
 
     fn search_detail(&mut self, detail: String) {
@@ -9621,7 +9658,15 @@ async fn run_daemon(
             format_count(stats.errors)
         ));
 
-        let prior_report_hashes = analytics::report_refresh_prior_hashes(store, &stats.delta)?;
+        let mut report_prepare = progress.phase("Preparing report refresh");
+        let prior_report_hashes = analytics::report_refresh_prior_hashes(
+            store,
+            &stats.delta,
+            |completed, total| {
+                report_prepare.update(prior_hash_progress_detail(completed, total));
+            },
+        )?;
+        report_prepare.finish("prior message templates captured".to_string());
         let mut index = progress.phase("Updating search index");
         let projected = refresh_search_after_update_with_progress(
             store,
@@ -9815,6 +9860,15 @@ mod tests {
         let mut view = UpdateProgressView::new();
         view.interactive = false;
         view.start_search_data(false, false);
+        view.last_emit = Instant::now() - Duration::from_secs(1);
+        let previous_emit = view.last_emit;
+        view.report_preparation(0, 10_742);
+        assert!(view.last_emit > previous_emit);
+        view.report_preparation(500, 10_742);
+        let row = view.data_rows.get("report").expect("report preparation row");
+        assert_eq!(row.state, "preparing");
+        assert_eq!((row.current, row.total), (Some(500), Some(10_742)));
+        assert!(row.detail.contains("500/10,742"));
 
         let event = analytics::ReportRefreshProgress {
             phase: "provenance",
