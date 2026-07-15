@@ -4108,6 +4108,50 @@ fn analytics_rebuild_progress_detail(event: analytics::RebuildProgress) -> Strin
     }
 }
 
+fn analytics_rebuild_progress_payload(event: &analytics::RebuildProgress) -> serde_json::Value {
+    let (phase, completed, total, detail) = match event {
+        analytics::RebuildProgress::Started {
+            projection,
+            completed,
+            total,
+        } => (*projection, *completed, *total, format!("starting {projection}")),
+        analytics::RebuildProgress::Detail {
+            projection,
+            completed,
+            total,
+            detail,
+        } => (*projection, *completed, *total, detail.clone()),
+        analytics::RebuildProgress::Completed {
+            projection,
+            completed,
+            total,
+        } => (*projection, *completed, *total, format!("{projection} ready")),
+    };
+    serde_json::json!({
+        "status": "rebuilding",
+        "mode": "full_rebuild",
+        "phase": phase,
+        "detail": detail,
+        "completed": completed,
+        "total": total,
+    })
+}
+
+fn analytics_rebuild_boundary_payload(
+    status: &'static str,
+    detail: &'static str,
+    completed: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "mode": "full_rebuild",
+        "phase": "report",
+        "detail": detail,
+        "completed": completed,
+        "total": analytics::REPORT_PROJECTION_COUNT,
+    })
+}
+
 fn refresh_search_index_repair_with_progress(
     store: &Store,
     mut progress: impl FnMut(String),
@@ -5378,15 +5422,6 @@ fn report_refresh_mode(report: &analytics::ReportRefreshOutcome) -> &'static str
     }
 }
 
-fn report_progress_detail(event: &analytics::ReportRefreshProgress) -> String {
-    format!(
-        "{} {}/{}: {}",
-        event.phase,
-        format_count(event.completed),
-        format_count(event.total),
-        event.detail
-    )
-}
 
 fn prior_hash_progress_detail(completed: usize, total: usize) -> String {
     format!(
@@ -5428,7 +5463,28 @@ fn refresh_report_for_command(
         return Ok(());
     }
 
-    let force_full_rebuild = force || status.is_some_and(|status| status.snapshot_missing);
+    if force || status.is_some_and(|status| status.prerequisites_invalid) {
+        rebuild_report_analytics_for_command(store, machine_output)?;
+    } else {
+        refresh_report_incrementally_for_command(
+            store,
+            machine_output,
+            status.is_some_and(|status| status.snapshot_missing),
+        )?;
+    }
+
+    let refreshed = analytics::report_refresh_status(store)?;
+    if refreshed.stale || refreshed.snapshot_missing {
+        bail!("report analytics remain stale after refresh");
+    }
+    Ok(())
+}
+
+fn refresh_report_incrementally_for_command(
+    store: &Store,
+    machine_output: bool,
+    refresh_snapshot: bool,
+) -> Result<()> {
     let outcome = if machine_output {
         write_machine_progress(
             "report",
@@ -5438,7 +5494,7 @@ fn refresh_report_for_command(
         );
         let outcome = analytics::refresh_report_on_demand_with_progress(
             store,
-            force_full_rebuild,
+            refresh_snapshot,
             |event| {
                 write_machine_progress(
                     "report",
@@ -5461,22 +5517,57 @@ fn refresh_report_for_command(
         );
         outcome
     } else {
-        let progress = ProgressUi::new();
-        let mut phase = progress.phase("Refreshing report");
+        let mut progress = UpdateProgressView::new();
+        progress.start_report_refresh();
         let outcome = analytics::refresh_report_on_demand_with_progress(
             store,
-            force_full_rebuild,
-            |event| phase.update(report_progress_detail(&event)),
+            refresh_snapshot,
+            |event| progress.report_event(&event),
         )?;
-        phase.finish(report_completion_detail(&outcome));
+        progress.finish_report(&outcome);
+        progress.finish_all();
         outcome
     };
+    debug_assert!(outcome.refreshed);
+    Ok(())
+}
 
-    let refreshed = analytics::report_refresh_status(store)?;
-    if refreshed.stale || refreshed.snapshot_missing {
-        bail!("report analytics remain stale after refresh");
+fn rebuild_report_analytics_for_command(store: &Store, machine_output: bool) -> Result<()> {
+    if machine_output {
+        write_machine_progress(
+            "report",
+            "refresh",
+            "rebuilding report analytics".to_string(),
+            analytics_rebuild_boundary_payload("starting", "rebuilding report analytics", 0),
+        );
+        analytics::rebuild_all_with_progress(store, |event| {
+            let data = analytics_rebuild_progress_payload(&event);
+            write_machine_progress(
+                "report",
+                "refresh",
+                analytics_rebuild_progress_detail(event),
+                data,
+            );
+        })?;
+        write_machine_progress(
+            "report",
+            "refresh",
+            "report refreshed (full rebuild)".to_string(),
+            analytics_rebuild_boundary_payload(
+                "refreshed",
+                "report refreshed (full rebuild)",
+                analytics::REPORT_PROJECTION_COUNT,
+            ),
+        );
+    } else {
+        let mut progress = UpdateProgressView::new();
+        progress.start_report_refresh();
+        analytics::rebuild_all_with_progress(store, |event| {
+            progress.report_rebuild_event(&event);
+        })?;
+        progress.finish_report_rebuild();
+        progress.finish_all();
     }
-    debug_assert!(outcome.refreshed || !force_full_rebuild);
     Ok(())
 }
 
@@ -5778,6 +5869,7 @@ enum UpdateDisplayPhase {
     LocalLogs,
     ChangedLogs,
     SearchData,
+    ReportData,
 }
 
 #[derive(Debug, Default)]
@@ -5973,6 +6065,20 @@ impl UpdateProgressView {
         self.render(true);
     }
 
+    fn start_report_refresh(&mut self) {
+        self.phase = UpdateDisplayPhase::ReportData;
+        self.data_rows.clear();
+        self.data_rows.insert(
+            "report".to_string(),
+            UpdateDataProgress {
+                state: "checking",
+                detail: "checking report analytics".to_string(),
+                ..Default::default()
+            },
+        );
+        self.render(true);
+    }
+
     fn report_preparation(&mut self, completed: usize, total: usize) {
         self.phase = UpdateDisplayPhase::SearchData;
         let row = self.data_rows.entry("report".to_string()).or_default();
@@ -6027,7 +6133,9 @@ impl UpdateProgressView {
     }
 
     fn report_event(&mut self, event: &analytics::ReportRefreshProgress) {
-        self.phase = UpdateDisplayPhase::SearchData;
+        if self.phase != UpdateDisplayPhase::ReportData {
+            self.phase = UpdateDisplayPhase::SearchData;
+        }
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = event.phase;
         row.current = Some(event.completed);
@@ -6052,6 +6160,73 @@ impl UpdateProgressView {
             row.current = Some(total);
         }
         row.detail = report_completion_detail(report);
+        self.render(true);
+    }
+
+    fn report_rebuild_event(&mut self, event: &analytics::RebuildProgress) {
+        self.phase = UpdateDisplayPhase::ReportData;
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        let state_for = |projection| match projection {
+            analytics::SESSION_RELATIONSHIPS_PROJECTION => "relations",
+            analytics::MESSAGE_PROVENANCE_PROJECTION => "provenance",
+            analytics::SESSION_FACTS_PROJECTION => "facts",
+            analytics::REPORT_SNAPSHOT_PROJECTION => "snapshot",
+            _ => "rebuilding",
+        };
+        match event.clone() {
+            analytics::RebuildProgress::Started {
+                projection,
+                completed,
+                total,
+            } => {
+                row.state = state_for(projection);
+                row.current = Some(completed);
+                row.total = Some(total);
+                row.detail = format!("starting {}", projection.replace('_', " "));
+            }
+            analytics::RebuildProgress::Detail {
+                projection,
+                completed,
+                total,
+                detail,
+            } => {
+                row.state = state_for(projection);
+                row.current = Some(completed);
+                row.total = Some(total);
+                row.detail = if let Some((current, detail_total)) = parse_progress_fraction(&detail)
+                {
+                    let raw_fraction = format!("{current}/{detail_total}");
+                    let formatted_fraction = format!(
+                        "{}/{}",
+                        format_count(current),
+                        format_count(detail_total)
+                    );
+                    detail.replacen(&raw_fraction, &formatted_fraction, 1)
+                } else {
+                    detail
+                };
+            }
+            analytics::RebuildProgress::Completed {
+                projection,
+                completed,
+                total,
+            } => {
+                row.state = state_for(projection);
+                row.current = Some(completed);
+                row.total = Some(total);
+                row.detail = format!("{} ready", projection.replace('_', " "));
+            }
+        }
+        self.render(false);
+    }
+
+    fn finish_report_rebuild(&mut self) {
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        row.state = "refreshed";
+        if let Some(total) = row.total {
+            row.current = Some(total);
+        }
+        row.detail = "report refreshed (full rebuild)".to_string();
         self.render(true);
     }
 
@@ -6158,6 +6333,7 @@ impl UpdateProgressView {
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
+            UpdateDisplayPhase::ReportData => self.data_lines("report data: updating"),
         }
     }
 
@@ -10059,6 +10235,102 @@ mod tests {
     }
 
     #[test]
+    fn report_command_reuses_update_progress_row_and_counts() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.start_report_refresh();
+        assert_eq!(view.lines()[0], "report data: updating");
+        assert_eq!(
+            view.lines()
+                .iter()
+                .skip(1)
+                .map(|line| line.split_whitespace().next().expect("row label"))
+                .collect::<Vec<_>>(),
+            vec!["report"]
+        );
+
+        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
+            projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+            completed: 0,
+            total: 4,
+            detail: "scanning 2772460/2772460 events for relationships".to_string(),
+        });
+        assert_eq!(
+            (
+                view.data_rows["report"].current,
+                view.data_rows["report"].total
+            ),
+            (Some(0), Some(4))
+        );
+        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
+            projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+            completed: 0,
+            total: 4,
+            detail: "resolved 1/5691 session relationships".to_string(),
+        });
+        assert_eq!(
+            (
+                view.data_rows["report"].current,
+                view.data_rows["report"].total
+            ),
+            (Some(0), Some(4))
+        );
+        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
+            projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
+            completed: 1,
+            total: 4,
+            detail: "classifying 12345/294384 messages".to_string(),
+        });
+        let row = view.data_rows.get("report").expect("report rebuild row");
+        assert_eq!(row.state, "provenance");
+        assert_eq!((row.current, row.total), (Some(1), Some(4)));
+        assert_eq!(row.detail, "classifying 12,345/294,384 messages");
+        assert!(view
+            .lines_for_terminal(64)
+            .iter()
+            .all(|line| line.chars().count() <= 64));
+
+        view.finish_report_rebuild();
+        assert_eq!(
+            view.data_rows.get("report").expect("finished report row").state,
+            "refreshed"
+        );
+    }
+
+    #[test]
+    fn forced_report_machine_progress_keeps_rebuild_fields() {
+        let payload = analytics_rebuild_progress_payload(&analytics::RebuildProgress::Detail {
+            projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
+            completed: 1,
+            total: 4,
+            detail: "classified 500/1000 messages".to_string(),
+        });
+
+        assert_eq!(payload["status"], "rebuilding");
+        assert_eq!(payload["mode"], "full_rebuild");
+        assert_eq!(payload["phase"], analytics::MESSAGE_PROVENANCE_PROJECTION);
+        assert_eq!(payload["detail"], "classified 500/1000 messages");
+        assert_eq!(payload["completed"], 1);
+        assert_eq!(payload["total"], 4);
+
+        for (status, detail, completed) in [
+            ("starting", "rebuilding report analytics", 0),
+            (
+                "refreshed",
+                "report refreshed (full rebuild)",
+                analytics::REPORT_PROJECTION_COUNT,
+            ),
+        ] {
+            let boundary = analytics_rebuild_boundary_payload(status, detail, completed);
+            assert_eq!(boundary["status"], status);
+            assert_eq!(boundary["phase"], "report");
+            assert_eq!(boundary["detail"], detail);
+            assert_eq!(boundary["completed"], completed);
+            assert_eq!(boundary["total"], analytics::REPORT_PROJECTION_COUNT);
+        }
+    }
+
+    #[test]
     fn corpus_shortcuts_resolve_to_clear_tier_sets() {
         assert_eq!(
             resolve_search_corpus(Some("tool,raw".to_string()), false, false)
@@ -10790,8 +11062,45 @@ mod tests {
             })
             .expect("reload generated timestamp");
         assert_eq!(unchanged_at, generated_at);
-    }
 
+        automatic_store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM report_snapshot", [])?;
+                Ok(())
+            })
+            .expect("remove current report snapshot");
+        refresh_report_for_command(&automatic_store, false, false, false)
+            .expect("restore missing report snapshot");
+        let restored_status = analytics::report_refresh_status(&automatic_store)
+            .expect("restored report status");
+        assert!(!restored_status.stale);
+        assert!(!restored_status.snapshot_missing);
+        let restored_at = automatic_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load restored generated timestamp");
+        assert_ne!(restored_at, unchanged_at);
+
+        refresh_report_for_command(&automatic_store, true, false, false)
+            .expect("force report analytics rebuild");
+        let forced_at = automatic_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load forced generated timestamp");
+        assert_ne!(forced_at, restored_at);
+    }
 
     #[test]
     fn report_plain_and_color_controls_parse() {

@@ -292,6 +292,7 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
     compute_live(store, options, true)
 }
 
+#[cfg(test)]
 pub fn rebuild_snapshot(store: &Store) -> Result<()> {
     rebuild_snapshot_with_progress(store, |_| {})
 }

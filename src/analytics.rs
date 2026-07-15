@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 pub const MESSAGE_PROVENANCE_PROJECTION: &str = "message_provenance";
 pub const MESSAGE_PROVENANCE_VERSION: u32 = 8;
@@ -17,8 +18,9 @@ pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 2;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
 pub const REPORT_SNAPSHOT_VERSION: u32 = 8;
+pub(crate) const REPORT_PROJECTION_COUNT: usize = 4;
 
-const PROJECTIONS: [Projection; 4] = [
+const PROJECTIONS: [Projection; REPORT_PROJECTION_COUNT] = [
     Projection {
         name: SESSION_RELATIONSHIPS_PROJECTION,
         version: SESSION_RELATIONSHIPS_VERSION,
@@ -82,6 +84,7 @@ pub(crate) struct ReportRefreshProgress {
 pub(crate) struct ReportRefreshStatus {
     pub stale: bool,
     pub snapshot_missing: bool,
+    pub prerequisites_invalid: bool,
 }
 
 
@@ -210,7 +213,8 @@ pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus
     store.with_conn(|conn| {
         let input_rowid = max_event_rowid(conn)?;
         let mut stale = false;
-        for projection in PROJECTIONS {
+        let mut prerequisites_invalid = false;
+        for (index, projection) in PROJECTIONS.into_iter().enumerate() {
             let stored = conn
                 .query_row(
                     "SELECT status, input_high_watermark
@@ -223,8 +227,12 @@ pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus
             let state = stored
                 .as_ref()
                 .and_then(|(_, state)| serde_json::from_str::<ProjectionState>(state).ok());
-            stale |= stored.as_ref().map(|(status, _)| status.as_str()) != Some("ready")
-                || state.as_ref().map(|state| state.version) != Some(projection.version)
+            let invalid = stored.as_ref().map(|(status, _)| status.as_str()) != Some("ready")
+                || state.as_ref().map(|state| state.version) != Some(projection.version);
+            if index < 3 {
+                prerequisites_invalid |= invalid;
+            }
+            stale |= invalid
                 || state
                     .as_ref()
                     .is_none_or(|state| input_rowid > state.input_rowid);
@@ -237,6 +245,7 @@ pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus
         Ok(ReportRefreshStatus {
             stale,
             snapshot_missing,
+            prerequisites_invalid,
         })
     })
 }
@@ -299,25 +308,19 @@ pub(crate) fn refresh_report_after_update_with_prior_hashes(
     prior_candidate_hashes: &HashSet<String>,
     progress: impl FnMut(ReportRefreshProgress),
 ) -> Result<ReportRefreshOutcome> {
-    refresh_report_with_progress(
-        store,
-        delta,
-        prior_candidate_hashes,
-        false,
-        progress,
-    )
+    refresh_report_with_progress(store, delta, prior_candidate_hashes, false, progress)
 }
 
 pub(crate) fn refresh_report_on_demand_with_progress(
     store: &Store,
-    force: bool,
+    refresh_snapshot: bool,
     progress: impl FnMut(ReportRefreshProgress),
 ) -> Result<ReportRefreshOutcome> {
     refresh_report_with_progress(
         store,
         &ImportDelta::default(),
         &HashSet::new(),
-        force,
+        refresh_snapshot,
         progress,
     )
 }
@@ -326,7 +329,7 @@ fn refresh_report_with_progress(
     store: &Store,
     delta: &ImportDelta,
     prior_candidate_hashes: &HashSet<String>,
-    force_full_rebuild: bool,
+    refresh_snapshot: bool,
     mut progress: impl FnMut(ReportRefreshProgress),
 ) -> Result<ReportRefreshOutcome> {
     let statuses = freshness(store)?;
@@ -335,7 +338,7 @@ fn refresh_report_with_progress(
         && delta.inserted_events.is_empty()
         && delta.touched_events.is_empty()
         && delta.repaired_events.is_empty();
-    if !force_full_rebuild
+    if !refresh_snapshot
         && statuses.iter().all(|status| !status.stale)
         && (delta_empty || !delta.repaired_events.is_empty())
     {
@@ -348,12 +351,11 @@ fn refresh_report_with_progress(
     }
 
     let captured_input_rowid = store.with_conn(max_event_rowid)?;
-    let invalid_state = force_full_rebuild
-        || statuses.iter().any(|status| {
-            status.status.as_deref() != Some("ready")
-                || status.stored_version != Some(status.version)
-                || (status.stale && status.new_event_rows == 0)
-        });
+    let invalid_state = statuses.iter().take(3).any(|status| {
+        status.status.as_deref() != Some("ready")
+            || status.stored_version != Some(status.version)
+            || (status.stale && status.new_event_rows == 0)
+    });
     let mut event_ids = delta
         .inserted_events
         .iter()
@@ -592,7 +594,8 @@ fn run_projection_refresh(
 
 fn classified_message_progress(detail: &str) -> Option<usize> {
     detail
-        .strip_prefix("classifying ")?
+        .strip_prefix("classifying ")
+        .or_else(|| detail.strip_prefix("classified "))?
         .split_once('/')?
         .0
         .parse()
@@ -696,10 +699,33 @@ fn rebuild_projection(
     set_projection_building(store, projection, input_rowid)?;
 
     let result = match projection.name {
-        SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships(store),
+        SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships_with_detailed_progress(
+            store,
+            |processed, total, detail| {
+                progress(detail.unwrap_or_else(|| {
+                    format!("resolved {processed}/{total} session relationships")
+                }));
+            },
+        ),
         MESSAGE_PROVENANCE_PROJECTION => rebuild_message_provenance(store, &mut progress),
-        SESSION_FACTS_PROJECTION => rebuild_session_facts(store),
-        REPORT_SNAPSHOT_PROJECTION => crate::report::rebuild_snapshot(store),
+        SESSION_FACTS_PROJECTION => {
+            let total = store.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count.max(0) as usize)
+                .map_err(Into::into)
+            })?;
+            progress(format!("refreshed 0/{total} session facts"));
+            rebuild_session_facts_with_progress(store, |processed| {
+                progress(format!("refreshed {processed}/{total} session facts"));
+            })
+        }
+        REPORT_SNAPSHOT_PROJECTION => {
+            crate::report::rebuild_snapshot_with_progress(store, |event| {
+                progress(event.detail);
+            })
+        }
         _ => clear_projection(store, projection),
     };
 
@@ -712,13 +738,20 @@ fn rebuild_projection(
     }
 }
 
-fn rebuild_session_relationships(store: &Store) -> Result<()> {
-    rebuild_session_relationships_with_progress(store, |_, _| {})
-}
-
 fn rebuild_session_relationships_with_progress(
     store: &Store,
     mut progress: impl FnMut(usize, usize),
+) -> Result<()> {
+    rebuild_session_relationships_with_detailed_progress(store, |processed, total, detail| {
+        if detail.is_none() {
+            progress(processed, total);
+        }
+    })
+}
+
+fn rebuild_session_relationships_with_detailed_progress(
+    store: &Store,
+    mut progress: impl FnMut(usize, usize, Option<String>),
 ) -> Result<()> {
     let projection = PROJECTIONS[0];
     clear_projection(store, projection)?;
@@ -755,25 +788,51 @@ fn rebuild_session_relationships_with_progress(
             .push(session.session_id.clone());
     }
 
-    let codex_notifications = store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT s.machine_id, e.session_id, e.content
-             FROM events e
-             JOIN sessions s ON s.id = e.session_id
-             WHERE e.source_kind = 'codex'
-               AND e.content LIKE '%subagent_notification%'
-             ORDER BY e.rowid",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+    const EVENT_SCAN_BATCH: i64 = 50_000;
+    let max_event_rowid = store.with_conn(max_event_rowid)?;
+    let mut scanned_rowid = 0i64;
+    let mut codex_notifications = Vec::new();
+    progress(
+        scanned_rowid.max(0) as usize,
+        max_event_rowid.max(0) as usize,
+        Some(format!(
+            "scanning {scanned_rowid}/{max_event_rowid} events for relationships"
+        )),
+    );
+    while scanned_rowid < max_event_rowid {
+        let batch_end = scanned_rowid
+            .saturating_add(EVENT_SCAN_BATCH)
+            .min(max_event_rowid);
+        let batch = store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.machine_id, e.session_id, e.content
+                 FROM events e
+                 JOIN sessions s ON s.id = e.session_id
+                 WHERE e.rowid > ?1 AND e.rowid <= ?2
+                   AND e.source_kind = 'codex'
+                   AND e.content LIKE '%subagent_notification%'
+                 ORDER BY e.rowid",
+            )?;
+            let rows = stmt.query_map(params![scanned_rowid, batch_end], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })?;
+        codex_notifications.extend(batch);
+        scanned_rowid = batch_end;
+        progress(
+            scanned_rowid.max(0) as usize,
+            max_event_rowid.max(0) as usize,
+            Some(format!(
+                "scanning {scanned_rowid}/{max_event_rowid} events for relationships"
+            )),
+        );
+    }
     let mut codex_parents = HashMap::<(String, String), (String, bool)>::new();
     for (machine_id, parent_session_id, content) in codex_notifications {
         for child_external_id in ingest::codex_subagent_paths(&content) {
@@ -834,7 +893,7 @@ fn rebuild_session_relationships_with_progress(
         }
         parents.insert(session.session_id.clone(), parent_session_id.clone());
         hints.push((hint, parent_session_id));
-        progress(index + 1, total);
+        progress(index + 1, total, None);
     }
     let fork_parents = codex_fork_parents(store, &sessions, &hints)?;
     for (session, (hint, parent_session_id)) in sessions.iter().zip(hints.iter_mut()) {
@@ -1460,9 +1519,6 @@ fn total_conversation_messages(store: &Store) -> Result<usize> {
 }
 
 
-fn rebuild_session_facts(store: &Store) -> Result<()> {
-    rebuild_session_facts_with_progress(store, |_| {})
-}
 
 fn rebuild_session_facts_with_progress(
     store: &Store,
@@ -1473,6 +1529,7 @@ fn rebuild_session_facts_with_progress(
     clear_projection(store, PROJECTIONS[2])?;
     let mut last_rowid = 0i64;
     let mut processed = 0usize;
+    let mut last_progress = Instant::now();
     loop {
         let batch = store.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -1544,10 +1601,15 @@ fn rebuild_session_facts_with_progress(
                 first_event_at: input.first_event_at,
                 last_event_at: input.last_event_at,
             });
+            if last_progress.elapsed() >= Duration::from_secs(1) {
+                progress(processed + rows.len());
+                last_progress = Instant::now();
+            }
         }
         insert_session_facts_batch(store, &rows)?;
         processed += rows.len();
         progress(processed);
+        last_progress = Instant::now();
     }
     Ok(())
 }
@@ -1984,14 +2046,16 @@ fn refresh_message_provenance_scoped(
 }
 
 fn rebuild_message_provenance(store: &Store, mut progress: impl FnMut(String)) -> Result<()> {
-    const BATCH_SIZE: i64 = 1_000;
+    const BATCH_SIZE: i64 = 500;
 
-    progress("clearing previous provenance rows".to_string());
-    clear_projection(store, PROJECTIONS[1])?;
     progress("finding repeated message templates".to_string());
     let repeated_templates = repeated_template_hashes(store)?;
     progress("loading inherited parent messages".to_string());
-    let inherited_parent_items = inherited_parent_items(store)?;
+    let inherited_parent_items = inherited_parent_items(store, |processed, total| {
+        progress(format!(
+            "loaded {processed}/{total} inherited relationships"
+        ));
+    })?;
     let total_messages = store.with_conn(|conn| {
         conn.query_row(
             "SELECT COUNT(*) FROM history_items
@@ -2003,146 +2067,277 @@ fn rebuild_message_provenance(store: &Store, mut progress: impl FnMut(String)) -
         .map(|count| count.max(0) as usize)
         .map_err(Into::into)
     })?;
-    let mut session_classes = HashMap::new();
-    let mut last_rowid = 0i64;
-    let mut processed = 0usize;
-    progress(format!("classifying {processed}/{total_messages} messages"));
-    loop {
-        let batch = store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
-                        hi.text_hash, hi.occurred_at, s.metadata_json,
-                        COALESCE(sr.relationship, 'none'),
-                        eso.event_id IS NOT NULL
-                 FROM history_items hi
-                 JOIN sessions s ON s.id = hi.session_id
-                 LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
-                 LEFT JOIN session_relationships sr
-                   ON sr.session_id = COALESCE(eso.session_id, hi.session_id)
-                 WHERE hi.rowid > ?1
-                   AND hi.tier = 'conversation'
-                   AND hi.kind IN ('user', 'assistant')
-                 ORDER BY hi.rowid
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![last_rowid, BATCH_SIZE], |row| {
-                Ok(ProvenanceInput {
-                    rowid: row.get(0)?,
-                    item_id: row.get(1)?,
-                    session_id: row.get(2)?,
-                    source_kind: row.get(3)?,
-                    message_kind: row.get(4)?,
-                    text: row.get(5)?,
-                    text_hash: row.get(6)?,
-                    occurred_at: row.get(7)?,
-                    session_metadata: row.get(8)?,
-                    relationship: row.get(9)?,
-                    event_session_overridden: row.get(10)?,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })?;
-        if batch.is_empty() {
-            break;
-        }
-        last_rowid = batch.last().expect("non-empty provenance batch").rowid;
-
-        let batch_len = batch.len();
-        let mut rows = Vec::with_capacity(batch.len());
-        for input in batch {
-            let session_class = if let Some(class) = session_classes.get(&input.session_id) {
-                *class
-            } else {
-                let metadata = serde_json::from_str::<Value>(&input.session_metadata)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let class = classify_stored_session(
-                    store,
-                    &input.session_id,
-                    &input.source_kind,
-                    &metadata,
-                )?;
-                session_classes.insert(input.session_id.clone(), class);
-                class
-            };
-            let relationship = if !input.event_session_overridden
-                && input.relationship == "subagent"
-                && inherited_parent_items.contains(&(
-                    input.session_id.clone(),
-                    input.message_kind.clone(),
-                    input.text_hash.clone(),
-                ))
-            {
-                "none"
-            } else {
-                input.relationship.as_str()
-            };
-            let classification = provenance::classify_message(
-                &input.text,
-                &input.message_kind,
-                repeated_templates.contains(&input.text_hash),
-                relationship,
-                session_class,
-            );
-            rows.push(ProvenanceRow {
-                item_id: input.item_id,
-                session_id: input.session_id,
-                source_kind: input.source_kind,
-                authored_by: classification.authored_by,
-                sentiment_usable: classification.sentiment_usable,
-                rule: classification.rule,
-                occurred_at: input.occurred_at,
-            });
-        }
-        insert_provenance_batch(store, &rows)?;
-        processed += batch_len;
-        progress(format!("classifying {processed}/{total_messages} messages"));
-    }
-    Ok(())
-}
-
-fn inherited_parent_items(store: &Store) -> Result<HashSet<(String, String, String)>> {
     store.with_conn(|conn| {
-        let edges = {
-            let mut stmt = conn.prepare(
-                "SELECT session_id, parent_session_id
-             FROM session_relationships
-             WHERE relationship = 'subagent'
-               AND parent_session_id IS NOT NULL",
-            )?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
-        };
-        let parent_ids = edges
-            .iter()
-            .map(|(_, parent_id)| parent_id.clone())
-            .collect::<HashSet<_>>();
-        let mut by_parent = HashMap::<String, Vec<(String, String)>>::new();
-        let mut stmt = conn.prepare(
-            "SELECT kind, text_hash
-             FROM history_items INDEXED BY idx_history_items_session_order
-             WHERE session_id = ?1
-               AND tier = 'conversation'
-               AND kind IN ('user', 'assistant')",
+        progress("preparing provenance staging table".to_string());
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.message_provenance_rebuild;
+             CREATE TEMP TABLE message_provenance_rebuild (
+               item_id TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               source_kind TEXT NOT NULL,
+               authored_by TEXT NOT NULL,
+               sentiment_usable TEXT NOT NULL,
+               rule TEXT NOT NULL,
+               occurred_at TEXT
+             );",
         )?;
-        for parent_id in parent_ids {
-            let rows = stmt.query_map([parent_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            by_parent.insert(
-                parent_id,
-                rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?,
-            );
-        }
+        let mut insert_stmt = conn.prepare(
+            "INSERT INTO temp.message_provenance_rebuild
+             (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
+             SELECT json_extract(value, '$.item_id'),
+                    json_extract(value, '$.session_id'),
+                    json_extract(value, '$.source_kind'),
+                    json_extract(value, '$.authored_by'),
+                    json_extract(value, '$.sentiment_usable'),
+                    json_extract(value, '$.rule'),
+                    json_extract(value, '$.occurred_at')
+             FROM json_each(?1)",
+        )?;
+        let mut session_classes = HashMap::new();
+        let mut user_rowid = 0i64;
+        let mut assistant_rowid = 0i64;
+        let mut users_done = false;
+        let mut assistants_done = false;
+        let mut processed = 0usize;
+        progress(format!("classifying {processed}/{total_messages} messages"));
+        let mut last_progress = Instant::now();
+        let mut select_stmt = conn.prepare(
+            "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
+                    hi.text_hash, hi.occurred_at, s.metadata_json,
+                    COALESCE(sr.relationship, 'none'),
+                    eso.event_id IS NOT NULL
+             FROM history_items hi INDEXED BY idx_history_items_tier_kind
+             JOIN sessions s ON s.id = hi.session_id
+             LEFT JOIN event_session_overrides eso ON eso.event_id = hi.event_id
+             LEFT JOIN session_relationships sr
+               ON sr.session_id = COALESCE(eso.session_id, hi.session_id)
+             WHERE hi.tier = 'conversation' AND hi.kind = ?1 AND hi.rowid > ?2
+             ORDER BY hi.rowid
+             LIMIT ?3",
+        )?;
+        loop {
+            let mut batch = Vec::with_capacity((BATCH_SIZE * 2) as usize);
+            if !users_done {
+                let rows = select_stmt.query_map(params!["user", user_rowid, BATCH_SIZE], |row| {
+                    Ok(ProvenanceInput {
+                        rowid: row.get(0)?,
+                        item_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        source_kind: row.get(3)?,
+                        message_kind: row.get(4)?,
+                        text: row.get(5)?,
+                        text_hash: row.get(6)?,
+                        occurred_at: row.get(7)?,
+                        session_metadata: row.get(8)?,
+                        relationship: row.get(9)?,
+                        event_session_overridden: row.get(10)?,
+                    })
+                })?;
+                let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                users_done = rows.is_empty();
+                if let Some(last) = rows.last() {
+                    user_rowid = last.rowid;
+                }
+                batch.extend(rows);
+            }
+            if !assistants_done {
+                let rows = select_stmt.query_map(
+                    params!["assistant", assistant_rowid, BATCH_SIZE],
+                    |row| {
+                        Ok(ProvenanceInput {
+                            rowid: row.get(0)?,
+                            item_id: row.get(1)?,
+                            session_id: row.get(2)?,
+                            source_kind: row.get(3)?,
+                            message_kind: row.get(4)?,
+                            text: row.get(5)?,
+                            text_hash: row.get(6)?,
+                            occurred_at: row.get(7)?,
+                            session_metadata: row.get(8)?,
+                            relationship: row.get(9)?,
+                            event_session_overridden: row.get(10)?,
+                        })
+                    },
+                )?;
+                let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                assistants_done = rows.is_empty();
+                if let Some(last) = rows.last() {
+                    assistant_rowid = last.rowid;
+                }
+                batch.extend(rows);
+            }
+            if batch.is_empty() {
+                break;
+            }
 
-        let mut inherited = HashSet::new();
-        for (child_id, parent_id) in edges {
-            if let Some(items) = by_parent.get(&parent_id) {
-                for (kind, text_hash) in items {
-                    inherited.insert((child_id.clone(), kind.clone(), text_hash.clone()));
+            let batch_len = batch.len();
+            let mut rows = Vec::with_capacity(batch.len());
+            for input in batch {
+                let session_class = if let Some(class) = session_classes.get(&input.session_id) {
+                    *class
+                } else {
+                    let metadata = serde_json::from_str::<Value>(&input.session_metadata)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let class = classify_stored_session_with_conn(
+                        conn,
+                        &input.session_id,
+                        &input.source_kind,
+                        &metadata,
+                    )?;
+                    session_classes.insert(input.session_id.clone(), class);
+                    class
+                };
+                let relationship = if !input.event_session_overridden
+                    && input.relationship == "subagent"
+                    && inherited_parent_items.contains(&(
+                        input.session_id.clone(),
+                        input.message_kind.clone(),
+                        input.text_hash.clone(),
+                    ))
+                {
+                    "none"
+                } else {
+                    input.relationship.as_str()
+                };
+                let classification = provenance::classify_message(
+                    &input.text,
+                    &input.message_kind,
+                    repeated_templates.contains(&input.text_hash),
+                    relationship,
+                    session_class,
+                );
+                rows.push(ProvenanceRow {
+                    item_id: input.item_id,
+                    session_id: input.session_id,
+                    source_kind: input.source_kind,
+                    authored_by: classification.authored_by,
+                    sentiment_usable: classification.sentiment_usable,
+                    rule: classification.rule,
+                    occurred_at: input.occurred_at,
+                });
+                if last_progress.elapsed() >= Duration::from_secs(1) {
+                    progress(format!(
+                        "classifying {}/{} messages",
+                        processed + rows.len(),
+                        total_messages
+                    ));
+                    last_progress = Instant::now();
                 }
             }
+            progress(format!(
+                "classified {}/{} messages",
+                processed + batch_len,
+                total_messages
+            ));
+            insert_stmt.execute([serde_json::to_string(&rows)?])?;
+            processed += batch_len;
+            progress(format!("staged {processed}/{total_messages} messages"));
+            last_progress = Instant::now();
         }
-        Ok(inherited)
+        drop(select_stmt);
+        drop(insert_stmt);
+        progress(format!("indexing {total_messages} classified messages"));
+        conn.execute(
+            "CREATE INDEX temp.idx_message_provenance_rebuild_item_id
+             ON message_provenance_rebuild(item_id)",
+            [],
+        )?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting message provenance replacement")?;
+        tx.execute("DELETE FROM message_provenance", [])?;
+        const STORE_BATCH: usize = 5_000;
+        let mut stored = 0usize;
+        let mut last_item_id: Option<String> = None;
+        progress(format!("storing {stored}/{total_messages} classified messages"));
+        loop {
+            let item_ids = {
+                let mut stmt = tx.prepare(
+                    "SELECT item_id
+                     FROM temp.message_provenance_rebuild
+                     WHERE (?1 IS NULL OR item_id > ?1)
+                     ORDER BY item_id
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![last_item_id.as_deref(), STORE_BATCH as i64],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if item_ids.is_empty() {
+                break;
+            }
+            let batch_end = item_ids.last().expect("non-empty provenance store batch");
+            tx.execute(
+                "INSERT INTO message_provenance
+                 (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
+                 SELECT item_id, session_id, source_kind, authored_by, sentiment_usable, rule,
+                        occurred_at
+                 FROM temp.message_provenance_rebuild
+                 WHERE (?1 IS NULL OR item_id > ?1) AND item_id <= ?2
+                 ORDER BY item_id",
+                params![last_item_id.as_deref(), batch_end],
+            )?;
+            stored += item_ids.len();
+            last_item_id = Some(batch_end.clone());
+            progress(format!("storing {stored}/{total_messages} classified messages"));
+        }
+        progress("committing message provenance".to_string());
+        tx.commit().context("committing message provenance rebuild")
     })
+}
+
+fn inherited_parent_items(
+    store: &Store,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<HashSet<(String, String, String)>> {
+    const RELATIONSHIP_BATCH: i64 = 100;
+    let max_rowid = store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0)
+             FROM session_relationships
+             WHERE relationship = 'subagent' AND parent_session_id IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
+    })?;
+    let total = max_rowid.max(0) as usize;
+    let mut scanned_rowid = 0i64;
+    let mut inherited = HashSet::new();
+    progress(0, total);
+    while scanned_rowid < max_rowid {
+        let batch_end = scanned_rowid
+            .saturating_add(RELATIONSHIP_BATCH)
+            .min(max_rowid);
+        let batch = store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sr.session_id, hi.kind, hi.text_hash
+                 FROM session_relationships sr
+                 JOIN history_items hi INDEXED BY idx_history_items_session_order
+                   ON hi.session_id = sr.parent_session_id
+                 WHERE sr.rowid > ?1 AND sr.rowid <= ?2
+                   AND sr.relationship = 'subagent'
+                   AND sr.parent_session_id IS NOT NULL
+                   AND hi.tier = 'conversation'
+                   AND hi.kind IN ('user', 'assistant')",
+            )?;
+            let rows = stmt.query_map(params![scanned_rowid, batch_end], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<HashSet<_>>>()
+                .map_err(Into::into)
+        })?;
+        inherited.extend(batch);
+        scanned_rowid = batch_end;
+        progress(scanned_rowid.max(0) as usize, total);
+    }
+    Ok(inherited)
 }
 
 fn repeated_template_hashes(store: &Store) -> Result<HashSet<String>> {
@@ -2173,9 +2368,20 @@ fn classify_stored_session(
     source_kind: &str,
     metadata: &Value,
 ) -> Result<SessionClass> {
+    store.with_conn(|conn| {
+        classify_stored_session_with_conn(conn, session_id, source_kind, metadata)
+    })
+}
+
+fn classify_stored_session_with_conn(
+    conn: &Connection,
+    session_id: &str,
+    source_kind: &str,
+    metadata: &Value,
+) -> Result<SessionClass> {
     let contents = match source_kind {
-        "codex" => session_event_contents(store, session_id, Some("session_meta"))?,
-        "claude_code" => session_event_contents(store, session_id, None)?,
+        "codex" => session_event_contents_with_conn(conn, session_id, Some("session_meta"))?,
+        "claude_code" => session_event_contents_with_conn(conn, session_id, None)?,
         _ => Vec::new(),
     };
     let contents = contents.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2187,52 +2393,26 @@ fn session_event_contents(
     session_id: &str,
     event_type: Option<&str>,
 ) -> Result<Vec<String>> {
-    store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT content
-             FROM events INDEXED BY idx_events_session_ordinal
-             WHERE session_id = ?1
-               AND (?2 IS NULL OR event_type = ?2)
-             ORDER BY ordinal",
-        )?;
-        let rows = stmt.query_map(params![session_id, event_type], |row| row.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })
+    store.with_conn(|conn| session_event_contents_with_conn(conn, session_id, event_type))
 }
 
-fn insert_provenance_batch(store: &Store, rows: &[ProvenanceRow<'_>]) -> Result<()> {
-    store.with_conn(|conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("starting message provenance batch")?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO message_provenance
-                 (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(item_id) DO UPDATE SET
-                   session_id = excluded.session_id,
-                   source_kind = excluded.source_kind,
-                   authored_by = excluded.authored_by,
-                   sentiment_usable = excluded.sentiment_usable,
-                   rule = excluded.rule,
-                   occurred_at = excluded.occurred_at",
-            )?;
-            for row in rows {
-                stmt.execute(params![
-                    row.item_id,
-                    row.session_id,
-                    row.source_kind,
-                    row.authored_by,
-                    row.sentiment_usable,
-                    row.rule,
-                    row.occurred_at,
-                ])?;
-            }
-        }
-        tx.commit().context("committing message provenance batch")
-    })
+fn session_event_contents_with_conn(
+    conn: &Connection,
+    session_id: &str,
+    event_type: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT content
+         FROM events INDEXED BY idx_events_session_ordinal
+         WHERE session_id = ?1
+           AND (?2 IS NULL OR event_type = ?2)
+         ORDER BY ordinal",
+    )?;
+    let rows = stmt.query_map(params![session_id, event_type], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
+
 
 struct ProvenanceInput {
     rowid: i64,
@@ -2248,6 +2428,7 @@ struct ProvenanceInput {
     event_session_overridden: bool,
 }
 
+#[derive(Serialize)]
 struct ProvenanceRow<'a> {
     item_id: String,
     session_id: String,
@@ -3140,14 +3321,22 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert!(provenance_details.contains(&"clearing previous provenance rows"));
+        assert!(provenance_details.contains(&"preparing provenance staging table"));
         assert!(provenance_details.contains(&"finding repeated message templates"));
         assert!(provenance_details.contains(&"loading inherited parent messages"));
+        assert!(provenance_details
+            .iter()
+            .any(|detail| detail.starts_with("indexing ")));
+        assert!(provenance_details
+            .iter()
+            .any(|detail| detail.starts_with("storing 0/")));
+        assert!(provenance_details.contains(&"committing message provenance"));
         let classified = provenance_details
             .iter()
             .filter_map(|detail| {
                 detail
-                    .strip_prefix("classifying ")?
+                    .strip_prefix("classifying ")
+                    .or_else(|| detail.strip_prefix("classified "))?
                     .strip_suffix(" messages")?
                     .split_once('/')?
                     .0
@@ -3157,6 +3346,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(classified, vec![0, 7]);
         assert!(classified.windows(2).all(|window| window[0] <= window[1]));
+        assert!(provenance_details
+            .iter()
+            .any(|detail| detail == &"staged 7/7 messages"));
 
         assert_eq!(rows.len(), 7);
         assert_eq!(
@@ -3180,6 +3372,105 @@ mod tests {
         assert_eq!(rows[5].3, "default.human");
         assert_eq!(rows[6].1, "agent");
         assert_eq!(rows[6].3, "relationship.subagent");
+    }
+
+    #[test]
+    fn failed_provenance_rebuild_preserves_previous_rows() {
+        let (_dir, store) = current_refresh_store();
+        let load_rows = || {
+            store
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT item_id, authored_by, rule
+                         FROM message_provenance
+                         ORDER BY item_id",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(Into::into)
+                })
+                .expect("load provenance rows")
+        };
+        let before = load_rows();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_provenance_rebuild
+                     BEFORE INSERT ON message_provenance
+                     BEGIN
+                       SELECT RAISE(ABORT, 'fixture provenance insert failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("install failing provenance trigger");
+
+        let error = rebuild_message_provenance(&store, |_| {})
+            .expect_err("provenance replacement should fail");
+
+        assert!(error.to_string().contains("fixture provenance insert failure"));
+        assert_eq!(load_rows(), before);
+    }
+
+    #[test]
+    fn provenance_staging_does_not_hold_the_main_writer_lock() {
+        let (_dir, store) = current_refresh_store();
+        let mut wrote_during_staging = false;
+
+        rebuild_message_provenance(&store, |detail| {
+            if !wrote_during_staging && detail.starts_with("classifying 0/") {
+                store
+                    .with_conn(|conn| {
+                        conn.execute_batch(
+                            "CREATE TABLE provenance_writer_probe (id INTEGER PRIMARY KEY);",
+                        )?;
+                        Ok(())
+                    })
+                    .expect("write through a second connection during staging");
+                wrote_during_staging = true;
+            }
+        })
+        .expect("rebuild provenance without holding the main writer");
+
+        assert!(wrote_during_staging);
+    }
+
+    #[test]
+    fn classified_progress_accepts_active_and_completed_batches() {
+        assert_eq!(
+            classified_message_progress("classifying 500/1000 messages"),
+            Some(500)
+        );
+        assert_eq!(
+            classified_message_progress("classified 500/1000 messages"),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn relationship_progress_reports_only_resolved_sessions() {
+        let (_dir, store) = current_refresh_store();
+        let mut progress = Vec::new();
+
+        rebuild_session_relationships_with_progress(&store, |processed, total| {
+            progress.push((processed, total));
+        })
+        .expect("rebuild relationships with progress");
+
+        assert!(!progress.is_empty());
+        let total = progress[0].1;
+        assert!(total > 0);
+        assert!(progress.iter().all(|(processed, current_total)|
+            *current_total == total && processed <= current_total));
+        assert!(progress
+            .windows(2)
+            .all(|window| window[0].0 <= window[1].0));
     }
 
     #[test]
@@ -3266,38 +3557,25 @@ mod tests {
         assert_projections_current(&store);
     }
     #[test]
-    fn forced_on_demand_report_refresh_rebuilds_current_snapshot() {
-        let (_dir, store) = current_refresh_store();
-        let mut progress = Vec::new();
-
-        let outcome = refresh_report_on_demand_with_progress(&store, true, |event| {
-            progress.push((event.completed, event.total));
-        })
-        .expect("force current report refresh");
-
-        assert!(outcome.refreshed);
-        assert!(outcome.full_rebuild);
-        assert!(!progress.is_empty());
-        assert_eq!(progress.last(), Some(&(progress[0].1, progress[0].1)));
-        assert_projections_current(&store);
-    }
-    #[test]
     fn report_refresh_status_tracks_empty_current_and_stale_stores() {
         let empty_dir = tempfile::tempdir().expect("empty tempdir");
         let empty_store = Store::open(empty_dir.path()).expect("open empty store");
         let empty = report_refresh_status(&empty_store).expect("empty refresh status");
         assert!(empty.stale);
         assert!(empty.snapshot_missing);
+        assert!(empty.prerequisites_invalid);
 
         let (_dir, store) = current_refresh_store();
         let current = report_refresh_status(&store).expect("current refresh status");
         assert!(!current.stale);
         assert!(!current.snapshot_missing);
+        assert!(!current.prerequisites_invalid);
 
         append_target_turn(&store);
         let stale = report_refresh_status(&store).expect("stale refresh status");
         assert!(stale.stale);
         assert!(!stale.snapshot_missing);
+        assert!(!stale.prerequisites_invalid);
 
         store
             .with_conn(|conn| {
@@ -3313,6 +3591,34 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn missing_snapshot_with_current_prerequisites_avoids_full_fallback() {
+        let (_dir, store) = current_refresh_store();
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM report_snapshot", [])?;
+                conn.execute(
+                    "DELETE FROM projection_status WHERE projection_name = ?1",
+                    [REPORT_SNAPSHOT_PROJECTION],
+                )?;
+                Ok(())
+            })
+            .expect("remove report snapshot state");
+        let status = report_refresh_status(&store).expect("missing snapshot status");
+        assert!(status.stale);
+        assert!(status.snapshot_missing);
+        assert!(!status.prerequisites_invalid);
+
+        let outcome = refresh_report_on_demand_with_progress(&store, true, |_| {})
+            .expect("rebuild only missing report state");
+
+        assert!(outcome.refreshed);
+        assert!(!outcome.full_rebuild);
+        assert!(!report_refresh_status(&store)
+            .expect("restored snapshot status")
+            .stale);
+    }
 
     #[test]
     fn repaired_delta_skips_a_report_snapshot_already_rebuilt_by_repair() {
