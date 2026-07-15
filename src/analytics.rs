@@ -222,7 +222,8 @@ pub(crate) fn report_refresh_prior_hashes(
     })
 }
 
-pub(crate) fn refresh_report_after_update_with_progress(
+#[cfg(test)]
+fn refresh_report_after_update_with_progress(
     store: &Store,
     delta: &ImportDelta,
     progress: impl FnMut(ReportRefreshProgress),
