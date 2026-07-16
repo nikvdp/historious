@@ -3890,6 +3890,36 @@ mod tests {
     }
 
     #[test]
+    fn provenance_message_count_respects_the_requested_sessions() {
+        let (_dir, store) = current_refresh_store();
+        append_target_turn(&store);
+
+        assert_eq!(
+            provenance_message_count(&store, &HashSet::new()).expect("count empty scope"),
+            0
+        );
+        assert_eq!(
+            provenance_message_count(
+                &store,
+                &HashSet::from(["session_target".to_string()]),
+            )
+            .expect("count target scope"),
+            2
+        );
+        assert_eq!(
+            provenance_message_count(
+                &store,
+                &HashSet::from([
+                    "session_target".to_string(),
+                    "session_untouched".to_string(),
+                ]),
+            )
+            .expect("count full scope"),
+            3
+        );
+    }
+
+    #[test]
     fn prior_hash_capture_reports_batched_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
