@@ -4,7 +4,7 @@ use crate::provenance;
 use crate::storage::{ImportDelta, Store};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::functions::{Aggregate, Context as SqlContext, FunctionFlags};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1598,7 +1598,7 @@ fn total_conversation_messages(store: &Store) -> Result<usize> {
 
 
 
-const SESSION_FACT_BATCH_SIZE: usize = 100;
+const SESSION_FACT_BATCH_SIZE: usize = 500;
 
 fn rebuild_session_facts_with_progress(
     store: &Store,
@@ -1626,6 +1626,8 @@ fn rebuild_session_facts_with_progress(
                duration_secs INTEGER
              );",
         )?;
+        build_session_fact_input_cache(conn)?;
+        build_codex_session_fact_cache(conn)?;
 
         let mut last_rowid = 0i64;
         let mut processed = 0usize;
@@ -1656,7 +1658,7 @@ fn rebuild_session_facts_with_progress(
                 .into_iter()
                 .map(|(_, session_id)| session_id)
                 .collect::<Vec<_>>();
-            let (inputs, events) = load_session_fact_batch(conn, &session_ids)?;
+            let (inputs, events) = load_session_fact_batch(conn, &session_ids, true)?;
             let rows = project_session_fact_batch(
                 inputs,
                 events,
@@ -1714,7 +1716,7 @@ fn refresh_session_facts_scoped(
         let mut processed = 0usize;
         let mut last_progress = Instant::now();
         for batch in session_ids.chunks(SESSION_FACT_BATCH_SIZE) {
-            let (inputs, events) = load_session_fact_batch(conn, batch)?;
+            let (inputs, events) = load_session_fact_batch(conn, batch, false)?;
             let rows = project_session_fact_batch(
                 inputs,
                 events,
@@ -1731,9 +1733,154 @@ fn refresh_session_facts_scoped(
     })
 }
 
+fn build_session_fact_input_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.session_fact_input_cache;
+         CREATE TEMP TABLE session_fact_input_cache (
+           session_id TEXT PRIMARY KEY,
+           session_rowid INTEGER NOT NULL,
+           source_kind TEXT NOT NULL,
+           metadata_json TEXT NOT NULL,
+           event_count INTEGER,
+           first_event_at TEXT,
+           last_event_at TEXT,
+           user_message_count INTEGER NOT NULL
+         ) WITHOUT ROWID;
+         INSERT INTO session_fact_input_cache
+         WITH user_message_counts AS MATERIALIZED (
+           SELECT session_id, COUNT(*) AS user_message_count
+           FROM history_items INDEXED BY idx_history_items_tier_kind
+           WHERE tier = 'conversation' AND kind = 'user'
+           GROUP BY session_id
+         )
+         SELECT s.id, s.rowid, s.source_kind, s.metadata_json, sa.event_count,
+                COALESCE(sa.first_event_at, s.started_at),
+                COALESCE(sa.last_event_at, s.updated_at),
+                COALESCE(users.user_message_count, 0)
+         FROM sessions s
+         LEFT JOIN session_activity sa ON sa.session_id = s.id
+         LEFT JOIN user_message_counts users ON users.session_id = s.id;",
+    )?;
+    Ok(())
+}
+
+fn build_codex_session_fact_cache(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "codex_class_signal",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let content = context.get::<String>(0)?;
+            Ok(ingest::codex_event_fact(&content)
+                .class_signal
+                .map(|class| class.as_str().to_owned()))
+        },
+    )?;
+    // FILE-backed compact staging avoids retaining Codex event bodies or per-event facts in Rust.
+    // JSON1 duplicate-key selection for usage/models may differ from serde_json; classification
+    // remains exact, and normal Codex sessions carry their class signal in session_meta ordinal 0.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.codex_session_fact_cache;
+         CREATE TEMP TABLE codex_session_fact_cache (
+           session_id TEXT PRIMARY KEY,
+           event_row_count INTEGER NOT NULL,
+           session_class TEXT NOT NULL,
+           usage_seen INTEGER NOT NULL,
+           input_tokens INTEGER NOT NULL,
+           cached_input_tokens INTEGER NOT NULL,
+           output_tokens INTEGER NOT NULL,
+           model_counts_json TEXT NOT NULL
+         ) WITHOUT ROWID;
+         INSERT INTO codex_session_fact_cache
+         WITH codex_fields AS MATERIALIZED (
+           SELECT e.session_id,
+                  json_extract(
+                    CASE WHEN json_valid(e.content) THEN e.content END,
+                    '$.payload.model',
+                    '$.payload.info.total_token_usage',
+                    '$.payload.info.total_token_usage.input_tokens',
+                    '$.payload.info.total_token_usage.cached_input_tokens',
+                    '$.payload.info.total_token_usage.output_tokens'
+                  ) AS fields
+           FROM sessions s
+           CROSS JOIN events e INDEXED BY idx_events_session_ordinal ON e.session_id = s.id
+           WHERE s.source_kind = 'codex'
+         ),
+         class_signals AS MATERIALIZED (
+           SELECT e.session_id, e.ordinal, codex_class_signal(e.content) AS signal
+           FROM sessions s
+           CROSS JOIN events e INDEXED BY idx_events_session_ordinal ON e.session_id = s.id
+           WHERE s.source_kind = 'codex' AND e.event_type = 'session_meta'
+         ),
+         session_meta_counts AS (
+           SELECT session_id, COUNT(*) AS session_meta_count
+           FROM class_signals GROUP BY session_id
+         ),
+         first_class_ordinals AS (
+           SELECT session_id, MIN(ordinal) AS ordinal
+           FROM class_signals WHERE signal IS NOT NULL GROUP BY session_id
+         ),
+         classes AS (
+           SELECT session_meta_counts.session_id, session_meta_counts.session_meta_count,
+                  class_signals.signal
+           FROM session_meta_counts
+           LEFT JOIN first_class_ordinals USING (session_id)
+           LEFT JOIN class_signals USING (session_id, ordinal)
+         ),
+         usage AS (
+           SELECT fields.session_id, COUNT(*) AS event_row_count,
+                  COALESCE(
+                    classes.signal,
+                    CASE WHEN classes.session_meta_count IS NULL THEN (
+                      SELECT codex_class_signal(class_event.content)
+                      FROM events class_event INDEXED BY idx_events_session_ordinal
+                      WHERE class_event.session_id = fields.session_id
+                        AND codex_class_signal(class_event.content) IS NOT NULL
+                      ORDER BY class_event.ordinal LIMIT 1
+                    ) END,
+                    'interactive'
+                  ) AS session_class,
+                  MAX(CASE WHEN json_type(fields.fields, '$[1]') = 'object'
+                           THEN 1 ELSE 0 END) AS usage_seen,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[2]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[2]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[2]'), 0) ELSE 0 END) AS input_tokens,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[3]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[3]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[3]'), 0) ELSE 0 END) AS cached_input_tokens,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[4]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[4]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[4]'), 0) ELSE 0 END) AS output_tokens
+           FROM codex_fields fields
+           LEFT JOIN classes ON classes.session_id = fields.session_id
+           GROUP BY fields.session_id
+         ),
+         model_counts AS (
+           SELECT session_id, json_extract(fields, '$[0]') AS model, COUNT(*) AS model_count
+           FROM codex_fields
+           WHERE json_type(fields, '$[0]') = 'text'
+           GROUP BY session_id, json_extract(fields, '$[0]')
+         ),
+         models AS (
+           SELECT session_id, json_group_object(model, model_count) AS model_counts_json
+           FROM model_counts GROUP BY session_id
+         )
+         SELECT usage.session_id, usage.event_row_count, usage.session_class,
+                usage.usage_seen, usage.input_tokens, usage.cached_input_tokens,
+                usage.output_tokens, COALESCE(models.model_counts_json, '{}')
+         FROM usage
+         LEFT JOIN models USING (session_id);",
+    )?;
+    Ok(())
+}
+
 fn load_session_fact_batch<S: AsRef<str>>(
     conn: &Connection,
     session_ids: &[S],
+    use_codex_cache: bool,
 ) -> Result<(Vec<SessionFactInput>, SessionEventFacts)> {
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS session_fact_scope (
@@ -1751,7 +1898,15 @@ fn load_session_fact_batch<S: AsRef<str>>(
     }
 
     let inputs = {
-        let mut stmt = conn.prepare(
+        let input_sql = if use_codex_cache {
+            "SELECT cache.session_id, cache.source_kind, cache.metadata_json,
+                    cache.event_count, cache.first_event_at, cache.last_event_at,
+                    cache.user_message_count
+             FROM temp.session_fact_scope scope
+             CROSS JOIN temp.session_fact_input_cache cache
+               ON cache.session_id = scope.session_id
+             ORDER BY cache.session_rowid"
+        } else {
             "WITH user_message_counts AS (
                SELECT hi.session_id, COUNT(*) AS user_message_count
                FROM temp.session_fact_scope scope
@@ -1768,8 +1923,9 @@ fn load_session_fact_batch<S: AsRef<str>>(
              CROSS JOIN sessions s ON s.id = scope.session_id
              LEFT JOIN session_activity sa ON sa.session_id = s.id
              LEFT JOIN user_message_counts users ON users.session_id = s.id
-             ORDER BY s.rowid",
-        )?;
+             ORDER BY s.rowid"
+        };
+        let mut stmt = conn.prepare(input_sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(SessionFactInput {
                 session_id: row.get(0)?,
@@ -1783,55 +1939,174 @@ fn load_session_fact_batch<S: AsRef<str>>(
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let facts = session_usage_events(conn)?;
+    let facts = session_usage_events(conn, use_codex_cache)?;
     Ok((inputs, facts))
 }
 
-fn session_usage_events(conn: &Connection) -> Result<SessionEventFacts> {
-    conn.create_aggregate_function::<CodexSessionFactAccumulator, _, String>(
-        "codex_session_fact",
-        2,
+fn session_usage_events(conn: &Connection, use_codex_cache: bool) -> Result<SessionEventFacts> {
+    conn.create_scalar_function(
+        "codex_class_signal",
+        1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        CodexSessionFactAggregate,
+        |context| {
+            let content = context.get::<String>(0)?;
+            Ok(ingest::codex_event_fact(&content)
+                .class_signal
+                .map(|class| class.as_str().to_owned()))
+        },
     )?;
 
     let mut facts = SessionEventFacts::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT e.session_id, codex_session_fact(e.content, e.ordinal)
-             FROM temp.session_fact_scope scope
-             CROSS JOIN sessions s ON s.id = scope.session_id AND s.source_kind = 'codex'
-             CROSS JOIN events e INDEXED BY idx_events_session_ordinal
-               ON e.session_id = scope.session_id
-             GROUP BY e.session_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (session_id, serialized) = row?;
-            let compact = serde_json::from_str::<CodexSessionFactOutput>(&serialized)?;
-            facts.insert(
-                session_id,
-                SessionEventFact {
-                    event_row_count: compact.event_row_count,
-                    classified_from_events: Some(match compact.session_class.as_str() {
-                        "interactive" => SessionClass::Interactive,
-                        "subagent" => SessionClass::Subagent,
-                        "automation" => SessionClass::Automation,
-                        _ => SessionClass::Unknown,
-                    }),
-                    usage: ingest::SessionUsage {
-                        models: compact.models,
-                        primary_model: compact.primary_model,
-                        input_tokens: compact.input_tokens,
-                        cached_input_tokens: compact.cached_input_tokens,
-                        output_tokens: compact.output_tokens,
-                    },
-                    legacy_events: Vec::new(),
-                },
-            );
+    let mut model_counts = HashMap::<String, HashMap<String, u64>>::new();
+    let codex_sql = if use_codex_cache {
+        "SELECT cache.session_id, cache.event_row_count, cache.session_class,
+                cache.usage_seen, cache.input_tokens, cache.cached_input_tokens,
+                cache.output_tokens, cache.model_counts_json, NULL
+         FROM temp.session_fact_scope scope
+         CROSS JOIN temp.codex_session_fact_cache cache
+           ON cache.session_id = scope.session_id"
+    } else {
+        "WITH codex_docs AS (
+           SELECT e.session_id,
+                  CASE WHEN json_valid(e.content) THEN e.content END AS doc
+           FROM temp.session_fact_scope scope
+           CROSS JOIN sessions s ON s.id = scope.session_id AND s.source_kind = 'codex'
+           CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+             ON e.session_id = scope.session_id
+         ),
+         codex_fields AS MATERIALIZED (
+           SELECT session_id,
+                  json_extract(
+                    doc,
+                    '$.payload.model',
+                    '$.payload.info.total_token_usage',
+                    '$.payload.info.total_token_usage.input_tokens',
+                    '$.payload.info.total_token_usage.cached_input_tokens',
+                    '$.payload.info.total_token_usage.output_tokens'
+                  ) AS fields
+           FROM codex_docs
+         ),
+         class_signals AS MATERIALIZED (
+           SELECT e.session_id, e.ordinal, codex_class_signal(e.content) AS signal
+           FROM temp.session_fact_scope scope
+           CROSS JOIN sessions s ON s.id = scope.session_id AND s.source_kind = 'codex'
+           CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+             ON e.session_id = scope.session_id
+           WHERE e.event_type = 'session_meta'
+         ),
+         session_meta_counts AS (
+           SELECT session_id, COUNT(*) AS session_meta_count
+           FROM class_signals GROUP BY session_id
+         ),
+         first_class_ordinals AS (
+           SELECT session_id, MIN(ordinal) AS ordinal
+           FROM class_signals WHERE signal IS NOT NULL GROUP BY session_id
+         ),
+         classes AS (
+           SELECT session_meta_counts.session_id, session_meta_counts.session_meta_count,
+                  class_signals.signal
+           FROM session_meta_counts
+           LEFT JOIN first_class_ordinals USING (session_id)
+           LEFT JOIN class_signals USING (session_id, ordinal)
+         ),
+         usage AS MATERIALIZED (
+           SELECT fields.session_id, COUNT(*) AS event_row_count,
+                  COALESCE(
+                    classes.signal,
+                    CASE WHEN classes.session_meta_count IS NULL THEN (
+                      SELECT codex_class_signal(class_event.content)
+                      FROM events class_event INDEXED BY idx_events_session_ordinal
+                      WHERE class_event.session_id = fields.session_id
+                        AND codex_class_signal(class_event.content) IS NOT NULL
+                      ORDER BY class_event.ordinal LIMIT 1
+                    ) END,
+                    'interactive'
+                  ) AS session_class,
+                  MAX(CASE WHEN json_type(fields.fields, '$[1]') = 'object'
+                           THEN 1 ELSE 0 END) AS usage_seen,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[2]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[2]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[2]'), 0) ELSE 0 END) AS input_tokens,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[3]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[3]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[3]'), 0) ELSE 0 END) AS cached_input_tokens,
+                  MAX(CASE
+                    WHEN json_type(fields.fields, '$[4]') = 'integer'
+                     AND typeof(json_extract(fields.fields, '$[4]')) = 'integer'
+                    THEN max(json_extract(fields.fields, '$[4]'), 0) ELSE 0 END) AS output_tokens
+           FROM codex_fields fields
+           LEFT JOIN classes ON classes.session_id = fields.session_id
+           GROUP BY fields.session_id
+         ),
+         models AS (
+           SELECT session_id, json_extract(fields, '$[0]') AS model, COUNT(*) AS model_count
+           FROM codex_fields
+           WHERE json_type(fields, '$[0]') = 'text'
+           GROUP BY session_id, json_extract(fields, '$[0]')
+         )
+         SELECT usage.session_id, usage.event_row_count, usage.session_class,
+                usage.usage_seen, usage.input_tokens, usage.cached_input_tokens,
+                usage.output_tokens, models.model, models.model_count
+         FROM usage LEFT JOIN models USING (session_id)"
+    };
+    let mut stmt = conn.prepare(codex_sql)?;
+    let rows = stmt.query_map([], |row| {
+        let class = match row.get::<_, String>(2)?.as_str() {
+            "interactive" => SessionClass::Interactive,
+            "subagent" => SessionClass::Subagent,
+            "automation" => SessionClass::Automation,
+            _ => SessionClass::Unknown,
+        };
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            class,
+            row.get::<_, i64>(3)? != 0,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<u64>>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (session_id, event_count, class, seen, input, cached, output, model, count) = row?;
+        facts.entry(session_id.clone()).or_insert_with(|| SessionEventFact {
+            event_row_count: event_count,
+            classified_from_events: Some(class),
+            usage: ingest::session_usage_from_aggregates(
+                std::iter::empty(),
+                seen,
+                input,
+                cached,
+                output,
+            ),
+            legacy_events: Vec::new(),
+        });
+        if use_codex_cache {
+            if let Some(counts_json) = model {
+                model_counts.insert(session_id, serde_json::from_str(&counts_json)?);
+            }
+        } else if let (Some(model), Some(count)) = (model, count) {
+            model_counts
+                .entry(session_id)
+                .or_default()
+                .insert(model, count);
         }
+    }
+    for (session_id, counts) in model_counts {
+        let fact = facts
+            .get_mut(&session_id)
+            .expect("Codex model row has session fact");
+        fact.usage = ingest::session_usage_from_aggregates(
+            counts,
+            fact.usage.input_tokens.is_some(),
+            fact.usage.input_tokens.unwrap_or(0),
+            fact.usage.cached_input_tokens.unwrap_or(0),
+            fact.usage.output_tokens.unwrap_or(0),
+        );
     }
 
     let mut stmt = conn.prepare(
@@ -1988,96 +2263,6 @@ fn insert_session_fact_rows(
     Ok(())
 }
 
-#[derive(Default)]
-struct CodexSessionFactAccumulator {
-    event_row_count: i64,
-    first_class: Option<(i64, SessionClass)>,
-    model_counts: HashMap<String, u64>,
-    usage_seen: bool,
-    input_tokens: i64,
-    cached_input_tokens: i64,
-    output_tokens: i64,
-}
-
-struct CodexSessionFactAggregate;
-
-impl Aggregate<CodexSessionFactAccumulator, String> for CodexSessionFactAggregate {
-    fn init(&self, _context: &mut SqlContext<'_>) -> rusqlite::Result<CodexSessionFactAccumulator> {
-        Ok(CodexSessionFactAccumulator::default())
-    }
-
-    fn step(
-        &self,
-        context: &mut SqlContext<'_>,
-        accumulator: &mut CodexSessionFactAccumulator,
-    ) -> rusqlite::Result<()> {
-        let content = context.get::<String>(0)?;
-        let ordinal = context.get::<i64>(1)?;
-        let fact = ingest::codex_event_fact(&content);
-        accumulator.event_row_count += 1;
-        if let Some(class) = fact.class_signal {
-            if accumulator
-                .first_class
-                .is_none_or(|(first_ordinal, _)| ordinal < first_ordinal)
-            {
-                accumulator.first_class = Some((ordinal, class));
-            }
-        }
-        if let Some(model) = fact.model {
-            *accumulator.model_counts.entry(model).or_default() += 1;
-        }
-        if fact.usage_seen {
-            accumulator.usage_seen = true;
-            accumulator.input_tokens = accumulator.input_tokens.max(fact.input_tokens);
-            accumulator.cached_input_tokens = accumulator
-                .cached_input_tokens
-                .max(fact.cached_input_tokens);
-            accumulator.output_tokens = accumulator.output_tokens.max(fact.output_tokens);
-        }
-        Ok(())
-    }
-
-    fn finalize(
-        &self,
-        _context: &mut SqlContext<'_>,
-        accumulator: Option<CodexSessionFactAccumulator>,
-    ) -> rusqlite::Result<String> {
-        let accumulator = accumulator.unwrap_or_default();
-        let usage = ingest::session_usage_from_aggregates(
-            accumulator.model_counts,
-            accumulator.usage_seen,
-            accumulator.input_tokens,
-            accumulator.cached_input_tokens,
-            accumulator.output_tokens,
-        );
-        serde_json::to_string(&CodexSessionFactOutput {
-            event_row_count: accumulator.event_row_count,
-            session_class: accumulator
-                .first_class
-                .map(|(_, class)| class)
-                .unwrap_or(SessionClass::Interactive)
-                .as_str()
-                .to_owned(),
-            models: usage.models,
-            primary_model: usage.primary_model,
-            input_tokens: usage.input_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            output_tokens: usage.output_tokens,
-        })
-        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-struct CodexSessionFactOutput {
-    event_row_count: i64,
-    session_class: String,
-    models: Vec<String>,
-    primary_model: Option<String>,
-    input_tokens: Option<i64>,
-    cached_input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-}
 
 #[derive(Default)]
 struct SessionEventFact {
@@ -2602,12 +2787,9 @@ fn inherited_parent_items(
     conn: &Connection,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<()> {
-    const MESSAGE_BATCH_SIZE: i64 = 500;
-
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.inherited_parent_items;
          DROP TABLE IF EXISTS temp.inherited_parent_scope;
-         DROP TABLE IF EXISTS temp.inherited_parent_message_batch;
          CREATE TEMP TABLE inherited_parent_items (
            parent_session_id TEXT NOT NULL,
            kind TEXT NOT NULL,
@@ -2617,87 +2799,29 @@ fn inherited_parent_items(
          CREATE TEMP TABLE inherited_parent_scope (
            parent_session_id TEXT PRIMARY KEY
          ) WITHOUT ROWID;
-         CREATE TEMP TABLE inherited_parent_message_batch (
-           parent_session_id TEXT NOT NULL,
-           ordinal INTEGER NOT NULL,
-           subordinal INTEGER NOT NULL,
-           history_rowid INTEGER NOT NULL,
-           kind TEXT NOT NULL,
-           text_hash TEXT NOT NULL
-         );
          INSERT INTO temp.inherited_parent_scope (parent_session_id)
          SELECT DISTINCT parent_session_id
          FROM session_relationships
          WHERE relationship = 'subagent' AND parent_session_id IS NOT NULL;",
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.inherited_parent_items
+         (parent_session_id, kind, text_hash)
+         SELECT hi.session_id, hi.kind, hi.text_hash
+         FROM temp.inherited_parent_scope scope
+         CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
+           ON hi.session_id = scope.parent_session_id
+         WHERE hi.tier = 'conversation' AND hi.kind IN ('user', 'assistant')",
+        [],
+    )?;
     let total = conn
         .query_row(
-            "SELECT COUNT(*)
-             FROM temp.inherited_parent_scope scope
-             CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
-               ON hi.session_id = scope.parent_session_id
-             WHERE hi.tier = 'conversation' AND hi.kind IN ('user', 'assistant')",
+            "SELECT COUNT(*) FROM temp.inherited_parent_items",
             [],
             |row| row.get::<_, i64>(0),
         )?
         .max(0) as usize;
-    let Some(mut last_parent) = conn.query_row(
-        "SELECT MIN(parent_session_id) FROM temp.inherited_parent_scope",
-        [],
-        |row| row.get::<_, Option<String>>(0),
-    )? else {
-        progress(0, total);
-        return Ok(());
-    };
-    let mut last_ordinal = i64::MIN;
-    let mut last_subordinal = i64::MIN;
-    let mut last_rowid = i64::MIN;
-    let mut processed = 0usize;
-    progress(processed, total);
-    loop {
-        conn.execute("DELETE FROM temp.inherited_parent_message_batch", [])?;
-        let loaded = conn.execute(
-            "INSERT INTO temp.inherited_parent_message_batch
-             (parent_session_id, ordinal, subordinal, history_rowid, kind, text_hash)
-             SELECT hi.session_id, hi.ordinal, hi.subordinal, hi.rowid, hi.kind, hi.text_hash
-             FROM temp.inherited_parent_scope scope
-             CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
-               ON hi.session_id = scope.parent_session_id
-             WHERE hi.tier = 'conversation' AND hi.kind IN ('user', 'assistant')
-               AND scope.parent_session_id >= ?1
-               AND (hi.session_id, hi.ordinal, hi.subordinal, hi.rowid)
-                     > (?1, ?2, ?3, ?4)
-             ORDER BY hi.session_id, hi.ordinal, hi.subordinal, hi.rowid
-             LIMIT ?5",
-            params![
-                last_parent.as_str(),
-                last_ordinal,
-                last_subordinal,
-                last_rowid,
-                MESSAGE_BATCH_SIZE,
-            ],
-        )?;
-        if loaded == 0 {
-            break;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO temp.inherited_parent_items
-             (parent_session_id, kind, text_hash)
-             SELECT parent_session_id, kind, text_hash
-             FROM temp.inherited_parent_message_batch",
-            [],
-        )?;
-        (last_parent, last_ordinal, last_subordinal, last_rowid) = conn.query_row(
-            "SELECT parent_session_id, ordinal, subordinal, history_rowid
-             FROM temp.inherited_parent_message_batch
-             ORDER BY parent_session_id DESC, ordinal DESC, subordinal DESC, history_rowid DESC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        processed += loaded;
-        progress(processed, total);
-    }
+    progress(total, total);
     Ok(())
 }
 

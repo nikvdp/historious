@@ -11,7 +11,9 @@ use crate::storage::{ImportDelta, SourceCheckpointFingerprint, SourceFileStatus,
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
-use serde::Serialize;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Map;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -280,11 +282,311 @@ pub(crate) struct CodexEventFact {
 }
 
 pub(crate) fn codex_event_fact(content: &str) -> CodexEventFact {
-    serde_json::from_str::<Value>(content)
-        .ok()
-        .as_ref()
-        .map(codex_event_fact_from_value)
+    serde_json::from_str::<CodexEventDocument>(content)
+        .map(|document| document.0)
         .unwrap_or_default()
+}
+
+struct CodexEventDocument(CodexEventFact);
+
+#[derive(Default)]
+struct CodexRelevantFields {
+    thread_source: Option<String>,
+    source: Option<CodexSourceFields>,
+    originator: Option<String>,
+    base_instructions: Option<String>,
+    model: Option<String>,
+    usage: Option<CodexUsageFields>,
+}
+
+#[derive(Default)]
+struct CodexSourceFields {
+    thread_source: Option<String>,
+    has_subagent: bool,
+}
+
+#[derive(Default)]
+struct CodexUsageFields {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+}
+
+impl<'de> Deserialize<'de> for CodexEventDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EventVisitor;
+
+        impl<'de> Visitor<'de> for EventVisitor {
+            type Value = CodexEventDocument;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Codex event object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut root = CodexRelevantFields::default();
+                let mut payload = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    let raw = map.next_value::<&RawValue>()?;
+                    match key.as_str() {
+                        "payload" => payload = Some(parse_relevant_fields(raw)),
+                        "thread_source" => root.thread_source = parse_raw_string(raw),
+                        "source" => root.source = parse_source_fields(raw),
+                        "originator" => root.originator = parse_raw_string(raw),
+                        "base_instructions" => {
+                            root.base_instructions = parse_base_instructions(raw)
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(CodexEventDocument(codex_fact_from_fields(root, payload)))
+            }
+        }
+
+        deserializer.deserialize_map(EventVisitor)
+    }
+}
+
+fn parse_relevant_fields(raw: &RawValue) -> Option<CodexRelevantFields> {
+    struct RelevantVisitor;
+
+    impl<'de> Visitor<'de> for RelevantVisitor {
+        type Value = CodexRelevantFields;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a payload object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut fields = CodexRelevantFields::default();
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                match key.as_str() {
+                    "thread_source" => fields.thread_source = parse_raw_string(raw),
+                    "source" => fields.source = parse_source_fields(raw),
+                    "originator" => fields.originator = parse_raw_string(raw),
+                    "base_instructions" => {
+                        fields.base_instructions = parse_base_instructions(raw)
+                    }
+                    "model" => fields.model = parse_raw_string(raw),
+                    "info" => fields.usage = parse_info_fields(raw),
+                    _ => {}
+                }
+            }
+            Ok(fields)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer.deserialize_map(RelevantVisitor).ok()
+}
+
+fn parse_source_fields(raw: &RawValue) -> Option<CodexSourceFields> {
+    struct SourceVisitor;
+
+    impl<'de> Visitor<'de> for SourceVisitor {
+        type Value = CodexSourceFields;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a source object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut source = CodexSourceFields::default();
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                match key.as_str() {
+                    "thread_source" => source.thread_source = parse_raw_string(raw),
+                    "subagent" => source.has_subagent = true,
+                    _ => {}
+                }
+            }
+            Ok(source)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer.deserialize_map(SourceVisitor).ok()
+}
+
+fn parse_base_instructions(raw: &RawValue) -> Option<String> {
+    if let Some(text) = parse_raw_string(raw) {
+        return Some(text);
+    }
+
+    struct InstructionsVisitor;
+
+    impl<'de> Visitor<'de> for InstructionsVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an instructions object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut text = None;
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                if key == "text" {
+                    text = parse_raw_string(raw);
+                }
+            }
+            Ok(text)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer.deserialize_map(InstructionsVisitor).ok().flatten()
+}
+
+fn parse_info_fields(raw: &RawValue) -> Option<CodexUsageFields> {
+    struct InfoVisitor;
+
+    impl<'de> Visitor<'de> for InfoVisitor {
+        type Value = Option<CodexUsageFields>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an info object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut usage = None;
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                if key == "total_token_usage" {
+                    usage = parse_usage_fields(raw);
+                }
+            }
+            Ok(usage)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer.deserialize_map(InfoVisitor).ok().flatten()
+}
+
+fn parse_usage_fields(raw: &RawValue) -> Option<CodexUsageFields> {
+    struct UsageVisitor;
+
+    impl<'de> Visitor<'de> for UsageVisitor {
+        type Value = CodexUsageFields;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a token usage object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut usage = CodexUsageFields::default();
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                match key.as_str() {
+                    "input_tokens" => usage.input_tokens = parse_raw_token(raw),
+                    "cached_input_tokens" => {
+                        usage.cached_input_tokens = parse_raw_token(raw)
+                    }
+                    "output_tokens" => usage.output_tokens = parse_raw_token(raw),
+                    _ => {}
+                }
+            }
+            Ok(usage)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer.deserialize_map(UsageVisitor).ok()
+}
+
+fn parse_raw_string(raw: &RawValue) -> Option<String> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+fn parse_raw_token(raw: &RawValue) -> i64 {
+    serde_json::from_str::<i64>(raw.get()).unwrap_or(0).max(0)
+}
+
+fn codex_fact_from_fields(
+    root: CodexRelevantFields,
+    payload: Option<Option<CodexRelevantFields>>,
+) -> CodexEventFact {
+    let empty = CodexRelevantFields::default();
+    let class_fields = match &payload {
+        None => &root,
+        Some(Some(payload)) => payload,
+        Some(None) => &empty,
+    };
+    let thread_source = class_fields
+        .thread_source
+        .as_deref()
+        .or_else(|| class_fields.source.as_ref()?.thread_source.as_deref());
+    let class_signal = if let Some(thread_source) = thread_source {
+        Some(match thread_source {
+            "user" => SessionClass::Interactive,
+            "subagent" => SessionClass::Subagent,
+            "automation" => SessionClass::Automation,
+            _ => SessionClass::Unknown,
+        })
+    } else if class_fields
+        .source
+        .as_ref()
+        .is_some_and(|source| source.has_subagent)
+    {
+        Some(SessionClass::Subagent)
+    } else {
+        match class_fields.originator.as_deref() {
+            Some("codex_exec") => Some(SessionClass::Automation),
+            Some("codex_chatgpt_ios_remote") => Some(SessionClass::Interactive),
+            _ => class_fields
+                .base_instructions
+                .as_deref()
+                .filter(|instructions| is_reviewer_instructions(instructions))
+                .map(|_| SessionClass::Automation),
+        }
+    };
+    let payload = payload.and_then(|payload| payload);
+    let usage_seen = payload
+        .as_ref()
+        .is_some_and(|payload| payload.usage.is_some());
+    let input_tokens = payload
+        .as_ref()
+        .and_then(|payload| payload.usage.as_ref())
+        .map_or(0, |usage| usage.input_tokens);
+    let cached_input_tokens = payload
+        .as_ref()
+        .and_then(|payload| payload.usage.as_ref())
+        .map_or(0, |usage| usage.cached_input_tokens);
+    let output_tokens = payload
+        .as_ref()
+        .and_then(|payload| payload.usage.as_ref())
+        .map_or(0, |usage| usage.output_tokens);
+    CodexEventFact {
+        class_signal,
+        model: payload.and_then(|payload| payload.model),
+        usage_seen,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    }
 }
 
 pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) -> SessionUsage {
@@ -1683,47 +1985,6 @@ fn classify_codex_session(event_contents: &[&str]) -> SessionClass {
         .unwrap_or(SessionClass::Interactive)
 }
 
-fn codex_event_fact_from_value(value: &Value) -> CodexEventFact {
-    let payload = value.get("payload").unwrap_or(value);
-    let class_signal = if let Some(thread_source) = string_at(payload, &["thread_source"])
-        .or_else(|| string_at(payload, &["source", "thread_source"]))
-    {
-        Some(match thread_source.as_str() {
-            "user" => SessionClass::Interactive,
-            "subagent" => SessionClass::Subagent,
-            "automation" => SessionClass::Automation,
-            _ => SessionClass::Unknown,
-        })
-    } else if payload
-        .get("source")
-        .and_then(Value::as_object)
-        .is_some_and(|source| source.contains_key("subagent"))
-    {
-        Some(SessionClass::Subagent)
-    } else {
-        match string_at(payload, &["originator"]).as_deref() {
-            Some("codex_exec") => Some(SessionClass::Automation),
-            Some("codex_chatgpt_ios_remote") => Some(SessionClass::Interactive),
-            _ => string_at(payload, &["base_instructions"])
-                .or_else(|| string_at(payload, &["base_instructions", "text"]))
-                .filter(|instructions| is_reviewer_instructions(instructions))
-                .map(|_| SessionClass::Automation),
-        }
-    };
-    let model = string_at(value, &["payload", "model"]);
-    let usage = value
-        .pointer("/payload/info/total_token_usage")
-        .and_then(Value::as_object);
-    CodexEventFact {
-        class_signal,
-        model,
-        usage_seen: usage.is_some(),
-        input_tokens: usage.map_or(0, |usage| json_i64(usage.get("input_tokens"))),
-        cached_input_tokens: usage
-            .map_or(0, |usage| json_i64(usage.get("cached_input_tokens"))),
-        output_tokens: usage.map_or(0, |usage| json_i64(usage.get("output_tokens"))),
-    }
-}
 
 fn is_reviewer_instructions(instructions: &str) -> bool {
     instructions
