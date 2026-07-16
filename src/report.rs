@@ -310,6 +310,7 @@ pub(crate) fn rebuild_snapshot_with_progress(
     store: &Store,
     mut progress: impl FnMut(ReportSnapshotProgress),
 ) -> Result<()> {
+    let mut total = 15;
     let report = compute_live_with_progress(
         store,
         &ReportOptions {
@@ -320,14 +321,14 @@ pub(crate) fn rebuild_snapshot_with_progress(
         },
         false,
         |event| {
+            total = event.total + 2;
             progress(ReportSnapshotProgress {
                 completed: event.completed,
-                total: event.total + 2,
+                total,
                 detail: event.detail,
             });
         },
     )?;
-    let total = 15 + frequency_message_count(store, None, None, None)?;
     progress(ReportSnapshotProgress {
         completed: total - 1,
         total,
@@ -398,13 +399,13 @@ fn compute_live_with_progress(
     mut progress: impl FnMut(ReportSnapshotProgress),
 ) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
-    let mut frequency_messages = frequency_message_count(
-        store,
-        options.after.as_deref(),
-        options.before.as_deref(),
-        project_pattern.as_deref(),
-    )?;
-    let mut total = 13 + frequency_messages;
+    let mut frequency_messages = 0;
+    let mut total = 13;
+    progress(ReportSnapshotProgress {
+        completed: 0,
+        total,
+        detail: "computing report snapshot".to_string(),
+    });
     let totals = report_totals(
         store,
         options.after.as_deref(),
@@ -472,8 +473,8 @@ fn compute_live_with_progress(
         options.before.as_deref(),
         project_pattern.as_deref(),
         |processed, actual_total, detail| {
-            frequency_messages = frequency_messages.max(actual_total);
-            total = total.max(13 + actual_total);
+            frequency_messages = actual_total;
+            total = 13 + actual_total;
             progress(ReportSnapshotProgress {
                 completed: 9 + processed,
                 total,
@@ -873,30 +874,6 @@ fn report_topics(
 }
 
 
-fn frequency_message_count(
-    store: &Store,
-    after: Option<&str>,
-    before: Option<&str>,
-    project: Option<&str>,
-) -> Result<usize> {
-    store.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COUNT(*)
-             FROM message_provenance p
-             JOIN history_items hi ON hi.id = p.item_id
-             JOIN session_facts sf ON sf.session_id = p.session_id
-             WHERE p.authored_by = 'human'
-               AND p.sentiment_usable IN ('yes', 'strip_wrapper')
-               AND (?1 IS NULL OR hi.occurred_at >= ?1)
-               AND (?2 IS NULL OR hi.occurred_at < ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
-            params![after, before, project],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as usize)
-        .map_err(Into::into)
-    })
-}
 
 fn report_frequencies(
     store: &Store,
@@ -905,10 +882,12 @@ fn report_frequencies(
     project: Option<&str>,
     mut progress: impl FnMut(usize, usize, String),
 ) -> Result<(FrequencySection, HashMap<String, Vec<TermCount>>)> {
-    let messages = store.with_conn(|conn| {
+    let stopwords = english_stopwords();
+    let project_noise = project_noise_words();
+    let (unigrams, bigrams, trigrams, project_unigrams) = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT hi.text, p.sentiment_usable, p.rule,
-                    COALESCE(sf.workspace_path, 'unknown')
+                    COALESCE(sf.workspace_path, 'unknown'), COUNT(*) OVER()
              FROM message_provenance p
              JOIN history_items hi ON hi.id = p.item_id
              JOIN session_facts sf ON sf.session_id = p.session_id
@@ -918,77 +897,81 @@ fn report_frequencies(
                AND (?2 IS NULL OR hi.occurred_at < ?2)
                AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
         )?;
-        let rows = stmt.query_map(params![after, before, project], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })?;
-    let total = messages.len();
-    progress(0, total, format!("loaded {total} frequency messages"));
-
-    let stopwords = english_stopwords();
-    let mut unigrams = HashMap::new();
-    let mut bigrams = HashMap::new();
-    let mut trigrams = HashMap::new();
-    let project_noise = project_noise_words();
-    let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
-    for (index, (text, usable, rule, workspace_path)) in messages.into_iter().enumerate() {
-        let text = if usable == "strip_wrapper" {
-            provenance::strip_human_wrapper(&text, &rule)
-        } else {
-            text
-        };
-        let tokens = tokenize_frequency_text(&text);
-        let mut message_unigrams = HashMap::new();
-        let mut project_message_unigrams = HashMap::new();
-        let mut message_bigrams = HashMap::new();
-        let mut message_trigrams = HashMap::new();
-        for token in &tokens {
-            if token.len() > 1 && !stopwords.contains(token.as_str()) {
-                increment_capped(&mut unigrams, &mut message_unigrams, token.clone());
+        let mut rows = stmt.query(params![after, before, project])?;
+        let mut unigrams = HashMap::new();
+        let mut bigrams = HashMap::new();
+        let mut trigrams = HashMap::new();
+        let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
+        let mut processed = 0;
+        let mut total = 0;
+        while let Some(row) = rows.next()? {
+            let text = row.get::<_, String>(0)?;
+            let usable = row.get::<_, String>(1)?;
+            let rule = row.get::<_, String>(2)?;
+            let workspace_path = row.get::<_, String>(3)?;
+            if processed == 0 {
+                total = row.get::<_, i64>(4)?.max(0) as usize;
+                progress(
+                    0,
+                    total,
+                    format!("tokenizing 0/{total} frequency messages"),
+                );
             }
-            if token.len() > 2
-                && !stopwords.contains(token.as_str())
-                && !project_noise.contains(token.as_str())
-            {
-                increment_capped(
-                    project_unigrams.entry(workspace_path.clone()).or_default(),
-                    &mut project_message_unigrams,
-                    token.clone(),
+            let text = if usable == "strip_wrapper" {
+                provenance::strip_human_wrapper(&text, &rule)
+            } else {
+                text
+            };
+            let tokens = tokenize_frequency_text(&text);
+            let mut message_unigrams = HashMap::new();
+            let mut project_message_unigrams = HashMap::new();
+            let mut message_bigrams = HashMap::new();
+            let mut message_trigrams = HashMap::new();
+            for token in &tokens {
+                if token.len() > 1 && !stopwords.contains(token.as_str()) {
+                    increment_capped(&mut unigrams, &mut message_unigrams, token.clone());
+                }
+                if token.len() > 2
+                    && !stopwords.contains(token.as_str())
+                    && !project_noise.contains(token.as_str())
+                {
+                    increment_capped(
+                        project_unigrams.entry(workspace_path.clone()).or_default(),
+                        &mut project_message_unigrams,
+                        token.clone(),
+                    );
+                }
+            }
+            for window in tokens.windows(2) {
+                if window
+                    .iter()
+                    .any(|token| !stopwords.contains(token.as_str()))
+                {
+                    increment_capped(&mut bigrams, &mut message_bigrams, window.join(" "));
+                }
+            }
+            for window in tokens.windows(3) {
+                if window
+                    .iter()
+                    .any(|token| !stopwords.contains(token.as_str()))
+                {
+                    increment_capped(&mut trigrams, &mut message_trigrams, window.join(" "));
+                }
+            }
+            processed += 1;
+            if processed == total || processed % 100 == 0 {
+                progress(
+                    processed,
+                    total,
+                    format!("tokenized {processed}/{total} frequency messages"),
                 );
             }
         }
-        for window in tokens.windows(2) {
-            if window
-                .iter()
-                .any(|token| !stopwords.contains(token.as_str()))
-            {
-                increment_capped(&mut bigrams, &mut message_bigrams, window.join(" "));
-            }
+        if processed == 0 {
+            progress(0, 0, "tokenized 0/0 frequency messages".to_string());
         }
-        for window in tokens.windows(3) {
-            if window
-                .iter()
-                .any(|token| !stopwords.contains(token.as_str()))
-            {
-                increment_capped(&mut trigrams, &mut message_trigrams, window.join(" "));
-            }
-        }
-        let processed = index + 1;
-        if processed == total || processed % 100 == 0 {
-            progress(
-                processed,
-                total,
-                format!("tokenized {processed}/{total} frequency messages"),
-            );
-        }
-    }
+        Ok((unigrams, bigrams, trigrams, project_unigrams))
+    })?;
     Ok((
         FrequencySection {
             unigrams: top_terms(unigrams, 3, 20),
