@@ -776,9 +776,7 @@ fn rebuild_session_relationships_with_detailed_progress(
     store: &Store,
     mut progress: impl FnMut(usize, usize, Option<String>),
 ) -> Result<usize> {
-    let projection = PROJECTIONS[0];
-    clear_projection(store, projection)?;
-    clear_event_session_overrides(store)?;
+    const SESSION_BATCH_SIZE: usize = 500;
 
     let sessions = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -811,114 +809,102 @@ fn rebuild_session_relationships_with_detailed_progress(
             .push(session.session_id.clone());
     }
 
-    const EVENT_SCAN_BATCH: i64 = 50_000;
-    let max_event_rowid = store.with_conn(max_event_rowid)?;
-    let mut scanned_rowid = 0i64;
-    let mut codex_notifications = Vec::new();
-    progress(
-        scanned_rowid.max(0) as usize,
-        max_event_rowid.max(0) as usize,
-        Some(format!(
-            "scanning {scanned_rowid}/{max_event_rowid} events for relationships"
-        )),
-    );
-    while scanned_rowid < max_event_rowid {
-        let batch_end = scanned_rowid
-            .saturating_add(EVENT_SCAN_BATCH)
-            .min(max_event_rowid);
-        let batch = store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT s.machine_id, e.session_id, e.content
-                 FROM events e
-                 JOIN sessions s ON s.id = e.session_id
-                 WHERE e.rowid > ?1 AND e.rowid <= ?2
-                   AND e.source_kind = 'codex'
-                   AND e.content LIKE '%subagent_notification%'
-                 ORDER BY e.rowid",
-            )?;
-            let rows = stmt.query_map(params![scanned_rowid, batch_end], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })?;
-        codex_notifications.extend(batch);
-        scanned_rowid = batch_end;
-        progress(
-            scanned_rowid.max(0) as usize,
-            max_event_rowid.max(0) as usize,
-            Some(format!(
-                "scanning {scanned_rowid}/{max_event_rowid} events for relationships"
-            )),
-        );
-    }
     let mut codex_parents = HashMap::<(String, String), (String, bool)>::new();
-    for (machine_id, parent_session_id, content) in codex_notifications {
-        for child_external_id in ingest::codex_subagent_paths(&content) {
-            codex_parents
-                .entry((machine_id.clone(), child_external_id))
-                .and_modify(|(existing_parent_id, collision)| {
-                    if existing_parent_id != &parent_session_id {
-                        *collision = true;
-                    }
-                })
-                .or_insert_with(|| (parent_session_id.clone(), false));
-        }
-    }
-
+    let mut codex_hashes = HashMap::<String, Vec<String>>::new();
     let mut hints = Vec::with_capacity(sessions.len());
     let mut parents = HashMap::with_capacity(sessions.len());
     let mut inline_relationships = Vec::new();
     let mut event_overrides = Vec::new();
     let total = sessions.len();
-    for (index, session) in sessions.iter().enumerate() {
-        let metadata = serde_json::from_str::<Value>(&session.metadata_json)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let event_contents = session_event_contents(store, &session.session_id, None)?;
-        let event_contents = event_contents
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let hint = ingest::resolve_session_relationship(
-            &session.source_kind,
-            &session.external_id,
-            &metadata,
-            &event_contents,
+    let mut scanned = 0usize;
+    progress(
+        scanned,
+        total,
+        Some(format!("scanning {scanned}/{total} sessions for relationships")),
+    );
+    for session_batch in sessions.chunks(SESSION_BATCH_SIZE) {
+        let events = store.with_conn(|conn| load_relationship_event_batch(conn, session_batch))?;
+        scanned += session_batch.len();
+        progress(
+            scanned,
+            total,
+            Some(format!("scanning {scanned}/{total} sessions for relationships")),
         );
-        let mut parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
-            relationship_parent_session_id(session, external_id, &session_ids)
-        });
-        let mut hint = hint;
-        if session.source_kind == "codex" {
-            if let Some((codex_parent_session_id, collision)) =
-                codex_parents.get(&(session.machine_id.clone(), session.external_id.clone()))
-            {
-                parent_session_id = Some(codex_parent_session_id.clone());
-                hint.relationship = ingest::SessionRelationshipKind::Subagent;
-                hint.rule = if *collision {
-                    "codex.subagent_notification.collision"
-                } else {
-                    "codex.subagent_notification"
-                };
+        for session in session_batch {
+            let session_events = events
+                .get(&session.session_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let metadata = serde_json::from_str::<Value>(&session.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let hint = ingest::resolve_session_relationship(
+                &session.source_kind,
+                &session.external_id,
+                &metadata,
+                &[],
+            );
+            let parent_session_id = hint.parent_external_id.as_ref().and_then(|external_id| {
+                relationship_parent_session_id(session, external_id, &session_ids)
+            });
+            if session.source_kind == "codex" {
+                for content in session_events
+                    .iter()
+                    .filter_map(|event| event.notification.as_deref())
+                {
+                    for child_external_id in ingest::codex_subagent_paths(content) {
+                        codex_parents
+                            .entry((session.machine_id.clone(), child_external_id))
+                            .and_modify(|(existing_parent_id, collision)| {
+                                if existing_parent_id != &session.session_id {
+                                    *collision = true;
+                                }
+                            })
+                            .or_insert_with(|| (session.session_id.clone(), false));
+                    }
+                }
+                if hint.relationship == ingest::SessionRelationshipKind::None {
+                    codex_hashes.insert(
+                        session.session_id.clone(),
+                        session_events
+                            .iter()
+                            .filter_map(|event| event.hash.clone())
+                            .collect(),
+                    );
+                }
             }
+            if session.source_kind == "claude_code"
+                && hint.relationship == ingest::SessionRelationshipKind::None
+            {
+                let (relationships, overrides) =
+                    claude_inline_relationships(&session.session_id, session_events)?;
+                inline_relationships.extend(relationships);
+                event_overrides.extend(overrides);
+            }
+            parents.insert(session.session_id.clone(), parent_session_id.clone());
+            hints.push((hint, parent_session_id));
+            progress(hints.len(), total, None);
         }
-        if session.source_kind == "claude_code"
-            && hint.relationship == ingest::SessionRelationshipKind::None
-        {
-            let (relationships, overrides) =
-                claude_inline_relationships(store, &session.session_id)?;
-            inline_relationships.extend(relationships);
-            event_overrides.extend(overrides);
-        }
-        parents.insert(session.session_id.clone(), parent_session_id.clone());
-        hints.push((hint, parent_session_id));
-        progress(index + 1, total, None);
     }
-    let fork_parents = codex_fork_parents(store, &sessions, &hints)?;
+
+    for (session, (hint, parent_session_id)) in sessions.iter().zip(hints.iter_mut()) {
+        if session.source_kind != "codex" {
+            continue;
+        }
+        if let Some((codex_parent_session_id, collision)) =
+            codex_parents.get(&(session.machine_id.clone(), session.external_id.clone()))
+        {
+            *parent_session_id = Some(codex_parent_session_id.clone());
+            hint.relationship = ingest::SessionRelationshipKind::Subagent;
+            hint.rule = if *collision {
+                "codex.subagent_notification.collision"
+            } else {
+                "codex.subagent_notification"
+            };
+            parents.insert(session.session_id.clone(), parent_session_id.clone());
+        }
+    }
+
+    let fork_parents = codex_fork_parents(&sessions, &hints, &codex_hashes)?;
     for (session, (hint, parent_session_id)) in sessions.iter().zip(hints.iter_mut()) {
         if let Some(fork_parent_id) = fork_parents.get(&session.session_id) {
             *parent_session_id = Some(fork_parent_id.clone());
@@ -961,12 +947,7 @@ fn rebuild_session_relationships_with_detailed_progress(
     }
 
     let row_count = rows.len();
-    for batch in rows.chunks(500) {
-        insert_session_relationships_batch(store, batch)?;
-    }
-    for batch in event_overrides.chunks(500) {
-        insert_event_session_overrides_batch(store, batch)?;
-    }
+    replace_session_relationships(store, &rows, &event_overrides)?;
     Ok(row_count)
 }
 
@@ -1005,10 +986,88 @@ fn relationship_parent_session_id(
     matches.next().is_none().then_some(parent_id)
 }
 
+fn load_relationship_event_batch(
+    conn: &Connection,
+    sessions: &[RelationshipSession],
+) -> Result<HashMap<String, Vec<RelationshipEvent>>> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS relationship_session_scope (
+           session_id TEXT PRIMARY KEY,
+           source_kind TEXT NOT NULL
+         ) WITHOUT ROWID;
+         DELETE FROM temp.relationship_session_scope;",
+    )?;
+    {
+        let mut insert = conn.prepare(
+            "INSERT INTO temp.relationship_session_scope (session_id, source_kind)
+             VALUES (?1, ?2)",
+        )?;
+        for session in sessions {
+            insert.execute(params![session.session_id, session.source_kind])?;
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT e.session_id, e.id,
+                CASE WHEN scope.source_kind = 'codex'
+                           AND instr(e.content, 'subagent_notification') > 0
+                     THEN e.content END,
+                CASE WHEN scope.source_kind = 'claude_code' THEN e.metadata_json END,
+                CASE WHEN scope.source_kind = 'codex' THEN e.hash END
+         FROM temp.relationship_session_scope scope
+         CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+           ON e.session_id = scope.session_id
+         WHERE scope.source_kind IN ('codex', 'claude_code')
+         ORDER BY e.session_id, e.ordinal",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let inline = row
+            .get::<_, Option<String>>(3)?
+            .map(|metadata| {
+                let metadata = serde_json::from_str::<Value>(&metadata)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let relationship = metadata.get("claude_relationship");
+                Ok::<_, rusqlite::Error>(InlineClaudeEvent {
+                    event_id: row.get(1)?,
+                    uuid: relationship
+                        .and_then(|value| value.get("uuid"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    parent_uuid: relationship
+                        .and_then(|value| value.get("parent_uuid"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    is_sidechain: relationship
+                        .and_then(|value| value.get("is_sidechain"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    task_tool_use: relationship
+                        .and_then(|value| value.get("task_tool_use"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .transpose()?;
+        Ok((
+            row.get::<_, String>(0)?,
+            RelationshipEvent {
+                notification: row.get(2)?,
+                hash: row.get(4)?,
+                inline,
+            },
+        ))
+    })?;
+    let mut events = HashMap::<String, Vec<RelationshipEvent>>::new();
+    for row in rows {
+        let (session_id, event) = row?;
+        events.entry(session_id).or_default().push(event);
+    }
+    Ok(events)
+}
+
 fn codex_fork_parents(
-    store: &Store,
     sessions: &[RelationshipSession],
     hints: &[(ingest::SessionRelationshipHint, Option<String>)],
+    hashes: &HashMap<String, Vec<String>>,
 ) -> Result<HashMap<String, String>> {
     const MIN_SHARED_EVENTS: usize = 8;
 
@@ -1023,14 +1082,17 @@ fn codex_fork_parents(
         .collect::<Vec<_>>();
     let mut groups = HashMap::<(String, Vec<String>), Vec<&RelationshipSession>>::new();
     for session in candidates {
-        let prefix = session_event_hashes(store, &session.session_id, MIN_SHARED_EVENTS + 1)?;
-        if prefix.len() <= MIN_SHARED_EVENTS {
+        let session_hashes = hashes
+            .get(&session.session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if session_hashes.len() <= MIN_SHARED_EVENTS {
             continue;
         }
         groups
             .entry((
                 session.machine_id.clone(),
-                prefix[..MIN_SHARED_EVENTS].to_vec(),
+                session_hashes[..MIN_SHARED_EVENTS].to_vec(),
             ))
             .or_default()
             .push(session);
@@ -1039,15 +1101,8 @@ fn codex_fork_parents(
     let mut parents = HashMap::new();
     for mut group in groups.into_values().filter(|group| group.len() > 1) {
         group.sort_by_key(|session| session.rowid);
-        let mut hashes = HashMap::new();
-        for session in &group {
-            hashes.insert(
-                session.session_id.as_str(),
-                session_event_hashes(store, &session.session_id, i64::MAX as usize)?,
-            );
-        }
         for (child_index, child) in group.iter().enumerate().skip(1) {
-            let child_hashes = &hashes[child.session_id.as_str()];
+            let child_hashes = &hashes[&child.session_id];
             let mut best_parent = None;
             let mut best_length = 0;
             let mut tied = false;
@@ -1055,7 +1110,7 @@ fn codex_fork_parents(
                 if parent.external_id == child.external_id {
                     continue;
                 }
-                let parent_hashes = &hashes[parent.session_id.as_str()];
+                let parent_hashes = &hashes[&parent.session_id];
                 let shared = parent_hashes
                     .iter()
                     .zip(child_hashes)
@@ -1085,62 +1140,14 @@ fn codex_fork_parents(
     Ok(parents)
 }
 
-fn session_event_hashes(store: &Store, session_id: &str, limit: usize) -> Result<Vec<String>> {
-    store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT hash
-             FROM events INDEXED BY idx_events_session_ordinal
-             WHERE session_id = ?1
-             ORDER BY ordinal
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit.min(i64::MAX as usize) as i64], |row| {
-            row.get(0)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })
-}
-
 fn claude_inline_relationships(
-    store: &Store,
     parent_session_id: &str,
+    relationship_events: &[RelationshipEvent],
 ) -> Result<(Vec<InlineRelationship>, Vec<EventSessionOverride>)> {
-    let events = store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, metadata_json
-             FROM events INDEXED BY idx_events_session_ordinal
-             WHERE session_id = ?1
-             ORDER BY ordinal",
-        )?;
-        let rows = stmt.query_map([parent_session_id], |row| {
-            let metadata = row.get::<_, String>(1)?;
-            let metadata = serde_json::from_str::<Value>(&metadata)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let relationship = metadata.get("claude_relationship");
-            Ok(InlineClaudeEvent {
-                event_id: row.get(0)?,
-                uuid: relationship
-                    .and_then(|value| value.get("uuid"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                parent_uuid: relationship
-                    .and_then(|value| value.get("parent_uuid"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                is_sidechain: relationship
-                    .and_then(|value| value.get("is_sidechain"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                task_tool_use: relationship
-                    .and_then(|value| value.get("task_tool_use"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })?;
+    let events = relationship_events
+        .iter()
+        .filter_map(|event| event.inline.as_ref())
+        .collect::<Vec<_>>();
     if !events.iter().any(|event| event.is_sidechain) {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -1222,31 +1229,6 @@ fn claude_inline_relationships(
     Ok((relationships, overrides))
 }
 
-fn clear_event_session_overrides(store: &Store) -> Result<()> {
-    store.with_conn(|conn| {
-        conn.execute("DELETE FROM event_session_overrides", [])?;
-        Ok(())
-    })
-}
-
-fn insert_event_session_overrides_batch(
-    store: &Store,
-    rows: &[EventSessionOverride],
-) -> Result<()> {
-    store.with_conn(|conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("starting event session override batch")?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO event_session_overrides (event_id, session_id) VALUES (?1, ?2)",
-            )?;
-            for row in rows {
-                stmt.execute(params![row.event_id, row.session_id])?;
-            }
-        }
-        tx.commit().context("committing event session override batch")
-    })
-}
 
 fn root_session_id(session_id: &str, parents: &HashMap<String, Option<String>>) -> Result<String> {
     let mut current = session_id;
@@ -1260,21 +1242,37 @@ fn root_session_id(session_id: &str, parents: &HashMap<String, Option<String>>) 
     Ok(current.to_string())
 }
 
-fn insert_session_relationships_batch(
+fn replace_session_relationships(
     store: &Store,
     rows: &[SessionRelationshipRow<'_>],
+    overrides: &[EventSessionOverride],
 ) -> Result<()> {
     store.with_conn(|conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("starting session relationships batch")?;
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.session_relationships_rebuild;
+             DROP TABLE IF EXISTS temp.event_session_overrides_rebuild;
+             CREATE TEMP TABLE session_relationships_rebuild (
+               session_id TEXT PRIMARY KEY,
+               parent_session_id TEXT,
+               root_session_id TEXT NOT NULL,
+               relationship TEXT NOT NULL,
+               rule TEXT NOT NULL,
+               resolved_at TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE event_session_overrides_rebuild (
+               event_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
         {
-            let mut stmt = tx.prepare(
-                "INSERT INTO session_relationships
+            let mut insert = conn.prepare(
+                "INSERT INTO temp.session_relationships_rebuild
                  (session_id, parent_session_id, root_session_id, relationship, rule, resolved_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for row in rows {
-                stmt.execute(params![
+                insert.execute(params![
                     row.session_id,
                     row.parent_session_id,
                     row.root_session_id,
@@ -1284,8 +1282,33 @@ fn insert_session_relationships_batch(
                 ])?;
             }
         }
-        tx.commit()
-            .context("committing session relationships batch")
+        {
+            let mut insert = conn.prepare(
+                "INSERT INTO temp.event_session_overrides_rebuild (event_id, session_id)
+                 VALUES (?1, ?2)",
+            )?;
+            for row in overrides {
+                insert.execute(params![row.event_id, row.session_id])?;
+            }
+        }
+
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting relationship replacement")?;
+        tx.execute("DELETE FROM session_relationships", [])?;
+        tx.execute("DELETE FROM event_session_overrides", [])?;
+        tx.execute(
+            "INSERT INTO session_relationships
+             (session_id, parent_session_id, root_session_id, relationship, rule, resolved_at)
+             SELECT session_id, parent_session_id, root_session_id, relationship, rule, resolved_at
+             FROM temp.session_relationships_rebuild",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO event_session_overrides (event_id, session_id)
+             SELECT event_id, session_id FROM temp.event_session_overrides_rebuild",
+            [],
+        )?;
+        tx.commit().context("committing relationship replacement")
     })
 }
 
@@ -1305,6 +1328,12 @@ struct SessionRelationshipRow<'a> {
     relationship: &'a str,
     rule: &'a str,
     resolved_at: &'a str,
+}
+
+struct RelationshipEvent {
+    notification: Option<String>,
+    hash: Option<String>,
+    inline: Option<InlineClaudeEvent>,
 }
 
 struct InlineClaudeEvent {
@@ -2176,12 +2205,6 @@ fn rebuild_message_provenance(
 
     progress("finding repeated message templates".to_string());
     let repeated_templates = repeated_template_hashes(store)?;
-    progress("loading inherited parent messages".to_string());
-    let inherited_parent_items = inherited_parent_items(store, |processed, total| {
-        progress(format!(
-            "loaded {processed}/{total} inherited relationships"
-        ));
-    })?;
     let total_messages = store.with_conn(|conn| {
         conn.query_row(
             "SELECT COUNT(*) FROM history_items
@@ -2196,6 +2219,12 @@ fn rebuild_message_provenance(
     store.with_conn(|conn| {
         progress("preparing provenance staging table".to_string());
         conn.pragma_update(None, "temp_store", "FILE")?;
+        progress("loading inherited parent messages".to_string());
+        inherited_parent_items(conn, |processed, total| {
+            progress(format!(
+                "loaded {processed}/{total} inherited parent messages"
+            ));
+        })?;
         conn.execute_batch(
             "DROP TABLE IF EXISTS temp.message_provenance_rebuild;
              CREATE TEMP TABLE message_provenance_rebuild (
@@ -2231,7 +2260,14 @@ fn rebuild_message_provenance(
         let mut select_stmt = conn.prepare(
             "SELECT hi.rowid, hi.id, hi.session_id, hi.source_kind, hi.kind, hi.text,
                     hi.text_hash, hi.occurred_at, s.metadata_json,
-                    COALESCE(sr.relationship, 'none'),
+                    CASE WHEN eso.event_id IS NULL AND sr.relationship = 'subagent'
+                              AND EXISTS (
+                                SELECT 1 FROM temp.inherited_parent_items inherited
+                                WHERE inherited.child_session_id = hi.session_id
+                                  AND inherited.kind = hi.kind
+                                  AND inherited.text_hash = hi.text_hash
+                              )
+                         THEN 'none' ELSE COALESCE(sr.relationship, 'none') END,
                     eso.event_id IS NOT NULL
              FROM history_items hi INDEXED BY idx_history_items_tier_kind
              JOIN sessions s ON s.id = hi.session_id
@@ -2314,18 +2350,7 @@ fn rebuild_message_provenance(
                     session_classes.insert(input.session_id.clone(), class);
                     class
                 };
-                let relationship = if !input.event_session_overridden
-                    && input.relationship == "subagent"
-                    && inherited_parent_items.contains(&(
-                        input.session_id.clone(),
-                        input.message_kind.clone(),
-                        input.text_hash.clone(),
-                    ))
-                {
-                    "none"
-                } else {
-                    input.relationship.as_str()
-                };
+                let relationship = input.relationship.as_str();
                 let classification = provenance::classify_message(
                     &input.text,
                     &input.message_kind,
@@ -2416,55 +2441,109 @@ fn rebuild_message_provenance(
 }
 
 fn inherited_parent_items(
-    store: &Store,
+    conn: &Connection,
     mut progress: impl FnMut(usize, usize),
-) -> Result<HashSet<(String, String, String)>> {
-    const RELATIONSHIP_BATCH: i64 = 100;
-    let max_rowid = store.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(MAX(rowid), 0)
-             FROM session_relationships
-             WHERE relationship = 'subagent' AND parent_session_id IS NOT NULL",
+) -> Result<()> {
+    const MESSAGE_BATCH_SIZE: i64 = 500;
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.inherited_parent_items;
+         DROP TABLE IF EXISTS temp.inherited_parent_scope;
+         DROP TABLE IF EXISTS temp.inherited_parent_message_batch;
+         CREATE TEMP TABLE inherited_parent_items (
+           child_session_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           text_hash TEXT NOT NULL,
+           PRIMARY KEY (child_session_id, kind, text_hash)
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE inherited_parent_scope (
+           parent_session_id TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE inherited_parent_message_batch (
+           parent_session_id TEXT NOT NULL,
+           ordinal INTEGER NOT NULL,
+           subordinal INTEGER NOT NULL,
+           history_rowid INTEGER NOT NULL,
+           kind TEXT NOT NULL,
+           text_hash TEXT NOT NULL
+         );
+         INSERT INTO temp.inherited_parent_scope (parent_session_id)
+         SELECT DISTINCT parent_session_id
+         FROM session_relationships
+         WHERE relationship = 'subagent' AND parent_session_id IS NOT NULL;",
+    )?;
+    let total = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM temp.inherited_parent_scope scope
+             CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
+               ON hi.session_id = scope.parent_session_id
+             WHERE hi.tier = 'conversation' AND hi.kind IN ('user', 'assistant')",
             [],
             |row| row.get::<_, i64>(0),
-        )
-        .map_err(Into::into)
-    })?;
-    let total = max_rowid.max(0) as usize;
-    let mut scanned_rowid = 0i64;
-    let mut inherited = HashSet::new();
-    progress(0, total);
-    while scanned_rowid < max_rowid {
-        let batch_end = scanned_rowid
-            .saturating_add(RELATIONSHIP_BATCH)
-            .min(max_rowid);
-        let batch = store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT sr.session_id, hi.kind, hi.text_hash
-                 FROM session_relationships sr
-                 JOIN history_items hi INDEXED BY idx_history_items_session_order
-                   ON hi.session_id = sr.parent_session_id
-                 WHERE sr.rowid > ?1 AND sr.rowid <= ?2
-                   AND sr.relationship = 'subagent'
-                   AND sr.parent_session_id IS NOT NULL
-                   AND hi.tier = 'conversation'
-                   AND hi.kind IN ('user', 'assistant')",
-            )?;
-            let rows = stmt.query_map(params![scanned_rowid, batch_end], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<HashSet<_>>>()
-                .map_err(Into::into)
-        })?;
-        inherited.extend(batch);
-        scanned_rowid = batch_end;
-        progress(scanned_rowid.max(0) as usize, total);
+        )?
+        .max(0) as usize;
+    let Some(mut last_parent) = conn.query_row(
+        "SELECT MIN(parent_session_id) FROM temp.inherited_parent_scope",
+        [],
+        |row| row.get::<_, Option<String>>(0),
+    )? else {
+        progress(0, total);
+        return Ok(());
+    };
+    let mut last_ordinal = i64::MIN;
+    let mut last_subordinal = i64::MIN;
+    let mut last_rowid = i64::MIN;
+    let mut processed = 0usize;
+    progress(processed, total);
+    loop {
+        conn.execute("DELETE FROM temp.inherited_parent_message_batch", [])?;
+        let loaded = conn.execute(
+            "INSERT INTO temp.inherited_parent_message_batch
+             (parent_session_id, ordinal, subordinal, history_rowid, kind, text_hash)
+             SELECT hi.session_id, hi.ordinal, hi.subordinal, hi.rowid, hi.kind, hi.text_hash
+             FROM temp.inherited_parent_scope scope
+             CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
+               ON hi.session_id = scope.parent_session_id
+             WHERE hi.tier = 'conversation' AND hi.kind IN ('user', 'assistant')
+               AND scope.parent_session_id >= ?1
+               AND (hi.session_id, hi.ordinal, hi.subordinal, hi.rowid)
+                     > (?1, ?2, ?3, ?4)
+             ORDER BY hi.session_id, hi.ordinal, hi.subordinal, hi.rowid
+             LIMIT ?5",
+            params![
+                last_parent.as_str(),
+                last_ordinal,
+                last_subordinal,
+                last_rowid,
+                MESSAGE_BATCH_SIZE,
+            ],
+        )?;
+        if loaded == 0 {
+            break;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.inherited_parent_items
+             (child_session_id, kind, text_hash)
+             SELECT sr.session_id, batch.kind, batch.text_hash
+             FROM temp.inherited_parent_message_batch batch
+             CROSS JOIN session_relationships sr INDEXED BY idx_session_relationships_parent
+               ON sr.parent_session_id = batch.parent_session_id
+             WHERE sr.relationship = 'subagent'",
+            [],
+        )?;
+        (last_parent, last_ordinal, last_subordinal, last_rowid) = conn.query_row(
+            "SELECT parent_session_id, ordinal, subordinal, history_rowid
+             FROM temp.inherited_parent_message_batch
+             ORDER BY parent_session_id DESC, ordinal DESC, subordinal DESC, history_rowid DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        processed += loaded;
+        progress(processed, total);
     }
-    Ok(inherited)
+    Ok(())
 }
 
 fn repeated_template_hashes(store: &Store) -> Result<HashSet<String>> {
@@ -2515,13 +2594,6 @@ fn classify_stored_session_with_conn(
     Ok(ingest::classify_session(source_kind, metadata, &contents))
 }
 
-fn session_event_contents(
-    store: &Store,
-    session_id: &str,
-    event_type: Option<&str>,
-) -> Result<Vec<String>> {
-    store.with_conn(|conn| session_event_contents_with_conn(conn, session_id, event_type))
-}
 
 fn session_event_contents_with_conn(
     conn: &Connection,
