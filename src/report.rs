@@ -935,23 +935,21 @@ fn report_frequencies(
                 text
             };
             let tokens = tokenize_frequency_text(&text);
-            let mut message_unigrams = HashMap::new();
-            let mut project_message_unigrams = HashMap::new();
-            let mut message_bigrams = HashMap::new();
-            let mut message_trigrams = HashMap::new();
+            let mut message_unigrams = HashMap::<&str, u8>::new();
+            let mut project_message_unigrams = HashMap::<&str, u8>::new();
+            let mut message_bigrams = HashMap::<String, u8>::new();
+            let mut message_trigrams = HashMap::<String, u8>::new();
             for token in &tokens {
                 if token.len() > 1 && !stopwords.contains(token.as_str()) {
-                    increment_capped(&mut unigrams, &mut message_unigrams, token.clone());
+                    let count = message_unigrams.entry(token).or_default();
+                    *count = count.saturating_add(1).min(3);
                 }
                 if token.len() > 2
                     && !stopwords.contains(token.as_str())
                     && !project_noise.contains(token.as_str())
                 {
-                    increment_capped(
-                        project_unigrams.entry(workspace_path.clone()).or_default(),
-                        &mut project_message_unigrams,
-                        token.clone(),
-                    );
+                    let count = project_message_unigrams.entry(token).or_default();
+                    *count = count.saturating_add(1).min(3);
                 }
             }
             for window in tokens.windows(2) {
@@ -959,7 +957,8 @@ fn report_frequencies(
                     .iter()
                     .any(|token| !stopwords.contains(token.as_str()))
                 {
-                    increment_capped(&mut bigrams, &mut message_bigrams, window.join(" "));
+                    let count = message_bigrams.entry(window.join(" ")).or_default();
+                    *count = count.saturating_add(1).min(3);
                 }
             }
             for window in tokens.windows(3) {
@@ -967,8 +966,32 @@ fn report_frequencies(
                     .iter()
                     .any(|token| !stopwords.contains(token.as_str()))
                 {
-                    increment_capped(&mut trigrams, &mut message_trigrams, window.join(" "));
+                    let count = message_trigrams.entry(window.join(" ")).or_default();
+                    *count = count.saturating_add(1).min(3);
                 }
+            }
+            for (term, count) in message_unigrams {
+                if let Some(total) = unigrams.get_mut(term) {
+                    *total += u64::from(count);
+                } else {
+                    unigrams.insert(term.to_owned(), u64::from(count));
+                }
+            }
+            if !project_message_unigrams.is_empty() {
+                let counts = project_unigrams.entry(workspace_path).or_default();
+                for (term, count) in project_message_unigrams {
+                    if let Some(total) = counts.get_mut(term) {
+                        *total += u64::from(count);
+                    } else {
+                        counts.insert(term.to_owned(), u64::from(count));
+                    }
+                }
+            }
+            for (term, count) in message_bigrams {
+                *bigrams.entry(term).or_default() += u64::from(count);
+            }
+            for (term, count) in message_trigrams {
+                *trigrams.entry(term).or_default() += u64::from(count);
             }
             processed += 1;
             if processed == total || processed % 100 == 0 {
@@ -1044,59 +1067,63 @@ fn distinctive_project_terms(
 }
 
 pub(crate) fn tokenize_frequency_text(text: &str) -> Vec<String> {
-    let mut outside_code = String::new();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_has_ascii_digit = false;
     let mut in_fence = false;
     for line in text.lines() {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             continue;
         }
-        if !in_fence {
-            outside_code.push_str(line);
-            outside_code.push(' ');
+        if in_fence {
+            continue;
         }
-    }
-    let without_paths = outside_code
-        .split_whitespace()
-        .filter(|chunk| {
-            let chunk = chunk.trim_matches(|character: char| {
+        for chunk in line.split_whitespace() {
+            let trimmed = chunk.trim_matches(|character: char| {
                 matches!(character, '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';')
             });
-            !chunk.starts_with("http://")
-                && !chunk.starts_with("https://")
-                && !chunk.starts_with('/')
-                && !chunk.starts_with("~/")
-                && !chunk.contains("://")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    without_paths
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || character == '\'' {
-                character.to_ascii_lowercase()
-            } else {
-                ' '
+            if trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with('/')
+                || trimmed.starts_with("~/")
+                || trimmed.contains("://")
+            {
+                continue;
             }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .filter(|token| !token.chars().any(|character| character.is_ascii_digit()))
-        .map(ToOwned::to_owned)
-        .collect()
+            for character in chunk.chars() {
+                if character.is_alphanumeric() || character == '\'' {
+                    token_has_ascii_digit |= character.is_ascii_digit();
+                    token.push(character.to_ascii_lowercase());
+                } else {
+                    push_frequency_token(
+                        &mut tokens,
+                        &mut token,
+                        &mut token_has_ascii_digit,
+                    );
+                }
+            }
+            push_frequency_token(&mut tokens, &mut token, &mut token_has_ascii_digit);
+        }
+    }
+    tokens
 }
 
-fn increment_capped(
-    totals: &mut HashMap<String, u64>,
-    message_counts: &mut HashMap<String, u8>,
-    term: String,
+fn push_frequency_token(
+    tokens: &mut Vec<String>,
+    token: &mut String,
+    token_has_ascii_digit: &mut bool,
 ) {
-    let count = message_counts.entry(term.clone()).or_default();
-    if *count < 3 {
-        *totals.entry(term).or_default() += 1;
-        *count += 1;
+    if !token.is_empty() {
+        if *token_has_ascii_digit {
+            token.clear();
+        } else {
+            tokens.push(std::mem::take(token));
+        }
+        *token_has_ascii_digit = false;
     }
 }
+
 
 fn top_terms(counts: HashMap<String, u64>, minimum: u64, limit: usize) -> Vec<TermCount> {
     let mut terms = counts
@@ -2908,6 +2935,30 @@ mod tests {
             "Hello, friend!\n```rust\nsecret_code();\n```\nvisit https://example.com /tmp/file okay-done",
         );
         assert_eq!(tokens, vec!["hello", "friend", "visit", "okay", "done"]);
+    }
+
+    #[test]
+    fn frequency_tokenizer_preserves_chunk_and_unicode_edge_semantics() {
+        let tokens = tokenize_frequency_text(
+            "Alpha_beta CAFÉ ÉLAN L'AMOUR abc123 １２３ \
+             (https://example.test/x), [~/tmp], <scheme://host>; path/inside\n\
+             plain\n  ```rust\nhidden_words\n```\nafter",
+        );
+        assert_eq!(
+            tokens,
+            vec![
+                "alpha", "beta", "cafÉ", "Élan", "l'amour", "１２３", "path", "inside",
+                "plain", "after",
+            ]
+        );
+    }
+
+    #[test]
+    fn frequency_tokenizer_keeps_apostrophes_and_drops_unclosed_fences() {
+        assert_eq!(
+            tokenize_frequency_text("' quoted' can't rock’n\n```\nnever_seen"),
+            vec!["'", "quoted'", "can't", "rock", "n"]
+        );
     }
 
     #[test]
