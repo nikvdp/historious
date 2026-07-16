@@ -3717,6 +3717,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_relationship_swap_preserves_relationships_and_overrides() {
+        let (_dir, store) = current_refresh_store();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO event_session_overrides (event_id, session_id)
+                     VALUES ('target_event_1', 'session_target')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed event override");
+        let load_rows = || {
+            store
+                .with_conn(|conn| {
+                    let relationships = {
+                        let mut stmt = conn.prepare(
+                            "SELECT session_id, parent_session_id, root_session_id, relationship, rule
+                             FROM session_relationships ORDER BY session_id",
+                        )?;
+                        let rows = stmt.query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    let overrides = {
+                        let mut stmt = conn.prepare(
+                            "SELECT event_id, session_id FROM event_session_overrides
+                             ORDER BY event_id",
+                        )?;
+                        let rows = stmt.query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    Ok((relationships, overrides))
+                })
+                .expect("load relationship projections")
+        };
+        let before = load_rows();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_relationship_insert
+                     BEFORE INSERT ON session_relationships
+                     BEGIN SELECT RAISE(FAIL, 'forced relationship failure'); END;",
+                )?;
+                Ok(())
+            })
+            .expect("install relationship failure trigger");
+
+        let error = rebuild_session_relationships_with_progress(&store, |_, _| {})
+            .expect_err("relationship replacement should fail");
+
+        assert!(error.to_string().contains("forced relationship failure"));
+        assert_eq!(load_rows(), before);
+    }
+
+    #[test]
     fn incremental_report_refresh_updates_only_the_touched_session() {
         let (_dir, store) = current_refresh_store();
         let delta = append_target_turn(&store);
