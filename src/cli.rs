@@ -11126,6 +11126,23 @@ mod tests {
     }
 
     #[test]
+    fn generated_completion_exposes_report_maintenance_without_lab() {
+        let mut command = Cli::command();
+        let mut output = Vec::new();
+        clap_complete::generate(Shell::Bash, &mut command, "histo", &mut output);
+        let completion = String::from_utf8(output).expect("UTF-8 completion");
+
+        for command in ["backfill-opencode-tokens", "audit", "topics"] {
+            assert!(
+                completion.contains(command),
+                "missing {command} from completion"
+            );
+        }
+        assert!(completion.contains("histo__subcmd__report"));
+        assert!(!completion.contains("histo__subcmd__lab"));
+    }
+
+    #[test]
     fn report_display_flags_conflict_with_subcommands() {
         assert!(Cli::try_parse_from(["histo", "report", "--json", "audit"]).is_err());
         assert!(
