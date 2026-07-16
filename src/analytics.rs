@@ -778,7 +778,7 @@ fn rebuild_session_relationships_with_detailed_progress(
     store: &Store,
     mut progress: impl FnMut(usize, usize, Option<String>),
 ) -> Result<usize> {
-    const SESSION_BATCH_SIZE: usize = 250;
+    const SESSION_BATCH_SIZE: usize = 100;
 
     let sessions = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
