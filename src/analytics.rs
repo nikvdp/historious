@@ -392,13 +392,19 @@ fn refresh_report_with_progress(
     }
     session_ids.extend(session_ids_for_events(store, &unmapped_event_ids)?);
 
-    let relationship_fallback = invalid_state
-        || !delta.inserted_sessions.is_empty()
-        || relationship_sensitive_scope(store, &session_ids, &event_ids)?;
-    let mut provenance_sessions = if invalid_state || relationship_fallback {
+    let relationship_scope = if invalid_state {
         all_session_ids(store)?
     } else {
-        widen_provenance_sessions(store, &session_ids, &event_ids, prior_candidate_hashes)?
+        relationship_recompute_scope(store, &session_ids)?
+    };
+    let provenance_seed = session_ids
+        .union(&relationship_scope)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut provenance_sessions = if invalid_state {
+        all_session_ids(store)?
+    } else {
+        widen_provenance_sessions(store, &provenance_seed, &event_ids, prior_candidate_hashes)?
     };
     if provenance_sessions.is_empty() {
         provenance_sessions.extend(session_ids.iter().cloned());
@@ -406,13 +412,9 @@ fn refresh_report_with_progress(
     let affected_sessions = session_ids.union(&provenance_sessions).count();
     let relationship_row_count = statuses[0].row_count as usize;
 
-    let relationship_work = if relationship_fallback {
-        provenance_sessions.len().max(1)
-    } else {
-        1
-    };
+    let relationship_work = relationship_scope.len().max(1);
     let fact_work = session_ids.len().max(1);
-    let provenance_work = if relationship_fallback {
+    let provenance_work = if invalid_state {
         total_conversation_messages(store)?
     } else {
         provenance_message_count(store, &provenance_sessions)?
@@ -426,14 +428,17 @@ fn refresh_report_with_progress(
         phase: "relationship",
         completed,
         total,
-        detail: if relationship_fallback {
+        detail: if invalid_state {
             "rebuilding relationship-sensitive inputs".to_string()
         } else {
-            "advancing unchanged relationships".to_string()
+            format!(
+                "refreshing {} relationship-sensitive sessions",
+                relationship_scope.len()
+            )
         },
     });
-    if relationship_fallback {
-        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || {
+    run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || {
+        if invalid_state {
             rebuild_session_relationships_with_progress(store, |processed, relationship_total| {
                 completed = processed.min(relationship_work);
                 progress(ReportRefreshProgress {
@@ -445,12 +450,28 @@ fn refresh_report_with_progress(
                     ),
                 });
             })
-        })?;
-    } else {
-        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || {
+        } else if relationship_scope.is_empty() {
             Ok(relationship_row_count)
-        })?;
-    }
+        } else {
+            rebuild_session_relationships_scoped(
+                store,
+                Some(&relationship_scope),
+                |processed, relationship_total, detail| {
+                    if detail.is_none() {
+                        completed = processed.min(relationship_work);
+                        progress(ReportRefreshProgress {
+                            phase: "relationship",
+                            completed,
+                            total,
+                            detail: format!(
+                                "resolved {processed}/{relationship_total} scoped relationships"
+                            ),
+                        });
+                    }
+                },
+            )
+        }
+    })?;
     completed = relationship_work;
     progress(ReportRefreshProgress {
         phase: "relationship",
@@ -512,7 +533,7 @@ fn refresh_report_with_progress(
         detail: format!("classifying {provenance_work} affected messages"),
     });
     run_projection_refresh(store, PROJECTIONS[1], captured_input_rowid, || {
-        if relationship_fallback {
+        if invalid_state {
             rebuild_message_provenance(store, |detail| {
                 if let Some(processed) = classified_message_progress(&detail) {
                     completed = provenance_start + processed.min(provenance_work);
@@ -591,7 +612,7 @@ fn refresh_report_with_progress(
 
     Ok(ReportRefreshOutcome {
         refreshed: true,
-        full_rebuild: invalid_state || relationship_fallback,
+        full_rebuild: invalid_state,
         affected_sessions,
         affected_events: event_ids.len(),
     })
@@ -776,6 +797,14 @@ fn rebuild_session_relationships_with_progress(
 
 fn rebuild_session_relationships_with_detailed_progress(
     store: &Store,
+    progress: impl FnMut(usize, usize, Option<String>),
+) -> Result<usize> {
+    rebuild_session_relationships_scoped(store, None, progress)
+}
+
+fn rebuild_session_relationships_scoped(
+    store: &Store,
+    scope: Option<&HashSet<String>>,
     mut progress: impl FnMut(usize, usize, Option<String>),
 ) -> Result<usize> {
     const SESSION_BATCH_SIZE: usize = 100;
@@ -810,11 +839,28 @@ fn rebuild_session_relationships_with_detailed_progress(
             .or_default()
             .push(session.session_id.clone());
     }
+    let sessions = sessions
+        .into_iter()
+        .filter(|session| scope.is_none_or(|scope| scope.contains(&session.session_id)))
+        .collect::<Vec<_>>();
+    let mut parents = if scope.is_some() {
+        store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, parent_session_id FROM session_relationships",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+                .map_err(Into::into)
+        })?
+    } else {
+        HashMap::with_capacity(sessions.len())
+    };
 
     let mut codex_parents = HashMap::<(String, String), (String, bool)>::new();
     let mut codex_hashes = HashMap::<String, Vec<String>>::new();
     let mut hints = Vec::with_capacity(sessions.len());
-    let mut parents = HashMap::with_capacity(sessions.len());
     let mut inline_relationships = Vec::new();
     let mut event_overrides = Vec::new();
     let total = sessions.len();
@@ -948,9 +994,20 @@ fn rebuild_session_relationships_with_detailed_progress(
         });
     }
 
-    let row_count = rows.len();
-    replace_session_relationships(store, &rows, &event_overrides)?;
-    Ok(row_count)
+    if let Some(scope) = scope {
+        replace_session_relationships_scoped(store, scope, &rows, &event_overrides)?;
+        store.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count.max(0) as usize)
+            .map_err(Into::into)
+        })
+    } else {
+        let row_count = rows.len();
+        replace_session_relationships(store, &rows, &event_overrides)?;
+        Ok(row_count)
+    }
 }
 
 fn relationship_parent_session_id(
@@ -1314,6 +1371,117 @@ fn replace_session_relationships(
     })
 }
 
+fn replace_session_relationships_scoped(
+    store: &Store,
+    scope: &HashSet<String>,
+    rows: &[SessionRelationshipRow<'_>],
+    overrides: &[EventSessionOverride],
+) -> Result<()> {
+    store.with_conn(|conn| {
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.session_relationship_scope;
+             DROP TABLE IF EXISTS temp.old_inline_relationship_scope;
+             DROP TABLE IF EXISTS temp.session_relationships_scoped_rebuild;
+             DROP TABLE IF EXISTS temp.event_session_overrides_scoped_rebuild;
+             CREATE TEMP TABLE session_relationship_scope (
+               session_id TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE old_inline_relationship_scope (
+               session_id TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE session_relationships_scoped_rebuild (
+               session_id TEXT PRIMARY KEY,
+               parent_session_id TEXT,
+               root_session_id TEXT NOT NULL,
+               relationship TEXT NOT NULL,
+               rule TEXT NOT NULL,
+               resolved_at TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE event_session_overrides_scoped_rebuild (
+               event_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        {
+            let mut insert = conn.prepare(
+                "INSERT INTO temp.session_relationship_scope (session_id) VALUES (?1)",
+            )?;
+            for session_id in scope {
+                insert.execute([session_id])?;
+            }
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.old_inline_relationship_scope (session_id)
+             SELECT DISTINCT eso.session_id
+             FROM temp.session_relationship_scope scope
+             CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+               ON e.session_id = scope.session_id
+             JOIN event_session_overrides eso ON eso.event_id = e.id",
+            [],
+        )?;
+        {
+            let mut insert = conn.prepare(
+                "INSERT INTO temp.session_relationships_scoped_rebuild
+                 (session_id, parent_session_id, root_session_id, relationship, rule, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for row in rows {
+                insert.execute(params![
+                    row.session_id,
+                    row.parent_session_id,
+                    row.root_session_id,
+                    row.relationship,
+                    row.rule,
+                    row.resolved_at,
+                ])?;
+            }
+        }
+        {
+            let mut insert = conn.prepare(
+                "INSERT INTO temp.event_session_overrides_scoped_rebuild (event_id, session_id)
+                 VALUES (?1, ?2)",
+            )?;
+            for row in overrides {
+                insert.execute(params![row.event_id, row.session_id])?;
+            }
+        }
+
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting scoped relationship replacement")?;
+        tx.execute(
+            "DELETE FROM event_session_overrides
+             WHERE event_id IN (
+               SELECT e.id
+               FROM temp.session_relationship_scope scope
+               CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+                 ON e.session_id = scope.session_id
+             )",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM session_relationships
+             WHERE session_id IN (SELECT session_id FROM temp.session_relationship_scope)
+                OR session_id IN (SELECT session_id FROM temp.old_inline_relationship_scope)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO session_relationships
+             (session_id, parent_session_id, root_session_id, relationship, rule, resolved_at)
+             SELECT session_id, parent_session_id, root_session_id, relationship, rule, resolved_at
+             FROM temp.session_relationships_scoped_rebuild",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO event_session_overrides (event_id, session_id)
+             SELECT event_id, session_id FROM temp.event_session_overrides_scoped_rebuild",
+            [],
+        )?;
+        tx.commit().context("committing scoped relationship replacement")
+    })
+}
+
+#[derive(Clone)]
 struct RelationshipSession {
     rowid: i64,
     session_id: String,
@@ -1422,78 +1590,255 @@ fn session_ids_for_events(
     })
 }
 
-fn relationship_sensitive_scope(
+
+fn relationship_recompute_scope(
     store: &Store,
-    session_ids: &HashSet<String>,
-    event_ids: &HashSet<String>,
-) -> Result<bool> {
-    store.with_conn(|conn| {
-        let mut session_stmt = conn.prepare(
-            "SELECT s.source_kind, s.external_id, s.metadata_json,
-                    sr.relationship, sr.rule, parent.external_id
-             FROM sessions s
-             LEFT JOIN session_relationships sr ON sr.session_id = s.id
-             LEFT JOIN sessions parent ON parent.id = sr.parent_session_id
-             WHERE s.id = ?1",
+    seeds: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    if seeds.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let sessions = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, id, machine_id, source_kind, external_id, metadata_json
+             FROM sessions ORDER BY rowid",
         )?;
-        for session_id in session_ids {
-            let stored = session_stmt
-                .query_row([session_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                    ))
-                })
-                .optional()?;
-            let Some((source_kind, external_id, metadata_json, relationship, rule, parent)) =
-                stored
-            else {
-                continue;
-            };
-            if matches!(source_kind.as_str(), "codex" | "claude_code") {
-                return Ok(true);
-            }
-            if matches!(source_kind.as_str(), "opencode" | "omp") {
-                let metadata = serde_json::from_str::<Value>(&metadata_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let hint = ingest::resolve_session_relationship(
-                    &source_kind,
-                    &external_id,
-                    &metadata,
-                    &[],
-                );
-                let parent_matches = match hint.parent_external_id.as_deref() {
-                    None => parent.is_none(),
-                    Some(expected) => parent.as_deref().is_some_and(|actual| {
-                        actual == expected || (source_kind == "omp" && actual.ends_with(expected))
-                    }),
-                };
-                if relationship.as_deref() != Some(hint.relationship.as_str())
-                    || rule.as_deref() != Some(hint.rule)
-                    || !parent_matches
-                {
-                    return Ok(true);
+        let rows = stmt.query_map([], |row| {
+            Ok(RelationshipSession {
+                rowid: row.get(0)?,
+                session_id: row.get(1)?,
+                machine_id: row.get(2)?,
+                source_kind: row.get(3)?,
+                external_id: row.get(4)?,
+                metadata_json: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let by_id = sessions
+        .iter()
+        .map(|session| (session.session_id.as_str(), session))
+        .collect::<HashMap<_, _>>();
+    let mut session_ids = HashMap::<(String, String, String), Vec<String>>::new();
+    for session in &sessions {
+        session_ids
+            .entry((
+                session.machine_id.clone(),
+                session.source_kind.clone(),
+                session.external_id.clone(),
+            ))
+            .or_default()
+            .push(session.session_id.clone());
+    }
+    let edges = store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, parent_session_id FROM session_relationships
+             WHERE parent_session_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+    let mut affected = seeds
+        .iter()
+        .filter(|session_id| by_id.contains_key(session_id.as_str()))
+        .cloned()
+        .collect::<HashSet<_>>();
+    loop {
+        let before = affected.len();
+        for (child, parent) in &edges {
+            if affected.contains(child) || affected.contains(parent) {
+                if by_id.contains_key(child.as_str()) {
+                    affected.insert(child.clone());
+                }
+                if by_id.contains_key(parent.as_str()) {
+                    affected.insert(parent.clone());
                 }
             }
         }
-        let mut event_stmt = conn.prepare("SELECT source_kind FROM events WHERE id = ?1")?;
-        for event_id in event_ids {
-            let source_kind = event_stmt
-                .query_row([event_id], |row| row.get::<_, String>(0))
-                .optional()?;
-            if source_kind
-                .as_deref()
-                .is_some_and(|kind| matches!(kind, "codex" | "claude_code"))
+        for session in &sessions {
+            if matches!(session.source_kind.as_str(), "codex" | "claude_code") {
+                continue;
+            }
+            let metadata = serde_json::from_str::<Value>(&session.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let hint = ingest::resolve_session_relationship(
+                &session.source_kind,
+                &session.external_id,
+                &metadata,
+                &[],
+            );
+            let Some(parent_external_id) = hint.parent_external_id.as_deref() else {
+                continue;
+            };
+            let mut parent_ids = session_ids
+                .get(&(
+                    session.machine_id.clone(),
+                    session.source_kind.clone(),
+                    parent_external_id.to_string(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            if session.source_kind == "omp" && !parent_external_id.contains('/') {
+                let suffix = format!("_{parent_external_id}");
+                parent_ids.extend(
+                    session_ids
+                        .iter()
+                        .filter(|((machine_id, source_kind, external_id), _)| {
+                            machine_id == &session.machine_id
+                                && source_kind == "omp"
+                                && external_id.ends_with(&suffix)
+                        })
+                        .flat_map(|(_, ids)| ids.iter().cloned()),
+                );
+            }
+            if affected.contains(&session.session_id)
+                || parent_ids.iter().any(|parent_id| affected.contains(parent_id))
             {
-                return Ok(true);
+                affected.insert(session.session_id.clone());
+                affected.extend(parent_ids);
             }
         }
-        Ok(false)
-    })
+        if affected.len() == before {
+            break;
+        }
+    }
+
+    let mut selected_codex = Vec::new();
+    let mut selected_events = HashMap::new();
+    loop {
+        selected_codex = sessions
+            .iter()
+            .filter(|session| {
+                session.source_kind == "codex" && affected.contains(&session.session_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        selected_events.clear();
+        for batch in selected_codex.chunks(100) {
+            selected_events.extend(store.with_conn(|conn| {
+                load_relationship_event_batch(conn, batch)
+            })?);
+        }
+        let before = affected.len();
+        for parent in &selected_codex {
+            let Some(events) = selected_events.get(&parent.session_id) else {
+                continue;
+            };
+            for content in events
+                .iter()
+                .filter_map(|event| event.notification.as_deref())
+            {
+                for child_external_id in ingest::codex_subagent_paths(content) {
+                    if let Some(child_ids) = session_ids.get(&(
+                        parent.machine_id.clone(),
+                        "codex".to_string(),
+                        child_external_id,
+                    )) {
+                        affected.extend(child_ids.iter().cloned());
+                    }
+                }
+            }
+        }
+        if affected.len() == before {
+            break;
+        }
+    }
+    if !selected_codex.is_empty() {
+        let mut first_hashes = HashMap::<String, HashSet<String>>::new();
+        for session in &selected_codex {
+            if let Some(first_hash) = selected_events
+                .get(&session.session_id)
+                .and_then(|events| events.iter().find_map(|event| event.hash.clone()))
+            {
+                first_hashes
+                    .entry(first_hash)
+                    .or_default()
+                    .insert(session.machine_id.clone());
+            }
+        }
+        let candidates = store.with_conn(|conn| {
+            let mut candidates = HashSet::new();
+            let mut stmt = conn.prepare(
+                "SELECT e.session_id, s.machine_id
+                 FROM events e INDEXED BY idx_events_hash
+                 JOIN sessions s ON s.id = e.session_id
+                 WHERE e.hash = ?1 AND e.source_kind = 'codex'",
+            )?;
+            for (hash, machines) in &first_hashes {
+                let rows = stmt.query_map([hash], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (session_id, machine_id) = row?;
+                    if machines.contains(&machine_id) {
+                        candidates.insert(session_id);
+                    }
+                }
+            }
+            Ok(candidates)
+        })?;
+        let candidate_sessions = sessions
+            .iter()
+            .filter(|session| candidates.contains(&session.session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidate_events = store.with_conn(|conn| {
+            load_relationship_event_batch(conn, &candidate_sessions)
+        })?;
+        let selected_prefixes = selected_codex
+            .iter()
+            .filter_map(|session| {
+                let hashes = selected_events
+                    .get(&session.session_id)?
+                    .iter()
+                    .filter_map(|event| event.hash.clone())
+                    .take(8)
+                    .collect::<Vec<_>>();
+                (hashes.len() == 8).then_some((session.machine_id.as_str(), hashes))
+            })
+            .collect::<Vec<_>>();
+        for session in &candidate_sessions {
+            let hashes = candidate_events
+                .get(&session.session_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|event| event.hash.clone())
+                .take(8)
+                .collect::<Vec<_>>();
+            if hashes.len() == 8
+                && selected_prefixes.iter().any(|(machine_id, prefix)| {
+                    *machine_id == session.machine_id && prefix == &hashes
+                })
+            {
+                affected.insert(session.session_id.clone());
+            }
+        }
+    }
+    loop {
+        let before = affected.len();
+        for (child, parent) in &edges {
+            if affected.contains(child) || affected.contains(parent) {
+                if by_id.contains_key(child.as_str()) {
+                    affected.insert(child.clone());
+                }
+                if by_id.contains_key(parent.as_str()) {
+                    affected.insert(parent.clone());
+                }
+            }
+        }
+        if affected.len() == before {
+            break;
+        }
+    }
+    if affected.len() > seeds.len() {
+        let next_seeds = affected.clone();
+        affected.extend(relationship_recompute_scope(store, &next_seeds)?);
+    }
+    Ok(affected)
 }
 
 fn widen_provenance_sessions(
@@ -1506,9 +1851,11 @@ fn widen_provenance_sessions(
         let mut affected = touched.clone();
         let edges = {
             let mut stmt = conn.prepare(
-                "SELECT session_id, parent_session_id
-                 FROM session_relationships
-                 WHERE parent_session_id IS NOT NULL",
+                "SELECT sr.session_id, sr.parent_session_id
+                 FROM session_relationships sr
+                 JOIN sessions child ON child.id = sr.session_id
+                 JOIN sessions parent ON parent.id = sr.parent_session_id
+                 WHERE sr.parent_session_id IS NOT NULL",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -4558,6 +4905,227 @@ mod tests {
                 && window[0].1 == 10_742
                 && window[1].1 == 10_742
         }));
+    }
+
+    #[test]
+    fn touched_codex_notification_parent_adds_its_child_to_relationship_scope() {
+        let (_dir, store) = current_refresh_store();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('notification_parent', 'notification_parent_source', 'machine', 'codex',
+                       'notification-parent', 'open', '{}', 'notification_parent_hash'),
+                      ('notification_child', 'notification_child_source', 'machine', 'codex',
+                       'notification-child', 'open', '{}', 'notification_child_hash');
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, metadata_json, hash)
+                    VALUES
+                      ('notification_event', 'notification_parent',
+                       'notification_parent_source', 'machine', 'codex', 0, 'message', 'user',
+                       '<subagent_notification>{"agent_path":"notification-child"}</subagent_notification>',
+                       '{}', 'notification_event_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert touched notification fixtures");
+
+        let scope = relationship_recompute_scope(
+            &store,
+            &HashSet::from(["notification_parent".to_string()]),
+        )
+        .expect("expand touched notification relationship scope");
+
+        assert_eq!(
+            scope,
+            HashSet::from([
+                "notification_parent".to_string(),
+                "notification_child".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn scoped_relationship_refresh_matches_full_mixed_source_results() {
+        let (_dir, store) = current_refresh_store();
+        let untouched_resolved_at = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT resolved_at FROM session_relationships
+                     WHERE session_id = 'session_untouched'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load untouched relationship timestamp");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO sessions
+                      (id, source_id, machine_id, source_kind, external_id, status,
+                       metadata_json, hash)
+                    VALUES
+                      ('scoped_omp_parent', 'omp_parent_source', 'machine', 'omp',
+                       '2026-07-16T00-00-00-000Z_parent-id', 'open', '{}',
+                       'scoped_omp_parent_hash'),
+                      ('scoped_omp_child', 'omp_child_source', 'machine', 'omp',
+                       '2026-07-16T00-01-00-000Z_parent-id/Reviewer', 'open',
+                       '{"omp_parent_external_id":"2026-07-16T00-00-00-000Z_parent-id","omp_relationship":"subagent"}',
+                       'scoped_omp_child_hash'),
+                      ('scoped_codex_parent', 'codex_parent_source', 'machine', 'codex',
+                       'codex-parent', 'open', '{}', 'scoped_codex_parent_hash'),
+                      ('scoped_codex_child', 'codex_child_source', 'machine', 'codex',
+                       'codex-child', 'open', '{}', 'scoped_codex_child_hash');
+
+                    INSERT INTO events
+                      (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+                       role, content, metadata_json, hash)
+                    VALUES
+                      ('scoped_codex_notification', 'scoped_codex_parent',
+                       'codex_parent_source', 'machine', 'codex', 0, 'message', 'user',
+                       '<subagent_notification>{"agent_path":"codex-child"}</subagent_notification>',
+                       '{}', 'scoped_codex_notification_hash');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert scoped mixed-source sessions");
+        let delta = ImportDelta {
+            inserted_sessions: vec![
+                "scoped_omp_parent".to_string(),
+                "scoped_omp_child".to_string(),
+                "scoped_codex_parent".to_string(),
+                "scoped_codex_child".to_string(),
+            ],
+            inserted_events: vec!["scoped_codex_notification".to_string()],
+            ..ImportDelta::default()
+        };
+        let mut details = Vec::new();
+        let outcome = refresh_report_after_update_with_progress(&store, &delta, |event| {
+            if event.phase == "relationship" {
+                details.push(event.detail);
+            }
+        })
+        .expect("refresh scoped mixed-source relationships");
+        assert!(!outcome.full_rebuild);
+        assert!(details
+            .iter()
+            .any(|detail| detail.contains("4 relationship-sensitive sessions")));
+        let scoped_rows = load_relationship_semantics(&store);
+        assert!(scoped_rows.iter().any(|row| {
+            row.0 == "scoped_omp_child"
+                && row.1.as_deref() == Some("scoped_omp_parent")
+                && row.3 == "subagent"
+        }));
+        assert!(scoped_rows.iter().any(|row| {
+            row.0 == "scoped_codex_child"
+                && row.1.as_deref() == Some("scoped_codex_parent")
+                && row.3 == "subagent"
+        }));
+        let untouched_after = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT resolved_at FROM session_relationships
+                     WHERE session_id = 'session_untouched'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("reload untouched relationship timestamp");
+        assert_eq!(untouched_after, untouched_resolved_at);
+
+        rebuild_session_relationships_with_progress(&store, |_, _| {})
+            .expect("rebuild full relationships for equivalence");
+        assert_eq!(load_relationship_semantics(&store), scoped_rows);
+    }
+
+    #[test]
+    fn failed_scoped_relationship_swap_preserves_prior_rows() {
+        let (_dir, store) = current_refresh_store();
+        let before = load_relationship_semantics(&store);
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO event_session_overrides (event_id, session_id)
+                     VALUES ('target_event_1', 'session_target')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed scoped event override");
+        let override_before = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT event_id, session_id FROM event_session_overrides",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load scoped event override");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_scoped_relationship_insert
+                     BEFORE INSERT ON session_relationships
+                     BEGIN SELECT RAISE(FAIL, 'forced scoped relationship failure'); END;",
+                )?;
+                Ok(())
+            })
+            .expect("install scoped relationship failure trigger");
+        let scope = HashSet::from(["session_target".to_string()]);
+
+        let error = rebuild_session_relationships_scoped(&store, Some(&scope), |_, _, _| {})
+            .expect_err("scoped relationship replacement should fail");
+
+        assert!(error
+            .to_string()
+            .contains("forced scoped relationship failure"));
+        assert_eq!(load_relationship_semantics(&store), before);
+        let override_after = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT event_id, session_id FROM event_session_overrides",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .expect("reload scoped event override");
+        assert_eq!(override_after, override_before);
+    }
+
+    fn load_relationship_semantics(
+        store: &Store,
+    ) -> Vec<(String, Option<String>, String, String, String)> {
+        store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, parent_session_id, root_session_id, relationship, rule
+                     FROM session_relationships ORDER BY session_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("load relationship semantics")
     }
 
     fn current_refresh_store() -> (tempfile::TempDir, Store) {
