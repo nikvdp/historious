@@ -632,15 +632,12 @@ fn report_sentiment(
             .optional()
             .map_err(Into::into)
         })?;
-        let warning = latest.map_or_else(
-            || "sentiment is unavailable; run `histo lab annotate`".to_string(),
-            |(version, count)| {
-                format!(
-                    "sentiment version {version} has {count} of {corpus_messages} messages; resume `histo lab annotate`"
-                )
-            },
-        );
-        return Ok((None, Some(warning)));
+        let warning = latest.map(|(version, count)| {
+            format!(
+                "sentiment version {version} has {count} of {corpus_messages} messages; resume `histo lab annotate`"
+            )
+        });
+        return Ok((None, warning));
     };
     let by_week = sentiment_periods(store, &version, after, before, project, "%Y-%W", "week")?
         .into_iter()
@@ -3039,7 +3036,7 @@ mod tests {
         assert_eq!(report.model_mix_by_month.len(), 2);
         assert!(report.topics.is_none());
         assert!(report.sentiment.is_none());
-        assert!(report
+        assert!(!report
             .warnings
             .iter()
             .any(|warning| warning.contains("sentiment is unavailable")));
