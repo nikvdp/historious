@@ -3625,15 +3625,24 @@ fn run_update_once_machine(
     repair: bool,
 ) -> Result<UpdateOutput> {
     let source_selection = ingest::SourceSelection::parse(source)?;
-    let ingest = ingest::update_local_with_progress(
-        store,
-        &config.machine_id,
-        ingest::UpdateOptions {
-            max_files,
-            source_selection,
-            sources: config.sources.clone(),
+    let ingest = run_scoped_progress_with_timeout(
+        ingest::UpdateProgress::Discovering {
+            sources: Vec::new(),
         },
-        |event| {
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            ingest::update_local_with_progress(
+                store,
+                &config.machine_id,
+                ingest::UpdateOptions {
+                    max_files,
+                    source_selection,
+                    sources: config.sources.clone(),
+                },
+                |event| send(event.clone()),
+            )
+        },
+        |event, _emission| {
             write_update_progress(
                 "scan",
                 update_progress_detail(event),
@@ -3680,12 +3689,24 @@ fn run_update_once_machine(
     } else {
         None
     };
-    let projected = refresh_search_after_update_with_progress(
-        store,
-        &ingest.delta,
-        repair,
-        config.embedder.is_disabled(),
-        |detail| {
+    let initial_search_detail = if repair {
+        "repairing all indexable events".to_string()
+    } else {
+        "updating search index".to_string()
+    };
+    let projected = run_scoped_progress_with_timeout(
+        initial_search_detail,
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            refresh_search_after_update_with_progress(
+                store,
+                &ingest.delta,
+                repair,
+                config.embedder.is_disabled(),
+                send,
+            )
+        },
+        |detail, _emission| {
             write_update_progress(
                 "search_index",
                 detail.clone(),
@@ -3790,15 +3811,31 @@ fn run_update_once_human(
 ) -> Result<UpdateOutput> {
     let source_selection = ingest::SourceSelection::parse(source)?;
     let mut progress = UpdateProgressView::new();
-    let ingest = ingest::update_local_with_progress(
-        store,
-        &config.machine_id,
-        ingest::UpdateOptions {
-            max_files,
-            source_selection,
-            sources: config.sources.clone(),
+    let ingest = run_scoped_progress_with_timeout(
+        ingest::UpdateProgress::Discovering {
+            sources: Vec::new(),
         },
-        |event| progress.ingest_event(event),
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            ingest::update_local_with_progress(
+                store,
+                &config.machine_id,
+                ingest::UpdateOptions {
+                    max_files,
+                    source_selection,
+                    sources: config.sources.clone(),
+                },
+                |event| send(event.clone()),
+            )
+        },
+        |event, emission| match emission {
+            ScopedProgressEmission::Initial => {
+                progress.ingest_event(event);
+                progress.render(true);
+            }
+            ScopedProgressEmission::Event => progress.ingest_event(event),
+            ScopedProgressEmission::Heartbeat => progress.render(true),
+        },
     )?;
     progress.finish_ingest();
 
@@ -3812,13 +3849,30 @@ fn run_update_once_human(
     } else {
         None
     };
-    let projected = refresh_search_after_update_with_progress(
-        store,
-        &ingest.delta,
-        repair,
-        config.embedder.is_disabled(),
-        |detail| {
-            progress.search_detail(detail);
+    let initial_search_detail = if repair {
+        "repairing all indexable events".to_string()
+    } else {
+        "updating search index".to_string()
+    };
+    let projected = run_scoped_progress_with_timeout(
+        initial_search_detail,
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            refresh_search_after_update_with_progress(
+                store,
+                &ingest.delta,
+                repair,
+                config.embedder.is_disabled(),
+                send,
+            )
+        },
+        |detail, emission| match emission {
+            ScopedProgressEmission::Initial => {
+                progress.search_detail(detail.clone());
+                progress.render(true);
+            }
+            ScopedProgressEmission::Event => progress.search_detail(detail.clone()),
+            ScopedProgressEmission::Heartbeat => progress.render(true),
         },
     )?;
     progress.finish_search_index(projected);
@@ -5345,6 +5399,72 @@ struct MachineProgressEvent {
     phase: &'static str,
     detail: String,
     data: serde_json::Value,
+}
+
+const UPDATE_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(900);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopedProgressEmission {
+    Initial,
+    Event,
+    Heartbeat,
+}
+
+enum ScopedProgressMessage<E, T> {
+    Progress(E),
+    Finished(Result<T>),
+    Panicked,
+}
+
+fn run_scoped_progress_with_timeout<T, E, F, P>(
+    initial: E,
+    heartbeat_interval: Duration,
+    operation: F,
+    mut on_progress: P,
+) -> Result<T>
+where
+    T: Send,
+    E: Send,
+    F: FnOnce(&mut dyn FnMut(E)) -> Result<T> + Send,
+    P: FnMut(&E, ScopedProgressEmission),
+{
+    let mut latest = initial;
+    on_progress(&latest, ScopedProgressEmission::Initial);
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut progress = |event| {
+                    let _ = sender.send(ScopedProgressMessage::Progress(event));
+                };
+                operation(&mut progress)
+            }));
+            let message = match result {
+                Ok(result) => ScopedProgressMessage::Finished(result),
+                Err(_) => ScopedProgressMessage::Panicked,
+            };
+            let _ = sender.send(message);
+        });
+
+        loop {
+            match receiver.recv_timeout(heartbeat_interval) {
+                Ok(ScopedProgressMessage::Progress(event)) => {
+                    latest = event;
+                    on_progress(&latest, ScopedProgressEmission::Event);
+                }
+                Ok(ScopedProgressMessage::Finished(result)) => return result,
+                Ok(ScopedProgressMessage::Panicked) => {
+                    bail!("scoped progress worker panicked");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    on_progress(&latest, ScopedProgressEmission::Heartbeat);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("scoped progress worker disconnected");
+                }
+            }
+        }
+    })
 }
 
 enum ReportMaintenanceMessage<T> {
@@ -10306,6 +10426,7 @@ mod tests {
         assert!(view.last_emit > previous_emit);
         view.report_preparation(500, 10_742);
         let row = view.data_rows.get("report").expect("report preparation row");
+
         assert_eq!(row.state, "preparing");
         assert_eq!((row.current, row.total), (Some(500), Some(10_742)));
         assert!(row.detail.contains("500/10,742"));
@@ -10400,6 +10521,85 @@ mod tests {
             "report refresh skipped: snapshot already current"
         );
     }
+    #[test]
+    fn scoped_progress_runner_replays_latest_truth_and_preserves_event_order() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let observations = std::cell::RefCell::new(Vec::new());
+        let released_initial = std::cell::Cell::new(false);
+        let released_working = std::cell::Cell::new(false);
+        let worker_finished = AtomicBool::new(false);
+        let worker_finished_ref = &worker_finished;
+
+        let value = run_scoped_progress_with_timeout(
+            "starting".to_string(),
+            Duration::from_millis(1),
+            move |progress| {
+                release_receiver.recv().expect("release initial state");
+                progress("working".to_string());
+                release_receiver.recv().expect("release working state");
+                worker_finished_ref.store(true, Ordering::SeqCst);
+                Ok(42)
+            },
+            |detail, emission| {
+                observations.borrow_mut().push((emission, detail.clone()));
+                if emission == ScopedProgressEmission::Heartbeat
+                    && detail == "starting"
+                    && !released_initial.replace(true)
+                {
+                    release_sender.send(()).expect("release worker start");
+                } else if emission == ScopedProgressEmission::Heartbeat
+                    && detail == "working"
+                    && !released_working.replace(true)
+                {
+                    release_sender.send(()).expect("release worker finish");
+                }
+            },
+        )
+        .expect("scoped progress result");
+
+        assert_eq!(value, 42);
+        assert!(worker_finished.load(Ordering::SeqCst));
+        let observations = observations.into_inner();
+        assert_eq!(
+            observations.first(),
+            Some(&(ScopedProgressEmission::Initial, "starting".to_string()))
+        );
+        let event_index = observations
+            .iter()
+            .position(|observation| {
+                observation
+                    == &(ScopedProgressEmission::Event, "working".to_string())
+            })
+            .expect("real worker event");
+        assert!(observations[1..event_index].iter().all(|observation| {
+            observation == &(ScopedProgressEmission::Heartbeat, "starting".to_string())
+        }));
+        assert!(observations[event_index + 1..].iter().any(|observation| {
+            observation == &(ScopedProgressEmission::Heartbeat, "working".to_string())
+        }));
+    }
+
+    #[test]
+    fn scoped_progress_runner_propagates_errors_and_panics() {
+        let error = run_scoped_progress_with_timeout(
+            (),
+            Duration::from_millis(1),
+            |_progress| -> Result<()> { bail!("worker failed") },
+            |_event, _emission| {},
+        )
+        .expect_err("worker error");
+        assert_eq!(error.to_string(), "worker failed");
+
+        let panic_error = run_scoped_progress_with_timeout(
+            (),
+            Duration::from_millis(1),
+            |_progress| -> Result<()> { panic!("worker panic") },
+            |_event, _emission| {},
+        )
+        .expect_err("worker panic error");
+        assert_eq!(panic_error.to_string(), "scoped progress worker panicked");
+    }
+
 
 
     #[test]
