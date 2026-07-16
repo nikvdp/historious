@@ -1568,98 +1568,109 @@ fn total_conversation_messages(store: &Store) -> Result<usize> {
 
 
 
+const SESSION_FACT_BATCH_SIZE: usize = 100;
+
 fn rebuild_session_facts_with_progress(
     store: &Store,
     mut progress: impl FnMut(usize),
 ) -> Result<usize> {
-    const BATCH_SIZE: i64 = 500;
 
-    clear_projection(store, PROJECTIONS[2])?;
-    let mut last_rowid = 0i64;
-    let mut processed = 0usize;
-    let mut last_progress = Instant::now();
-    loop {
-        let batch = store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT s.rowid, s.id, s.source_kind, s.metadata_json,
-                        COALESCE(sa.event_count,
-                          (SELECT COUNT(*) FROM events e
-                           WHERE e.session_id = s.id)),
-                        COALESCE(sa.first_event_at, s.started_at),
-                        COALESCE(sa.last_event_at, s.updated_at),
-                        (SELECT COUNT(*)
-                         FROM history_items hi INDEXED BY idx_history_items_session_order
-                         WHERE hi.session_id = s.id
-                           AND hi.tier = 'conversation'
-                           AND hi.kind = 'user')
-                 FROM sessions s
-                 LEFT JOIN session_activity sa ON sa.session_id = s.id
-                 WHERE s.rowid > ?1
-                 ORDER BY s.rowid
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![last_rowid, BATCH_SIZE], |row| {
-                Ok(SessionFactInput {
-                    rowid: row.get(0)?,
-                    session_id: row.get(1)?,
-                    source_kind: row.get(2)?,
-                    metadata_json: row.get(3)?,
-                    event_count: row.get::<_, i64>(4)?.max(0),
-                    first_event_at: row.get(5)?,
-                    last_event_at: row.get(6)?,
-                    user_message_count: row.get::<_, i64>(7)?.max(0),
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })?;
-        if batch.is_empty() {
-            break;
-        }
-        last_rowid = batch.last().expect("non-empty session facts batch").rowid;
+    store.with_conn(|conn| {
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.session_facts_rebuild;
+             CREATE TEMP TABLE session_facts_rebuild (
+               session_id TEXT PRIMARY KEY,
+               source_kind TEXT NOT NULL,
+               workspace_path TEXT,
+               session_class TEXT NOT NULL,
+               models_json TEXT NOT NULL,
+               primary_model TEXT,
+               input_tokens INTEGER,
+               cached_input_tokens INTEGER,
+               output_tokens INTEGER,
+               event_count INTEGER NOT NULL,
+               user_message_count INTEGER NOT NULL,
+               first_event_at TEXT,
+               last_event_at TEXT,
+               duration_secs INTEGER
+             );",
+        )?;
 
-        let mut rows = Vec::with_capacity(batch.len());
-        for input in batch {
-            let metadata = serde_json::from_str::<Value>(&input.metadata_json)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let events = session_usage_events(store, &input.session_id)?;
-            let event_contents = events
-                .iter()
-                .map(|event| event.content.as_str())
-                .collect::<Vec<_>>();
-            let session_class =
-                ingest::classify_session(&input.source_kind, &metadata, &event_contents);
-            let usage = ingest::extract_session_usage(&input.source_kind, &events);
-            rows.push(SessionFactRow {
-                session_id: input.session_id,
-                source_kind: input.source_kind,
-                workspace_path: workspace_path(&metadata),
-                session_class: session_class.as_str(),
-                models_json: serde_json::to_string(&usage.models)?,
-                primary_model: usage.primary_model,
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                event_count: input.event_count,
-                user_message_count: input.user_message_count,
-                duration_secs: duration_secs(
-                    input.first_event_at.as_deref(),
-                    input.last_event_at.as_deref(),
-                ),
-                first_event_at: input.first_event_at,
-                last_event_at: input.last_event_at,
-            });
-            if last_progress.elapsed() >= Duration::from_secs(1) {
-                progress(processed + rows.len());
-                last_progress = Instant::now();
+        let mut last_rowid = 0i64;
+        let mut processed = 0usize;
+        let mut last_progress = Instant::now();
+        loop {
+            let session_ids = {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid, id
+                     FROM sessions
+                     WHERE rowid > ?1
+                     ORDER BY rowid
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![last_rowid, SESSION_FACT_BATCH_SIZE as i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if session_ids.is_empty() {
+                break;
             }
+            last_rowid = session_ids
+                .last()
+                .expect("non-empty session facts batch")
+                .0;
+            let session_ids = session_ids
+                .into_iter()
+                .map(|(_, session_id)| session_id)
+                .collect::<Vec<_>>();
+            let (inputs, events) = load_session_fact_batch(conn, &session_ids)?;
+            let rows = project_session_fact_batch(
+                inputs,
+                events,
+                processed,
+                &mut progress,
+                &mut last_progress,
+            )?;
+            insert_session_fact_rows(
+                conn,
+                "INSERT INTO temp.session_facts_rebuild
+                 (session_id, source_kind, workspace_path, session_class, models_json,
+                  primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
+                  user_message_count, first_event_at, last_event_at, duration_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                &rows,
+            )?;
+            processed += rows.len();
+            progress(processed);
+            last_progress = Instant::now();
         }
-        insert_session_facts_batch(store, &rows)?;
-        processed += rows.len();
-        progress(processed);
-        last_progress = Instant::now();
-    }
-    Ok(processed)
+
+        let staged = conn
+            .query_row("SELECT COUNT(*) FROM temp.session_facts_rebuild", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .context("counting staged session facts")?;
+        let staged = usize::try_from(staged).context("invalid staged session fact count")?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting session facts replacement")?;
+        tx.execute("DELETE FROM session_facts", [])?;
+        tx.execute(
+            "INSERT INTO session_facts
+             (session_id, source_kind, workspace_path, session_class, models_json,
+              primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
+              user_message_count, first_event_at, last_event_at, duration_secs)
+             SELECT session_id, source_kind, workspace_path, session_class, models_json,
+                    primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
+                    user_message_count, first_event_at, last_event_at, duration_secs
+             FROM temp.session_facts_rebuild",
+            [],
+        )?;
+        tx.commit().context("committing session facts replacement")?;
+        Ok(staged)
+    })
 }
 
 fn refresh_session_facts_scoped(
@@ -1669,98 +1680,156 @@ fn refresh_session_facts_scoped(
 ) -> Result<()> {
     let mut session_ids = session_ids.iter().collect::<Vec<_>>();
     session_ids.sort_unstable();
-    let mut processed = 0usize;
-    for batch in session_ids.chunks(500) {
-        let mut rows = Vec::with_capacity(batch.len());
-        for session_id in batch {
-            let input = store.with_conn(|conn| {
-                conn.query_row(
-                    "SELECT s.rowid, s.id, s.source_kind, s.metadata_json,
-                            COALESCE(sa.event_count,
-                              (SELECT COUNT(*) FROM events e WHERE e.session_id = s.id)),
-                            COALESCE(sa.first_event_at, s.started_at),
-                            COALESCE(sa.last_event_at, s.updated_at),
-                            (SELECT COUNT(*) FROM history_items hi
-                             WHERE hi.session_id = s.id AND hi.tier = 'conversation'
-                               AND hi.kind = 'user')
-                     FROM sessions s
-                     LEFT JOIN session_activity sa ON sa.session_id = s.id
-                     WHERE s.id = ?1",
-                    [session_id.as_str()],
-                    |row| {
-                        Ok(SessionFactInput {
-                            rowid: row.get(0)?,
-                            session_id: row.get(1)?,
-                            source_kind: row.get(2)?,
-                            metadata_json: row.get(3)?,
-                            event_count: row.get::<_, i64>(4)?.max(0),
-                            first_event_at: row.get(5)?,
-                            last_event_at: row.get(6)?,
-                            user_message_count: row.get::<_, i64>(7)?.max(0),
-                        })
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-            })?;
-            let Some(input) = input else {
-                continue;
-            };
-            let metadata = serde_json::from_str::<Value>(&input.metadata_json)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let events = session_usage_events(store, &input.session_id)?;
-            let event_contents = events
-                .iter()
-                .map(|event| event.content.as_str())
-                .collect::<Vec<_>>();
-            let session_class =
-                ingest::classify_session(&input.source_kind, &metadata, &event_contents);
-            let usage = ingest::extract_session_usage(&input.source_kind, &events);
-            rows.push(SessionFactRow {
-                session_id: input.session_id,
-                source_kind: input.source_kind,
-                workspace_path: workspace_path(&metadata),
-                session_class: session_class.as_str(),
-                models_json: serde_json::to_string(&usage.models)?,
-                primary_model: usage.primary_model,
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                event_count: input.event_count,
-                user_message_count: input.user_message_count,
-                duration_secs: duration_secs(
-                    input.first_event_at.as_deref(),
-                    input.last_event_at.as_deref(),
-                ),
-                first_event_at: input.first_event_at,
-                last_event_at: input.last_event_at,
-            });
+    store.with_conn(|conn| {
+        let mut processed = 0usize;
+        let mut last_progress = Instant::now();
+        for batch in session_ids.chunks(SESSION_FACT_BATCH_SIZE) {
+            let (inputs, events) = load_session_fact_batch(conn, batch)?;
+            let rows = project_session_fact_batch(
+                inputs,
+                events,
+                processed,
+                &mut progress,
+                &mut last_progress,
+            )?;
+            insert_session_facts_batch(conn, &rows)?;
+            processed += rows.len();
+            progress(processed);
+            last_progress = Instant::now();
         }
-        insert_session_facts_batch(store, &rows)?;
-        processed += batch.len();
-        progress(processed);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
-fn session_usage_events(store: &Store, session_id: &str) -> Result<Vec<ingest::UsageEvent>> {
-    store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT content, metadata_json
-             FROM events INDEXED BY idx_events_session_ordinal
-             WHERE session_id = ?1
-             ORDER BY ordinal",
+fn load_session_fact_batch<S: AsRef<str>>(
+    conn: &Connection,
+    session_ids: &[S],
+) -> Result<(Vec<SessionFactInput>, HashMap<String, Vec<ingest::UsageEvent>>)> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS session_fact_scope (
+           session_id TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM temp.session_fact_scope;",
+    )?;
+    {
+        let mut insert = conn.prepare(
+            "INSERT INTO temp.session_fact_scope (session_id) VALUES (?1)",
         )?;
-        let rows = stmt.query_map([session_id], |row| {
-            let metadata = row.get::<_, String>(1)?;
-            Ok(ingest::UsageEvent {
-                content: row.get(0)?,
-                metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| serde_json::json!({})),
+        for session_id in session_ids {
+            insert.execute([session_id.as_ref()])?;
+        }
+    }
+
+    let inputs = {
+        let mut stmt = conn.prepare(
+            "WITH user_message_counts AS (
+               SELECT hi.session_id, COUNT(*) AS user_message_count
+               FROM temp.session_fact_scope scope
+               CROSS JOIN history_items hi INDEXED BY idx_history_items_session_order
+                 ON hi.session_id = scope.session_id
+               WHERE hi.tier = 'conversation' AND hi.kind = 'user'
+               GROUP BY hi.session_id
+             )
+             SELECT s.id, s.source_kind, s.metadata_json, sa.event_count,
+                    COALESCE(sa.first_event_at, s.started_at),
+                    COALESCE(sa.last_event_at, s.updated_at),
+                    COALESCE(users.user_message_count, 0)
+             FROM temp.session_fact_scope scope
+             CROSS JOIN sessions s ON s.id = scope.session_id
+             LEFT JOIN session_activity sa ON sa.session_id = s.id
+             LEFT JOIN user_message_counts users ON users.session_id = s.id
+             ORDER BY s.rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionFactInput {
+                session_id: row.get(0)?,
+                source_kind: row.get(1)?,
+                metadata_json: row.get(2)?,
+                event_count: row.get::<_, Option<i64>>(3)?.map(|count| count.max(0)),
+                first_event_at: row.get(4)?,
+                last_event_at: row.get(5)?,
+                user_message_count: row.get::<_, i64>(6)?.max(0),
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let events = session_usage_events(conn)?;
+    Ok((inputs, events))
+}
+
+fn session_usage_events(
+    conn: &Connection,
+) -> Result<HashMap<String, Vec<ingest::UsageEvent>>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.session_id, e.content, e.metadata_json
+         FROM temp.session_fact_scope scope
+         CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+           ON e.session_id = scope.session_id
+         ORDER BY e.session_id, e.ordinal",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let metadata = row.get::<_, String>(2)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            ingest::UsageEvent {
+                content: row.get(1)?,
+                metadata: serde_json::from_str(&metadata)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            },
+        ))
+    })?;
+    let mut events = HashMap::<String, Vec<ingest::UsageEvent>>::new();
+    for row in rows {
+        let (session_id, event) = row?;
+        events.entry(session_id).or_default().push(event);
+    }
+    Ok(events)
+}
+
+fn project_session_fact_batch(
+    inputs: Vec<SessionFactInput>,
+    mut events: HashMap<String, Vec<ingest::UsageEvent>>,
+    processed: usize,
+    progress: &mut impl FnMut(usize),
+    last_progress: &mut Instant,
+) -> Result<Vec<SessionFactRow>> {
+    let mut rows = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let metadata = serde_json::from_str::<Value>(&input.metadata_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let session_events = events.remove(&input.session_id).unwrap_or_default();
+        let event_contents = session_events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        let session_class =
+            ingest::classify_session(&input.source_kind, &metadata, &event_contents);
+        let usage = ingest::extract_session_usage(&input.source_kind, &session_events);
+        rows.push(SessionFactRow {
+            session_id: input.session_id,
+            source_kind: input.source_kind,
+            workspace_path: workspace_path(&metadata),
+            session_class: session_class.as_str(),
+            models_json: serde_json::to_string(&usage.models)?,
+            primary_model: usage.primary_model,
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+            event_count: input.event_count.unwrap_or(i64::try_from(session_events.len())?),
+            user_message_count: input.user_message_count,
+            duration_secs: duration_secs(
+                input.first_event_at.as_deref(),
+                input.last_event_at.as_deref(),
+            ),
+            first_event_at: input.first_event_at,
+            last_event_at: input.last_event_at,
+        });
+        if last_progress.elapsed() >= Duration::from_secs(1) {
+            progress(processed + rows.len());
+            *last_progress = Instant::now();
+        }
+    }
+    Ok(rows)
 }
 
 fn workspace_path(metadata: &Value) -> Option<String> {
@@ -1777,71 +1846,77 @@ fn duration_secs(first: Option<&str>, last: Option<&str>) -> Option<i64> {
     Some((last - first).num_seconds().max(0))
 }
 
-fn insert_session_facts_batch(store: &Store, rows: &[SessionFactRow<'_>]) -> Result<()> {
-    store.with_conn(|conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("starting session facts batch")?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO session_facts
-                 (session_id, source_kind, workspace_path, session_class, models_json,
-                  primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
-                  user_message_count, first_event_at, last_event_at, duration_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                   source_kind = excluded.source_kind,
-                   workspace_path = excluded.workspace_path,
-                   session_class = excluded.session_class,
-                   models_json = excluded.models_json,
-                   primary_model = excluded.primary_model,
-                   input_tokens = excluded.input_tokens,
-                   cached_input_tokens = excluded.cached_input_tokens,
-                   output_tokens = excluded.output_tokens,
-                   event_count = excluded.event_count,
-                   user_message_count = excluded.user_message_count,
-                   first_event_at = excluded.first_event_at,
-                   last_event_at = excluded.last_event_at,
-                   duration_secs = excluded.duration_secs",
-            )?;
-            for row in rows {
-                stmt.execute(params![
-                    row.session_id,
-                    row.source_kind,
-                    row.workspace_path,
-                    row.session_class,
-                    row.models_json,
-                    row.primary_model,
-                    row.input_tokens,
-                    row.cached_input_tokens,
-                    row.output_tokens,
-                    row.event_count,
-                    row.user_message_count,
-                    row.first_event_at,
-                    row.last_event_at,
-                    row.duration_secs,
-                ])?;
-            }
-        }
-        tx.commit().context("committing session facts batch")
-    })
+fn insert_session_facts_batch(conn: &Connection, rows: &[SessionFactRow]) -> Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("starting session facts batch")?;
+    insert_session_fact_rows(
+        &tx,
+        "INSERT INTO session_facts
+         (session_id, source_kind, workspace_path, session_class, models_json,
+          primary_model, input_tokens, cached_input_tokens, output_tokens, event_count,
+          user_message_count, first_event_at, last_event_at, duration_secs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(session_id) DO UPDATE SET
+           source_kind = excluded.source_kind,
+           workspace_path = excluded.workspace_path,
+           session_class = excluded.session_class,
+           models_json = excluded.models_json,
+           primary_model = excluded.primary_model,
+           input_tokens = excluded.input_tokens,
+           cached_input_tokens = excluded.cached_input_tokens,
+           output_tokens = excluded.output_tokens,
+           event_count = excluded.event_count,
+           user_message_count = excluded.user_message_count,
+           first_event_at = excluded.first_event_at,
+           last_event_at = excluded.last_event_at,
+           duration_secs = excluded.duration_secs",
+        rows,
+    )?;
+    tx.commit().context("committing session facts batch")
+}
+
+fn insert_session_fact_rows(
+    conn: &Connection,
+    sql: &str,
+    rows: &[SessionFactRow],
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    for row in rows {
+        stmt.execute(params![
+            row.session_id,
+            row.source_kind,
+            row.workspace_path,
+            row.session_class,
+            row.models_json,
+            row.primary_model,
+            row.input_tokens,
+            row.cached_input_tokens,
+            row.output_tokens,
+            row.event_count,
+            row.user_message_count,
+            row.first_event_at,
+            row.last_event_at,
+            row.duration_secs,
+        ])?;
+    }
+    Ok(())
 }
 
 struct SessionFactInput {
-    rowid: i64,
     session_id: String,
     source_kind: String,
     metadata_json: String,
-    event_count: i64,
+    event_count: Option<i64>,
     user_message_count: i64,
     first_event_at: Option<String>,
     last_event_at: Option<String>,
 }
 
-struct SessionFactRow<'a> {
+struct SessionFactRow {
     session_id: String,
     source_kind: String,
     workspace_path: Option<String>,
-    session_class: &'a str,
+    session_class: &'static str,
     models_json: String,
     primary_model: Option<String>,
     input_tokens: Option<i64>,
