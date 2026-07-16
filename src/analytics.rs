@@ -1707,17 +1707,15 @@ fn relationship_recompute_scope(
         }
     }
 
-    let mut selected_codex = Vec::new();
-    let mut selected_events = HashMap::new();
-    loop {
-        selected_codex = sessions
+    let (selected_codex, selected_events) = loop {
+        let selected_codex = sessions
             .iter()
             .filter(|session| {
                 session.source_kind == "codex" && affected.contains(&session.session_id)
             })
             .cloned()
             .collect::<Vec<_>>();
-        selected_events.clear();
+        let mut selected_events = HashMap::new();
         for batch in selected_codex.chunks(100) {
             selected_events.extend(store.with_conn(|conn| {
                 load_relationship_event_batch(conn, batch)
@@ -1744,9 +1742,9 @@ fn relationship_recompute_scope(
             }
         }
         if affected.len() == before {
-            break;
+            break (selected_codex, selected_events);
         }
-    }
+    };
     if !selected_codex.is_empty() {
         let mut first_hashes = HashMap::<String, HashSet<String>>::new();
         for session in &selected_codex {
