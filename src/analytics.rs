@@ -399,6 +399,7 @@ fn refresh_report_with_progress(
         provenance_sessions.extend(session_ids.iter().cloned());
     }
     let affected_sessions = session_ids.union(&provenance_sessions).count();
+    let relationship_row_count = statuses[0].row_count as usize;
 
     let relationship_work = if relationship_fallback {
         all_session_ids(store)?.len().max(1)
@@ -407,7 +408,8 @@ fn refresh_report_with_progress(
     };
     let fact_work = session_ids.len().max(1);
     let provenance_work = provenance_message_count(store, &provenance_sessions)?.max(1);
-    let report_work = 15 + total_conversation_messages(store)?;
+    let conversation_messages = total_conversation_messages(store)?;
+    let report_work = 15 + conversation_messages;
     let total = relationship_work + fact_work + provenance_work + report_work;
     let mut completed = 0usize;
 
@@ -436,7 +438,9 @@ fn refresh_report_with_progress(
             })
         })?;
     } else {
-        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || Ok(()))?;
+        run_projection_refresh(store, PROJECTIONS[0], captured_input_rowid, || {
+            Ok(relationship_row_count)
+        })?;
     }
     completed = relationship_work;
     progress(ReportRefreshProgress {
@@ -473,6 +477,13 @@ fn refresh_report_with_progress(
                     total,
                     detail: format!("refreshed {processed}/{} session facts", session_ids.len()),
                 });
+            })?;
+            store.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count.max(0) as usize)
+                .map_err(Into::into)
             })
         }
     })?;
@@ -520,7 +531,8 @@ fn refresh_report_with_progress(
                         ),
                     });
                 },
-            )
+            )?;
+            Ok(conversation_messages)
         }
     })?;
     completed = provenance_start + provenance_work;
@@ -549,7 +561,7 @@ fn refresh_report_with_progress(
         });
     });
     match report_result {
-        Ok(()) => set_projection_ready(store, PROJECTIONS[3], captured_input_rowid)?,
+        Ok(()) => set_projection_ready(store, PROJECTIONS[3], captured_input_rowid, 1)?,
         Err(error) => {
             let _ = set_projection_failed(
                 store,
@@ -580,11 +592,11 @@ fn run_projection_refresh(
     store: &Store,
     projection: Projection,
     input_rowid: i64,
-    action: impl FnOnce() -> Result<()>,
+    action: impl FnOnce() -> Result<usize>,
 ) -> Result<()> {
     set_projection_building(store, projection, input_rowid)?;
     match action() {
-        Ok(()) => set_projection_ready(store, projection, input_rowid),
+        Ok(row_count) => set_projection_ready(store, projection, input_rowid, row_count),
         Err(error) => {
             let _ = set_projection_failed(store, projection, input_rowid, &error.to_string());
             Err(error)
@@ -698,7 +710,7 @@ fn rebuild_projection(
     let input_rowid = store.with_conn(max_event_rowid)?;
     set_projection_building(store, projection, input_rowid)?;
 
-    let result = match projection.name {
+    let result: Result<usize> = match projection.name {
         SESSION_RELATIONSHIPS_PROJECTION => rebuild_session_relationships_with_detailed_progress(
             store,
             |processed, total, detail| {
@@ -724,13 +736,17 @@ fn rebuild_projection(
         REPORT_SNAPSHOT_PROJECTION => {
             crate::report::rebuild_snapshot_with_progress(store, |event| {
                 progress(event.detail);
-            })
+            })?;
+            Ok(1)
         }
-        _ => clear_projection(store, projection),
+        _ => {
+            clear_projection(store, projection)?;
+            Ok(0)
+        }
     };
 
     match result {
-        Ok(()) => set_projection_ready(store, projection, input_rowid),
+        Ok(row_count) => set_projection_ready(store, projection, input_rowid, row_count),
         Err(error) => {
             let _ = set_projection_failed(store, projection, input_rowid, &error.to_string());
             Err(error)
@@ -741,7 +757,7 @@ fn rebuild_projection(
 fn rebuild_session_relationships_with_progress(
     store: &Store,
     mut progress: impl FnMut(usize, usize),
-) -> Result<()> {
+) -> Result<usize> {
     rebuild_session_relationships_with_detailed_progress(store, |processed, total, detail| {
         if detail.is_none() {
             progress(processed, total);
@@ -752,7 +768,7 @@ fn rebuild_session_relationships_with_progress(
 fn rebuild_session_relationships_with_detailed_progress(
     store: &Store,
     mut progress: impl FnMut(usize, usize, Option<String>),
-) -> Result<()> {
+) -> Result<usize> {
     let projection = PROJECTIONS[0];
     clear_projection(store, projection)?;
     clear_event_session_overrides(store)?;
@@ -937,13 +953,14 @@ fn rebuild_session_relationships_with_detailed_progress(
         });
     }
 
+    let row_count = rows.len();
     for batch in rows.chunks(500) {
         insert_session_relationships_batch(store, batch)?;
     }
     for batch in event_overrides.chunks(500) {
         insert_event_session_overrides_batch(store, batch)?;
     }
-    Ok(())
+    Ok(row_count)
 }
 
 fn relationship_parent_session_id(
@@ -1523,7 +1540,7 @@ fn total_conversation_messages(store: &Store) -> Result<usize> {
 fn rebuild_session_facts_with_progress(
     store: &Store,
     mut progress: impl FnMut(usize),
-) -> Result<()> {
+) -> Result<usize> {
     const BATCH_SIZE: i64 = 500;
 
     clear_projection(store, PROJECTIONS[2])?;
@@ -1611,7 +1628,7 @@ fn rebuild_session_facts_with_progress(
         progress(processed);
         last_progress = Instant::now();
     }
-    Ok(())
+    Ok(processed)
 }
 
 fn refresh_session_facts_scoped(
@@ -2045,7 +2062,10 @@ fn refresh_message_provenance_scoped(
     })
 }
 
-fn rebuild_message_provenance(store: &Store, mut progress: impl FnMut(String)) -> Result<()> {
+fn rebuild_message_provenance(
+    store: &Store,
+    mut progress: impl FnMut(String),
+) -> Result<usize> {
     const BATCH_SIZE: i64 = 500;
 
     progress("finding repeated message templates".to_string());
@@ -2284,7 +2304,8 @@ fn rebuild_message_provenance(store: &Store, mut progress: impl FnMut(String)) -
             progress(format!("storing {stored}/{total_messages} classified messages"));
         }
         progress("committing message provenance".to_string());
-        tx.commit().context("committing message provenance rebuild")
+        tx.commit().context("committing message provenance rebuild")?;
+        Ok(processed)
     })
 }
 
@@ -2442,7 +2463,6 @@ struct ProvenanceRow<'a> {
 fn projection_freshness(store: &Store, projection: Projection) -> Result<ProjectionFreshness> {
     store.with_conn(|conn| {
         let input_rowid = max_event_rowid(conn)?;
-        let row_count = table_count(conn, projection.table)?;
         let stored = conn
             .query_row(
                 "SELECT status, input_high_watermark
@@ -2481,7 +2501,7 @@ fn projection_freshness(store: &Store, projection: Projection) -> Result<Project
             new_event_rows: stored_input_rowid
                 .map(|stored| input_rowid.saturating_sub(stored) as u64)
                 .unwrap_or(input_rowid.max(0) as u64),
-            row_count,
+            row_count: state.as_ref().map_or(0, |state| state.row_count),
         })
     })
 }
@@ -2493,21 +2513,25 @@ fn max_event_rowid(conn: &Connection) -> Result<i64> {
     .context("reading analytics input high-water mark")
 }
 
-fn table_count(conn: &Connection, table: &str) -> Result<u64> {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|count| count.max(0) as u64)
-    .with_context(|| format!("counting {table} rows"))
-}
 
 fn set_projection_building(store: &Store, projection: Projection, input_rowid: i64) -> Result<()> {
     set_projection_status(store, projection, input_rowid, "building", None, 0)
 }
 
-fn set_projection_ready(store: &Store, projection: Projection, input_rowid: i64) -> Result<()> {
-    let row_count = store.with_conn(|conn| table_count(conn, projection.table))?;
-    set_projection_status(store, projection, input_rowid, "ready", None, row_count)
+fn set_projection_ready(
+    store: &Store,
+    projection: Projection,
+    input_rowid: i64,
+    row_count: usize,
+) -> Result<()> {
+    set_projection_status(
+        store,
+        projection,
+        input_rowid,
+        "ready",
+        None,
+        row_count as u64,
+    )
 }
 
 fn set_projection_failed(
