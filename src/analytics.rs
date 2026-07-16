@@ -363,6 +363,7 @@ fn refresh_report_with_progress(
         .chain(&delta.repaired_events)
         .cloned()
         .collect::<HashSet<_>>();
+    let mut unmapped_event_ids = event_ids.clone();
     let mut session_ids = delta
         .inserted_sessions
         .iter()
@@ -373,6 +374,7 @@ fn refresh_report_with_progress(
     if invalid_state {
         event_ids = all_event_ids(store, captured_input_rowid)?;
         session_ids = all_session_ids(store)?;
+        unmapped_event_ids.clear();
     } else if statuses.iter().any(|status| status.stale) {
         let catch_up_after = statuses
             .iter()
@@ -381,11 +383,12 @@ fn refresh_report_with_progress(
             .unwrap_or(0);
         let catch_up = events_after_watermark(store, catch_up_after, captured_input_rowid)?;
         for (event_id, session_id) in catch_up {
+            unmapped_event_ids.remove(&event_id);
             event_ids.insert(event_id);
             session_ids.insert(session_id);
         }
     }
-    session_ids.extend(session_ids_for_events(store, &event_ids)?);
+    session_ids.extend(session_ids_for_events(store, &unmapped_event_ids)?);
 
     let relationship_fallback = invalid_state
         || !delta.inserted_sessions.is_empty()
@@ -393,7 +396,7 @@ fn refresh_report_with_progress(
     let mut provenance_sessions = if invalid_state || relationship_fallback {
         all_session_ids(store)?
     } else {
-        widen_provenance_sessions(store, &session_ids, prior_candidate_hashes)?
+        widen_provenance_sessions(store, &session_ids, &event_ids, prior_candidate_hashes)?
     };
     if provenance_sessions.is_empty() {
         provenance_sessions.extend(session_ids.iter().cloned());
@@ -402,14 +405,18 @@ fn refresh_report_with_progress(
     let relationship_row_count = statuses[0].row_count as usize;
 
     let relationship_work = if relationship_fallback {
-        all_session_ids(store)?.len().max(1)
+        provenance_sessions.len().max(1)
     } else {
         1
     };
     let fact_work = session_ids.len().max(1);
-    let provenance_work = provenance_message_count(store, &provenance_sessions)?.max(1);
-    let conversation_messages = total_conversation_messages(store)?;
-    let report_work = 15 + conversation_messages;
+    let provenance_work = if relationship_fallback {
+        total_conversation_messages(store)?
+    } else {
+        provenance_message_count(store, &provenance_sessions)?
+    }
+    .max(1);
+    let report_work = 1;
     let total = relationship_work + fact_work + provenance_work + report_work;
     let mut completed = 0usize;
 
@@ -532,7 +539,7 @@ fn refresh_report_with_progress(
                     });
                 },
             )?;
-            Ok(conversation_messages)
+            Ok(total_conversation_messages(store)?)
         }
     })?;
     completed = provenance_start + provenance_work;
@@ -1361,15 +1368,23 @@ fn session_ids_for_events(
     store: &Store,
     event_ids: &HashSet<String>,
 ) -> Result<HashSet<String>> {
+    if event_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut event_ids = event_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    event_ids.sort_unstable();
     store.with_conn(|conn| {
-        let mut stmt = conn.prepare("SELECT session_id FROM events WHERE id = ?1")?;
         let mut session_ids = HashSet::new();
-        for event_id in event_ids {
-            if let Some(session_id) = stmt
-                .query_row([event_id], |row| row.get::<_, String>(0))
-                .optional()?
-            {
-                session_ids.insert(session_id);
+        for batch in event_ids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT session_id FROM events WHERE id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter().copied()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for session_id in rows {
+                session_ids.insert(session_id?);
             }
         }
         Ok(session_ids)
@@ -1453,6 +1468,7 @@ fn relationship_sensitive_scope(
 fn widen_provenance_sessions(
     store: &Store,
     touched: &HashSet<String>,
+    event_ids: &HashSet<String>,
     prior_candidate_hashes: &HashSet<String>,
 ) -> Result<HashSet<String>> {
     store.with_conn(|conn| {
@@ -1481,18 +1497,24 @@ fn widen_provenance_sessions(
             }
         }
 
-        let mut hash_stmt = conn.prepare(
-            "SELECT DISTINCT text_hash FROM history_items
-             WHERE session_id = ?1 AND tier = 'conversation' AND kind = 'user'
-               AND length(text) > 200",
-        )?;
         let mut touched_candidate_hashes = prior_candidate_hashes.clone();
-        for session_id in touched {
-            let hashes = hash_stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
-            for hash in hashes {
+        let mut event_ids = event_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        event_ids.sort_unstable();
+        for batch in event_ids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT text_hash FROM history_items INDEXED BY idx_history_items_event
+                 WHERE event_id IN ({placeholders})
+                   AND tier = 'conversation' AND kind = 'user' AND length(text) > 200"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter().copied()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for hash in rows {
                 touched_candidate_hashes.insert(hash?);
             }
         }
+
         let mut sessions_stmt = conn.prepare(
             "SELECT DISTINCT session_id FROM history_items WHERE text_hash = ?1",
         )?;
@@ -1507,15 +1529,24 @@ fn widen_provenance_sessions(
 }
 
 fn provenance_message_count(store: &Store, session_ids: &HashSet<String>) -> Result<usize> {
+    if session_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut session_ids = session_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    session_ids.sort_unstable();
     store.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM history_items
-             WHERE session_id = ?1 AND tier = 'conversation'
-               AND kind IN ('user', 'assistant')",
-        )?;
         let mut total = 0usize;
-        for session_id in session_ids {
-            let count = stmt.query_row([session_id], |row| row.get::<_, i64>(0))?;
+        for batch in session_ids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let count = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM history_items INDEXED BY idx_history_items_session_order
+                     WHERE session_id IN ({placeholders})
+                       AND tier = 'conversation' AND kind IN ('user', 'assistant')"
+                ),
+                rusqlite::params_from_iter(batch.iter().copied()),
+                |row| row.get::<_, i64>(0),
+            )?;
             total = total.saturating_add(count.max(0) as usize);
         }
         Ok(total)
