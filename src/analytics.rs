@@ -203,6 +203,7 @@ pub fn freshness(store: &Store) -> Result<Vec<ProjectionFreshness>> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn is_stale(store: &Store) -> Result<bool> {
     Ok(freshness(store)?.iter().any(|status| status.stale))
 }
