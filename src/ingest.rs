@@ -269,8 +269,26 @@ pub(crate) struct SessionUsage {
     pub output_tokens: Option<i64>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct CodexEventFact {
+    pub class_signal: Option<SessionClass>,
+    pub model: Option<String>,
+    pub usage_seen: bool,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+pub(crate) fn codex_event_fact(content: &str) -> CodexEventFact {
+    serde_json::from_str::<Value>(content)
+        .ok()
+        .as_ref()
+        .map(codex_event_fact_from_value)
+        .unwrap_or_default()
+}
+
 pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) -> SessionUsage {
-    let mut models = HashMap::<String, usize>::new();
+    let mut models = HashMap::<String, u64>::new();
     let mut input = 0i64;
     let mut cached = 0i64;
     let mut output = 0i64;
@@ -278,23 +296,20 @@ pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) ->
     let mut opencode_messages = BTreeSet::new();
 
     for event in events {
-        let content = serde_json::from_str::<Value>(&event.content).ok();
+        let content = (source_kind != "codex")
+            .then(|| serde_json::from_str::<Value>(&event.content).ok())
+            .flatten();
         match source_kind {
             "codex" => {
-                let Some(value) = content.as_ref() else {
-                    continue;
-                };
-                if let Some(model) = string_at(value, &["payload", "model"]) {
+                let fact = codex_event_fact(&event.content);
+                if let Some(model) = fact.model {
                     *models.entry(model).or_default() += 1;
                 }
-                if let Some(total) = value
-                    .pointer("/payload/info/total_token_usage")
-                    .and_then(Value::as_object)
-                {
+                if fact.usage_seen {
                     usage_seen = true;
-                    input = input.max(json_i64(total.get("input_tokens")));
-                    cached = cached.max(json_i64(total.get("cached_input_tokens")));
-                    output = output.max(json_i64(total.get("output_tokens")));
+                    input = input.max(fact.input_tokens);
+                    cached = cached.max(fact.cached_input_tokens);
+                    output = output.max(fact.output_tokens);
                 }
             }
             "claude_code" => {
@@ -364,22 +379,38 @@ pub(crate) fn extract_session_usage(source_kind: &str, events: &[UsageEvent]) ->
         }
     }
 
-    let primary_model = models
-        .iter()
-        .max_by(|(left_model, left_count), (right_model, right_count)| {
-            left_count
-                .cmp(right_count)
-                .then_with(|| right_model.cmp(left_model))
-        })
-        .map(|(model, _)| model.clone());
-    let mut models = models.into_keys().collect::<Vec<_>>();
+    session_usage_from_aggregates(models, usage_seen, input, cached, output)
+}
+
+pub(crate) fn session_usage_from_aggregates(
+    model_counts: impl IntoIterator<Item = (String, u64)>,
+    usage_seen: bool,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+) -> SessionUsage {
+    let mut primary = None::<(String, u64)>;
+    let mut models = Vec::new();
+    for (model, count) in model_counts {
+        let replace_primary = match primary.as_ref() {
+            None => true,
+            Some((current, current_count)) => {
+                count > *current_count || (count == *current_count && model < *current)
+            }
+        };
+        if replace_primary {
+            primary = Some((model.clone(), count));
+        }
+        models.push(model);
+    }
+    let primary_model = primary.map(|(model, _)| model);
     models.sort();
     SessionUsage {
         models,
         primary_model,
-        input_tokens: usage_seen.then_some(input),
-        cached_input_tokens: usage_seen.then_some(cached),
-        output_tokens: usage_seen.then_some(output),
+        input_tokens: usage_seen.then_some(input_tokens),
+        cached_input_tokens: usage_seen.then_some(cached_input_tokens),
+        output_tokens: usage_seen.then_some(output_tokens),
     }
 }
 
@@ -1646,41 +1677,52 @@ fn omp_parent_session_external_id(parent: &str) -> Option<String> {
 }
 
 fn classify_codex_session(event_contents: &[&str]) -> SessionClass {
-    for content in event_contents {
-        let Ok(value) = serde_json::from_str::<Value>(content) else {
-            continue;
-        };
-        let payload = value.get("payload").unwrap_or(&value);
-        if let Some(thread_source) = string_at(payload, &["thread_source"])
-            .or_else(|| string_at(payload, &["source", "thread_source"]))
-        {
-            return match thread_source.as_str() {
-                "user" => SessionClass::Interactive,
-                "subagent" => SessionClass::Subagent,
-                "automation" => SessionClass::Automation,
-                _ => SessionClass::Unknown,
-            };
-        }
-        if payload
-            .get("source")
-            .and_then(Value::as_object)
-            .is_some_and(|source| source.contains_key("subagent"))
-        {
-            return SessionClass::Subagent;
-        }
+    event_contents
+        .iter()
+        .find_map(|content| codex_event_fact(content).class_signal)
+        .unwrap_or(SessionClass::Interactive)
+}
+
+fn codex_event_fact_from_value(value: &Value) -> CodexEventFact {
+    let payload = value.get("payload").unwrap_or(value);
+    let class_signal = if let Some(thread_source) = string_at(payload, &["thread_source"])
+        .or_else(|| string_at(payload, &["source", "thread_source"]))
+    {
+        Some(match thread_source.as_str() {
+            "user" => SessionClass::Interactive,
+            "subagent" => SessionClass::Subagent,
+            "automation" => SessionClass::Automation,
+            _ => SessionClass::Unknown,
+        })
+    } else if payload
+        .get("source")
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent"))
+    {
+        Some(SessionClass::Subagent)
+    } else {
         match string_at(payload, &["originator"]).as_deref() {
-            Some("codex_exec") => return SessionClass::Automation,
-            Some("codex_chatgpt_ios_remote") => return SessionClass::Interactive,
-            _ => {}
+            Some("codex_exec") => Some(SessionClass::Automation),
+            Some("codex_chatgpt_ios_remote") => Some(SessionClass::Interactive),
+            _ => string_at(payload, &["base_instructions"])
+                .or_else(|| string_at(payload, &["base_instructions", "text"]))
+                .filter(|instructions| is_reviewer_instructions(instructions))
+                .map(|_| SessionClass::Automation),
         }
-        if string_at(payload, &["base_instructions"])
-            .or_else(|| string_at(payload, &["base_instructions", "text"]))
-            .is_some_and(|instructions| is_reviewer_instructions(&instructions))
-        {
-            return SessionClass::Automation;
-        }
+    };
+    let model = string_at(value, &["payload", "model"]);
+    let usage = value
+        .pointer("/payload/info/total_token_usage")
+        .and_then(Value::as_object);
+    CodexEventFact {
+        class_signal,
+        model,
+        usage_seen: usage.is_some(),
+        input_tokens: usage.map_or(0, |usage| json_i64(usage.get("input_tokens"))),
+        cached_input_tokens: usage
+            .map_or(0, |usage| json_i64(usage.get("cached_input_tokens"))),
+        output_tokens: usage.map_or(0, |usage| json_i64(usage.get("output_tokens"))),
     }
-    SessionClass::Interactive
 }
 
 fn is_reviewer_instructions(instructions: &str) -> bool {

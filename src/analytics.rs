@@ -4,6 +4,7 @@ use crate::provenance;
 use crate::storage::{ImportDelta, Store};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::functions::{Aggregate, Context as SqlContext, FunctionFlags};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +16,7 @@ pub const MESSAGE_PROVENANCE_VERSION: u32 = 8;
 pub const SESSION_RELATIONSHIPS_PROJECTION: &str = "session_relationships";
 pub const SESSION_RELATIONSHIPS_VERSION: u32 = 8;
 pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
-pub const SESSION_FACTS_VERSION: u32 = 2;
+pub const SESSION_FACTS_VERSION: u32 = 3;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
 pub const REPORT_SNAPSHOT_VERSION: u32 = 8;
 pub(crate) const REPORT_PROJECTION_COUNT: usize = 4;
@@ -1733,7 +1734,7 @@ fn refresh_session_facts_scoped(
 fn load_session_fact_batch<S: AsRef<str>>(
     conn: &Connection,
     session_ids: &[S],
-) -> Result<(Vec<SessionFactInput>, HashMap<String, Vec<ingest::UsageEvent>>)> {
+) -> Result<(Vec<SessionFactInput>, SessionEventFacts)> {
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS session_fact_scope (
            session_id TEXT PRIMARY KEY
@@ -1782,16 +1783,61 @@ fn load_session_fact_batch<S: AsRef<str>>(
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let events = session_usage_events(conn)?;
-    Ok((inputs, events))
+    let facts = session_usage_events(conn)?;
+    Ok((inputs, facts))
 }
 
-fn session_usage_events(
-    conn: &Connection,
-) -> Result<HashMap<String, Vec<ingest::UsageEvent>>> {
+fn session_usage_events(conn: &Connection) -> Result<SessionEventFacts> {
+    conn.create_aggregate_function::<CodexSessionFactAccumulator, _, String>(
+        "codex_session_fact",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        CodexSessionFactAggregate,
+    )?;
+
+    let mut facts = SessionEventFacts::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.session_id, codex_session_fact(e.content, e.ordinal)
+             FROM temp.session_fact_scope scope
+             CROSS JOIN sessions s ON s.id = scope.session_id AND s.source_kind = 'codex'
+             CROSS JOIN events e INDEXED BY idx_events_session_ordinal
+               ON e.session_id = scope.session_id
+             GROUP BY e.session_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (session_id, serialized) = row?;
+            let compact = serde_json::from_str::<CodexSessionFactOutput>(&serialized)?;
+            facts.insert(
+                session_id,
+                SessionEventFact {
+                    event_row_count: compact.event_row_count,
+                    classified_from_events: Some(match compact.session_class.as_str() {
+                        "interactive" => SessionClass::Interactive,
+                        "subagent" => SessionClass::Subagent,
+                        "automation" => SessionClass::Automation,
+                        _ => SessionClass::Unknown,
+                    }),
+                    usage: ingest::SessionUsage {
+                        models: compact.models,
+                        primary_model: compact.primary_model,
+                        input_tokens: compact.input_tokens,
+                        cached_input_tokens: compact.cached_input_tokens,
+                        output_tokens: compact.output_tokens,
+                    },
+                    legacy_events: Vec::new(),
+                },
+            );
+        }
+    }
+
     let mut stmt = conn.prepare(
         "SELECT e.session_id, e.content, e.metadata_json
          FROM temp.session_fact_scope scope
+         CROSS JOIN sessions s ON s.id = scope.session_id AND s.source_kind <> 'codex'
          CROSS JOIN events e INDEXED BY idx_events_session_ordinal
            ON e.session_id = scope.session_id
          ORDER BY e.session_id, e.ordinal",
@@ -1807,17 +1853,18 @@ fn session_usage_events(
             },
         ))
     })?;
-    let mut events = HashMap::<String, Vec<ingest::UsageEvent>>::new();
     for row in rows {
         let (session_id, event) = row?;
-        events.entry(session_id).or_default().push(event);
+        let fact = facts.entry(session_id).or_default();
+        fact.event_row_count += 1;
+        fact.legacy_events.push(event);
     }
-    Ok(events)
+    Ok(facts)
 }
 
 fn project_session_fact_batch(
     inputs: Vec<SessionFactInput>,
-    mut events: HashMap<String, Vec<ingest::UsageEvent>>,
+    mut facts: SessionEventFacts,
     processed: usize,
     progress: &mut impl FnMut(usize),
     last_progress: &mut Instant,
@@ -1826,14 +1873,24 @@ fn project_session_fact_batch(
     for input in inputs {
         let metadata = serde_json::from_str::<Value>(&input.metadata_json)
             .unwrap_or_else(|_| serde_json::json!({}));
-        let session_events = events.remove(&input.session_id).unwrap_or_default();
-        let event_contents = session_events
-            .iter()
-            .map(|event| event.content.as_str())
-            .collect::<Vec<_>>();
-        let session_class =
-            ingest::classify_session(&input.source_kind, &metadata, &event_contents);
-        let usage = ingest::extract_session_usage(&input.source_kind, &session_events);
+        let fact = facts.remove(&input.session_id).unwrap_or_default();
+        let (session_class, usage) = if input.source_kind == "codex" {
+            (
+                fact.classified_from_events
+                    .unwrap_or(SessionClass::Interactive),
+                fact.usage,
+            )
+        } else {
+            let event_contents = fact
+                .legacy_events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>();
+            (
+                ingest::classify_session(&input.source_kind, &metadata, &event_contents),
+                ingest::extract_session_usage(&input.source_kind, &fact.legacy_events),
+            )
+        };
         rows.push(SessionFactRow {
             session_id: input.session_id,
             source_kind: input.source_kind,
@@ -1844,7 +1901,7 @@ fn project_session_fact_batch(
             input_tokens: usage.input_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             output_tokens: usage.output_tokens,
-            event_count: input.event_count.unwrap_or(i64::try_from(session_events.len())?),
+            event_count: input.event_count.unwrap_or(fact.event_row_count),
             user_message_count: input.user_message_count,
             duration_secs: duration_secs(
                 input.first_event_at.as_deref(),
@@ -1930,6 +1987,107 @@ fn insert_session_fact_rows(
     }
     Ok(())
 }
+
+#[derive(Default)]
+struct CodexSessionFactAccumulator {
+    event_row_count: i64,
+    first_class: Option<(i64, SessionClass)>,
+    model_counts: HashMap<String, u64>,
+    usage_seen: bool,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+}
+
+struct CodexSessionFactAggregate;
+
+impl Aggregate<CodexSessionFactAccumulator, String> for CodexSessionFactAggregate {
+    fn init(&self, _context: &mut SqlContext<'_>) -> rusqlite::Result<CodexSessionFactAccumulator> {
+        Ok(CodexSessionFactAccumulator::default())
+    }
+
+    fn step(
+        &self,
+        context: &mut SqlContext<'_>,
+        accumulator: &mut CodexSessionFactAccumulator,
+    ) -> rusqlite::Result<()> {
+        let content = context.get::<String>(0)?;
+        let ordinal = context.get::<i64>(1)?;
+        let fact = ingest::codex_event_fact(&content);
+        accumulator.event_row_count += 1;
+        if let Some(class) = fact.class_signal {
+            if accumulator
+                .first_class
+                .is_none_or(|(first_ordinal, _)| ordinal < first_ordinal)
+            {
+                accumulator.first_class = Some((ordinal, class));
+            }
+        }
+        if let Some(model) = fact.model {
+            *accumulator.model_counts.entry(model).or_default() += 1;
+        }
+        if fact.usage_seen {
+            accumulator.usage_seen = true;
+            accumulator.input_tokens = accumulator.input_tokens.max(fact.input_tokens);
+            accumulator.cached_input_tokens = accumulator
+                .cached_input_tokens
+                .max(fact.cached_input_tokens);
+            accumulator.output_tokens = accumulator.output_tokens.max(fact.output_tokens);
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _context: &mut SqlContext<'_>,
+        accumulator: Option<CodexSessionFactAccumulator>,
+    ) -> rusqlite::Result<String> {
+        let accumulator = accumulator.unwrap_or_default();
+        let usage = ingest::session_usage_from_aggregates(
+            accumulator.model_counts,
+            accumulator.usage_seen,
+            accumulator.input_tokens,
+            accumulator.cached_input_tokens,
+            accumulator.output_tokens,
+        );
+        serde_json::to_string(&CodexSessionFactOutput {
+            event_row_count: accumulator.event_row_count,
+            session_class: accumulator
+                .first_class
+                .map(|(_, class)| class)
+                .unwrap_or(SessionClass::Interactive)
+                .as_str()
+                .to_owned(),
+            models: usage.models,
+            primary_model: usage.primary_model,
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+        })
+        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct CodexSessionFactOutput {
+    event_row_count: i64,
+    session_class: String,
+    models: Vec<String>,
+    primary_model: Option<String>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+#[derive(Default)]
+struct SessionEventFact {
+    event_row_count: i64,
+    classified_from_events: Option<SessionClass>,
+    usage: ingest::SessionUsage,
+    legacy_events: Vec<ingest::UsageEvent>,
+}
+
+type SessionEventFacts = HashMap<String, SessionEventFact>;
 
 struct SessionFactInput {
     session_id: String,
@@ -2263,7 +2421,7 @@ fn rebuild_message_provenance(
                     CASE WHEN eso.event_id IS NULL AND sr.relationship = 'subagent'
                               AND EXISTS (
                                 SELECT 1 FROM temp.inherited_parent_items inherited
-                                WHERE inherited.child_session_id = hi.session_id
+                                WHERE inherited.parent_session_id = sr.parent_session_id
                                   AND inherited.kind = hi.kind
                                   AND inherited.text_hash = hi.text_hash
                               )
@@ -2451,10 +2609,10 @@ fn inherited_parent_items(
          DROP TABLE IF EXISTS temp.inherited_parent_scope;
          DROP TABLE IF EXISTS temp.inherited_parent_message_batch;
          CREATE TEMP TABLE inherited_parent_items (
-           child_session_id TEXT NOT NULL,
+           parent_session_id TEXT NOT NULL,
            kind TEXT NOT NULL,
            text_hash TEXT NOT NULL,
-           PRIMARY KEY (child_session_id, kind, text_hash)
+           PRIMARY KEY (parent_session_id, kind, text_hash)
          ) WITHOUT ROWID;
          CREATE TEMP TABLE inherited_parent_scope (
            parent_session_id TEXT PRIMARY KEY
@@ -2524,12 +2682,9 @@ fn inherited_parent_items(
         }
         conn.execute(
             "INSERT OR IGNORE INTO temp.inherited_parent_items
-             (child_session_id, kind, text_hash)
-             SELECT sr.session_id, batch.kind, batch.text_hash
-             FROM temp.inherited_parent_message_batch batch
-             CROSS JOIN session_relationships sr INDEXED BY idx_session_relationships_parent
-               ON sr.parent_session_id = batch.parent_session_id
-             WHERE sr.relationship = 'subagent'",
+             (parent_session_id, kind, text_hash)
+             SELECT parent_session_id, kind, text_hash
+             FROM temp.inherited_parent_message_batch",
             [],
         )?;
         (last_parent, last_ordinal, last_subordinal, last_rowid) = conn.query_row(
