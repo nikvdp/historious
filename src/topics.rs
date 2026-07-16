@@ -410,7 +410,7 @@ fn load_topic_dataset(store: &Store) -> Result<TopicDataset> {
             .optional()
             .map_err(Into::into)
         })?
-        .context("no human topic embeddings found; run `histo lab topics embed`")?;
+        .context("no human topic embeddings found; run `histo report topics embed`")?;
     let rows = store.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT hi.id, e.vector
@@ -433,7 +433,7 @@ fn load_topic_dataset(store: &Store) -> Result<TopicDataset> {
     })?;
     if rows.len() != total {
         bail!(
-            "topic embeddings are incomplete: {} of {} human messages ready; run `histo lab topics embed`",
+            "topic embeddings are incomplete: {} of {} human messages ready; run `histo report topics embed`",
             rows.len(),
             total
         );
@@ -866,7 +866,7 @@ fn current_topic_version(store: &Store) -> Result<String> {
             |row| row.get(0),
         )
         .optional()?
-        .context("no current completed topic version; run `histo lab topics cluster`")
+        .context("no current completed topic version; run `histo report topics cluster`")
     })
 }
 

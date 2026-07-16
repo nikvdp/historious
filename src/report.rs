@@ -508,7 +508,7 @@ fn compute_live_with_progress(
             .filter(|status| status.stale)
             .map(|status| {
                 format!(
-                    "{} is stale by {} event rows; run `histo lab rebuild`",
+                    "{} is stale by {} event rows; run `histo report --update`",
                     status.name, status.new_event_rows
                 )
             })
@@ -527,7 +527,7 @@ fn compute_live_with_progress(
     })?;
     if missing_opencode > 0 {
         warnings.push(format!(
-            "{missing_opencode} OpenCode sessions have no token data; run the OpenCode backfill, then `histo lab rebuild`"
+            "{missing_opencode} OpenCode sessions have no token data; run `histo report backfill-opencode-tokens`, then `histo report --update`"
         ));
     }
     if let Some(warning) = topic_warning {
@@ -635,7 +635,7 @@ fn report_sentiment(
         })?;
         let warning = latest.map(|(version, count)| {
             format!(
-                "sentiment version {version} has {count} of {corpus_messages} messages; resume `histo lab annotate`"
+                "sentiment version {version} has {count} of {corpus_messages} messages; resume `histo enrich sentiment`"
             )
         });
         return Ok((None, warning));
@@ -764,7 +764,7 @@ fn report_topics(
         .map_err(Into::into)
     })?
     else {
-        return Ok((None, Some("topics are unavailable; run `histo lab topics cluster` and `histo lab topics label`".to_string())));
+        return Ok((None, Some("topics are unavailable; run `histo report topics cluster` and `histo enrich topics`".to_string())));
     };
     if silhouette < crate::topics::MIN_TOPIC_SILHOUETTE {
         return Ok((None, None));
@@ -781,7 +781,7 @@ fn report_topics(
         return Ok((
             None,
             Some(format!(
-                "topic version {version} has {labeled} of {selected_k} labels; run `histo lab topics label`"
+                "topic version {version} has {labeled} of {selected_k} labels; run `histo enrich topics`"
             )),
         ));
     }

@@ -774,6 +774,7 @@ pub enum Command {
         all: bool,
     },
     /// Summarize agent usage, projects, models, and working rhythms.
+    #[command(args_conflicts_with_subcommands = true)]
     Report {
         #[arg(
             long,
@@ -817,6 +818,8 @@ pub enum Command {
         color: Option<ColorArg>,
         #[arg(long, value_enum, help = "Comparison window: 7, 14, 28, or all")]
         window: Option<ReportWindowArg>,
+        #[command(subcommand)]
+        command: Option<ReportCommand>,
     },
     /// Send explicitly approved local data to a configured enrichment provider.
     Enrich {
@@ -832,11 +835,6 @@ pub enum Command {
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
-    },
-    /// Rebuild and inspect experimental derived data.
-    Lab {
-        #[command(subcommand)]
-        command: LabCommand,
     },
     /// Output agent instructions for Historious.
     Onboard {
@@ -998,9 +996,7 @@ pub enum MaintenanceCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum LabCommand {
-    /// Rebuild analytics projections from stored events and sessions.
-    Rebuild,
+pub enum ReportCommand {
     /// Add model and token metadata to existing OpenCode events.
     BackfillOpencodeTokens,
     /// Inspect provenance counts and random message samples.
@@ -1012,22 +1008,7 @@ pub enum LabCommand {
         #[arg(short = 'n', default_value_t = 20)]
         limit: usize,
     },
-    /// Score approved sentiment dimensions over human-authored messages.
-    Annotate {
-        #[arg(long, help = "Annotate at most this many incomplete messages")]
-        limit: Option<usize>,
-        #[arg(long, default_value_t = 10)]
-        batch_size: usize,
-        #[arg(long, default_value_t = 1)]
-        concurrency: usize,
-        #[arg(long, default_value = "sentiment-v1")]
-        annotator_version: String,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, help = "Exact chat completions endpoint URL")]
-        url: Option<String>,
-    },
-    /// Build local embeddings for topic analysis.
+    /// Build and cluster local embeddings for topic analysis.
     Topics {
         #[command(subcommand)]
         command: TopicCommand,
@@ -1053,17 +1034,6 @@ pub enum TopicCommand {
         sample_size: usize,
         #[arg(long, help = "Create a new version even when the corpus is unchanged")]
         rebuild: bool,
-    },
-    /// Label current topic clusters with an OpenAI-compatible model.
-    Label {
-        #[arg(long)]
-        limit: Option<usize>,
-        #[arg(long, default_value = "topic-label-v1")]
-        labeler_version: String,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, help = "Exact chat completions endpoint URL")]
-        url: Option<String>,
     },
 }
 
@@ -2627,177 +2597,6 @@ impl Cli {
                     }
                 }
             }
-            Command::Lab { command } => match command {
-                LabCommand::Rebuild => {
-                    let statuses = analytics::rebuild_all_with_progress(&store, |event| {
-                        println!("{}", analytics_rebuild_progress_detail(event));
-                    })?;
-                    if analytics::is_stale(&store)? {
-                        bail!("analytics projections remain stale after rebuild");
-                    }
-                    for status in statuses {
-                        println!("{}: {} rows, fresh", status.name, status.row_count);
-                    }
-                }
-                LabCommand::BackfillOpencodeTokens => {
-                    let outcome = ingest::backfill_default_opencode_usage(&store)?;
-                    println!(
-                        "OpenCode usage backfill: {} assistant parts scanned, {} events updated",
-                        outcome.scanned, outcome.updated
-                    );
-                }
-                LabCommand::Audit {
-                    bucket,
-                    rule,
-                    limit,
-                } => {
-                    if limit == 0 {
-                        bail!("audit sample count must be greater than zero");
-                    }
-                    if let Some(status) = analytics::freshness(&store)?
-                        .into_iter()
-                        .find(|status| status.name == analytics::MESSAGE_PROVENANCE_PROJECTION)
-                        .filter(|status| status.stale)
-                    {
-                        println!(
-                            "Note: provenance is stale by {} event rows; run `histo lab rebuild`.",
-                            status.new_event_rows
-                        );
-                    }
-                    let audit = analytics::audit_provenance(
-                        &store,
-                        bucket.map(ProvenanceBucket::as_str),
-                        rule.as_deref(),
-                        limit,
-                    )?;
-                    println!("Buckets");
-                    for count in audit.buckets {
-                        println!(
-                            "  {:<8} {:<13} {}",
-                            count.authored_by, count.sentiment_usable, count.count
-                        );
-                    }
-                    println!("\nRules");
-                    for count in audit.rules {
-                        println!("  {:<32} {}", count.rule, count.count);
-                    }
-                    println!("\nSamples");
-                    for sample in audit.samples {
-                        println!(
-                            "  [{} · {} · {} · {} · {}] {}",
-                            sample.source_kind,
-                            sample.authored_by,
-                            sample.sentiment_usable,
-                            sample.rule,
-                            sample
-                                .workspace_path
-                                .as_deref()
-                                .unwrap_or("unknown workspace"),
-                            sample.preview
-                        );
-                        if let Some(occurred_at) = sample.occurred_at {
-                            println!("    {occurred_at}");
-                        }
-                    }
-                }
-                LabCommand::Annotate {
-                    limit: _,
-                    batch_size: _,
-                    concurrency: _,
-                    annotator_version: _,
-                    model: _,
-                    url: _,
-                } => {
-                    bail!("`histo lab annotate` is disabled; use consent-gated `histo enrich sentiment`");
-                }
-                LabCommand::Topics {
-                    command: TopicCommand::Embed { limit },
-                } => {
-                    if limit == Some(0) {
-                        bail!("topic embedding limit must be greater than zero");
-                    }
-                    let embedder = topics::load_embedder(&config.data_dir)?;
-                    let outcome = topics::backfill(
-                        &store,
-                        &config.machine_id,
-                        embedder.as_ref(),
-                        limit,
-                    )?;
-                    println!(
-                        "Topic embeddings ({}): {} added, {} reused, {} pending, {} vectors indexed ({:.1}/s)",
-                        outcome.model_id,
-                        outcome.embedded,
-                        outcome.reused,
-                        outcome.pending,
-                        outcome.vectors_indexed,
-                        outcome.per_second()
-                    );
-                }
-                LabCommand::Topics {
-                    command:
-                        TopicCommand::Cluster {
-                            min_k,
-                            max_k,
-                            step,
-                            sample_size,
-                            rebuild,
-                        },
-                } => {
-                    let outcome = topics::cluster(
-                        &store,
-                        &topics::ClusterOptions {
-                            min_k,
-                            max_k,
-                            step,
-                            sample_size,
-                            rebuild,
-                        },
-                        |candidate| {
-                            println!(
-                                "  k={:<3} centroid silhouette {:.4}",
-                                candidate.k, candidate.silhouette
-                            );
-                        },
-                    )?;
-                    if outcome.reused {
-                        for candidate in &outcome.candidates {
-                            println!(
-                                "  k={:<3} centroid silhouette {:.4}",
-                                candidate.k, candidate.silhouette
-                            );
-                        }
-                    }
-                    if outcome.demoted {
-                        println!(
-                            "Topic clustering {}: {} messages, silhouette {:.4}; below the 0.18 coherence bar, stored as miscellaneous{}",
-                            outcome.version,
-                            outcome.item_count,
-                            outcome.silhouette,
-                            if outcome.reused { " (reused)" } else { "" }
-                        );
-                    } else {
-                        println!(
-                            "Topic clustering {}: {} messages, k={}, silhouette {:.4}{}",
-                            outcome.version,
-                            outcome.item_count,
-                            outcome.selected_k,
-                            outcome.silhouette,
-                            if outcome.reused { " (reused)" } else { "" }
-                        );
-                    }
-                }
-                LabCommand::Topics {
-                    command:
-                        TopicCommand::Label {
-                            limit: _,
-                            labeler_version: _,
-                            model: _,
-                            url: _,
-                        },
-                } => {
-                    bail!("`histo lab topics label` is disabled; use consent-gated `histo enrich topics`");
-                }
-            },
             Command::Daemon {
                 interval_secs,
                 max_files,
@@ -2893,34 +2692,174 @@ impl Cli {
                 models,
                 color,
                 window,
-            } => {
-                let (after, before) =
-                    search_time_bounds(today, after.as_deref(), before.as_deref())?;
-                refresh_report_for_command(&store, update, no_update, json || robot)?;
-                let report = report::compute(
-                    &store,
-                    &report::ReportOptions {
-                        after: after.map(|value| value.to_rfc3339()),
-                        before: before.map(|value| value.to_rfc3339()),
-                        project,
-                        sort: sort.into(),
-                    },
-                )?;
-                if json || robot {
-                    serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
-                    println!();
-                } else {
-                    let no_color = plain || std::env::var_os("NO_COLOR").is_some();
-                    let color = should_color(no_color, color, robot);
-                    write_stdout(&report::render_terminal_window(
-                        &report,
-                        terminal_columns(),
-                        color,
-                        window.into(),
-                        models,
-                    ))?;
+                command,
+            } => match command {
+                Some(ReportCommand::BackfillOpencodeTokens) => {
+                    let outcome = ingest::backfill_default_opencode_usage(&store)?;
+                    println!(
+                        "OpenCode usage backfill: {} assistant parts scanned, {} events updated",
+                        outcome.scanned, outcome.updated
+                    );
                 }
-            }
+                Some(ReportCommand::Audit {
+                    bucket,
+                    rule,
+                    limit,
+                }) => {
+                    if limit == 0 {
+                        bail!("audit sample count must be greater than zero");
+                    }
+                    if let Some(status) = analytics::freshness(&store)?
+                        .into_iter()
+                        .find(|status| status.name == analytics::MESSAGE_PROVENANCE_PROJECTION)
+                        .filter(|status| status.stale)
+                    {
+                        println!(
+                            "Note: provenance is stale by {} event rows; run `histo report --update`.",
+                            status.new_event_rows
+                        );
+                    }
+                    let audit = analytics::audit_provenance(
+                        &store,
+                        bucket.map(ProvenanceBucket::as_str),
+                        rule.as_deref(),
+                        limit,
+                    )?;
+                    println!("Buckets");
+                    for count in audit.buckets {
+                        println!(
+                            "  {:<8} {:<13} {}",
+                            count.authored_by, count.sentiment_usable, count.count
+                        );
+                    }
+                    println!("\nRules");
+                    for count in audit.rules {
+                        println!("  {:<32} {}", count.rule, count.count);
+                    }
+                    println!("\nSamples");
+                    for sample in audit.samples {
+                        println!(
+                            "  [{} · {} · {} · {} · {}] {}",
+                            sample.source_kind,
+                            sample.authored_by,
+                            sample.sentiment_usable,
+                            sample.rule,
+                            sample
+                                .workspace_path
+                                .as_deref()
+                                .unwrap_or("unknown workspace"),
+                            sample.preview
+                        );
+                        if let Some(occurred_at) = sample.occurred_at {
+                            println!("    {occurred_at}");
+                        }
+                    }
+                }
+                Some(ReportCommand::Topics {
+                    command: TopicCommand::Embed { limit },
+                }) => {
+                    if limit == Some(0) {
+                        bail!("topic embedding limit must be greater than zero");
+                    }
+                    let embedder = topics::load_embedder(&config.data_dir)?;
+                    let outcome = topics::backfill(
+                        &store,
+                        &config.machine_id,
+                        embedder.as_ref(),
+                        limit,
+                    )?;
+                    println!(
+                        "Topic embeddings ({}): {} added, {} reused, {} pending, {} vectors indexed ({:.1}/s)",
+                        outcome.model_id,
+                        outcome.embedded,
+                        outcome.reused,
+                        outcome.pending,
+                        outcome.vectors_indexed,
+                        outcome.per_second()
+                    );
+                }
+                Some(ReportCommand::Topics {
+                    command:
+                        TopicCommand::Cluster {
+                            min_k,
+                            max_k,
+                            step,
+                            sample_size,
+                            rebuild,
+                        },
+                }) => {
+                    let outcome = topics::cluster(
+                        &store,
+                        &topics::ClusterOptions {
+                            min_k,
+                            max_k,
+                            step,
+                            sample_size,
+                            rebuild,
+                        },
+                        |candidate| {
+                            println!(
+                                "  k={:<3} centroid silhouette {:.4}",
+                                candidate.k, candidate.silhouette
+                            );
+                        },
+                    )?;
+                    if outcome.reused {
+                        for candidate in &outcome.candidates {
+                            println!(
+                                "  k={:<3} centroid silhouette {:.4}",
+                                candidate.k, candidate.silhouette
+                            );
+                        }
+                    }
+                    if outcome.demoted {
+                        println!(
+                            "Topic clustering {}: {} messages, silhouette {:.4}; below the 0.18 coherence bar, stored as miscellaneous{}",
+                            outcome.version,
+                            outcome.item_count,
+                            outcome.silhouette,
+                            if outcome.reused { " (reused)" } else { "" }
+                        );
+                    } else {
+                        println!(
+                            "Topic clustering {}: {} messages, k={}, silhouette {:.4}{}",
+                            outcome.version,
+                            outcome.item_count,
+                            outcome.selected_k,
+                            outcome.silhouette,
+                            if outcome.reused { " (reused)" } else { "" }
+                        );
+                    }
+                }
+                None => {
+                    let (after, before) =
+                        search_time_bounds(today, after.as_deref(), before.as_deref())?;
+                    refresh_report_for_command(&store, update, no_update, json || robot)?;
+                    let report = report::compute(
+                        &store,
+                        &report::ReportOptions {
+                            after: after.map(|value| value.to_rfc3339()),
+                            before: before.map(|value| value.to_rfc3339()),
+                            project,
+                            sort: sort.into(),
+                        },
+                    )?;
+                    if json || robot {
+                        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+                        println!();
+                    } else {
+                        let no_color = plain || std::env::var_os("NO_COLOR").is_some();
+                        let color = should_color(no_color, color, robot);
+                        write_stdout(&report::render_terminal_window(
+                            &report,
+                            terminal_columns(),
+                            color,
+                            window.into(),
+                            models,
+                        ))?;
+                    }
+                }
+            },
             Command::Onboard { agents_md } => {
                 if agents_md {
                     write_stdout(crate::skills::onboard_agents_md())?;
@@ -2962,7 +2901,6 @@ impl Command {
             Command::Enrich { .. } => "enrich",
             Command::Config { .. } => "config",
             Command::Maintenance { .. } => "maintenance",
-            Command::Lab { .. } => "lab",
             Command::Onboard { .. } => "onboard",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
@@ -2995,7 +2933,11 @@ impl Command {
                     command: MaintenanceCommand::Compact { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
-                | Command::Report { json: true, .. }
+                | Command::Report {
+                    json: true,
+                    command: None,
+                    ..
+                }
         )
     }
 }
@@ -6277,19 +6219,6 @@ impl UpdateProgressView {
         self.render(true);
     }
 
-    fn start_report_refresh(&mut self) {
-        self.phase = UpdateDisplayPhase::ReportData;
-        self.data_rows.clear();
-        self.data_rows.insert(
-            "report".to_string(),
-            UpdateDataProgress {
-                state: "checking",
-                detail: "checking report analytics".to_string(),
-                ..Default::default()
-            },
-        );
-        self.render(true);
-    }
 
     fn report_preparation(&mut self, completed: usize, total: usize) {
         self.phase = UpdateDisplayPhase::SearchData;
@@ -6425,61 +6354,7 @@ impl UpdateProgressView {
         self.render(true);
     }
 
-    fn report_rebuild_event(&mut self, event: &analytics::RebuildProgress) {
-        self.phase = UpdateDisplayPhase::ReportData;
-        let row = self.data_rows.entry("report".to_string()).or_default();
-        let state_for = |projection| match projection {
-            analytics::SESSION_RELATIONSHIPS_PROJECTION => "relations",
-            analytics::MESSAGE_PROVENANCE_PROJECTION => "provenance",
-            analytics::SESSION_FACTS_PROJECTION => "facts",
-            analytics::REPORT_SNAPSHOT_PROJECTION => "snapshot",
-            _ => "rebuilding",
-        };
-        match event.clone() {
-            analytics::RebuildProgress::Started {
-                projection,
-                completed,
-                total,
-            } => {
-                row.state = state_for(projection);
-                row.current = Some(completed);
-                row.total = Some(total);
-                row.detail = format!("starting {}", projection.replace('_', " "));
-            }
-            analytics::RebuildProgress::Detail {
-                projection,
-                completed,
-                total,
-                detail,
-            } => {
-                row.state = state_for(projection);
-                let (current, detail_total) =
-                    parse_progress_fraction(&detail).unwrap_or((completed, total));
-                row.current = Some(current);
-                row.total = Some(detail_total);
-                row.detail = format_progress_fraction(detail);
-            }
-            analytics::RebuildProgress::Completed {
-                projection,
-                completed,
-                total,
-            } => {
-                row.state = state_for(projection);
-                row.current = Some(completed);
-                row.total = Some(total);
-                row.detail = format!("{} ready", projection.replace('_', " "));
-            }
-        }
-        self.render(false);
-    }
 
-    fn finish_report_rebuild(&mut self) {
-        let row = self.data_rows.entry("report".to_string()).or_default();
-        row.state = "refreshed";
-        // The last worker event owns the truthful phase-local count.
-        row.detail = "report refreshed (full rebuild)".to_string();
-        self.render(true);
-    }
 
     fn embedding_event(&mut self, event: &search::EmbeddingProgress) {
         self.phase = UpdateDisplayPhase::SearchData;
@@ -10526,68 +10401,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn report_command_reuses_update_progress_row_and_counts() {
-        let mut view = UpdateProgressView::new();
-        view.interactive = false;
-        view.start_report_refresh();
-        assert_eq!(view.lines()[0], "report data: updating");
-        assert_eq!(
-            view.lines()
-                .iter()
-                .skip(1)
-                .map(|line| line.split_whitespace().next().expect("row label"))
-                .collect::<Vec<_>>(),
-            vec!["report"]
-        );
-
-        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
-            projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
-            completed: 0,
-            total: 4,
-            detail: "scanning 2772460/2772460 events for relationships".to_string(),
-        });
-        assert_eq!(
-            (
-                view.data_rows["report"].current,
-                view.data_rows["report"].total
-            ),
-            (Some(2_772_460), Some(2_772_460))
-        );
-        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
-            projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
-            completed: 0,
-            total: 4,
-            detail: "resolved 1/5691 session relationships".to_string(),
-        });
-        assert_eq!(
-            (
-                view.data_rows["report"].current,
-                view.data_rows["report"].total
-            ),
-            (Some(1), Some(5_691))
-        );
-        view.report_rebuild_event(&analytics::RebuildProgress::Detail {
-            projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
-            completed: 1,
-            total: 4,
-            detail: "classifying 12345/294384 messages".to_string(),
-        });
-        let row = view.data_rows.get("report").expect("report rebuild row");
-        assert_eq!(row.state, "provenance");
-        assert_eq!((row.current, row.total), (Some(12_345), Some(294_384)));
-        assert_eq!(row.detail, "classifying 12,345/294,384 messages");
-        assert!(view
-            .lines_for_terminal(64)
-            .iter()
-            .all(|line| line.chars().count() <= 64));
-
-        view.finish_report_rebuild();
-        assert_eq!(
-            view.data_rows.get("report").expect("finished report row").state,
-            "refreshed"
-        );
-    }
 
     #[test]
     fn forced_report_machine_progress_keeps_one_truthful_schema() {
@@ -10608,7 +10421,7 @@ mod tests {
         assert_eq!(payload["status"], "rebuilding");
         assert_eq!(payload["mode"], "full_rebuild");
         assert_eq!(payload["phase"], analytics::MESSAGE_PROVENANCE_PROJECTION);
-        assert_eq!(payload["detail"], "classified 500/1000 messages (2s elapsed)");
+        assert_eq!(payload["detail"], "classified 500/1,000 messages (2s elapsed)");
         assert_eq!(payload["completed"], 500);
         assert_eq!(payload["total"], 1000);
         assert_eq!(payload["elapsed_seconds"], 2);
@@ -11189,33 +11002,23 @@ mod tests {
     }
 
     #[test]
-    fn lab_rebuild_subcommand_parses() {
-        let cli = Cli::try_parse_from(["histo", "lab", "rebuild"]).expect("parse lab rebuild");
-        assert!(matches!(
-            cli.command,
-            Command::Lab {
-                command: LabCommand::Rebuild
-            }
-        ));
-    }
-
-    #[test]
-    fn lab_opencode_backfill_subcommand_parses() {
-        let cli = Cli::try_parse_from(["histo", "lab", "backfill-opencode-tokens"])
+    fn report_opencode_backfill_subcommand_parses() {
+        let cli = Cli::try_parse_from(["histo", "report", "backfill-opencode-tokens"])
             .expect("parse OpenCode usage backfill");
         assert!(matches!(
             cli.command,
-            Command::Lab {
-                command: LabCommand::BackfillOpencodeTokens
+            Command::Report {
+                command: Some(ReportCommand::BackfillOpencodeTokens),
+                ..
             }
         ));
     }
 
     #[test]
-    fn lab_audit_filters_parse() {
+    fn report_audit_filters_parse() {
         let cli = Cli::try_parse_from([
             "histo",
-            "lab",
+            "report",
             "audit",
             "--bucket",
             "human",
@@ -11227,70 +11030,39 @@ mod tests {
         .expect("parse provenance audit");
         assert!(matches!(
             cli.command,
-            Command::Lab {
-                command: LabCommand::Audit {
+            Command::Report {
+                command: Some(ReportCommand::Audit {
                     bucket: Some(ProvenanceBucket::Human),
                     rule: Some(rule),
                     limit: 30,
-                }
+                }),
+                ..
             } if rule == "default.human"
         ));
     }
 
     #[test]
-    fn lab_annotation_options_parse() {
+    fn report_topic_embedding_limit_parses() {
         let cli = Cli::try_parse_from([
-            "histo",
-            "lab",
-            "annotate",
-            "--limit",
-            "25",
-            "--batch-size",
-            "5",
-            "--concurrency",
-            "3",
-            "--annotator-version",
-            "mood-v2",
-            "--model",
-            "small-model",
-        ])
-        .expect("parse annotation command");
-        assert!(matches!(
-            cli.command,
-            Command::Lab {
-                command: LabCommand::Annotate {
-                    limit: Some(25),
-                    batch_size: 5,
-                    concurrency: 3,
-                    annotator_version,
-                    model: Some(model),
-                    url: None,
-                }
-            } if annotator_version == "mood-v2" && model == "small-model"
-        ));
-    }
-
-    #[test]
-    fn lab_topic_embedding_limit_parses() {
-        let cli = Cli::try_parse_from([
-            "histo", "lab", "topics", "embed", "--limit", "25",
+            "histo", "report", "topics", "embed", "--limit", "25",
         ])
         .expect("parse topic embedding command");
         assert!(matches!(
             cli.command,
-            Command::Lab {
-                command: LabCommand::Topics {
+            Command::Report {
+                command: Some(ReportCommand::Topics {
                     command: TopicCommand::Embed { limit: Some(25) }
-                }
+                }),
+                ..
             }
         ));
     }
 
     #[test]
-    fn lab_topic_cluster_options_parse() {
+    fn report_topic_cluster_options_parse() {
         let cli = Cli::try_parse_from([
             "histo",
-            "lab",
+            "report",
             "topics",
             "cluster",
             "--min-k",
@@ -11306,8 +11078,8 @@ mod tests {
         .expect("parse topic cluster command");
         assert!(matches!(
             cli.command,
-            Command::Lab {
-                command: LabCommand::Topics {
+            Command::Report {
+                command: Some(ReportCommand::Topics {
                     command: TopicCommand::Cluster {
                         min_k: 4,
                         max_k: 12,
@@ -11315,39 +11087,50 @@ mod tests {
                         sample_size: 500,
                         rebuild: true,
                     }
-                }
+                }),
+                ..
             }
         ));
     }
 
     #[test]
-    fn lab_topic_label_options_parse() {
-        let cli = Cli::try_parse_from([
-            "histo",
-            "lab",
-            "topics",
-            "label",
-            "--limit",
-            "20",
-            "--labeler-version",
-            "labels-v2",
-            "--model",
-            "small-model",
-        ])
-        .expect("parse topic label command");
-        assert!(matches!(
-            cli.command,
-            Command::Lab {
-                command: LabCommand::Topics {
-                    command: TopicCommand::Label {
-                        limit: Some(20),
-                        labeler_version,
-                        model: Some(model),
-                        url: None,
-                    }
-                }
-            } if labeler_version == "labels-v2" && model == "small-model"
-        ));
+    fn removed_report_routes_are_rejected() {
+        for args in [
+            &["histo", "lab"][..],
+            &["histo", "lab", "audit"][..],
+            &["histo", "report", "annotate"][..],
+            &["histo", "report", "rebuild"][..],
+            &["histo", "report", "topics", "label"][..],
+        ] {
+            assert!(Cli::try_parse_from(args.iter().copied()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn report_help_discovers_supported_subcommands_only() {
+        let help = Cli::try_parse_from(["histo", "report", "--help"])
+            .expect_err("report help should exit")
+            .to_string();
+        for command in ["backfill-opencode-tokens", "audit", "topics"] {
+            assert!(help.contains(command), "missing {command} from {help}");
+        }
+        assert!(!help.contains("annotate"));
+        assert!(!help.contains("rebuild"));
+
+        let topics_help = Cli::try_parse_from(["histo", "report", "topics", "--help"])
+            .expect_err("topic help should exit")
+            .to_string();
+        assert!(topics_help.contains("embed"));
+        assert!(topics_help.contains("cluster"));
+        assert!(!topics_help.contains("label"));
+    }
+
+    #[test]
+    fn report_display_flags_conflict_with_subcommands() {
+        assert!(Cli::try_parse_from(["histo", "report", "--json", "audit"]).is_err());
+        assert!(
+            Cli::try_parse_from(["histo", "report", "--today", "topics", "embed"]).is_err()
+        );
     }
 
     #[test]
@@ -11376,6 +11159,7 @@ mod tests {
                 sort: ReportSortArg::Messages,
                 json: true,
                 models: true,
+                command: None,
                 ..
             } if after == "2026-06-01" && before == "3 days ago" && project == "example-project"
         ));
@@ -11384,7 +11168,11 @@ mod tests {
             Cli::try_parse_from(["histo", "report", "--today"])
                 .expect("parse today's report")
                 .command,
-            Command::Report { today: true, .. }
+            Command::Report {
+                today: true,
+                command: None,
+                ..
+            }
         ));
         assert!(
             Cli::try_parse_from(["histo", "report", "--today", "--after", "yesterday"])
@@ -11401,6 +11189,7 @@ mod tests {
             Command::Report {
                 update: true,
                 no_update: false,
+                command: None,
                 ..
             }
         ));
@@ -11411,6 +11200,7 @@ mod tests {
             Command::Report {
                 update: false,
                 no_update: true,
+                command: None,
                 ..
             }
         ));
