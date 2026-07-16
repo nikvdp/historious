@@ -3769,7 +3769,13 @@ fn run_update_once_machine(
                 write_update_progress(
                     "report",
                     event.detail.clone(),
-                    report_progress_payload(&event),
+                    report_progress_payload(
+                        &event,
+                        "refreshing",
+                        "incremental",
+                        Duration::ZERO,
+                        None,
+                    ),
                 );
             },
         )?;
@@ -4108,48 +4114,45 @@ fn analytics_rebuild_progress_detail(event: analytics::RebuildProgress) -> Strin
     }
 }
 
-fn analytics_rebuild_progress_payload(event: &analytics::RebuildProgress) -> serde_json::Value {
-    let (phase, completed, total, detail) = match event {
+fn report_refresh_progress_from_rebuild(
+    event: analytics::RebuildProgress,
+) -> analytics::ReportRefreshProgress {
+    match event {
         analytics::RebuildProgress::Started {
             projection,
             completed,
             total,
-        } => (*projection, *completed, *total, format!("starting {projection}")),
+        } => analytics::ReportRefreshProgress {
+            phase: projection,
+            completed,
+            total,
+            detail: format!("starting {}", projection.replace('_', " ")),
+        },
         analytics::RebuildProgress::Detail {
             projection,
             completed,
             total,
             detail,
-        } => (*projection, *completed, *total, detail.clone()),
+        } => {
+            let (completed, total) = parse_progress_fraction(&detail).unwrap_or((completed, total));
+            analytics::ReportRefreshProgress {
+                phase: projection,
+                completed,
+                total,
+                detail: format_progress_fraction(detail),
+            }
+        }
         analytics::RebuildProgress::Completed {
             projection,
             completed,
             total,
-        } => (*projection, *completed, *total, format!("{projection} ready")),
-    };
-    serde_json::json!({
-        "status": "rebuilding",
-        "mode": "full_rebuild",
-        "phase": phase,
-        "detail": detail,
-        "completed": completed,
-        "total": total,
-    })
-}
-
-fn analytics_rebuild_boundary_payload(
-    status: &'static str,
-    detail: &'static str,
-    completed: usize,
-) -> serde_json::Value {
-    serde_json::json!({
-        "status": status,
-        "mode": "full_rebuild",
-        "phase": "report",
-        "detail": detail,
-        "completed": completed,
-        "total": analytics::REPORT_PROJECTION_COUNT,
-    })
+        } => analytics::ReportRefreshProgress {
+            phase: projection,
+            completed,
+            total,
+            detail: format!("{} ready", projection.replace('_', " ")),
+        },
+    }
 }
 
 fn refresh_search_index_repair_with_progress(
@@ -5402,13 +5405,156 @@ struct MachineProgressEvent {
     data: serde_json::Value,
 }
 
-fn report_progress_payload(event: &analytics::ReportRefreshProgress) -> serde_json::Value {
+enum ReportMaintenanceMessage<T> {
+    Progress(analytics::ReportRefreshProgress),
+    Finished(Result<T>),
+    Panicked,
+}
+
+fn copy_report_progress(
+    event: &analytics::ReportRefreshProgress,
+) -> analytics::ReportRefreshProgress {
+    let (completed, total) =
+        parse_progress_fraction(&event.detail).unwrap_or((event.completed, event.total));
+    analytics::ReportRefreshProgress {
+        phase: event.phase,
+        completed,
+        total,
+        detail: format_progress_fraction(event.detail.clone()),
+    }
+}
+
+fn report_progress_count_detail(event: &analytics::ReportRefreshProgress) -> String {
+    let detail = format_progress_fraction(event.detail.clone());
+    if parse_progress_fraction(&detail).is_none() && event.total > 0 {
+        format!(
+            "{detail} ({}/{})",
+            format_count(event.completed),
+            format_count(event.total)
+        )
+    } else {
+        detail
+    }
+}
+
+fn report_progress_detail(
+    event: &analytics::ReportRefreshProgress,
+    elapsed: Duration,
+) -> String {
+    format!(
+        "{} ({}s elapsed)",
+        report_progress_count_detail(event),
+        elapsed.as_secs()
+    )
+}
+
+fn report_progress_payload(
+    event: &analytics::ReportRefreshProgress,
+    status: &'static str,
+    mode: &'static str,
+    elapsed: Duration,
+    outcome: Option<&analytics::ReportRefreshOutcome>,
+) -> serde_json::Value {
     serde_json::json!({
-        "status": "refreshing",
+        "status": status,
+        "mode": mode,
         "phase": event.phase,
-        "detail": event.detail,
+        "detail": report_progress_detail(event, elapsed),
         "completed": event.completed,
         "total": event.total,
+        "elapsed_seconds": elapsed.as_secs(),
+        "affected_sessions": outcome.map(|outcome| outcome.affected_sessions),
+        "affected_events": outcome.map(|outcome| outcome.affected_events),
+    })
+}
+
+fn run_report_maintenance<T, F, P, C>(
+    initial: analytics::ReportRefreshProgress,
+    operation: F,
+    on_progress: P,
+    on_complete: C,
+) -> Result<T>
+where
+    T: Send,
+    F: FnOnce(&mut dyn FnMut(analytics::ReportRefreshProgress)) -> Result<T> + Send,
+    P: FnMut(&analytics::ReportRefreshProgress, Duration, bool),
+    C: FnMut(&T, &analytics::ReportRefreshProgress, Duration),
+{
+    let started = Instant::now();
+    run_report_maintenance_with_timeout(
+        initial,
+        Duration::from_millis(900),
+        || started.elapsed(),
+        operation,
+        on_progress,
+        on_complete,
+    )
+}
+
+fn run_report_maintenance_with_timeout<T, F, P, C, E>(
+    initial: analytics::ReportRefreshProgress,
+    heartbeat_interval: Duration,
+    mut elapsed: E,
+    operation: F,
+    mut on_progress: P,
+    mut on_complete: C,
+) -> Result<T>
+where
+    T: Send,
+    F: FnOnce(&mut dyn FnMut(analytics::ReportRefreshProgress)) -> Result<T> + Send,
+    P: FnMut(&analytics::ReportRefreshProgress, Duration, bool),
+    C: FnMut(&T, &analytics::ReportRefreshProgress, Duration),
+    E: FnMut() -> Duration,
+{
+    let mut latest = copy_report_progress(&initial);
+    let mut last_emit = Instant::now();
+    on_progress(&latest, elapsed(), true);
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut progress = |event| {
+                    let _ = sender.send(ReportMaintenanceMessage::Progress(event));
+                };
+                operation(&mut progress)
+            }));
+            match result {
+                Ok(result) => {
+                    let _ = sender.send(ReportMaintenanceMessage::Finished(result));
+                }
+                Err(_) => {
+                    let _ = sender.send(ReportMaintenanceMessage::Panicked);
+                }
+            }
+        });
+
+        loop {
+            let wait = heartbeat_interval.saturating_sub(last_emit.elapsed());
+            match receiver.recv_timeout(wait) {
+                Ok(ReportMaintenanceMessage::Progress(event)) => {
+                    latest = copy_report_progress(&event);
+                    if last_emit.elapsed() >= heartbeat_interval {
+                        on_progress(&latest, elapsed(), true);
+                        last_emit = Instant::now();
+                    }
+                }
+                Ok(ReportMaintenanceMessage::Finished(result)) => {
+                    let value = result?;
+                    on_complete(&value, &latest, elapsed());
+                    return Ok(value);
+                }
+                Ok(ReportMaintenanceMessage::Panicked) => {
+                    bail!("report maintenance worker panicked");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    on_progress(&latest, elapsed(), true);
+                    last_emit = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("report maintenance worker disconnected");
+                }
+            }
+        }
     })
 }
 
@@ -5485,47 +5631,79 @@ fn refresh_report_incrementally_for_command(
     machine_output: bool,
     refresh_snapshot: bool,
 ) -> Result<()> {
+    let initial = analytics::ReportRefreshProgress {
+        phase: "preflight",
+        completed: 0,
+        total: 0,
+        detail: "checking report analytics".to_string(),
+    };
+    let worker_store = (*store).clone();
     let outcome = if machine_output {
-        write_machine_progress(
-            "report",
-            "refresh",
-            "checking report analytics".to_string(),
-            serde_json::json!({ "status": "starting" }),
-        );
-        let outcome = analytics::refresh_report_on_demand_with_progress(
-            store,
-            refresh_snapshot,
-            |event| {
+        let mut first = true;
+        run_report_maintenance(
+            initial,
+            move |progress| {
+                analytics::refresh_report_on_demand_with_progress(
+                    &worker_store,
+                    refresh_snapshot,
+                    |event| progress(event),
+                )
+            },
+            |event, elapsed, _force| {
+                let status = if first { "starting" } else { "refreshing" };
+                first = false;
                 write_machine_progress(
                     "report",
                     "refresh",
-                    event.detail.clone(),
-                    report_progress_payload(&event),
+                    report_progress_detail(event, elapsed),
+                    report_progress_payload(event, status, "incremental", elapsed, None),
                 );
             },
-        )?;
-        write_machine_progress(
-            "report",
-            "refresh",
-            report_completion_detail(&outcome),
-            serde_json::json!({
-                "status": if outcome.refreshed { "refreshed" } else { "current" },
-                "mode": report_refresh_mode(&outcome),
-                "affected_sessions": outcome.affected_sessions,
-                "affected_events": outcome.affected_events,
-            }),
-        );
-        outcome
+            |outcome, latest, elapsed| {
+                let completion = analytics::ReportRefreshProgress {
+                    phase: latest.phase,
+                    completed: latest.completed,
+                    total: latest.total,
+                    detail: report_completion_detail(outcome),
+                };
+                let status = if outcome.refreshed { "refreshed" } else { "current" };
+                write_machine_progress(
+                    "report",
+                    "refresh",
+                    report_progress_detail(&completion, elapsed),
+                    report_progress_payload(
+                        &completion,
+                        status,
+                        report_refresh_mode(outcome),
+                        elapsed,
+                        Some(outcome),
+                    ),
+                );
+            },
+        )?
     } else {
-        let mut progress = UpdateProgressView::new();
-        progress.start_report_refresh();
-        let outcome = analytics::refresh_report_on_demand_with_progress(
-            store,
-            refresh_snapshot,
-            |event| progress.report_event(&event),
+        let progress = std::cell::RefCell::new(UpdateProgressView::new());
+        let outcome = run_report_maintenance(
+            initial,
+            move |send| {
+                analytics::refresh_report_on_demand_with_progress(
+                    &worker_store,
+                    refresh_snapshot,
+                    |event| send(event),
+                )
+            },
+            |event, elapsed, force| {
+                progress
+                    .borrow_mut()
+                    .report_maintenance_event(event, elapsed, force);
+            },
+            |outcome, latest, elapsed| {
+                progress
+                    .borrow_mut()
+                    .finish_report_maintenance(outcome, latest, elapsed);
+            },
         )?;
-        progress.finish_report(&outcome);
-        progress.finish_all();
+        progress.borrow_mut().finish_all();
         outcome
     };
     debug_assert!(outcome.refreshed);
@@ -5533,40 +5711,74 @@ fn refresh_report_incrementally_for_command(
 }
 
 fn rebuild_report_analytics_for_command(store: &Store, machine_output: bool) -> Result<()> {
+    let initial = analytics::ReportRefreshProgress {
+        phase: "report",
+        completed: 0,
+        total: analytics::REPORT_PROJECTION_COUNT,
+        detail: "rebuilding report analytics".to_string(),
+    };
+    let worker_store = (*store).clone();
     if machine_output {
-        write_machine_progress(
-            "report",
-            "refresh",
-            "rebuilding report analytics".to_string(),
-            analytics_rebuild_boundary_payload("starting", "rebuilding report analytics", 0),
-        );
-        analytics::rebuild_all_with_progress(store, |event| {
-            let data = analytics_rebuild_progress_payload(&event);
-            write_machine_progress(
-                "report",
-                "refresh",
-                analytics_rebuild_progress_detail(event),
-                data,
-            );
-        })?;
-        write_machine_progress(
-            "report",
-            "refresh",
-            "report refreshed (full rebuild)".to_string(),
-            analytics_rebuild_boundary_payload(
-                "refreshed",
-                "report refreshed (full rebuild)",
-                analytics::REPORT_PROJECTION_COUNT,
-            ),
-        );
+        let mut first = true;
+        run_report_maintenance(
+            initial,
+            move |progress| {
+                analytics::rebuild_all_with_progress(&worker_store, |event| {
+                    progress(report_refresh_progress_from_rebuild(event));
+                })
+            },
+            |event, elapsed, _force| {
+                let status = if first { "starting" } else { "rebuilding" };
+                first = false;
+                write_machine_progress(
+                    "report",
+                    "refresh",
+                    report_progress_detail(event, elapsed),
+                    report_progress_payload(event, status, "full_rebuild", elapsed, None),
+                );
+            },
+            |_outcome, latest, elapsed| {
+                let completion = analytics::ReportRefreshProgress {
+                    phase: latest.phase,
+                    completed: latest.completed,
+                    total: latest.total,
+                    detail: "report refreshed (full rebuild)".to_string(),
+                };
+                write_machine_progress(
+                    "report",
+                    "refresh",
+                    report_progress_detail(&completion, elapsed),
+                    report_progress_payload(
+                        &completion,
+                        "refreshed",
+                        "full_rebuild",
+                        elapsed,
+                        None,
+                    ),
+                );
+            },
+        )?;
     } else {
-        let mut progress = UpdateProgressView::new();
-        progress.start_report_refresh();
-        analytics::rebuild_all_with_progress(store, |event| {
-            progress.report_rebuild_event(&event);
-        })?;
-        progress.finish_report_rebuild();
-        progress.finish_all();
+        let progress = std::cell::RefCell::new(UpdateProgressView::new());
+        run_report_maintenance(
+            initial,
+            move |send| {
+                analytics::rebuild_all_with_progress(&worker_store, |event| {
+                    send(report_refresh_progress_from_rebuild(event));
+                })
+            },
+            |event, elapsed, force| {
+                progress
+                    .borrow_mut()
+                    .report_maintenance_event(event, elapsed, force);
+            },
+            |_outcome, latest, elapsed| {
+                progress
+                    .borrow_mut()
+                    .finish_report_rebuild_maintenance(latest, elapsed);
+            },
+        )?;
+        progress.borrow_mut().finish_all();
     }
     Ok(())
 }
@@ -6138,15 +6350,67 @@ impl UpdateProgressView {
         }
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = event.phase;
+        let (current, total) =
+            parse_progress_fraction(&event.detail).unwrap_or((event.completed, event.total));
+        row.current = Some(current);
+        row.total = Some(total);
+        row.detail = report_progress_count_detail(event);
+        self.render(false);
+    }
+    fn report_maintenance_event(
+        &mut self,
+        event: &analytics::ReportRefreshProgress,
+        elapsed: Duration,
+        force: bool,
+    ) {
+        self.phase = UpdateDisplayPhase::ReportData;
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        row.state = report_row_state(event.phase);
         row.current = Some(event.completed);
         row.total = Some(event.total);
-        row.detail = format!(
-            "{} ({}/{})",
-            event.detail,
-            format_count(event.completed),
-            format_count(event.total)
-        );
-        self.render(false);
+        row.detail = report_progress_detail(event, elapsed);
+        self.render(force);
+    }
+
+    fn finish_report_maintenance(
+        &mut self,
+        report: &analytics::ReportRefreshOutcome,
+        latest: &analytics::ReportRefreshProgress,
+        elapsed: Duration,
+    ) {
+        self.phase = UpdateDisplayPhase::ReportData;
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        row.state = if report.refreshed { "refreshed" } else { "current" };
+        row.current = Some(latest.completed);
+        row.total = Some(latest.total);
+        let completion = analytics::ReportRefreshProgress {
+            phase: latest.phase,
+            completed: latest.completed,
+            total: latest.total,
+            detail: report_completion_detail(report),
+        };
+        row.detail = report_progress_detail(&completion, elapsed);
+        self.render(true);
+    }
+
+    fn finish_report_rebuild_maintenance(
+        &mut self,
+        latest: &analytics::ReportRefreshProgress,
+        elapsed: Duration,
+    ) {
+        self.phase = UpdateDisplayPhase::ReportData;
+        let row = self.data_rows.entry("report".to_string()).or_default();
+        row.state = "refreshed";
+        row.current = Some(latest.completed);
+        row.total = Some(latest.total);
+        let completion = analytics::ReportRefreshProgress {
+            phase: latest.phase,
+            completed: latest.completed,
+            total: latest.total,
+            detail: "report refreshed (full rebuild)".to_string(),
+        };
+        row.detail = report_progress_detail(&completion, elapsed);
+        self.render(true);
     }
 
     fn finish_report(&mut self, report: &analytics::ReportRefreshOutcome) {
@@ -6156,9 +6420,7 @@ impl UpdateProgressView {
         } else {
             "current"
         };
-        if let Some(total) = row.total {
-            row.current = Some(total);
-        }
+        // The last worker event owns the truthful phase-local count.
         row.detail = report_completion_detail(report);
         self.render(true);
     }
@@ -6191,20 +6453,11 @@ impl UpdateProgressView {
                 detail,
             } => {
                 row.state = state_for(projection);
-                row.current = Some(completed);
-                row.total = Some(total);
-                row.detail = if let Some((current, detail_total)) = parse_progress_fraction(&detail)
-                {
-                    let raw_fraction = format!("{current}/{detail_total}");
-                    let formatted_fraction = format!(
-                        "{}/{}",
-                        format_count(current),
-                        format_count(detail_total)
-                    );
-                    detail.replacen(&raw_fraction, &formatted_fraction, 1)
-                } else {
-                    detail
-                };
+                let (current, detail_total) =
+                    parse_progress_fraction(&detail).unwrap_or((completed, total));
+                row.current = Some(current);
+                row.total = Some(detail_total);
+                row.detail = format_progress_fraction(detail);
             }
             analytics::RebuildProgress::Completed {
                 projection,
@@ -6223,9 +6476,7 @@ impl UpdateProgressView {
     fn finish_report_rebuild(&mut self) {
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = "refreshed";
-        if let Some(total) = row.total {
-            row.current = Some(total);
-        }
+        // The last worker event owns the truthful phase-local count.
         row.detail = "report refreshed (full rebuild)".to_string();
         self.render(true);
     }
@@ -6290,7 +6541,7 @@ impl UpdateProgressView {
     }
 
     fn render(&mut self, force: bool) {
-        if !self.interactive && !force && self.last_emit.elapsed() < Duration::from_secs(2) {
+        if !self.interactive && !force && self.last_emit.elapsed() < Duration::from_secs(1) {
             return;
         }
         if self.interactive {
@@ -6429,6 +6680,28 @@ impl UpdateProgressView {
             .unwrap_or(7)
             .max(7)
     }
+}
+
+fn report_row_state(phase: &'static str) -> &'static str {
+    match phase {
+        analytics::SESSION_RELATIONSHIPS_PROJECTION => "relations",
+        analytics::MESSAGE_PROVENANCE_PROJECTION => "provenance",
+        analytics::SESSION_FACTS_PROJECTION => "facts",
+        analytics::REPORT_SNAPSHOT_PROJECTION => "snapshot",
+        "preflight" => "checking",
+        phase => phase,
+    }
+}
+
+fn format_progress_fraction(detail: String) -> String {
+    let Some((current, total)) = parse_progress_fraction(&detail) else {
+        return detail;
+    };
+    detail.replacen(
+        &format!("{current}/{total}"),
+        &format!("{}/{}", format_count(current), format_count(total)),
+        1,
+    )
 }
 
 fn progress_meter(current: usize, total: usize, width: usize) -> String {
@@ -10187,13 +10460,23 @@ mod tests {
         assert_eq!(terminal_rows_for_lines(&terminal_lines, 48), terminal_lines.len());
 
         assert_eq!(
-            report_progress_payload(&event),
+            report_progress_payload(
+                &event,
+                "refreshing",
+                "incremental",
+                Duration::from_secs(3),
+                None,
+            ),
             json!({
                 "status": "refreshing",
+                "mode": "incremental",
                 "phase": "provenance",
-                "detail": "refreshing report provenance",
+                "detail": "refreshing report provenance (7/11) (3s elapsed)",
                 "completed": 7,
                 "total": 11,
+                "elapsed_seconds": 3,
+                "affected_sessions": null,
+                "affected_events": null,
             })
         );
 
@@ -10206,12 +10489,21 @@ mod tests {
         view.finish_report(&refreshed);
         let row = view.data_rows.get("report").expect("refreshed report row");
         assert_eq!(row.state, "refreshed");
-        assert_eq!((row.current, row.total), (Some(11), Some(11)));
+        assert_eq!((row.current, row.total), (Some(7), Some(11)));
         assert_eq!(report_refresh_mode(&refreshed), "incremental");
         assert_eq!(
             report_completion_detail(&refreshed),
             "report refreshed (incremental): 2 sessions, 5 events affected"
         );
+        let completed_payload = report_progress_payload(
+            &event,
+            "refreshed",
+            "incremental",
+            Duration::from_secs(4),
+            Some(&refreshed),
+        );
+        assert_eq!(completed_payload["affected_sessions"], 2);
+        assert_eq!(completed_payload["affected_events"], 5);
 
         let current = analytics::ReportRefreshOutcome {
             refreshed: false,
@@ -10260,7 +10552,7 @@ mod tests {
                 view.data_rows["report"].current,
                 view.data_rows["report"].total
             ),
-            (Some(0), Some(4))
+            (Some(2_772_460), Some(2_772_460))
         );
         view.report_rebuild_event(&analytics::RebuildProgress::Detail {
             projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
@@ -10273,7 +10565,7 @@ mod tests {
                 view.data_rows["report"].current,
                 view.data_rows["report"].total
             ),
-            (Some(0), Some(4))
+            (Some(1), Some(5_691))
         );
         view.report_rebuild_event(&analytics::RebuildProgress::Detail {
             projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
@@ -10283,7 +10575,7 @@ mod tests {
         });
         let row = view.data_rows.get("report").expect("report rebuild row");
         assert_eq!(row.state, "provenance");
-        assert_eq!((row.current, row.total), (Some(1), Some(4)));
+        assert_eq!((row.current, row.total), (Some(12_345), Some(294_384)));
         assert_eq!(row.detail, "classifying 12,345/294,384 messages");
         assert!(view
             .lines_for_terminal(64)
@@ -10298,36 +10590,148 @@ mod tests {
     }
 
     #[test]
-    fn forced_report_machine_progress_keeps_rebuild_fields() {
-        let payload = analytics_rebuild_progress_payload(&analytics::RebuildProgress::Detail {
+    fn forced_report_machine_progress_keeps_one_truthful_schema() {
+        let event = report_refresh_progress_from_rebuild(analytics::RebuildProgress::Detail {
             projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
             completed: 1,
             total: 4,
             detail: "classified 500/1000 messages".to_string(),
         });
+        let payload = report_progress_payload(
+            &event,
+            "rebuilding",
+            "full_rebuild",
+            Duration::from_secs(2),
+            None,
+        );
 
         assert_eq!(payload["status"], "rebuilding");
         assert_eq!(payload["mode"], "full_rebuild");
         assert_eq!(payload["phase"], analytics::MESSAGE_PROVENANCE_PROJECTION);
-        assert_eq!(payload["detail"], "classified 500/1000 messages");
-        assert_eq!(payload["completed"], 1);
-        assert_eq!(payload["total"], 4);
+        assert_eq!(payload["detail"], "classified 500/1000 messages (2s elapsed)");
+        assert_eq!(payload["completed"], 500);
+        assert_eq!(payload["total"], 1000);
+        assert_eq!(payload["elapsed_seconds"], 2);
+        assert!(payload["affected_sessions"].is_null());
+        assert!(payload["affected_events"].is_null());
+        assert_eq!(payload.as_object().expect("payload object").len(), 9);
+    }
 
-        for (status, detail, completed) in [
-            ("starting", "rebuilding report analytics", 0),
-            (
-                "refreshed",
-                "report refreshed (full rebuild)",
-                analytics::REPORT_PROJECTION_COUNT,
-            ),
-        ] {
-            let boundary = analytics_rebuild_boundary_payload(status, detail, completed);
-            assert_eq!(boundary["status"], status);
-            assert_eq!(boundary["phase"], "report");
-            assert_eq!(boundary["detail"], detail);
-            assert_eq!(boundary["completed"], completed);
-            assert_eq!(boundary["total"], analytics::REPORT_PROJECTION_COUNT);
+    #[test]
+    fn report_maintenance_runner_replays_truth_without_inventing_progress() {
+        let initial = analytics::ReportRefreshProgress {
+            phase: "preflight",
+            completed: 2,
+            total: 10,
+            detail: "checking report analytics".to_string(),
+        };
+        let (release_sender, release_receiver) = mpsc::channel();
+        let observations = std::cell::RefCell::new(Vec::new());
+        let worker_finished = AtomicBool::new(false);
+        let completion_seen = std::cell::Cell::new(false);
+        let ticks = std::cell::Cell::new(0_u64);
+        let worker_finished_ref = &worker_finished;
+
+        let value = run_report_maintenance_with_timeout(
+            initial,
+            Duration::from_millis(1),
+            || {
+                let elapsed = ticks.get();
+                ticks.set(elapsed + 1);
+                Duration::from_secs(elapsed)
+            },
+            move |progress| {
+                release_receiver.recv().expect("release first event");
+                progress(analytics::ReportRefreshProgress {
+                    phase: "provenance",
+                    completed: 4,
+                    total: 10,
+                    detail: "classified 4/10 messages".to_string(),
+                });
+                release_receiver.recv().expect("release result");
+                worker_finished_ref.store(true, Ordering::SeqCst);
+                Ok(42)
+            },
+            |event, elapsed, force| {
+                let mut observations = observations.borrow_mut();
+                observations.push((
+                    event.phase,
+                    event.completed,
+                    event.total,
+                    event.detail.clone(),
+                    elapsed.as_secs(),
+                    force,
+                ));
+                if observations.len() == 2 || event.phase == "provenance" {
+                    release_sender.send(()).expect("release worker");
+                }
+            },
+            |_value, latest, elapsed| {
+                assert!(worker_finished.load(Ordering::SeqCst));
+                assert_eq!((latest.completed, latest.total), (4, 10));
+                assert!(elapsed.as_secs() >= 3);
+                completion_seen.set(true);
+            },
+        )
+        .expect("report maintenance result");
+
+        assert_eq!(value, 42);
+        assert!(completion_seen.get());
+        let observations = observations.into_inner();
+        assert!(observations.len() >= 3);
+        assert_eq!(
+            &observations[0],
+            &("preflight", 2, 10, "checking report analytics".to_string(), 0, true)
+        );
+        let real_index = observations
+            .iter()
+            .position(|observation| observation.0 == "provenance")
+            .expect("real progress event");
+        assert!(real_index >= 2);
+        for (index, observation) in observations[1..real_index].iter().enumerate() {
+            assert_eq!(observation.0, "preflight");
+            assert_eq!((observation.1, observation.2), (2, 10));
+            assert_eq!(observation.3, "checking report analytics");
+            assert_eq!(observation.4, (index + 1) as u64);
+            assert!(observation.5);
         }
+        let real = &observations[real_index];
+        assert_eq!((real.1, real.2), (4, 10));
+        assert!(real.5);
+    }
+
+    #[test]
+    fn report_maintenance_runner_propagates_errors_and_panics() {
+        let initial = || analytics::ReportRefreshProgress {
+            phase: "preflight",
+            completed: 0,
+            total: 0,
+            detail: "checking report analytics".to_string(),
+        };
+        let completed = std::cell::Cell::new(false);
+        let error = run_report_maintenance_with_timeout(
+            initial(),
+            Duration::from_millis(1),
+            || Duration::ZERO,
+            |_progress| -> Result<()> { bail!("maintenance failed") },
+            |_event, _elapsed, _force| {},
+            |_value, _latest, _elapsed| completed.set(true),
+        )
+        .expect_err("worker error");
+        assert_eq!(error.to_string(), "maintenance failed");
+        assert!(!completed.get());
+
+        let panic_error = run_report_maintenance_with_timeout(
+            initial(),
+            Duration::from_millis(1),
+            || Duration::ZERO,
+            |_progress| -> Result<()> { panic!("worker panic") },
+            |_event, _elapsed, _force| {},
+            |_value, _latest, _elapsed| completed.set(true),
+        )
+        .expect_err("worker panic error");
+        assert_eq!(panic_error.to_string(), "report maintenance worker panicked");
+        assert!(!completed.get());
     }
 
     #[test]
