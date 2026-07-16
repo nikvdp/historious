@@ -885,16 +885,37 @@ fn report_frequencies(
     let stopwords = english_stopwords();
     let project_noise = project_noise_words();
     let (unigrams, bigrams, trigrams, project_unigrams) = store.with_conn(|conn| {
+        let total = conn.query_row(
+            "SELECT COUNT(*)
+             FROM message_provenance p
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human'
+               AND p.sentiment_usable IN ('yes', 'strip_wrapper')
+               AND (?1 IS NULL OR p.occurred_at >= ?1)
+               AND (?2 IS NULL OR p.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
+            params![after, before, project],
+            |row| Ok(row.get::<_, i64>(0)?.max(0) as usize),
+        )?;
+        progress(
+            0,
+            total,
+            if total == 0 {
+                "tokenized 0/0 frequency messages".to_string()
+            } else {
+                format!("tokenizing 0/{total} frequency messages")
+            },
+        );
         let mut stmt = conn.prepare(
             "SELECT hi.text, p.sentiment_usable, p.rule,
-                    COALESCE(sf.workspace_path, 'unknown'), COUNT(*) OVER()
+                    COALESCE(sf.workspace_path, 'unknown')
              FROM message_provenance p
              JOIN history_items hi ON hi.id = p.item_id
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human'
                AND p.sentiment_usable IN ('yes', 'strip_wrapper')
-               AND (?1 IS NULL OR hi.occurred_at >= ?1)
-               AND (?2 IS NULL OR hi.occurred_at < ?2)
+               AND (?1 IS NULL OR p.occurred_at >= ?1)
+               AND (?2 IS NULL OR p.occurred_at < ?2)
                AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
         )?;
         let mut rows = stmt.query(params![after, before, project])?;
@@ -903,20 +924,11 @@ fn report_frequencies(
         let mut trigrams = HashMap::new();
         let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
         let mut processed = 0;
-        let mut total = 0;
         while let Some(row) = rows.next()? {
             let text = row.get::<_, String>(0)?;
             let usable = row.get::<_, String>(1)?;
             let rule = row.get::<_, String>(2)?;
             let workspace_path = row.get::<_, String>(3)?;
-            if processed == 0 {
-                total = row.get::<_, i64>(4)?.max(0) as usize;
-                progress(
-                    0,
-                    total,
-                    format!("tokenizing 0/{total} frequency messages"),
-                );
-            }
             let text = if usable == "strip_wrapper" {
                 provenance::strip_human_wrapper(&text, &rule)
             } else {
@@ -966,9 +978,6 @@ fn report_frequencies(
                     format!("tokenized {processed}/{total} frequency messages"),
                 );
             }
-        }
-        if processed == 0 {
-            progress(0, 0, "tokenized 0/0 frequency messages".to_string());
         }
         Ok((unigrams, bigrams, trigrams, project_unigrams))
     })?;
@@ -1200,15 +1209,14 @@ fn report_activity(
         }
 
         let mut stmt = conn.prepare(
-            "SELECT date(hi.occurred_at, 'localtime'), COUNT(*)
+            "SELECT date(p.occurred_at, 'localtime'), COUNT(*)
              FROM message_provenance p
-             JOIN history_items hi ON hi.id = p.item_id
              JOIN session_facts sf ON sf.session_id = p.session_id
-             WHERE p.authored_by = 'human' AND hi.occurred_at IS NOT NULL
-               AND (?1 IS NULL OR hi.occurred_at >= ?1)
-               AND (?2 IS NULL OR hi.occurred_at < ?2)
+             WHERE p.authored_by = 'human' AND p.occurred_at IS NOT NULL
+               AND (?1 IS NULL OR p.occurred_at >= ?1)
+               AND (?2 IS NULL OR p.occurred_at < ?2)
                AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
-               AND date(hi.occurred_at, 'localtime') >= ?4
+               AND date(p.occurred_at, 'localtime') >= ?4
              GROUP BY 1",
         )?;
         let rows = stmt.query_map(params![after, before, project, start.to_string()], |row| {
@@ -1526,31 +1534,46 @@ fn report_rhythms(
     project: Option<&str>,
 ) -> Result<Rhythms> {
     store.with_conn(|conn| {
-        let query = |format: &str| -> Result<Vec<RhythmBucket>> {
-            let sql = format!(
-                "SELECT strftime('{format}', hi.occurred_at, 'localtime'), COUNT(*)
-                 FROM message_provenance p
-                 JOIN history_items hi ON hi.id = p.item_id
-                 JOIN session_facts sf ON sf.session_id = p.session_id
-                 WHERE p.authored_by = 'human' AND hi.occurred_at IS NOT NULL
-                   AND (?1 IS NULL OR hi.occurred_at >= ?1)
-                   AND (?2 IS NULL OR hi.occurred_at < ?2)
-                   AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
-                 GROUP BY 1 ORDER BY 1"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![after, before, project], |row| {
-                Ok(RhythmBucket {
-                    label: row.get(0)?,
-                    human_messages: nonnegative(row.get(1)?),
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        };
+        let mut stmt = conn.prepare(
+            "SELECT strftime('%H', p.occurred_at, 'localtime'),
+                    strftime('%w', p.occurred_at, 'localtime'), COUNT(*)
+             FROM message_provenance p
+             JOIN session_facts sf ON sf.session_id = p.session_id
+             WHERE p.authored_by = 'human' AND p.occurred_at IS NOT NULL
+               AND (?1 IS NULL OR p.occurred_at >= ?1)
+               AND (?2 IS NULL OR p.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY 1, 2 ORDER BY 1, 2",
+        )?;
+        let rows = stmt.query_map(params![after, before, project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                nonnegative(row.get(2)?),
+            ))
+        })?;
+        let mut by_hour = BTreeMap::<String, u64>::new();
+        let mut by_weekday = BTreeMap::<String, u64>::new();
+        for row in rows {
+            let (hour, weekday, messages) = row?;
+            *by_hour.entry(hour).or_default() += messages;
+            *by_weekday.entry(weekday).or_default() += messages;
+        }
         Ok(Rhythms {
-            by_hour: query("%H")?,
-            by_weekday: query("%w")?,
+            by_hour: by_hour
+                .into_iter()
+                .map(|(label, human_messages)| RhythmBucket {
+                    label,
+                    human_messages,
+                })
+                .collect(),
+            by_weekday: by_weekday
+                .into_iter()
+                .map(|(label, human_messages)| RhythmBucket {
+                    label,
+                    human_messages,
+                })
+                .collect(),
         })
     })
 }
@@ -2932,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn report_computes_aggregate_sections_and_ignores_null_rhythm_times() {
+    fn report_aggregates_use_provenance_times_and_ignore_null_times() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         store
@@ -2957,7 +2980,7 @@ mod tests {
                        semantic_policy, metadata_json, hash)
                     VALUES
                       ('item_human', 'event_1', 'session_a', 'source', 'machine', 'codex', 0, 0,
-                       'conversation', 'user', 'hello', 'hash_1', '2026-06-01T01:02:00Z',
+                       'conversation', 'user', 'alpha alpha alpha', 'hash_1', '2025-06-01T01:02:00Z',
                        1, 'required', '{}', 'item_hash_1'),
                       ('item_null', 'event_2', 'session_a', 'source', 'machine', 'codex', 1, 0,
                        'conversation', 'user', 'no timestamp', 'hash_2', NULL,
@@ -2969,7 +2992,7 @@ mod tests {
                     INSERT INTO message_provenance
                       (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
                     VALUES
-                      ('item_human', 'session_a', 'codex', 'human', 'yes', 'default.human', '2026-06-01T01:02:00Z'),
+                      ('item_human', 'session_a', 'codex', 'human', 'yes', 'default.human', strftime('%Y-%m-%dT01:02:00Z', 'now')),
                       ('item_null', 'session_a', 'codex', 'human', 'yes', 'default.human', NULL),
                       ('item_agent', 'session_b', 'codex', 'agent', 'no', 'session.subagent', '2026-06-02T02:01:00Z');
                     "#,
@@ -2994,6 +3017,20 @@ mod tests {
         )
         .expect("compute report");
 
+        let mut frequency_progress = Vec::new();
+        let (filtered_frequencies, filtered_project_terms) = report_frequencies(
+            &store,
+            Some("2026-06-01T00:00:00+00:00"),
+            Some("2100-01-01T00:00:00+00:00"),
+            Some("%/repo/a%"),
+            |processed, total, _| frequency_progress.push((processed, total)),
+        )
+        .expect("filtered frequencies");
+        assert_eq!(frequency_progress, vec![(0, 1), (1, 1)]);
+        assert_eq!(filtered_frequencies.unigrams[0].term, "alpha");
+        assert_eq!(filtered_frequencies.unigrams[0].count, 3);
+        assert_eq!(filtered_project_terms["/repo/a"][0].term, "alpha");
+
         assert!(!report.contains_raw_text);
         assert_ne!(report.generated_at, snapshot_generated_at);
         assert_eq!(report.totals.sessions, 2);
@@ -3015,6 +3052,12 @@ mod tests {
                 .sum::<u64>(),
             1
         );
+        assert_eq!(
+            report.activity.iter().map(|point| point.human_turns).sum::<u64>(),
+            1
+        );
+        assert_eq!(report.frequencies.unigrams[0].term, "alpha");
+        assert_eq!(report.projects[0].terms[0].term, "alpha");
         assert_eq!(report.provider_mix_by_month[0].name, "codex");
         assert_eq!(report.model_mix_by_month.len(), 2);
         assert!(report.topics.is_none());

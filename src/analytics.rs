@@ -2316,39 +2316,45 @@ fn repeated_template_hashes_scoped(
     prior_candidate_hashes: &HashSet<String>,
 ) -> Result<HashSet<String>> {
     store.with_conn(|conn| {
-        let mut candidate_stmt = conn.prepare(
-            "SELECT DISTINCT text_hash FROM history_items
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.scoped_template_candidates;
+             CREATE TEMP TABLE scoped_template_candidates (
+               text_hash TEXT PRIMARY KEY
+             ) WITHOUT ROWID",
+        )?;
+        let mut insert_candidate = conn.prepare(
+            "INSERT OR IGNORE INTO temp.scoped_template_candidates (text_hash) VALUES (?1)",
+        )?;
+        for hash in prior_candidate_hashes {
+            insert_candidate.execute([hash])?;
+        }
+        let mut insert_session_candidates = conn.prepare(
+            "INSERT OR IGNORE INTO temp.scoped_template_candidates (text_hash)
+             SELECT text_hash FROM history_items INDEXED BY idx_history_items_session_order
              WHERE session_id = ?1 AND tier = 'conversation' AND kind = 'user'
                AND length(text) > 200",
         )?;
-        let mut candidates = prior_candidate_hashes.clone();
         for session_id in session_ids {
-            let hashes = candidate_stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
-            for hash in hashes {
-                candidates.insert(hash?);
-            }
+            insert_session_candidates.execute([session_id])?;
         }
+
         let mut threshold_stmt = conn.prepare(
-            "SELECT COUNT(DISTINCT hi.session_id),
-                    COUNT(DISTINCT COALESCE(
+            "SELECT candidates.text_hash
+             FROM temp.scoped_template_candidates candidates
+             CROSS JOIN history_items hi INDEXED BY idx_history_items_text_hash
+               ON hi.text_hash = candidates.text_hash
+             JOIN sessions s ON s.id = hi.session_id
+             WHERE hi.tier = 'conversation' AND hi.kind = 'user' AND length(hi.text) > 200
+             GROUP BY candidates.text_hash
+             HAVING COUNT(DISTINCT hi.session_id) > 3
+                AND COUNT(DISTINCT COALESCE(
                       json_extract(s.metadata_json, '$.workspace_path'),
                       json_extract(s.metadata_json, '$.path')
-                    ))
-             FROM history_items hi
-             JOIN sessions s ON s.id = hi.session_id
-             WHERE hi.text_hash = ?1 AND hi.tier = 'conversation'
-               AND hi.kind = 'user' AND length(hi.text) > 200",
+                    )) > 3",
         )?;
-        let mut repeated = HashSet::new();
-        for hash in candidates {
-            let (sessions, workspaces) = threshold_stmt.query_row([hash.as_str()], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            if sessions > 3 && workspaces > 3 {
-                repeated.insert(hash);
-            }
-        }
-        Ok(repeated)
+        let rows = threshold_stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(Into::into)
     })
 }
 
@@ -3606,6 +3612,80 @@ mod tests {
         let hashes = repeated_template_hashes(&store).expect("find repeated templates");
         assert!(hashes.contains("hash_wide"));
         assert!(!hashes.contains("hash_fork"));
+    }
+
+    #[test]
+    fn scoped_templates_classify_requested_and_prior_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                for index in 0..4 {
+                    for cohort in ["requested", "prior"] {
+                        let session_id = format!("{cohort}_session_{index}");
+                        conn.execute(
+                            "INSERT INTO sessions
+                             (id, source_id, machine_id, source_kind, external_id, status,
+                              metadata_json, hash)
+                             VALUES (?1, 'source', 'machine', 'codex', ?1, 'open', ?2, ?3)",
+                            params![
+                                session_id,
+                                serde_json::json!({
+                                    "workspace_path": format!("/{cohort}/{index}")
+                                })
+                                .to_string(),
+                                format!("{cohort}_session_hash_{index}")
+                            ],
+                        )?;
+                        conn.execute(
+                            "INSERT INTO history_items
+                             (id, event_id, session_id, source_id, machine_id, source_kind,
+                              ordinal, subordinal, tier, kind, text, text_hash,
+                              lexical_indexable, semantic_policy, metadata_json, hash)
+                             VALUES (?1, ?2, ?3, 'source', 'machine', 'codex', 0, 0,
+                                     'conversation', 'user', ?4, ?5, 1, 'required', '{}', ?6)",
+                            params![
+                                format!("{cohort}_item_{index}"),
+                                format!("{cohort}_event_{index}"),
+                                session_id,
+                                "repeated template text ".repeat(12),
+                                format!("{cohort}_repeated_hash"),
+                                format!("{cohort}_item_hash_{index}")
+                            ],
+                        )?;
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO history_items
+                     (id, event_id, session_id, source_id, machine_id, source_kind,
+                      ordinal, subordinal, tier, kind, text, text_hash,
+                      lexical_indexable, semantic_policy, metadata_json, hash)
+                     VALUES ('single_item', 'single_event', 'requested_session_0',
+                             'source', 'machine', 'codex', 1, 0, 'conversation', 'user',
+                             ?1, 'requested_single_hash', 1, 'required', '{}', 'single_item_hash')",
+                    ["one-off user message ".repeat(12)],
+                )?;
+                Ok(())
+            })
+            .expect("insert scoped template fixtures");
+
+        let hashes = repeated_template_hashes_scoped(
+            &store,
+            &HashSet::from(["requested_session_0".to_string()]),
+            &HashSet::from([
+                "prior_repeated_hash".to_string(),
+                "missing_hash".to_string(),
+            ]),
+        )
+        .expect("classify scoped templates");
+
+        assert_eq!(
+            hashes,
+            HashSet::from([
+                "requested_repeated_hash".to_string(),
+                "prior_repeated_hash".to_string(),
+            ])
+        );
     }
 
     #[test]
