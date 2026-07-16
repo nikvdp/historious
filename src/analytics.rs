@@ -3344,6 +3344,47 @@ mod tests {
     }
 
     #[test]
+    fn failed_session_facts_swap_preserves_previous_rows() {
+        let (_dir, store) = current_refresh_store();
+        let load_facts = || {
+            store
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT session_id, event_count, user_message_count
+                         FROM session_facts ORDER BY session_id",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(Into::into)
+                })
+                .expect("load session facts")
+        };
+        let before = load_facts();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_session_facts_insert
+                     BEFORE INSERT ON session_facts
+                     BEGIN SELECT RAISE(FAIL, 'forced session facts failure'); END;",
+                )?;
+                Ok(())
+            })
+            .expect("install session facts failure trigger");
+
+        let error = rebuild_session_facts_with_progress(&store, |_| {})
+            .expect_err("session facts replacement should fail");
+
+        assert!(error.to_string().contains("forced session facts failure"));
+        assert_eq!(load_facts(), before);
+    }
+
+    #[test]
     fn provenance_rebuild_uses_relationships_and_includes_assistant_items() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
