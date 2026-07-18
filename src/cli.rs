@@ -1989,6 +1989,8 @@ impl Cli {
                 let session_record = store
                     .session_by_id(&session)?
                     .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
+                let session_record =
+                    refresh_transcript_session(&store, &config.machine_id, &session_record)?;
                 let target_event = target_event_id
                     .as_deref()
                     .map(|event_id| {
@@ -8696,6 +8698,38 @@ fn view_metadata_for_session(
     })
 }
 
+fn refresh_transcript_session(
+    store: &Store,
+    machine_id: &str,
+    session: &crate::archive::SessionRecord,
+) -> Result<crate::archive::SessionRecord> {
+    let Some(source_path) = store
+        .source_by_id(&session.source_id)?
+        .and_then(|source| source.path)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        return Ok(session.clone());
+    };
+    let stats = ingest::update_source_path_with_progress_and_cancel(
+        store,
+        machine_id,
+        &session.source_kind,
+        &source_path,
+        |_| {},
+        || false,
+    )?;
+    if stats.errors > 0 {
+        bail!("failed to refresh transcript source {}", source_path.display());
+    }
+    if !stats.delta.touched_events.is_empty() {
+        refresh_tail_history_items(store, &stats.delta.touched_events)?;
+    }
+    store
+        .session_by_id(&session.id)?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", session.id))
+}
+
 async fn run_transcript_tail(
     store: &Store,
     config: &AppConfig,
@@ -11960,6 +11994,78 @@ mod tests {
         .expect("resolve indexed tail target");
 
         assert_eq!(resolved, "session_view");
+    }
+
+    #[test]
+    fn transcript_refresh_ingests_resumed_claude_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let external_id = "8fc27f28-100a-436c-b217-bf637ac7a5bc";
+        let log_path = dir.path().join(format!("{external_id}.jsonl"));
+        let first = format!(
+            "{}\n",
+            json!({
+                "parentUuid": null,
+                "type": "user",
+                "message": {"role": "user", "content": "initial question"},
+                "uuid": "initial",
+                "timestamp": "2026-07-05T09:42:08.873Z",
+                "sessionId": external_id
+            })
+        );
+        std::fs::write(&log_path, &first).expect("write initial Claude log");
+        let stats = ingest::update_source_path_with_progress_and_cancel(
+            &store,
+            "machine_transcript",
+            "claude_code",
+            &log_path,
+            |_| {},
+            || false,
+        )
+        .expect("ingest initial Claude log");
+        refresh_tail_history_items(&store, &stats.delta.touched_events)
+            .expect("project initial transcript");
+        let session = store
+            .sessions_by_external_id(external_id)
+            .expect("session lookup")
+            .pop()
+            .expect("Claude session exists");
+
+        let resumed = format!(
+            "{first}{}\n",
+            json!({
+                "parentUuid": "initial",
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "resumed answer"}]
+                },
+                "uuid": "resumed",
+                "timestamp": "2026-07-15T09:09:30.434Z",
+                "sessionId": external_id
+            })
+        );
+        std::fs::write(&log_path, resumed).expect("append resumed Claude turn");
+
+        let refreshed = refresh_transcript_session(&store, "machine_transcript", &session)
+            .expect("refresh transcript source");
+        let context = store
+            .history_items_for_transcript_session(&refreshed.id)
+            .expect("transcript lookup")
+            .expect("transcript exists");
+
+        assert_eq!(
+            refreshed.updated_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-15T09:09:30.434Z")
+                    .expect("timestamp")
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(
+            context.items.last().map(|item| item.text.as_str()),
+            Some("resumed answer")
+        );
     }
 
     #[test]

@@ -5441,6 +5441,12 @@ fn insert_source(conn: &Connection, source: &SourceRecord) -> Result<bool> {
             source.hash
         ],
     )?;
+    if changed == 0 {
+        conn.execute(
+            "UPDATE sources SET updated_at = ?2 WHERE id = ?1 AND updated_at < ?2",
+            params![source.id, source.updated_at.to_rfc3339()],
+        )?;
+    }
     Ok(changed > 0)
 }
 
@@ -5682,11 +5688,24 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
     if changed == 0 {
         update_session_title(conn, session)?;
         enrich_session_metadata(conn, session)?;
+        update_session_timestamp(conn, session)?;
     } else {
         ensure_session_activity_row(conn, &session.id)?;
         update_source_status_count_delta(conn, &session.source_kind, 1, 0, 0, 0, 0)?;
     }
     Ok(changed > 0)
+}
+
+fn update_session_timestamp(conn: &Connection, session: &SessionRecord) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET updated_at = ?2
+         WHERE id = ?1
+           AND (?2 IS NOT NULL)
+           AND (updated_at IS NULL OR updated_at < ?2)",
+        params![session.id, opt_dt(session.updated_at)],
+    )?;
+    Ok(())
 }
 
 fn update_session_title(conn: &Connection, session: &SessionRecord) -> Result<()> {
@@ -8995,6 +9014,59 @@ mod tests {
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.duplicates, 1);
         assert_eq!(session.title.as_deref(), Some("Fix thread listing titles"));
+    }
+
+    #[test]
+    fn duplicate_source_and_session_imports_advance_timestamps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut source = fixture_source("source_activity");
+        source.first_seen_at = dt("2026-07-05T09:00:00Z");
+        source.updated_at = dt("2026-07-05T09:00:00Z");
+        let mut session = fixture_session("session_activity", &source.id);
+        session.updated_at = Some(dt("2026-07-05T09:00:00Z"));
+
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source.clone()),
+                ArchiveRecord::Session(session.clone()),
+            ])
+            .expect("initial import");
+
+        source.updated_at = dt("2026-07-15T09:00:00Z");
+        session.updated_at = Some(dt("2026-07-15T09:00:00Z"));
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source.clone()),
+                ArchiveRecord::Session(session.clone()),
+            ])
+            .expect("resumed import");
+
+        source.updated_at = dt("2026-07-10T09:00:00Z");
+        session.updated_at = Some(dt("2026-07-10T09:00:00Z"));
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+            ])
+            .expect("older duplicate import");
+
+        assert_eq!(
+            store
+                .source_by_id("source_activity")
+                .expect("source lookup")
+                .expect("source exists")
+                .updated_at,
+            dt("2026-07-15T09:00:00Z")
+        );
+        assert_eq!(
+            store
+                .session_by_id("session_activity")
+                .expect("session lookup")
+                .expect("session exists")
+                .updated_at,
+            Some(dt("2026-07-15T09:00:00Z"))
+        );
     }
 
     #[test]
