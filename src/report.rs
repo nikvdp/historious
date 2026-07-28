@@ -2096,8 +2096,8 @@ pub fn render_terminal_window(
 
     if show_models {
         render_model_usage(&mut out, &report.model_mix_by_month, width, color);
-        render_frustration(&mut out, &report.frustration, width, color);
     }
+    render_frustration(&mut out, &report.frustration, width, color);
 
     out.push('\n');
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
@@ -2245,14 +2245,29 @@ fn render_frustration(
         let mut rows = rows;
         rows.sort_by(|a, b| b.matches.cmp(&a.matches).then_with(|| a.model.cmp(&b.model)));
         for row in rows {
+            let percentage = if row.human_messages == 0 {
+                0.0
+            } else {
+                (row.matches as f64 * 1_000.0 / row.human_messages as f64).round() / 10.0
+            };
+            let mut detail = format!(
+                "{} · {} of {} human messages · {percentage:.1}%",
+                row.model,
+                exact_number(row.matches),
+                exact_number(row.human_messages)
+            );
+            if row.matches > 0 && row.human_messages > 0 {
+                let one_in = ((row.human_messages as f64 / row.matches as f64).round() as u64)
+                    .max(1);
+                detail.push_str(&format!(
+                    " · about 1 in {} message{}",
+                    exact_number(one_in),
+                    if one_in == 1 { "" } else { "s" }
+                ));
+            }
             push_wrapped(
                 out,
-                &format!(
-                    "{} · {} of {} human messages",
-                    row.model,
-                    exact_number(row.matches),
-                    exact_number(row.human_messages)
-                ),
+                &detail,
                 width,
                 4,
                 StyleRole::Count,
@@ -3891,10 +3906,11 @@ mod tests {
         assert_eq!(report.frustration[0].matches, 1);
         let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, true);
         assert!(rendered.contains("Frustration signals"));
-        assert!(rendered.contains("model-alpha · 1 of 1 human messages"));
-        // Hidden when models are hidden.
-        let without = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
-        assert!(!without.contains("Frustration signals"));
+        assert!(rendered.contains(
+            "model-alpha · 1 of 1 human messages · 100.0% · about 1 in 1 message"
+        ));
+        let default = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
+        assert!(default.contains("Frustration signals"));
     }
 
     #[test]
@@ -3920,15 +3936,19 @@ mod tests {
             },
         ];
         let mut out = String::new();
-        render_frustration(&mut out, &points, 80, false);
+        render_frustration(&mut out, &points, 120, false);
         assert!(out.contains("Frustration signals"));
         assert!(out.contains("wtf"));
         // Months render in chronological order.
         assert!(out.find("2026-06") < out.find("2026-07"));
-        assert!(out.contains("model-alpha · 3 of 120 human messages"));
-        assert!(out.contains("model-beta · 1 of 80 human messages"));
-        // Zero-match model-months still render as denominators.
-        assert!(out.contains("model-alpha · 0 of 100 human messages"));
+        assert!(out.contains(
+            "model-alpha · 3 of 120 human messages · 2.5% · about 1 in 40 messages"
+        ));
+        assert!(out.contains(
+            "model-beta · 1 of 80 human messages · 1.3% · about 1 in 80 messages"
+        ));
+        // Zero-match model-months still render as denominators without a fake ratio.
+        assert!(out.contains("model-alpha · 0 of 100 human messages · 0.0%"));
         assert!(!out.contains('\x1b'));
 
         let mut narrow = String::new();
