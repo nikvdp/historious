@@ -52,6 +52,8 @@ pub struct UsageReport {
     pub dayparts: Vec<DaypartBucket>,
     #[serde(default)]
     pub daypart_insights: Vec<DaypartInsight>,
+    #[serde(default)]
+    pub frustration: Vec<FrustrationPoint>,
     pub frequencies: FrequencySection,
     pub topics: Option<TopicSection>,
     pub sentiment: Option<SentimentSection>,
@@ -160,6 +162,20 @@ pub struct MixPoint {
     pub month: String,
     pub name: String,
     pub sessions: u64,
+}
+
+/// Human messages containing frustration terms, attributed to the model of
+/// the immediately preceding assistant reply, grouped by month.
+pub const FRUSTRATION_TERMS: &[&str] = &[
+    "wtf", "gdi", "ffs", "fuck", "damn", "shit", "ugh",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrustrationPoint {
+    pub month: String,
+    pub model: String,
+    pub matches: u64,
+    pub human_messages: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +326,7 @@ pub(crate) fn rebuild_snapshot_with_progress(
     store: &Store,
     mut progress: impl FnMut(ReportSnapshotProgress),
 ) -> Result<()> {
-    let mut total = 15;
+    let mut total = 16;
     let report = compute_live_with_progress(
         store,
         &ReportOptions {
@@ -400,7 +416,7 @@ fn compute_live_with_progress(
 ) -> Result<UsageReport> {
     let project_pattern = options.project.as_ref().map(|value| format!("%{value}%"));
     let mut frequency_messages = 0;
-    let mut total = 13;
+    let mut total = 14;
     progress(ReportSnapshotProgress {
         completed: 0,
         total,
@@ -467,6 +483,13 @@ fn compute_live_with_progress(
     let dayparts = report_dayparts(&rhythms);
     let daypart_insights = select_daypart_insights(&dayparts);
     progress(ReportSnapshotProgress { completed: 8, total, detail: "computed rhythms and dayparts".to_string() });
+    let frustration = report_frustration(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
+    progress(ReportSnapshotProgress { completed: 9, total, detail: "computed frustration signals".to_string() });
     let (frequencies, project_terms) = report_frequencies(
         store,
         options.after.as_deref(),
@@ -474,9 +497,9 @@ fn compute_live_with_progress(
         project_pattern.as_deref(),
         |processed, actual_total, detail| {
             frequency_messages = actual_total;
-            total = 13 + actual_total;
+            total = 14 + actual_total;
             progress(ReportSnapshotProgress {
-                completed: 9 + processed,
+                completed: 10 + processed,
                 total,
                 detail,
             });
@@ -494,14 +517,14 @@ fn compute_live_with_progress(
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
-    progress(ReportSnapshotProgress { completed: 10 + frequency_messages, total, detail: "computed topics".to_string() });
+    progress(ReportSnapshotProgress { completed: 11 + frequency_messages, total, detail: "computed topics".to_string() });
     let (sentiment, sentiment_warning) = report_sentiment(
         store,
         options.after.as_deref(),
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
-    progress(ReportSnapshotProgress { completed: 11 + frequency_messages, total, detail: "computed sentiment".to_string() });
+    progress(ReportSnapshotProgress { completed: 12 + frequency_messages, total, detail: "computed sentiment".to_string() });
     let mut warnings = if include_projection_warnings {
         analytics::freshness(store)?
             .into_iter()
@@ -536,7 +559,7 @@ fn compute_live_with_progress(
     if let Some(warning) = sentiment_warning {
         warnings.push(warning);
     }
-    progress(ReportSnapshotProgress { completed: 12 + frequency_messages, total, detail: "computed report warnings".to_string() });
+    progress(ReportSnapshotProgress { completed: 13 + frequency_messages, total, detail: "computed report warnings".to_string() });
 
     let report = UsageReport {
         schema: "historious.report.v1".to_string(),
@@ -559,6 +582,7 @@ fn compute_live_with_progress(
         rhythms,
         dayparts,
         daypart_insights,
+        frustration,
         frequencies,
         topics,
         sentiment,
@@ -1551,6 +1575,95 @@ fn report_mix(
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    })
+}
+
+fn report_frustration(
+    store: &Store,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<FrustrationPoint>> {
+    let match_expr = FRUSTRATION_TERMS
+        .iter()
+        .map(|term| format!("\"{term}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    store.with_conn(|conn| {
+        // Matches: human messages whose text contains a frustration term.
+        let mut matches_stmt = conn.prepare(
+            "SELECT strftime('%Y-%m', mc.occurred_at, 'localtime'), mc.model, COUNT(*)
+             FROM history_items_fts f
+             JOIN message_provenance p ON p.item_id = f.item_id
+             JOIN message_model_context mc ON mc.item_id = f.item_id
+             JOIN session_facts sf ON sf.session_id = mc.session_id
+             WHERE history_items_fts MATCH ?1
+               AND p.authored_by = 'human'
+               AND mc.occurred_at IS NOT NULL
+               AND (?2 IS NULL OR mc.occurred_at >= ?2)
+               AND (?3 IS NULL OR mc.occurred_at < ?3)
+               AND (?4 IS NULL OR sf.workspace_path LIKE ?4)
+             GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2",
+        )?;
+        let match_rows = matches_stmt.query_map(
+            params![match_expr, after, before, project],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    nonnegative(row.get(2)?),
+                ))
+            },
+        )?;
+        let mut points = BTreeMap::<(String, String), FrustrationPoint>::new();
+        for row in match_rows {
+            let (month, model, matches) = row?;
+            points.insert(
+                (month.clone(), model.clone()),
+                FrustrationPoint {
+                    month,
+                    model,
+                    matches,
+                    human_messages: 0,
+                },
+            );
+        }
+        drop(matches_stmt);
+
+        // Denominators: all human messages with a model attribution, so rates
+        // can be derived later and quiet months still render.
+        let mut totals_stmt = conn.prepare(
+            "SELECT strftime('%Y-%m', mc.occurred_at, 'localtime'), mc.model, COUNT(*)
+             FROM message_provenance p
+             JOIN message_model_context mc ON mc.item_id = p.item_id
+             JOIN session_facts sf ON sf.session_id = mc.session_id
+             WHERE p.authored_by = 'human'
+               AND mc.occurred_at IS NOT NULL
+               AND (?1 IS NULL OR mc.occurred_at >= ?1)
+               AND (?2 IS NULL OR mc.occurred_at < ?2)
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+             GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2",
+        )?;
+        let total_rows = totals_stmt.query_map(params![after, before, project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                nonnegative(row.get(2)?),
+            ))
+        })?;
+        for row in total_rows {
+            let (month, model, human_messages) = row?;
+            points
+                .entry((month.clone(), model.clone()))
+                .or_insert_with(|| FrustrationPoint {
+                    month,
+                    model,
+                    matches: 0,
+                    human_messages: 0,
+                })
+                .human_messages = human_messages;
+        }
+        Ok(points.into_values().collect())
     })
 }
 
@@ -2962,6 +3075,61 @@ mod tests {
     }
 
     #[test]
+    fn parallel_frequency_aggregation_matches_sequential_counts() {
+        let messages = vec![
+            FrequencyMessage {
+                text: "alpha alpha alpha alpha shared task".to_string(),
+                strip_rule: None,
+                workspace_path: "/repo/a".to_string(),
+            },
+            FrequencyMessage {
+                text: "<image name='photo.png'>beta beta beta beta shared".to_string(),
+                strip_rule: Some("tag.image".to_string()),
+                workspace_path: "/repo/b".to_string(),
+            },
+            FrequencyMessage {
+                text: "<command-name>/review</command-name>gamma gamma gamma gamma".to_string(),
+                strip_rule: Some("tag.command_name".to_string()),
+                workspace_path: "/repo/a".to_string(),
+            },
+            FrequencyMessage {
+                text: "the the alpha".to_string(),
+                strip_rule: None,
+                workspace_path: "/repo/b".to_string(),
+            },
+        ];
+        let stopwords = english_stopwords();
+        let project_noise = project_noise_words();
+        let sequential = aggregate_frequency_chunk(&messages, 1, &stopwords, &project_noise)
+            .expect("sequential frequency counts");
+        let parallel = aggregate_frequency_chunk(&messages, 3, &stopwords, &project_noise)
+            .expect("parallel frequency counts");
+
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel.unigrams["alpha"], 4);
+        assert_eq!(parallel.unigrams["beta"], 3);
+        assert_eq!(parallel.unigrams["gamma"], 3);
+        assert!(!parallel.unigrams.contains_key("image"));
+        assert_eq!(
+            parallel.project_unigrams["/repo/a"],
+            HashMap::from([
+                ("alpha".to_string(), 3),
+                ("shared".to_string(), 1),
+                ("task".to_string(), 1),
+                ("gamma".to_string(), 3),
+            ])
+        );
+        assert_eq!(
+            parallel.project_unigrams["/repo/b"],
+            HashMap::from([
+                ("beta".to_string(), 3),
+                ("shared".to_string(), 1),
+                ("alpha".to_string(), 1),
+            ])
+        );
+    }
+
+    #[test]
     fn frequency_counts_apply_threshold_and_stable_order() {
         let terms = top_terms(
             HashMap::from([
@@ -3433,5 +3601,136 @@ mod tests {
             .by_project
             .iter()
             .all(|row| row.project == "project-alpha"));
+    }
+
+    fn insert_frustration_fixture(
+        conn: &Connection,
+        session_id: &str,
+        model: &str,
+        item_id: &str,
+        text: &str,
+        occurred_at: &str,
+        workspace: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions
+             (id, source_id, machine_id, source_kind, external_id, status,
+              metadata_json, hash)
+             VALUES (?1, 'source', 'machine', 'claude_code', ?1, 'open', '{}', ?1)",
+            params![session_id],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO session_facts
+             (session_id, source_kind, workspace_path, session_class, models_json,
+              primary_model, first_event_at, last_event_at)
+             VALUES (?1, 'claude_code', ?2, 'interactive', '[]', ?3, ?4, ?4)",
+            params![session_id, workspace, model, occurred_at],
+        )
+        .expect("insert session facts");
+        conn.execute(
+            "INSERT INTO history_items
+             (id, event_id, session_id, source_id, machine_id, source_kind,
+              ordinal, subordinal, tier, kind, text, text_hash, occurred_at,
+              lexical_indexable, semantic_policy, metadata_json, hash)
+             VALUES (?1, ?1, ?2, 'source', 'machine', 'claude_code', 0, 0,
+                     'conversation', 'user', ?3, ?1, ?4, 1, 'required', '{}', ?1)",
+            params![item_id, session_id, text, occurred_at],
+        )
+        .expect("insert history item");
+        conn.execute(
+            "INSERT INTO history_items_fts (item_id, event_id, session_id, tier, kind, text)
+             VALUES (?1, ?1, ?2, 'conversation', 'user', ?3)",
+            params![item_id, session_id, text],
+        )
+        .expect("insert fts row");
+        conn.execute(
+            "INSERT INTO message_provenance
+             (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
+             VALUES (?1, ?2, 'claude_code', 'human', 'yes', 'test', ?3)",
+            params![item_id, session_id, occurred_at],
+        )
+        .expect("insert provenance");
+        conn.execute(
+            "INSERT INTO message_model_context (item_id, session_id, model, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![item_id, session_id, model, occurred_at],
+        )
+        .expect("insert model context");
+    }
+
+    #[test]
+    fn frustration_report_counts_terms_per_model_per_month() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                // Frustration aimed at model-alpha in July.
+                insert_frustration_fixture(
+                    conn, "s1", "model-alpha", "m1", "wtf is this output",
+                    "2026-07-12T01:00:00Z", "/repo/a",
+                );
+                // Frustration aimed at model-beta in July.
+                insert_frustration_fixture(
+                    conn, "s2", "model-beta", "m2", "gdi it broke again",
+                    "2026-07-13T01:00:00Z", "/repo/a",
+                );
+                // A calm model-alpha message the same month (denominator only).
+                insert_frustration_fixture(
+                    conn, "s3", "model-alpha", "m3", "looks good, thanks",
+                    "2026-07-14T01:00:00Z", "/repo/a",
+                );
+                // Whole-word check: 'wtfbbq' is a different token and must not match.
+                insert_frustration_fixture(
+                    conn, "s4", "model-beta", "m4", "wtfbbq not a match",
+                    "2026-07-15T01:00:00Z", "/repo/a",
+                );
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let points = report_frustration(&store, None, None, None).expect("frustration report");
+        assert_eq!(points.len(), 2);
+        let alpha = points.iter().find(|p| p.model == "model-alpha").unwrap();
+        assert_eq!(alpha.month, "2026-07");
+        assert_eq!(alpha.matches, 1);
+        assert_eq!(alpha.human_messages, 2);
+        let beta = points.iter().find(|p| p.model == "model-beta").unwrap();
+        assert_eq!(beta.matches, 1);
+        assert_eq!(beta.human_messages, 2);
+    }
+
+    #[test]
+    fn frustration_report_honors_time_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_frustration_fixture(
+                    conn, "s1", "model-alpha", "m1", "wtf",
+                    "2026-06-12T01:00:00Z", "/repo/a",
+                );
+                insert_frustration_fixture(
+                    conn, "s2", "model-alpha", "m2", "wtf",
+                    "2026-07-12T01:00:00Z", "/repo/a",
+                );
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let points = report_frustration(&store, Some("2026-07-01"), None, None)
+            .expect("windowed frustration report");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].month, "2026-07");
+        assert_eq!(points[0].matches, 1);
+        assert_eq!(points[0].human_messages, 1);
+    }
+
+    #[test]
+    fn frustration_report_empty_store_returns_no_points() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let points = report_frustration(&store, None, None, None).expect("empty report");
+        assert!(points.is_empty());
     }
 }
