@@ -4303,10 +4303,16 @@ mod tests {
                 matches: 6,
                 human_messages: 135,
             },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "very-high-rate".to_string(),
+                matches: 30,
+                human_messages: 150,
+            },
         ];
         let summary = summarize_frustration(&points, false).expect("summary");
-        assert_eq!(summary.matches, 398);
-        assert_eq!(summary.human_messages, 3_621);
+        assert_eq!(summary.matches, 428);
+        assert_eq!(summary.human_messages, 3_771);
         assert_eq!(summary.scale_percent, 13.0);
         assert_eq!(
             summary
@@ -4315,14 +4321,14 @@ mod tests {
                 .map(|model| model.model.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "claude-opus-5",
-                "gpt-5.5",
-                "gpt-5.6-sol",
+                "claude-fable-5",
                 "glm-5.2",
-                "claude-fable-5"
+                "gpt-5.6-sol",
+                "gpt-5.5",
+                "claude-opus-5"
             ]
         );
-        assert_eq!(summary.hidden_models, 1);
+        assert_eq!(summary.hidden_models, 2);
         assert_eq!(
             horizontal_bar(
                 summary.rate_percent,
@@ -4337,7 +4343,7 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "████████████████████"
+            "███████████░░░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
@@ -4345,7 +4351,7 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "███████████████████░"
+            "███████████████░░░░░"
         );
         assert_eq!(
             horizontal_bar(
@@ -4353,17 +4359,17 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "███████████░░░░░░░░░"
+            "████████████████████"
         );
 
         let mut out = String::new();
         render_frustration(&mut out, &points, false, 80, false);
         assert!(out.contains("Frustration signals"));
-        assert!(out.contains("2026-07 · 3,621 follow-ups · 398 signals · overall 11.0%"));
+        assert!(out.contains("2026-07 · 3,771 follow-ups · 428 signals · overall 11.3%"));
         assert!(out.contains("Bar scale 0–13%"));
-        assert!(out.contains("12.7% · +1.7pp · n=157"));
-        assert!(out.contains("6.9% · -4.1pp · n=245"));
-        assert!(out.contains("1 model hidden · minimum 150 follow-ups · top 5 shown"));
+        assert!(out.contains("12.7% · +1.4pp · n=157"));
+        assert!(out.contains("6.9% · -4.4pp · n=245"));
+        assert!(out.contains("2 models hidden · minimum 150 follow-ups · 5 lowest-rate shown"));
         assert!(!out.contains("about 1 in"));
         assert!(out.lines().count() <= 13);
         assert!(!out.contains('\x1b'));
