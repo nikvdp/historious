@@ -4266,67 +4266,32 @@ mod tests {
 
     #[test]
     fn frustration_rendering_is_compact_ranked_and_graphical() {
+        let point = |model: &str, matches, human_messages| FrustrationPoint {
+            month: "2026-07".to_string(),
+            model: model.to_string(),
+            matches,
+            human_messages,
+        };
         let points = vec![
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "claude-opus-5".to_string(),
-                matches: 20,
-                human_messages: 157,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "gpt-5.5".to_string(),
-                matches: 157,
-                human_messages: 1_259,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "gpt-5.6-sol".to_string(),
-                matches: 176,
-                human_messages: 1_605,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "glm-5.2".to_string(),
-                matches: 22,
-                human_messages: 220,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "claude-fable-5".to_string(),
-                matches: 17,
-                human_messages: 245,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "low-volume".to_string(),
-                matches: 6,
-                human_messages: 135,
-            },
-            FrustrationPoint {
-                month: "2026-07".to_string(),
-                model: "very-high-rate".to_string(),
-                matches: 30,
-                human_messages: 150,
-            },
+            point("model-f", 18, 300),
+            point("model-c", 9, 300),
+            point("model-a", 3, 300),
+            point("model-e", 15, 300),
+            point("model-b", 6, 300),
+            point("model-d", 12, 300),
+            point("low-volume", 1, 149),
         ];
         let summary = summarize_frustration(&points, false).expect("summary");
-        assert_eq!(summary.matches, 428);
-        assert_eq!(summary.human_messages, 3_771);
-        assert_eq!(summary.scale_percent, 13.0);
+        assert_eq!(summary.matches, 64);
+        assert_eq!(summary.human_messages, 1_949);
+        assert_eq!(summary.scale_percent, 5.0);
         assert_eq!(
             summary
                 .models
                 .iter()
                 .map(|model| model.model.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "claude-fable-5",
-                "glm-5.2",
-                "gpt-5.6-sol",
-                "gpt-5.5",
-                "claude-opus-5"
-            ]
+            vec!["model-a", "model-b", "model-c", "model-d", "model-e"]
         );
         assert_eq!(summary.hidden_models, 2);
         assert_eq!(
@@ -4335,7 +4300,7 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "█████████████████░░░"
+            "█████████████░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
@@ -4343,7 +4308,7 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "███████████░░░░░░░░░"
+            "████░░░░░░░░░░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
@@ -4351,7 +4316,7 @@ mod tests {
                 summary.scale_percent,
                 FRUSTRATION_CHART_WIDTH
             ),
-            "███████████████░░░░░"
+            "████████░░░░░░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
@@ -4365,10 +4330,10 @@ mod tests {
         let mut out = String::new();
         render_frustration(&mut out, &points, false, 80, false);
         assert!(out.contains("Frustration signals"));
-        assert!(out.contains("2026-07 · 3,771 follow-ups · 428 signals · overall 11.3%"));
-        assert!(out.contains("Bar scale 0–13%"));
-        assert!(out.contains("12.7% · +1.4pp · n=157"));
-        assert!(out.contains("6.9% · -4.4pp · n=245"));
+        assert!(out.contains("2026-07 · 1,949 follow-ups · 64 signals · overall 3.3%"));
+        assert!(out.contains("Bar scale 0–5%"));
+        assert!(out.contains("1.0% · -2.3pp · n=300"));
+        assert!(out.contains("5.0% · +1.7pp · n=300"));
         assert!(out.contains("2 models hidden · minimum 150 follow-ups · 5 lowest-rate shown"));
         assert!(!out.contains("about 1 in"));
         assert!(out.lines().count() <= 13);
