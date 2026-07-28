@@ -2315,9 +2315,9 @@ fn summarize_frustration(
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| {
-        right
+        left
             .rate_percent
-            .total_cmp(&left.rate_percent)
+            .total_cmp(&right.rate_percent)
             .then_with(|| right.matches.cmp(&left.matches))
             .then_with(|| left.model.cmp(&right.model))
     });
@@ -2526,7 +2526,7 @@ fn render_frustration(
         push_wrapped(
             out,
             &format!(
-                "{} model{} hidden · minimum {} follow-ups · top {} shown",
+                "{} model{} hidden · minimum {} follow-ups · {} lowest-rate shown",
                 exact_number(summary.hidden_models as u64),
                 if summary.hidden_models == 1 { "" } else { "s" },
                 exact_number(FRUSTRATION_MIN_MODEL_MESSAGES),
