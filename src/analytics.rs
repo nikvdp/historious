@@ -20,7 +20,7 @@ pub const SESSION_FACTS_VERSION: u32 = 3;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
 pub const REPORT_SNAPSHOT_VERSION: u32 = 9;
 pub const MESSAGE_MODEL_CONTEXT_PROJECTION: &str = "message_model_context";
-pub const MESSAGE_MODEL_CONTEXT_VERSION: u32 = 1;
+pub const MESSAGE_MODEL_CONTEXT_VERSION: u32 = 2;
 pub(crate) const REPORT_PROJECTION_COUNT: usize = 5;
 
 const PROJECTIONS: [Projection; REPORT_PROJECTION_COUNT] = [
@@ -1096,7 +1096,7 @@ fn map_session_model_context(
 /// Extract the assistant model reported by a single event for the given
 /// source kind. Mirrors `ingest::extract_session_usage`'s per-source parsers.
 fn event_model(source_kind: &str, content: &str, metadata_json: &str) -> Option<String> {
-    match source_kind {
+    let model = match source_kind {
         "codex" => ingest::codex_event_fact(content).model,
         "claude_code" | "pi_agent" | "omp" => serde_json::from_str::<Value>(content)
             .ok()
@@ -1115,7 +1115,9 @@ fn event_model(source_kind: &str, content: &str, metadata_json: &str) -> Option<
                     .map(ToOwned::to_owned)
             }),
         _ => None,
-    }
+    }?;
+    let model = model.trim();
+    (!model.is_empty()).then(|| model.to_owned())
 }
 
 fn rebuild_session_relationships_with_progress(
@@ -5970,5 +5972,26 @@ mod tests {
         let rows = model_context_rows(&store);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, "kimi-k2");
+    }
+
+    #[test]
+    fn event_model_rejects_blank_names() {
+        assert_eq!(
+            event_model(
+                "opencode",
+                "{}",
+                &serde_json::json!({"opencode_model_id": "  "}).to_string(),
+            ),
+            None
+        );
+        assert_eq!(
+            event_model(
+                "claude_code",
+                &serde_json::json!({"message": {"model": " model-a "}}).to_string(),
+                "{}",
+            )
+            .as_deref(),
+            Some("model-a")
+        );
     }
 }
