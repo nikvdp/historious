@@ -2096,6 +2096,7 @@ pub fn render_terminal_window(
 
     if show_models {
         render_model_usage(&mut out, &report.model_mix_by_month, width, color);
+        render_frustration(&mut out, &report.frustration, width, color);
     }
 
     out.push('\n');
@@ -2199,6 +2200,66 @@ fn slice_at(slices: &[ModelSlice], position: u64) -> usize {
         }
     }
     slices.len().saturating_sub(1)
+}
+
+fn render_frustration(
+    out: &mut String,
+    points: &[FrustrationPoint],
+    width: usize,
+    color: bool,
+) {
+    out.push('\n');
+    out.push_str(&styled_role("Frustration signals", StyleRole::Section, color));
+    out.push('\n');
+    push_wrapped(
+        out,
+        &format!(
+            "Human messages containing {} · attributed to the model of the preceding reply",
+            FRUSTRATION_TERMS.join(", ")
+        ),
+        width,
+        2,
+        StyleRole::Muted,
+        color,
+    );
+    if points.is_empty() {
+        push_wrapped(
+            out,
+            "No frustration signals recorded for this report window.",
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        return;
+    }
+    let mut by_month: BTreeMap<&str, Vec<&FrustrationPoint>> = BTreeMap::new();
+    for point in points {
+        by_month.entry(&point.month).or_default().push(point);
+    }
+    for (month, rows) in by_month {
+        out.push_str(&format!(
+            "  {}\n",
+            styled_role(month, StyleRole::Time, color)
+        ));
+        let mut rows = rows;
+        rows.sort_by(|a, b| b.matches.cmp(&a.matches).then_with(|| a.model.cmp(&b.model)));
+        for row in rows {
+            push_wrapped(
+                out,
+                &format!(
+                    "{} · {} of {} human messages",
+                    row.model,
+                    exact_number(row.matches),
+                    exact_number(row.human_messages)
+                ),
+                width,
+                4,
+                StyleRole::Count,
+                color,
+            );
+        }
+    }
 }
 
 fn render_model_usage(
@@ -3174,6 +3235,82 @@ mod tests {
     }
 
     #[test]
+    fn comparison_scan_preserves_window_metrics_and_project_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO session_facts
+                      (session_id, source_kind, workspace_path, input_tokens,
+                       cached_input_tokens, output_tokens, first_event_at, last_event_at)
+                    VALUES
+                      ('previous', 'codex', '/repo/rise', 60, 20, 20,
+                       datetime('now', '-8 days'), datetime('now', '-8 days')),
+                      ('current', 'codex', '/repo/rise', 150, 50, 50,
+                       datetime('now', '-1 day'), datetime('now', '-1 day'));
+
+                    WITH RECURSIVE messages(n) AS (
+                      VALUES(1) UNION ALL SELECT n + 1 FROM messages WHERE n < 50
+                    )
+                    INSERT INTO history_items
+                      (id, event_id, session_id, source_id, machine_id, source_kind, ordinal,
+                       subordinal, tier, kind, text, text_hash, occurred_at, lexical_indexable,
+                       semantic_policy, metadata_json, hash)
+                    SELECT 'item_' || n, 'event_' || n,
+                           CASE WHEN n <= 20 THEN 'previous' ELSE 'current' END,
+                           'source', 'machine', 'codex', n, 0, 'conversation', 'user',
+                           'message', 'text_hash_' || n,
+                           CASE WHEN n <= 20 THEN datetime('now', '-8 days')
+                                ELSE datetime('now', '-1 day') END,
+                           1, 'required', '{}', 'item_hash_' || n
+                    FROM messages;
+
+                    INSERT INTO message_provenance
+                      (item_id, session_id, source_kind, authored_by,
+                       sentiment_usable, rule, occurred_at)
+                    SELECT id, session_id, 'codex', 'human', 'yes', 'default.human', occurred_at
+                    FROM history_items;
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert comparison fixtures");
+
+        let comparisons = report_comparisons(&store, None, None, None).expect("comparison report");
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|window| window.days)
+                .collect::<Vec<_>>(),
+            vec![7, 14, 28]
+        );
+        assert_eq!(
+            comparisons[0]
+                .metrics
+                .iter()
+                .map(|metric| (metric.metric.as_str(), metric.current, metric.previous))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sessions", 1, 1),
+                ("human turns", 30, 20),
+                ("tokens", 250, 100)
+            ]
+        );
+        assert_eq!(comparisons[0].project_changes.len(), 1);
+        assert_eq!(
+            comparisons[0].project_changes[0].subject.as_deref(),
+            Some("rise")
+        );
+        assert_eq!(comparisons[0].project_changes[0].current, 30);
+        assert_eq!(comparisons[0].project_changes[0].previous, 20);
+        assert_eq!(comparisons[0].project_changes[0].change_percent, Some(50));
+        assert_eq!(comparisons[1].metrics[1].current, 50);
+        assert_eq!(comparisons[1].metrics[1].previous, 0);
+    }
+
+    #[test]
     fn report_aggregates_use_provenance_times_and_ignore_null_times() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
@@ -3724,6 +3861,88 @@ mod tests {
         assert_eq!(points[0].month, "2026-07");
         assert_eq!(points[0].matches, 1);
         assert_eq!(points[0].human_messages, 1);
+    }
+
+    #[test]
+    fn frustration_section_renders_in_terminal_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_frustration_fixture(
+                    conn, "s1", "model-alpha", "m1", "wtf happened here",
+                    "2026-07-12T01:00:00Z", "/repo/a",
+                );
+                Ok(())
+            })
+            .expect("seed fixture");
+        let report = compute_live(
+            &store,
+            &ReportOptions {
+                after: None,
+                before: None,
+                project: None,
+                sort: ReportSort::Tokens,
+            },
+            false,
+        )
+        .expect("compute report");
+        assert_eq!(report.frustration.len(), 1);
+        assert_eq!(report.frustration[0].matches, 1);
+        let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, true);
+        assert!(rendered.contains("Frustration signals"));
+        assert!(rendered.contains("model-alpha · 1 of 1 human messages"));
+        // Hidden when models are hidden.
+        let without = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
+        assert!(!without.contains("Frustration signals"));
+    }
+
+    #[test]
+    fn frustration_rendering_groups_by_month_and_handles_empty() {
+        let points = vec![
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "model-alpha".to_string(),
+                matches: 3,
+                human_messages: 120,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "model-beta".to_string(),
+                matches: 1,
+                human_messages: 80,
+            },
+            FrustrationPoint {
+                month: "2026-06".to_string(),
+                model: "model-alpha".to_string(),
+                matches: 0,
+                human_messages: 100,
+            },
+        ];
+        let mut out = String::new();
+        render_frustration(&mut out, &points, 80, false);
+        assert!(out.contains("Frustration signals"));
+        assert!(out.contains("wtf"));
+        // Months render in chronological order.
+        assert!(out.find("2026-06") < out.find("2026-07"));
+        assert!(out.contains("model-alpha · 3 of 120 human messages"));
+        assert!(out.contains("model-beta · 1 of 80 human messages"));
+        // Zero-match model-months still render as denominators.
+        assert!(out.contains("model-alpha · 0 of 100 human messages"));
+        assert!(!out.contains('\x1b'));
+
+        let mut narrow = String::new();
+        render_frustration(&mut narrow, &points, 40, false);
+        assert!(narrow.lines().all(|line| line.chars().count() <= 40));
+
+        let mut colored = String::new();
+        render_frustration(&mut colored, &points, 80, true);
+        assert!(colored.contains("\x1b["));
+
+        let mut empty = String::new();
+        render_frustration(&mut empty, &[], 80, false);
+        assert!(empty.contains("Frustration signals"));
+        assert!(empty.contains("No frustration signals recorded"));
     }
 
     #[test]
