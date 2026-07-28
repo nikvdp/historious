@@ -3093,6 +3093,7 @@ fn push_wrapped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn ranked_changes_and_dayparts_suppress_weak_patterns() {
@@ -4153,14 +4154,19 @@ mod tests {
     }
 
     #[test]
-    fn frustration_section_renders_in_terminal_report() {
+    fn frustration_section_renders_in_default_terminal_report() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         store
             .with_conn(|conn| {
                 insert_frustration_fixture(
-                    conn, "s1", "model-alpha", "m1", "wtf happened here",
-                    "2026-07-12T01:00:00Z", "/repo/a",
+                    conn,
+                    "s1",
+                    "model-alpha",
+                    "m1",
+                    "wtf happened here",
+                    "2026-07-12T01:00:00Z",
+                    "/repo/a",
                 );
                 Ok(())
             })
@@ -4176,66 +4182,202 @@ mod tests {
             false,
         )
         .expect("compute report");
-        assert_eq!(report.frustration.len(), 1);
-        assert_eq!(report.frustration[0].matches, 1);
-        let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, true);
+        let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
         assert!(rendered.contains("Frustration signals"));
-        assert!(rendered.contains(
-            "model-alpha · 1 of 1 human messages · 100.0% · about 1 in 1 message"
-        ));
-        let default = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
-        assert!(default.contains("Frustration signals"));
+        assert!(rendered.contains("Not enough data to compare models"));
+        assert!(rendered.contains("model-alpha (1)"));
+        assert!(!rendered.contains("Bar scale"));
     }
 
     #[test]
-    fn frustration_rendering_groups_by_month_and_handles_empty() {
+    fn frustration_summary_adapts_window_and_respects_filters() {
+        let point = |month: &str, matches, human_messages| FrustrationPoint {
+            month: month.to_string(),
+            model: "model-a".to_string(),
+            matches,
+            human_messages,
+        };
+        let points = vec![
+            point("2026-05", 100, 1_000),
+            point("2026-06", 80, 800),
+            point("2026-07", 12, 1_200),
+        ];
+
+        let recent = summarize_frustration(&points, false).expect("recent summary");
+        assert_eq!(recent.window_start, "2026-06");
+        assert_eq!(recent.window_end, "2026-07");
+        assert_eq!(recent.months, 2);
+        assert_eq!(recent.matches, 92);
+        assert_eq!(recent.human_messages, 2_000);
+        assert_eq!(rounded_tenth(recent.rate_percent), 4.6);
+
+        let filtered = summarize_frustration(&points, true).expect("filtered summary");
+        assert_eq!(filtered.window_start, "2026-05");
+        assert_eq!(filtered.months, 3);
+        assert_eq!(filtered.matches, 192);
+        assert_eq!(filtered.human_messages, 3_000);
+        assert_eq!(rounded_tenth(filtered.rate_percent), 6.4);
+
+        let capped = (1..=7)
+            .map(|month| point(&format!("2026-{month:02}"), 1, 100))
+            .collect::<Vec<_>>();
+        let capped = summarize_frustration(&capped, false).expect("capped summary");
+        assert_eq!(capped.window_start, "2026-02");
+        assert_eq!(capped.window_end, "2026-07");
+        assert_eq!(capped.months, FRUSTRATION_MAX_MONTHS);
+
+        let threshold = vec![
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "alpha-floor".to_string(),
+                matches: 15,
+                human_messages: FRUSTRATION_MIN_MODEL_MESSAGES,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "beta-floor".to_string(),
+                matches: 15,
+                human_messages: FRUSTRATION_MIN_MODEL_MESSAGES,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "more-matches".to_string(),
+                matches: 20,
+                human_messages: 200,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "below-floor".to_string(),
+                matches: 149,
+                human_messages: FRUSTRATION_MIN_MODEL_MESSAGES - 1,
+            },
+        ];
+        let threshold = summarize_frustration(&threshold, true).expect("threshold summary");
+        assert_eq!(
+            threshold
+                .models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["more-matches", "alpha-floor", "beta-floor"]
+        );
+        assert_eq!(threshold.hidden_models, 1);
+    }
+
+    #[test]
+    fn frustration_rendering_is_compact_ranked_and_graphical() {
         let points = vec![
             FrustrationPoint {
                 month: "2026-07".to_string(),
-                model: "model-alpha".to_string(),
-                matches: 3,
-                human_messages: 120,
+                model: "claude-opus-5".to_string(),
+                matches: 20,
+                human_messages: 157,
             },
             FrustrationPoint {
                 month: "2026-07".to_string(),
-                model: "model-beta".to_string(),
-                matches: 1,
-                human_messages: 80,
+                model: "gpt-5.5".to_string(),
+                matches: 157,
+                human_messages: 1_259,
             },
             FrustrationPoint {
-                month: "2026-06".to_string(),
-                model: "model-alpha".to_string(),
-                matches: 0,
-                human_messages: 100,
+                month: "2026-07".to_string(),
+                model: "gpt-5.6-sol".to_string(),
+                matches: 176,
+                human_messages: 1_605,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "glm-5.2".to_string(),
+                matches: 22,
+                human_messages: 220,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "claude-fable-5".to_string(),
+                matches: 17,
+                human_messages: 245,
+            },
+            FrustrationPoint {
+                month: "2026-07".to_string(),
+                model: "low-volume".to_string(),
+                matches: 6,
+                human_messages: 135,
             },
         ];
+        let summary = summarize_frustration(&points, false).expect("summary");
+        assert_eq!(summary.matches, 398);
+        assert_eq!(summary.human_messages, 3_621);
+        assert_eq!(summary.scale_percent, 13.0);
+        assert_eq!(
+            summary
+                .models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-opus-5",
+                "gpt-5.5",
+                "gpt-5.6-sol",
+                "glm-5.2",
+                "claude-fable-5"
+            ]
+        );
+        assert_eq!(summary.hidden_models, 1);
+        assert_eq!(
+            horizontal_bar(
+                summary.rate_percent,
+                summary.scale_percent,
+                FRUSTRATION_CHART_WIDTH
+            ),
+            "█████████████████░░░"
+        );
+        assert_eq!(
+            horizontal_bar(
+                summary.models[0].rate_percent,
+                summary.scale_percent,
+                FRUSTRATION_CHART_WIDTH
+            ),
+            "████████████████████"
+        );
+        assert_eq!(
+            horizontal_bar(
+                summary.models[1].rate_percent,
+                summary.scale_percent,
+                FRUSTRATION_CHART_WIDTH
+            ),
+            "███████████████████░"
+        );
+        assert_eq!(
+            horizontal_bar(
+                summary.models[4].rate_percent,
+                summary.scale_percent,
+                FRUSTRATION_CHART_WIDTH
+            ),
+            "███████████░░░░░░░░░"
+        );
+
         let mut out = String::new();
-        render_frustration(&mut out, &points, 120, false);
+        render_frustration(&mut out, &points, false, 80, false);
         assert!(out.contains("Frustration signals"));
-        assert!(out.contains("wtf"));
-        // Months render in chronological order.
-        assert!(out.find("2026-06") < out.find("2026-07"));
-        assert!(out.contains(
-            "model-alpha · 3 of 120 human messages · 2.5% · about 1 in 40 messages"
-        ));
-        assert!(out.contains(
-            "model-beta · 1 of 80 human messages · 1.3% · about 1 in 80 messages"
-        ));
-        // Zero-match model-months still render as denominators without a fake ratio.
-        assert!(out.contains("model-alpha · 0 of 100 human messages · 0.0%"));
+        assert!(out.contains("2026-07 · 3,621 follow-ups · 398 signals · overall 11.0%"));
+        assert!(out.contains("Bar scale 0–13%"));
+        assert!(out.contains("12.7% · +1.7pp · n=157"));
+        assert!(out.contains("6.9% · -4.1pp · n=245"));
+        assert!(out.contains("1 model hidden · minimum 150 follow-ups · top 5 shown"));
+        assert!(!out.contains("about 1 in"));
+        assert!(out.lines().count() <= 13);
         assert!(!out.contains('\x1b'));
 
         let mut narrow = String::new();
-        render_frustration(&mut narrow, &points, 40, false);
+        render_frustration(&mut narrow, &points, false, 40, false);
         assert!(narrow.lines().all(|line| line.chars().count() <= 40));
 
         let mut colored = String::new();
-        render_frustration(&mut colored, &points, 80, true);
+        render_frustration(&mut colored, &points, false, 80, true);
         assert!(colored.contains("\x1b["));
 
         let mut empty = String::new();
-        render_frustration(&mut empty, &[], 80, false);
-        assert!(empty.contains("Frustration signals"));
+        render_frustration(&mut empty, &[], false, 80, false);
         assert!(empty.contains("No frustration signals recorded"));
     }
 
