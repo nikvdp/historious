@@ -19,7 +19,9 @@ pub const SESSION_FACTS_PROJECTION: &str = "session_facts";
 pub const SESSION_FACTS_VERSION: u32 = 3;
 pub const REPORT_SNAPSHOT_PROJECTION: &str = "report_snapshot";
 pub const REPORT_SNAPSHOT_VERSION: u32 = 8;
-pub(crate) const REPORT_PROJECTION_COUNT: usize = 4;
+pub const MESSAGE_MODEL_CONTEXT_PROJECTION: &str = "message_model_context";
+pub const MESSAGE_MODEL_CONTEXT_VERSION: u32 = 1;
+pub(crate) const REPORT_PROJECTION_COUNT: usize = 5;
 
 const PROJECTIONS: [Projection; REPORT_PROJECTION_COUNT] = [
     Projection {
@@ -36,6 +38,11 @@ const PROJECTIONS: [Projection; REPORT_PROJECTION_COUNT] = [
         name: SESSION_FACTS_PROJECTION,
         version: SESSION_FACTS_VERSION,
         table: "session_facts",
+    },
+    Projection {
+        name: MESSAGE_MODEL_CONTEXT_PROJECTION,
+        version: MESSAGE_MODEL_CONTEXT_VERSION,
+        table: "message_model_context",
     },
     Projection {
         name: REPORT_SNAPSHOT_PROJECTION,
@@ -209,7 +216,7 @@ pub fn is_stale(store: &Store) -> Result<bool> {
 }
 
 pub fn report_snapshot_freshness(store: &Store) -> Result<ProjectionFreshness> {
-    projection_freshness(store, PROJECTIONS[3])
+    projection_freshness(store, PROJECTIONS[REPORT_PROJECTION_COUNT - 1])
 }
 pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus> {
     store.with_conn(|conn| {
@@ -231,7 +238,7 @@ pub(crate) fn report_refresh_status(store: &Store) -> Result<ReportRefreshStatus
                 .and_then(|(_, state)| serde_json::from_str::<ProjectionState>(state).ok());
             let invalid = stored.as_ref().map(|(status, _)| status.as_str()) != Some("ready")
                 || state.as_ref().map(|state| state.version) != Some(projection.version);
-            if index < 3 {
+            if index < REPORT_PROJECTION_COUNT - 1 {
                 prerequisites_invalid |= invalid;
             }
             stale |= invalid
@@ -574,7 +581,7 @@ fn refresh_report_with_progress(
     });
 
     let report_start = completed;
-    set_projection_building(store, PROJECTIONS[3], captured_input_rowid)?;
+    set_projection_building(store, PROJECTIONS[REPORT_PROJECTION_COUNT - 1], captured_input_rowid)?;
     let report_result = crate::report::rebuild_snapshot_with_progress(store, |event| {
         let scaled = event
             .completed
@@ -591,11 +598,16 @@ fn refresh_report_with_progress(
         });
     });
     match report_result {
-        Ok(()) => set_projection_ready(store, PROJECTIONS[3], captured_input_rowid, 1)?,
+        Ok(()) => set_projection_ready(
+            store,
+            PROJECTIONS[REPORT_PROJECTION_COUNT - 1],
+            captured_input_rowid,
+            1,
+        )?,
         Err(error) => {
             let _ = set_projection_failed(
                 store,
-                PROJECTIONS[3],
+                PROJECTIONS[REPORT_PROJECTION_COUNT - 1],
                 captured_input_rowid,
                 &error.to_string(),
             );
@@ -769,6 +781,7 @@ fn rebuild_projection(
             })?;
             Ok(1)
         }
+        MESSAGE_MODEL_CONTEXT_PROJECTION => rebuild_message_model_context(store, &mut progress),
         _ => {
             clear_projection(store, projection)?;
             Ok(0)
@@ -782,6 +795,16 @@ fn rebuild_projection(
             Err(error)
         }
     }
+}
+
+fn rebuild_message_model_context(
+    store: &Store,
+    progress: &mut impl FnMut(String),
+) -> Result<usize> {
+    let _ = (store, progress);
+    // Builder lands with the attribution implementation; skeleton keeps the
+    // projection registereable and markes it ready with zero rows.
+    Ok(0)
 }
 
 fn rebuild_session_relationships_with_progress(
@@ -5252,14 +5275,18 @@ mod tests {
         rebuild_all(&store, |_, _, _| {}).expect("rebuild projections");
         assert!(!is_stale(&store).expect("freshness after rebuild"));
         let statuses = freshness(&store).expect("projection statuses");
-        assert_eq!(statuses.len(), 4);
+        assert_eq!(statuses.len(), 5);
         assert_eq!(
             statuses[0].stored_version,
             Some(SESSION_RELATIONSHIPS_VERSION)
         );
         assert_eq!(statuses[1].stored_version, Some(MESSAGE_PROVENANCE_VERSION));
         assert_eq!(statuses[2].stored_version, Some(SESSION_FACTS_VERSION));
-        assert_eq!(statuses[3].stored_version, Some(REPORT_SNAPSHOT_VERSION));
+        assert_eq!(
+            statuses[3].stored_version,
+            Some(MESSAGE_MODEL_CONTEXT_VERSION)
+        );
+        assert_eq!(statuses[4].stored_version, Some(REPORT_SNAPSHOT_VERSION));
 
         insert_event(&store, "event-2", 2);
         let statuses = freshness(&store).expect("stale projection statuses");
