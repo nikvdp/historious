@@ -569,7 +569,13 @@ fn refresh_report_with_progress(
                     });
                 },
             )?;
-            Ok(total_conversation_messages(store)?)
+            store.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM message_provenance", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count.max(0) as usize)
+                .map_err(Into::into)
+            })
         }
     })?;
     completed = provenance_start + provenance_work;
@@ -801,10 +807,249 @@ fn rebuild_message_model_context(
     store: &Store,
     progress: &mut impl FnMut(String),
 ) -> Result<usize> {
-    let _ = (store, progress);
-    // Builder lands with the attribution implementation; skeleton keeps the
-    // projection registereable and markes it ready with zero rows.
-    Ok(0)
+    rebuild_message_model_context_scoped(store, None, progress)
+}
+
+/// Attribute each human-authored message to the model of the most recent
+/// preceding assistant event in the same session.
+///
+/// Walks each in-scope session's events in ordinal order, tracking the model
+/// reported by assistant events (codex turn-context, claude_code/pi_agent/omp
+/// `message.model`, opencode `opencode_model_id`). When a human-authored
+/// conversation message (per message_provenance) is reached, the current model
+/// is recorded for it. Messages before any identifiable model are skipped
+/// (strict attribution, no primary_model fallback).
+fn rebuild_message_model_context_scoped(
+    store: &Store,
+    scope: Option<&HashSet<String>>,
+    progress: &mut impl FnMut(String),
+) -> Result<usize> {
+    const SESSION_BATCH: usize = 200;
+
+    let total_sessions = store.with_conn(|conn| {
+        let count = match scope {
+            None => conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            Some(scope) if scope.is_empty() => 0,
+            Some(scope) => {
+                let mut count = 0i64;
+                let ids: Vec<&str> = scope.iter().map(String::as_str).collect();
+                for chunk in ids.chunks(500) {
+                    let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT COUNT(*) FROM sessions WHERE id IN ({marks})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    count += stmt.query_row(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                }
+                count
+            }
+        };
+        Ok(count.max(0) as usize)
+    })?;
+
+    if total_sessions == 0 {
+        progress("no sessions to map".to_string());
+        return Ok(0);
+    }
+
+    let mut processed_sessions = 0usize;
+    let mut total_rows = 0usize;
+    let mut last_progress = Instant::now();
+    progress(format!(
+        "mapped {processed_sessions}/{total_sessions} session model contexts"
+    ));
+
+    store.with_conn(|conn| {
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.message_model_context_rebuild;
+             CREATE TEMP TABLE message_model_context_rebuild (
+               item_id TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               model TEXT NOT NULL,
+               occurred_at TEXT
+             );",
+        )?;
+
+        // Sessions in scope, in stable rowid order.
+        let session_ids: Vec<String> = match scope {
+            None => {
+                let mut stmt = conn.prepare("SELECT id FROM sessions ORDER BY rowid")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            Some(scope) => {
+                let mut ids: Vec<String> = scope.iter().cloned().collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        let mut insert = conn.prepare(
+            "INSERT INTO temp.message_model_context_rebuild
+             (item_id, session_id, model, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+
+        for chunk in session_ids.chunks(SESSION_BATCH) {
+            for session_id in chunk {
+                let rows = map_session_model_context(conn, session_id)?;
+                for (item_id, model, occurred_at) in &rows {
+                    insert.execute(params![item_id, session_id, model, occurred_at])?;
+                }
+                total_rows += rows.len();
+            }
+            processed_sessions += chunk.len();
+            if last_progress.elapsed() >= Duration::from_secs(1) {
+                progress(format!(
+                    "mapped {processed_sessions}/{total_sessions} session model contexts"
+                ));
+                last_progress = Instant::now();
+            }
+        }
+        drop(insert);
+
+        // Atomic swap: staged rows replace the in-scope projection state.
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("starting message model context replacement")?;
+        if scope.is_none() {
+            tx.execute("DELETE FROM message_model_context", [])?;
+        } else if let Some(scope) = scope {
+            let ids: Vec<&str> = scope.iter().map(String::as_str).collect();
+            for id_chunk in ids.chunks(500) {
+                let marks = id_chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM message_model_context WHERE session_id IN ({marks})"
+                );
+                tx.execute(&sql, rusqlite::params_from_iter(id_chunk.iter()))?;
+            }
+        }
+        let staged: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM temp.message_model_context_rebuild",
+            [],
+            |row| row.get(0),
+        )?;
+        progress(format!("storing {staged} model attributions"));
+        tx.execute(
+            "INSERT INTO message_model_context (item_id, session_id, model, occurred_at)
+             SELECT item_id, session_id, model, occurred_at
+             FROM temp.message_model_context_rebuild",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })?;
+
+    progress(format!(
+        "mapped {processed_sessions}/{total_sessions} session model contexts"
+    ));
+    Ok(total_rows)
+}
+
+/// Build the (item_id, model, occurred_at) attribution rows for one session
+/// by walking its events in ordinal order.
+fn map_session_model_context(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let source_kind: Option<String> = conn
+        .query_row(
+            "SELECT source_kind FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(source_kind) = source_kind else {
+        return Ok(Vec::new());
+    };
+
+    // Human-authored conversation messages in this session, keyed by event.
+    let mut human_by_event: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT hi.event_id, hi.id, hi.occurred_at
+             FROM message_provenance p
+             JOIN history_items hi ON hi.id = p.item_id
+             WHERE p.session_id = ?1 AND p.authored_by = 'human'",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (event_id, item_id, occurred_at) = row?;
+            human_by_event
+                .entry(event_id)
+                .or_default()
+                .push((item_id, occurred_at));
+        }
+    }
+    if human_by_event.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut current_model: Option<String> = None;
+    let mut stmt = conn.prepare(
+        "SELECT id, content, metadata_json
+         FROM events
+         WHERE session_id = ?1
+         ORDER BY ordinal",
+    )?;
+    let events = stmt.query_map(params![session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for event in events {
+        let (event_id, content, metadata_json) = event?;
+        // Update the current model from assistant-bearing events before
+        // attributing any human message attached to this event.
+        if let Some(model) = event_model(&source_kind, &content, &metadata_json) {
+            current_model = Some(model);
+        }
+        if let (Some(model), Some(items)) = (current_model.as_ref(), human_by_event.get(&event_id))
+        {
+            for (item_id, occurred_at) in items {
+                out.push((item_id.clone(), model.clone(), occurred_at.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the assistant model reported by a single event for the given
+/// source kind. Mirrors `ingest::extract_session_usage`'s per-source parsers.
+fn event_model(source_kind: &str, content: &str, metadata_json: &str) -> Option<String> {
+    match source_kind {
+        "codex" => ingest::codex_event_fact(content).model,
+        "claude_code" | "pi_agent" | "omp" => serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/message/model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
+        "opencode" => serde_json::from_str::<Value>(metadata_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("opencode_model_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
+        _ => None,
+    }
 }
 
 fn rebuild_session_relationships_with_progress(
@@ -5321,5 +5566,248 @@ mod tests {
                 Ok(())
             })
             .expect("insert fixture event");
+    }
+
+    fn insert_model_context_session(
+        conn: &Connection,
+        session_id: &str,
+        source_kind: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions
+             (id, source_id, machine_id, source_kind, external_id, status,
+              metadata_json, hash)
+             VALUES (?1, 'source', 'machine', ?2, ?1, 'open', '{}', ?1)",
+            params![session_id, source_kind],
+        )
+        .expect("insert session");
+    }
+
+    fn insert_model_context_event(
+        conn: &Connection,
+        session_id: &str,
+        event_id: &str,
+        ordinal: i64,
+        source_kind: &str,
+        role: &str,
+        content: &str,
+        metadata_json: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO events
+             (id, session_id, source_id, machine_id, source_kind, ordinal, event_type,
+              role, content, occurred_at, metadata_json, hash)
+             VALUES (?1, ?2, 'source', 'machine', ?3, ?4, 'message',
+                     ?5, ?6, '2026-07-12T00:00:00Z', ?7, ?1)",
+            params![
+                event_id, session_id, source_kind, ordinal, role, content, metadata_json
+            ],
+        )
+        .expect("insert event");
+    }
+
+    fn insert_human_message(
+        conn: &Connection,
+        session_id: &str,
+        item_id: &str,
+        event_id: &str,
+        occurred_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO history_items
+             (id, event_id, session_id, source_id, machine_id, source_kind,
+              ordinal, subordinal, tier, kind, text, text_hash,
+              lexical_indexable, semantic_policy, metadata_json, hash)
+             VALUES (?1, ?2, ?3, 'source', 'machine', 'codex', 0, 0,
+                     'conversation', 'user', 'wtf this broke', ?1, 1, 'required', '{}', ?1)",
+            params![item_id, event_id, session_id],
+        )
+        .expect("insert history item");
+        conn.execute(
+            "INSERT INTO message_provenance
+             (item_id, session_id, source_kind, authored_by, sentiment_usable, rule, occurred_at)
+             VALUES (?1, ?2, 'codex', 'human', 'yes', 'test', ?3)",
+            params![item_id, session_id, occurred_at],
+        )
+        .expect("insert provenance");
+    }
+
+    fn model_context_rows(
+        store: &Store,
+    ) -> Vec<(String, String, String, Option<String>)> {
+        store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT item_id, session_id, model, occurred_at
+                     FROM message_model_context ORDER BY item_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .expect("load model context rows")
+    }
+
+    #[test]
+    fn model_context_attributes_human_messages_to_preceding_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_model_context_session(conn, "s1", "claude_code");
+                // Assistant reply from model A.
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "e1",
+                    1,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-a"}}).to_string(),
+                    "{}",
+                );
+                // Human message reacts to model A.
+                insert_model_context_event(
+                    conn, "s1", "e2", 2, "claude_code", "user", "plain text", "{}",
+                );
+                // Assistant switches to model B.
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "e3",
+                    3,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-b"}}).to_string(),
+                    "{}",
+                );
+                // Human message reacts to model B.
+                insert_model_context_event(
+                    conn, "s1", "e4", 4, "claude_code", "user", "more text", "{}",
+                );
+                insert_human_message(conn, "s1", "m1", "e2", "2026-07-12T01:00:00Z");
+                insert_human_message(conn, "s1", "m2", "e4", "2026-07-12T02:00:00Z");
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let mut progress = |_detail: String| {};
+        let count = rebuild_message_model_context(&store, &mut progress).expect("rebuild");
+        assert_eq!(count, 2);
+        let rows = model_context_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "m1");
+        assert_eq!(rows[0].2, "model-a");
+        assert_eq!(rows[1].0, "m2");
+        assert_eq!(rows[1].2, "model-b");
+    }
+
+    #[test]
+    fn model_context_skips_human_message_before_any_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_model_context_session(conn, "s1", "claude_code");
+                // Human speaks first, before any assistant model event.
+                insert_model_context_event(
+                    conn, "s1", "e1", 1, "claude_code", "user", "hello", "{}",
+                );
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "e2",
+                    2,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-a"}}).to_string(),
+                    "{}",
+                );
+                insert_human_message(conn, "s1", "m1", "e1", "2026-07-12T01:00:00Z");
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let mut progress = |_detail: String| {};
+        let count = rebuild_message_model_context(&store, &mut progress).expect("rebuild");
+        assert_eq!(count, 0);
+        assert!(model_context_rows(&store).is_empty());
+    }
+
+    #[test]
+    fn model_context_carries_codex_model_forward() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_model_context_session(conn, "s1", "codex");
+                // Codex turn-context event sets the model once.
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "e1",
+                    1,
+                    "codex",
+                    "assistant",
+                    &serde_json::json!({"payload": {"model": "gpt-5.4"}}).to_string(),
+                    "{}",
+                );
+                // Later human messages carry no model field but inherit the
+                // turn's model via carry-forward.
+                insert_model_context_event(
+                    conn, "s1", "e2", 2, "codex", "user", "one", "{}",
+                );
+                insert_model_context_event(
+                    conn, "s1", "e3", 3, "codex", "user", "two", "{}",
+                );
+                insert_human_message(conn, "s1", "m1", "e2", "2026-07-12T01:00:00Z");
+                insert_human_message(conn, "s1", "m2", "e3", "2026-07-12T02:00:00Z");
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let mut progress = |_detail: String| {};
+        rebuild_message_model_context(&store, &mut progress).expect("rebuild");
+        let rows = model_context_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.2 == "gpt-5.4"));
+    }
+
+    #[test]
+    fn model_context_reads_opencode_model_from_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_model_context_session(conn, "s1", "opencode");
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "e1",
+                    1,
+                    "opencode",
+                    "assistant",
+                    "{}",
+                    &serde_json::json!({"opencode_model_id": "kimi-k2"}).to_string(),
+                );
+                insert_model_context_event(
+                    conn, "s1", "e2", 2, "opencode", "user", "plain", "{}",
+                );
+                insert_human_message(conn, "s1", "m1", "e2", "2026-07-12T01:00:00Z");
+                Ok(())
+            })
+            .expect("seed fixtures");
+
+        let mut progress = |_detail: String| {};
+        rebuild_message_model_context(&store, &mut progress).expect("rebuild");
+        let rows = model_context_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "kimi-k2");
     }
 }
