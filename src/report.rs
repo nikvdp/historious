@@ -15,6 +15,11 @@ const MIN_CHANGE_PERCENT: f64 = 20.0;
 const MIN_DAYPART_MESSAGES: u64 = 50;
 const MIN_DAYPART_LIFT: f64 = 1.25;
 const MIN_DAYPART_SHARE_GAP: f64 = 5.0;
+const FRUSTRATION_TARGET_MESSAGES: u64 = 2_000;
+const FRUSTRATION_MAX_MONTHS: usize = 6;
+const FRUSTRATION_MIN_MODEL_MESSAGES: u64 = 150;
+const FRUSTRATION_MAX_MODELS: usize = 5;
+const FRUSTRATION_CHART_WIDTH: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReportSort {
@@ -176,6 +181,30 @@ pub struct FrustrationPoint {
     pub model: String,
     pub matches: u64,
     pub human_messages: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FrustrationModelSummary {
+    model: String,
+    matches: u64,
+    human_messages: u64,
+    rate_percent: f64,
+    delta_points: f64,
+}
+
+#[derive(Debug, Clone)]
+struct FrustrationSummary {
+    window_start: String,
+    window_end: String,
+    months: usize,
+    filtered: bool,
+    matches: u64,
+    human_messages: u64,
+    rate_percent: f64,
+    models: Vec<FrustrationModelSummary>,
+    hidden_models: usize,
+    largest_model: Option<(String, u64)>,
+    scale_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2097,7 +2126,13 @@ pub fn render_terminal_window(
     if show_models {
         render_model_usage(&mut out, &report.model_mix_by_month, width, color);
     }
-    render_frustration(&mut out, &report.frustration, width, color);
+    render_frustration(
+        &mut out,
+        &report.frustration,
+        report.filters.after.is_some() || report.filters.before.is_some(),
+        width,
+        color,
+    );
 
     out.push('\n');
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
@@ -2202,27 +2237,145 @@ fn slice_at(slices: &[ModelSlice], position: u64) -> usize {
     slices.len().saturating_sub(1)
 }
 
+fn frustration_rate(matches: u64, human_messages: u64) -> f64 {
+    if human_messages == 0 {
+        0.0
+    } else {
+        matches as f64 * 100.0 / human_messages as f64
+    }
+}
+
+fn summarize_frustration(
+    points: &[FrustrationPoint],
+    filtered: bool,
+) -> Option<FrustrationSummary> {
+    if points.is_empty() {
+        return None;
+    }
+
+    let mut month_totals = BTreeMap::<String, u64>::new();
+    for point in points {
+        *month_totals.entry(point.month.clone()).or_default() += point.human_messages;
+    }
+    let selected_months = if filtered {
+        month_totals.keys().cloned().collect::<Vec<_>>()
+    } else {
+        let mut selected = Vec::new();
+        let mut messages = 0u64;
+        for (month, month_messages) in month_totals.iter().rev() {
+            selected.push(month.clone());
+            messages = messages.saturating_add(*month_messages);
+            if messages >= FRUSTRATION_TARGET_MESSAGES
+                || selected.len() >= FRUSTRATION_MAX_MONTHS
+            {
+                break;
+            }
+        }
+        selected
+    };
+    let selected = selected_months.iter().cloned().collect::<HashSet<_>>();
+    let window_start = selected_months.iter().min()?.clone();
+    let window_end = selected_months.iter().max()?.clone();
+
+    let mut by_model = HashMap::<String, (u64, u64)>::new();
+    for point in points.iter().filter(|point| selected.contains(&point.month)) {
+        let totals = by_model.entry(point.model.clone()).or_default();
+        totals.0 = totals.0.saturating_add(point.matches);
+        totals.1 = totals.1.saturating_add(point.human_messages);
+    }
+    let matches = by_model.values().map(|(matches, _)| *matches).sum();
+    let human_messages = by_model
+        .values()
+        .map(|(_, human_messages)| *human_messages)
+        .sum();
+    let rate_percent = frustration_rate(matches, human_messages);
+    let largest_model = by_model
+        .iter()
+        .max_by(|(left_name, left), (right_name, right)| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right_name.cmp(left_name))
+        })
+        .map(|(model, (_, messages))| (model.clone(), *messages));
+
+    let model_count = by_model.len();
+    let mut models = by_model
+        .into_iter()
+        .filter(|(_, (_, messages))| *messages >= FRUSTRATION_MIN_MODEL_MESSAGES)
+        .map(|(model, (matches, human_messages))| {
+            let model_rate = frustration_rate(matches, human_messages);
+            let delta = model_rate - rate_percent;
+            FrustrationModelSummary {
+                model,
+                matches,
+                human_messages,
+                rate_percent: model_rate,
+                delta_points: if delta.abs() < 0.05 { 0.0 } else { delta },
+            }
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        right
+            .rate_percent
+            .total_cmp(&left.rate_percent)
+            .then_with(|| right.matches.cmp(&left.matches))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    models.truncate(FRUSTRATION_MAX_MODELS);
+    let hidden_models = model_count.saturating_sub(models.len());
+    let scale_percent = models
+        .iter()
+        .map(|model| model.rate_percent)
+        .fold(rate_percent, f64::max)
+        .ceil()
+        .max(1.0);
+
+    Some(FrustrationSummary {
+        window_start,
+        window_end,
+        months: selected_months.len(),
+        filtered,
+        matches,
+        human_messages,
+        rate_percent,
+        models,
+        hidden_models,
+        largest_model,
+        scale_percent,
+    })
+}
+
+fn frustration_window_label(summary: &FrustrationSummary) -> String {
+    let range = if summary.window_start == summary.window_end {
+        summary.window_start.clone()
+    } else {
+        format!(
+            "{} → {} ({} months)",
+            summary.window_start, summary.window_end, summary.months
+        )
+    };
+    if summary.filtered {
+        format!("{range} · filtered")
+    } else {
+        range
+    }
+}
+
+fn rounded_tenth(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
 fn render_frustration(
     out: &mut String,
     points: &[FrustrationPoint],
+    filtered: bool,
     width: usize,
     color: bool,
 ) {
     out.push('\n');
     out.push_str(&styled_role("Frustration signals", StyleRole::Section, color));
     out.push('\n');
-    push_wrapped(
-        out,
-        &format!(
-            "Human messages containing {} · attributed to the model of the preceding reply",
-            FRUSTRATION_TERMS.join(", ")
-        ),
-        width,
-        2,
-        StyleRole::Muted,
-        color,
-    );
-    if points.is_empty() {
+    let Some(summary) = summarize_frustration(points, filtered) else {
         push_wrapped(
             out,
             "No frustration signals recorded for this report window.",
@@ -2232,49 +2385,170 @@ fn render_frustration(
             color,
         );
         return;
+    };
+
+    push_wrapped(
+        out,
+        &format!(
+            "{} · {} follow-ups · {} signals · overall {:.1}%",
+            frustration_window_label(&summary),
+            exact_number(summary.human_messages),
+            exact_number(summary.matches),
+            rounded_tenth(summary.rate_percent)
+        ),
+        width,
+        2,
+        StyleRole::Time,
+        color,
+    );
+
+    if summary.models.is_empty() {
+        let largest = summary
+            .largest_model
+            .as_ref()
+            .map(|(model, messages)| {
+                format!(
+                    " · largest sample: {} ({})",
+                    model,
+                    exact_number(*messages)
+                )
+            })
+            .unwrap_or_default();
+        push_wrapped(
+            out,
+            &format!(
+                "Not enough data to compare models · minimum {} follow-ups/model{largest}",
+                exact_number(FRUSTRATION_MIN_MODEL_MESSAGES)
+            ),
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        push_wrapped(
+            out,
+            &format!(
+                "Cues: {} · grouped by the model of the preceding reply",
+                FRUSTRATION_TERMS.join(", ")
+            ),
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        return;
     }
-    let mut by_month: BTreeMap<&str, Vec<&FrustrationPoint>> = BTreeMap::new();
-    for point in points {
-        by_month.entry(&point.month).or_default().push(point);
-    }
-    for (month, rows) in by_month {
-        out.push_str(&format!(
-            "  {}\n",
-            styled_role(month, StyleRole::Time, color)
-        ));
-        let mut rows = rows;
-        rows.sort_by(|a, b| b.matches.cmp(&a.matches).then_with(|| a.model.cmp(&b.model)));
-        for row in rows {
-            let percentage = if row.human_messages == 0 {
-                0.0
-            } else {
-                (row.matches as f64 * 1_000.0 / row.human_messages as f64).round() / 10.0
-            };
-            let mut detail = format!(
-                "{} · {} of {} human messages · {percentage:.1}%",
-                row.model,
-                exact_number(row.matches),
-                exact_number(row.human_messages)
+
+    push_wrapped(
+        out,
+        &format!("Bar scale 0–{:.0}%", summary.scale_percent),
+        width,
+        2,
+        StyleRole::Muted,
+        color,
+    );
+    let chart_width = width
+        .saturating_sub(4)
+        .min(FRUSTRATION_CHART_WIDTH);
+    let overall_bar = horizontal_bar(
+        summary.rate_percent,
+        summary.scale_percent,
+        chart_width,
+    );
+    let overall_detail = format!(
+        "{:.1}% · baseline · n={}",
+        rounded_tenth(summary.rate_percent),
+        exact_number(summary.human_messages)
+    );
+
+    if width >= 80 {
+        push_working_hours_row(
+            out,
+            "all models",
+            &overall_bar,
+            Some(&overall_detail),
+            color,
+        );
+        for model in &summary.models {
+            let bar = horizontal_bar(model.rate_percent, summary.scale_percent, chart_width);
+            let detail = format!(
+                "{:.1}% · {:+.1}pp · n={}",
+                rounded_tenth(model.rate_percent),
+                rounded_tenth(model.delta_points),
+                exact_number(model.human_messages)
             );
-            if row.matches > 0 && row.human_messages > 0 {
-                let one_in = ((row.human_messages as f64 / row.matches as f64).round() as u64)
-                    .max(1);
-                detail.push_str(&format!(
-                    " · about 1 in {} message{}",
-                    exact_number(one_in),
-                    if one_in == 1 { "" } else { "s" }
-                ));
-            }
-            push_wrapped(
+            push_working_hours_row(
                 out,
-                &detail,
-                width,
-                4,
-                StyleRole::Count,
+                &ellipsize_middle(&model.model, 20),
+                &bar,
+                Some(&detail),
                 color,
             );
         }
+    } else {
+        push_wrapped(
+            out,
+            &format!("all models · {overall_detail}"),
+            width,
+            2,
+            StyleRole::Time,
+            color,
+        );
+        out.push_str("    ");
+        out.push_str(&styled_role(&overall_bar, StyleRole::Count, color));
+        out.push('\n');
+        for model in &summary.models {
+            push_wrapped(
+                out,
+                &format!(
+                    "{} · {:.1}% · {:+.1}pp · n={}",
+                    model.model,
+                    rounded_tenth(model.rate_percent),
+                    rounded_tenth(model.delta_points),
+                    exact_number(model.human_messages)
+                ),
+                width,
+                2,
+                StyleRole::Time,
+                color,
+            );
+            out.push_str("    ");
+            out.push_str(&styled_role(
+                &horizontal_bar(model.rate_percent, summary.scale_percent, chart_width),
+                StyleRole::Count,
+                color,
+            ));
+            out.push('\n');
+        }
     }
+
+    if summary.hidden_models > 0 {
+        push_wrapped(
+            out,
+            &format!(
+                "{} model{} hidden · minimum {} follow-ups · top {} shown",
+                exact_number(summary.hidden_models as u64),
+                if summary.hidden_models == 1 { "" } else { "s" },
+                exact_number(FRUSTRATION_MIN_MODEL_MESSAGES),
+                FRUSTRATION_MAX_MODELS
+            ),
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+    }
+    push_wrapped(
+        out,
+        &format!(
+            "Cues: {} · grouped by the model of the preceding reply",
+            FRUSTRATION_TERMS.join(", ")
+        ),
+        width,
+        2,
+        StyleRole::Muted,
+        color,
+    );
 }
 
 fn render_model_usage(
