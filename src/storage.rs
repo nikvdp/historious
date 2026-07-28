@@ -5162,6 +5162,19 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_annotations_version_axis_score
           ON message_annotations(annotator_version, axis, score);
 
+        CREATE TABLE IF NOT EXISTS message_model_context (
+          item_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          occurred_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_model_context_time
+          ON message_model_context(occurred_at);
+
+        CREATE INDEX IF NOT EXISTS idx_message_model_context_session
+          ON message_model_context(session_id);
+
         CREATE TABLE IF NOT EXISTS enrichment_runs (
           kind TEXT NOT NULL,
           version TEXT NOT NULL,
@@ -7599,6 +7612,38 @@ mod tests {
         SessionRecord, SourceRecord,
     };
     use serde_json::json;
+
+    #[test]
+    fn message_model_context_schema_exists_on_fresh_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                let table: String = conn.query_row(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name = 'message_model_context'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(table, "message_model_context");
+                let time_index: String = conn.query_row(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_message_model_context_time'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(time_index, "idx_message_model_context_time");
+                let session_index: String = conn.query_row(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_message_model_context_session'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(session_index, "idx_message_model_context_session");
+                Ok(())
+            })
+            .expect("schema check");
+    }
 
     #[test]
     fn sqlite_vec_search_returns_synced_embedding_without_fts_match() {
