@@ -360,11 +360,14 @@ fn refresh_report_with_progress(
     }
 
     let captured_input_rowid = store.with_conn(max_event_rowid)?;
-    let invalid_state = statuses.iter().take(3).any(|status| {
-        status.status.as_deref() != Some("ready")
-            || status.stored_version != Some(status.version)
-            || (status.stale && status.new_event_rows == 0)
-    });
+    let invalid_state = statuses
+        .iter()
+        .take(REPORT_PROJECTION_COUNT - 1)
+        .any(|status| {
+            status.status.as_deref() != Some("ready")
+                || status.stored_version != Some(status.version)
+                || (status.stale && status.new_event_rows == 0)
+        });
     let mut event_ids = delta
         .inserted_events
         .iter()
@@ -428,7 +431,8 @@ fn refresh_report_with_progress(
     }
     .max(1);
     let report_work = 1;
-    let total = relationship_work + fact_work + provenance_work + report_work;
+    let model_context_work = provenance_sessions.len().max(1);
+    let total = relationship_work + fact_work + provenance_work + model_context_work + report_work;
     let mut completed = 0usize;
 
     progress(ReportRefreshProgress {
@@ -584,6 +588,52 @@ fn refresh_report_with_progress(
         completed,
         total,
         detail: "provenance ready".to_string(),
+    });
+
+    let model_context_start = completed;
+    progress(ReportRefreshProgress {
+        phase: "model_context",
+        completed,
+        total,
+        detail: format!("mapping {model_context_work} session model contexts"),
+    });
+    run_projection_refresh(store, PROJECTIONS[3], captured_input_rowid, || {
+        if invalid_state {
+            rebuild_message_model_context(store, &mut |detail| {
+                progress(ReportRefreshProgress {
+                    phase: "model_context",
+                    completed: model_context_start,
+                    total,
+                    detail,
+                });
+            })
+        } else {
+            refresh_message_model_context_scoped(store, &provenance_sessions, |processed| {
+                completed = model_context_start + processed.min(model_context_work);
+                progress(ReportRefreshProgress {
+                    phase: "model_context",
+                    completed,
+                    total,
+                    detail: format!(
+                        "mapped {processed}/{model_context_work} session model contexts"
+                    ),
+                });
+            })?;
+            store.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM message_model_context", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count.max(0) as usize)
+                .map_err(Into::into)
+            })
+        }
+    })?;
+    completed = model_context_start + model_context_work;
+    progress(ReportRefreshProgress {
+        phase: "model_context",
+        completed,
+        total,
+        detail: "model contexts ready".to_string(),
     });
 
     let report_start = completed;
@@ -808,6 +858,22 @@ fn rebuild_message_model_context(
     progress: &mut impl FnMut(String),
 ) -> Result<usize> {
     rebuild_message_model_context_scoped(store, None, progress)
+}
+
+fn refresh_message_model_context_scoped(
+    store: &Store,
+    sessions: &HashSet<String>,
+    mut progress: impl FnMut(usize),
+) -> Result<usize> {
+    rebuild_message_model_context_scoped(store, Some(sessions), &mut |detail| {
+        if let Some(processed) = detail
+            .strip_prefix("mapped ")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            progress(processed);
+        }
+    })
 }
 
 /// Attribute each human-authored message to the model of the most recent
@@ -5738,6 +5804,101 @@ mod tests {
         let count = rebuild_message_model_context(&store, &mut progress).expect("rebuild");
         assert_eq!(count, 0);
         assert!(model_context_rows(&store).is_empty());
+    }
+
+    #[test]
+    fn incremental_refresh_maps_new_messages_and_preserves_untouched_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                insert_model_context_session(conn, "s1", "claude_code");
+                insert_model_context_session(conn, "s2", "claude_code");
+                // s1: model reply then human message (attributed on first build).
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "s1_e1",
+                    1,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-a"}}).to_string(),
+                    "{}",
+                );
+                insert_model_context_event(
+                    conn, "s1", "s1_e2", 2, "claude_code", "user", "first", "{}",
+                );
+                insert_human_message(conn, "s1", "s1_m1", "s1_e2", "2026-07-12T01:00:00Z");
+                // s2: untouched session with its own attribution.
+                insert_model_context_event(
+                    conn,
+                    "s2",
+                    "s2_e1",
+                    1,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-b"}}).to_string(),
+                    "{}",
+                );
+                insert_model_context_event(
+                    conn, "s2", "s2_e2", 2, "claude_code", "user", "other", "{}",
+                );
+                insert_human_message(conn, "s2", "s2_m1", "s2_e2", "2026-07-12T01:30:00Z");
+                Ok(())
+            })
+            .expect("seed fixtures");
+        rebuild_all(&store, |_, _, _| {}).expect("seed current projections");
+        assert_eq!(model_context_rows(&store).len(), 2);
+
+        // New turn lands in s1: model-b reply, then a frustrated human reply.
+        store
+            .with_conn(|conn| {
+                insert_model_context_event(
+                    conn,
+                    "s1",
+                    "s1_e3",
+                    3,
+                    "claude_code",
+                    "assistant",
+                    &serde_json::json!({"message": {"model": "model-b"}}).to_string(),
+                    "{}",
+                );
+                insert_model_context_event(
+                    conn, "s1", "s1_e4", 4, "claude_code", "user", "wtf", "{}",
+                );
+                insert_human_message(conn, "s1", "s1_m2", "s1_e4", "2026-07-12T02:00:00Z");
+                Ok(())
+            })
+            .expect("append new turn");
+        let delta = ImportDelta {
+            inserted_events: vec!["s1_e4".to_string()],
+            touched_sessions: vec!["s1".to_string()],
+            ..ImportDelta::default()
+        };
+
+        let mut phases: Vec<&'static str> = Vec::new();
+        let outcome = refresh_report_after_update_with_progress(&store, &delta, |event| {
+            phases.push(event.phase);
+        })
+        .expect("incremental refresh");
+
+        assert!(outcome.refreshed);
+        assert!(phases.contains(&"model_context"));
+        let rows = model_context_rows(&store);
+        assert_eq!(rows.len(), 3);
+        // New message attributed to model-b (the immediately preceding reply).
+        assert!(rows
+            .iter()
+            .any(|row| row.0 == "s1_m2" && row.2 == "model-b"));
+        // s1's earlier row recomputed, still model-a.
+        assert!(rows
+            .iter()
+            .any(|row| row.0 == "s1_m1" && row.2 == "model-a"));
+        // Untouched session's attribution survived the scoped refresh.
+        assert!(rows
+            .iter()
+            .any(|row| row.0 == "s2_m1" && row.2 == "model-b"));
+        assert_projections_current(&store);
     }
 
     #[test]
