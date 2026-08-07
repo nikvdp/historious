@@ -2180,7 +2180,7 @@ pub fn render_terminal(report: &UsageReport) -> String {
 
 #[cfg(test)]
 pub fn render_terminal_themed(report: &UsageReport, width: usize, color: bool) -> String {
-    render_terminal_window(report, width, color, ReportWindow::Default, false)
+    render_terminal_window(report, width, color, ReportWindow::Default, false, false)
 }
 
 pub fn render_terminal_window(
@@ -2189,6 +2189,7 @@ pub fn render_terminal_window(
     color: bool,
     window: ReportWindow,
     show_models: bool,
+    full: bool,
 ) -> String {
     let width = width.max(20);
     let mut out = String::new();
@@ -2331,10 +2332,10 @@ pub fn render_terminal_window(
         &mut out,
         &report.frustration,
         report.filters.after.is_some() || report.filters.before.is_some(),
+        full,
         width,
         color,
     );
-
     out.push('\n');
 
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
@@ -2513,6 +2514,7 @@ fn frustration_rate(matches: u64, human_messages: u64) -> f64 {
 fn summarize_frustration(
     points: &[FrustrationPoint],
     filtered: bool,
+    full: bool,
 ) -> Option<FrustrationSummary> {
     if points.is_empty() {
         return None;
@@ -2522,7 +2524,7 @@ fn summarize_frustration(
     for point in points {
         *month_totals.entry(point.month.clone()).or_default() += point.human_messages;
     }
-    let selected_months = if filtered {
+    let selected_months = if filtered || full {
         month_totals.keys().cloned().collect::<Vec<_>>()
     } else {
         let mut selected = Vec::new();
@@ -2566,7 +2568,7 @@ fn summarize_frustration(
     let model_count = by_model.len();
     let mut models = by_model
         .into_iter()
-        .filter(|(_, (_, messages))| *messages >= FRUSTRATION_MIN_MODEL_MESSAGES)
+        .filter(|(_, (_, messages))| full || *messages >= FRUSTRATION_MIN_MODEL_MESSAGES)
         .map(|(model, (matches, human_messages))| {
             let model_rate = frustration_rate(matches, human_messages);
             let delta = model_rate - rate_percent;
@@ -2586,7 +2588,9 @@ fn summarize_frustration(
             .then_with(|| right.matches.cmp(&left.matches))
             .then_with(|| left.model.cmp(&right.model))
     });
-    models.truncate(FRUSTRATION_MAX_MODELS);
+    if !full {
+        models.truncate(FRUSTRATION_MAX_MODELS);
+    }
     let hidden_models = model_count.saturating_sub(models.len());
     let scale_percent = models
         .iter()
@@ -2634,13 +2638,14 @@ fn render_frustration(
     out: &mut String,
     points: &[FrustrationPoint],
     filtered: bool,
+    full: bool,
     width: usize,
     color: bool,
 ) {
     out.push('\n');
     out.push_str(&styled_role("Frustration signals", StyleRole::Section, color));
     out.push('\n');
-    let Some(summary) = summarize_frustration(points, filtered) else {
+    let Some(summary) = summarize_frustration(points, filtered, full) else {
         push_wrapped(
             out,
             "No frustration signals recorded for this report window.",
@@ -2651,7 +2656,6 @@ fn render_frustration(
         );
         return;
     };
-
     push_wrapped(
         out,
         &format!(
@@ -2679,12 +2683,17 @@ fn render_frustration(
                 )
             })
             .unwrap_or_default();
+        let minimum = if full {
+            String::new()
+        } else {
+            format!(
+                " · minimum {} follow-ups/model",
+                exact_number(FRUSTRATION_MIN_MODEL_MESSAGES)
+            )
+        };
         push_wrapped(
             out,
-            &format!(
-                "Not enough data to compare models · minimum {} follow-ups/model{largest}",
-                exact_number(FRUSTRATION_MIN_MODEL_MESSAGES)
-            ),
+            &format!("Not enough data to compare models{minimum}{largest}"),
             width,
             2,
             StyleRole::Muted,
@@ -3993,13 +4002,13 @@ mod tests {
         assert!(!narrow.contains('\x1b'));
         assert!(render_terminal_themed(&report, 80, true).contains("\x1b["));
         let with_models =
-            render_terminal_window(&report, 80, false, ReportWindow::Default, true);
+            render_terminal_window(&report, 80, false, ReportWindow::Default, true, false);
         assert!(with_models.contains("Model usage"));
         assert!(with_models.contains("gpt-5.4"));
         assert!(with_models.contains("gpt-5.5"));
         assert_eq!(with_models.matches("1 session · 50.0%").count(), 2);
         let narrow_models =
-            render_terminal_window(&report, 40, false, ReportWindow::Default, true);
+            render_terminal_window(&report, 40, false, ReportWindow::Default, true, false);
         assert!(narrow_models
             .lines()
             .all(|line| line.chars().count() <= 40));
@@ -4094,10 +4103,10 @@ mod tests {
         assert!(default_tables.contains("current"));
         assert!(default_tables.contains("previous"));
         assert!(default_tables.contains("\n\n  28 days"));
-        let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All, false);
+        let all_tables = render_terminal_window(&unfiltered, 80, false, ReportWindow::All, false, false);
         assert!(all_tables.contains("14 days"));
         let narrow_tables =
-            render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven, false);
+            render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven, false, false);
         assert!(narrow_tables.lines().all(|line| line.chars().count() <= 40));
     }
 
@@ -4544,7 +4553,7 @@ mod tests {
             false,
         )
         .expect("compute report");
-        let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, false);
+        let rendered = render_terminal_window(&report, 80, false, ReportWindow::Default, false, false);
         assert!(rendered.contains("Frustration signals"));
         assert!(rendered.contains("Not enough data to compare models"));
         assert!(rendered.contains("model-alpha (1)"));
@@ -4565,7 +4574,7 @@ mod tests {
             point("2026-07", 12, 1_200),
         ];
 
-        let recent = summarize_frustration(&points, false).expect("recent summary");
+        let recent = summarize_frustration(&points, false, false).expect("recent summary");
         assert_eq!(recent.window_start, "2026-06");
         assert_eq!(recent.window_end, "2026-07");
         assert_eq!(recent.months, 2);
@@ -4573,7 +4582,7 @@ mod tests {
         assert_eq!(recent.human_messages, 2_000);
         assert_eq!(rounded_tenth(recent.rate_percent), 4.6);
 
-        let filtered = summarize_frustration(&points, true).expect("filtered summary");
+        let filtered = summarize_frustration(&points, true, false).expect("filtered summary");
         assert_eq!(filtered.window_start, "2026-05");
         assert_eq!(filtered.months, 3);
         assert_eq!(filtered.matches, 192);
@@ -4583,7 +4592,7 @@ mod tests {
         let capped = (1..=7)
             .map(|month| point(&format!("2026-{month:02}"), 1, 100))
             .collect::<Vec<_>>();
-        let capped = summarize_frustration(&capped, false).expect("capped summary");
+        let capped = summarize_frustration(&capped, false, false).expect("capped summary");
         assert_eq!(capped.window_start, "2026-02");
         assert_eq!(capped.window_end, "2026-07");
         assert_eq!(capped.months, FRUSTRATION_MAX_MONTHS);
@@ -4614,7 +4623,7 @@ mod tests {
                 human_messages: FRUSTRATION_MIN_MODEL_MESSAGES - 1,
             },
         ];
-        let threshold = summarize_frustration(&threshold, true).expect("threshold summary");
+        let threshold = summarize_frustration(&threshold, true, false).expect("threshold summary");
         assert_eq!(
             threshold
                 .models
@@ -4643,7 +4652,7 @@ mod tests {
             point("model-d", 12, 300),
             point("low-volume", 1, 149),
         ];
-        let summary = summarize_frustration(&points, false).expect("summary");
+        let summary = summarize_frustration(&points, false, false).expect("summary");
         assert_eq!(summary.matches, 64);
         assert_eq!(summary.human_messages, 1_949);
         assert_eq!(summary.scale_percent, 5.0);
@@ -4690,7 +4699,7 @@ mod tests {
         );
 
         let mut out = String::new();
-        render_frustration(&mut out, &points, false, 80, false);
+        render_frustration(&mut out, &points, false, false, 80, false);
         assert!(out.contains("Frustration signals"));
         assert!(out.contains("2026-07 · 1,949 follow-ups · 64 signals · overall 3.3%"));
         assert!(out.contains("Bar scale 0–5%"));
@@ -4702,16 +4711,75 @@ mod tests {
         assert!(!out.contains('\x1b'));
 
         let mut narrow = String::new();
-        render_frustration(&mut narrow, &points, false, 40, false);
+        render_frustration(&mut narrow, &points, false, false, 40, false);
         assert!(narrow.lines().all(|line| line.chars().count() <= 40));
 
         let mut colored = String::new();
-        render_frustration(&mut colored, &points, false, 80, true);
+        render_frustration(&mut colored, &points, false, false, 80, true);
         assert!(colored.contains("\x1b["));
 
         let mut empty = String::new();
-        render_frustration(&mut empty, &[], false, 80, false);
+        render_frustration(&mut empty, &[], false, false, 80, false);
         assert!(empty.contains("No frustration signals recorded"));
+    }
+
+    #[test]
+    fn frustration_full_flag_bypasses_month_and_model_caps() {
+        let month_point = |month: &str, model: &str, matches, human_messages| FrustrationPoint {
+            month: month.to_string(),
+            model: model.to_string(),
+            matches,
+            human_messages,
+        };
+        let months = [
+            "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07",
+        ];
+        let points = months
+            .iter()
+            .map(|month| month_point(month, "model-a", 30, 300))
+            .collect::<Vec<_>>();
+
+        let recent = summarize_frustration(&points, false, false).expect("recent summary");
+        assert_eq!(recent.months, FRUSTRATION_MAX_MONTHS);
+        assert_eq!(recent.window_start, "2026-02");
+        assert_eq!(recent.window_end, "2026-07");
+        let full = summarize_frustration(&points, false, true).expect("full summary");
+        assert_eq!(full.months, 7);
+        assert_eq!(full.window_start, "2026-01");
+        assert_eq!(full.window_end, "2026-07");
+
+        let mut model_points = Vec::new();
+        for index in 0..7 {
+            model_points.push(month_point(
+                "2026-07",
+                &format!("model-{index}"),
+                10,
+                300,
+            ));
+        }
+        model_points.push(month_point("2026-07", "model-rare", 1, 10));
+        let recent = summarize_frustration(&model_points, false, false).expect("recent summary");
+        assert_eq!(recent.models.len(), FRUSTRATION_MAX_MODELS);
+        assert_eq!(recent.hidden_models, 3);
+        assert!(!recent
+            .models
+            .iter()
+            .any(|model| model.model == "model-rare"));
+        let full = summarize_frustration(&model_points, false, true).expect("full summary");
+        assert_eq!(full.models.len(), 8);
+        assert_eq!(full.hidden_models, 0);
+        assert!(full.models.iter().any(|model| model.model == "model-rare"));
+
+        let mut out = String::new();
+        render_frustration(&mut out, &model_points, false, false, 80, false);
+        assert!(!out.contains("model-rare"));
+        assert!(out.contains("3 models hidden · minimum 150 follow-ups · 5 lowest-rate shown"));
+        assert!(!out.contains("model-6"));
+        let mut full_out = String::new();
+        render_frustration(&mut full_out, &model_points, false, true, 80, false);
+        assert!(!full_out.contains("hidden"));
+        assert!(full_out.contains("model-rare"));
+        assert!(full_out.contains("model-6"));
     }
 
     #[test]

@@ -812,6 +812,8 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Show primary-model share and monthly composition")]
         models: bool,
+        #[arg(long, help = "Show every frustration model and month without truncation")]
+        full: bool,
         #[arg(long, help = "Print stable unstyled text without terminal color")]
         plain: bool,
         #[arg(long, value_enum, help = "Color output: auto, always, or never")]
@@ -2692,6 +2694,7 @@ impl Cli {
                 json,
                 plain,
                 models,
+                full,
                 color,
                 window,
                 command,
@@ -2858,6 +2861,7 @@ impl Cli {
                             color,
                             window.into(),
                             models,
+                            full,
                         ))?;
                     }
                 }
@@ -11399,6 +11403,7 @@ mod tests {
             "messages",
             "--json",
             "--models",
+            "--full",
         ])
         .expect("parse report");
         assert!(matches!(
@@ -11410,6 +11415,7 @@ mod tests {
                 sort: ReportSortArg::Messages,
                 json: true,
                 models: true,
+                full: true,
                 command: None,
                 ..
             } if after == "2026-06-01" && before == "3 days ago" && project == "example-project"
