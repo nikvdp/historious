@@ -49,6 +49,8 @@ pub struct UsageReport {
     #[serde(default)]
     pub comparisons: Vec<ComparisonWindow>,
     pub tokens_by_session_end_date: Vec<TokenPoint>,
+    #[serde(default)]
+    pub tokens_by_model: Vec<TokenModelRow>,
     pub projects: Vec<ProjectRow>,
     pub provider_mix_by_month: Vec<MixPoint>,
     pub model_mix_by_month: Vec<MixPoint>,
@@ -146,6 +148,12 @@ pub struct TokenPoint {
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
     pub output_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenModelRow {
+    pub model: String,
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,6 +493,12 @@ fn compute_live_with_progress(
         options.before.as_deref(),
         project_pattern.as_deref(),
     )?;
+    let tokens_by_model = report_tokens_by_model(
+        store,
+        options.after.as_deref(),
+        options.before.as_deref(),
+        project_pattern.as_deref(),
+    )?;
     sort_projects(&mut projects, options.sort);
     progress(ReportSnapshotProgress { completed: 5, total, detail: "computed projects".to_string() });
     let provider_mix_by_month = report_mix(
@@ -610,6 +624,7 @@ fn compute_live_with_progress(
         model_mix_by_month,
         rhythms,
         dayparts,
+        tokens_by_model,
         daypart_insights,
         frustration,
         frequencies,
@@ -1670,6 +1685,39 @@ fn report_tokens(
     })
 }
 
+
+fn report_tokens_by_model(
+    store: &Store,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<TokenModelRow>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(primary_model, 'unknown'),
+                    COALESCE(input_tokens, 0) + COALESCE(cached_input_tokens, 0)
+                      + COALESCE(output_tokens, 0)
+             FROM session_facts sf
+             WHERE last_event_at IS NOT NULL
+               AND (?1 IS NULL OR last_event_at >= ?1)
+               AND (?2 IS NULL OR last_event_at < ?2)
+               AND (?3 IS NULL OR workspace_path LIKE ?3)
+             GROUP BY 1
+             HAVING COALESCE(input_tokens, 0) + COALESCE(cached_input_tokens, 0)
+                      + COALESCE(output_tokens, 0) > 0
+             ORDER BY 2 DESC, 1",
+        )?;
+        let rows = stmt.query_map(params![after, before, project], |row| {
+            Ok(TokenModelRow {
+                model: row.get(0)?,
+                tokens: nonnegative(row.get(1)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
 fn report_projects(
     store: &Store,
     after: Option<&str>,
@@ -2263,6 +2311,8 @@ pub fn render_terminal_window(
         }
     }
 
+    render_tokens_by_model(&mut out, &report.tokens_by_model, width, color);
+
     if !report.rhythms.by_hour.is_empty() {
         out.push('\n');
         render_working_hours(
@@ -2286,6 +2336,7 @@ pub fn render_terminal_window(
     );
 
     out.push('\n');
+
     out.push_str(&styled_role("Leading projects", StyleRole::Section, color));
     out.push('\n');
     for row in report.projects.iter().take(5) {
@@ -2328,6 +2379,69 @@ pub fn render_terminal_window(
         out.push_str("\nTopics\n  Coherent topic data is ready for ranked integration.\n");
     }
     out
+}
+
+fn render_tokens_by_model(
+    out: &mut String,
+    rows: &[TokenModelRow],
+    width: usize,
+    color: bool,
+) {
+    const LABEL_WIDTH: usize = 20;
+    const CHART_WIDTH: usize = 24;
+    let chart_width = width.saturating_sub(4).min(CHART_WIDTH);
+    let total = rows.iter().map(|row| row.tokens).sum::<u64>();
+
+    out.push('\n');
+    out.push_str(&styled_role("Tokens by model", StyleRole::Section, color));
+    out.push('\n');
+    if rows.is_empty() {
+        push_wrapped(
+            out,
+            "No token usage recorded for this report window.",
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        return;
+    }
+    push_wrapped(
+        out,
+        &format!("total {} tokens", compact_number(total)),
+        width,
+        2,
+        StyleRole::Count,
+        color,
+    );
+    if width >= 64 {
+        for row in rows {
+            let label = ellipsize_middle(&row.model, LABEL_WIDTH);
+            let bar = horizontal_bar(row.tokens as f64, total as f64, chart_width);
+            let share = row.tokens as f64 * 100.0 / total as f64;
+            let detail = format!("{} · {share:.0}%", compact_number(row.tokens));
+            push_working_hours_row(out, &label, &bar, Some(&detail), color);
+        }
+    } else {
+        for row in rows {
+            let share = row.tokens as f64 * 100.0 / total as f64;
+            push_wrapped(
+                out,
+                &format!("{} · {} · {share:.0}%", row.model, compact_number(row.tokens)),
+                width,
+                2,
+                StyleRole::Time,
+                color,
+            );
+            out.push_str("    ");
+            out.push_str(&styled_role(
+                &horizontal_bar(row.tokens as f64, total as f64, chart_width),
+                StyleRole::Count,
+                color,
+            ));
+            out.push('\n');
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3985,6 +4099,103 @@ mod tests {
         let narrow_tables =
             render_terminal_window(&unfiltered, 40, false, ReportWindow::Seven, false);
         assert!(narrow_tables.lines().all(|line| line.chars().count() <= 40));
+    }
+
+    #[test]
+    fn tokens_by_model_attribute_sessions_to_primary_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO session_facts
+                      (session_id, source_kind, workspace_path, session_class, models_json,
+                       primary_model, input_tokens, cached_input_tokens, output_tokens,
+                       event_count, user_message_count, first_event_at, last_event_at, duration_secs)
+                    VALUES
+                      ('session_a', 'codex', '/repo/a', 'interactive', '["gpt-5.4"]',
+                       'gpt-5.4', 100, 20, 30, 2, 2,
+                       '2026-06-01T01:00:00Z', '2026-06-01T01:10:00Z', 600),
+                      ('session_b', 'codex', '/repo/b', 'interactive', '["gpt-5.5"]',
+                       'gpt-5.5', 50, 10, 15, 1, 1,
+                       '2026-06-02T02:00:00Z', '2026-06-02T02:05:00Z', 300),
+                      ('session_unknown', 'codex', '/repo/b', 'interactive', '[]',
+                       NULL, 10, 5, 10, 1, 1,
+                       '2026-06-03T03:00:00Z', '2026-06-03T03:05:00Z', 300),
+                      ('session_dry', 'codex', '/repo/b', 'interactive', '["gpt-5.6"]',
+                       'gpt-5.6', NULL, NULL, NULL, 1, 1,
+                       '2026-06-04T04:00:00Z', '2026-06-04T04:05:00Z', 300);
+                    "#,
+                )?;
+                Ok(())
+            })
+            .expect("insert tokens-by-model fixtures");
+        rebuild_snapshot(&store).expect("build report snapshot");
+
+        let report = compute(
+            &store,
+            &ReportOptions {
+                after: None,
+                before: None,
+                project: None,
+                sort: ReportSort::Tokens,
+            },
+        )
+        .expect("compute report");
+
+        assert_eq!(
+            report.tokens_by_model,
+            vec![
+                TokenModelRow {
+                    model: "gpt-5.4".to_string(),
+                    tokens: 150,
+                },
+                TokenModelRow {
+                    model: "gpt-5.5".to_string(),
+                    tokens: 75,
+                },
+                TokenModelRow {
+                    model: "unknown".to_string(),
+                    tokens: 25,
+                },
+            ]
+        );
+        let rendered = render_terminal(&report);
+        assert!(rendered.contains("Tokens by model"));
+        assert!(rendered.contains("██████████████░░░░░░░░░░  150 · 60%"));
+        assert!(rendered.contains("███████░░░░░░░░░░░░░░░░░  75 · 30%"));
+        assert!(rendered.contains("██░░░░░░░░░░░░░░░░░░░░░░  25 · 10%"));
+        assert!(!rendered.contains("gpt-5.6"));
+        let json = serde_json::to_string(&report).expect("serialize report");
+        assert!(json.contains("\"tokens_by_model\""));
+        assert!(json.contains("\"unknown\""));
+        let narrow = render_terminal_themed(&report, 40, false);
+
+        assert!(narrow.lines().all(|line| line.chars().count() <= 40));
+        assert!(narrow.contains("total 250 tokens"));
+
+        let filtered = compute(
+            &store,
+            &ReportOptions {
+                after: None,
+                before: None,
+                project: Some("/repo/a".to_string()),
+                sort: ReportSort::Tokens,
+            },
+        )
+        .expect("compute project-filtered report");
+        assert_eq!(
+            filtered.tokens_by_model,
+            vec![TokenModelRow {
+                model: "gpt-5.4".to_string(),
+                tokens: 150,
+            }]
+        );
+
+        let mut out = String::new();
+        render_tokens_by_model(&mut out, &[], 80, false);
+        assert!(out.contains("No token usage recorded for this report window."));
     }
 
     #[test]
