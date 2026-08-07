@@ -795,7 +795,8 @@ fn report_topics(
     before: Option<&str>,
     project: Option<&str>,
 ) -> Result<(Option<TopicSection>, Option<String>)> {
-    let Some((version, model_id, corpus_messages, selected_k, silhouette)) = store.with_conn(|conn| {
+    let Some((version, model_id, corpus_messages, selected_k, silhouette)) =
+        store.with_conn(|conn| {
         conn.query_row(
             "SELECT version, model_id, item_count, selected_k, silhouette_score
              FROM topic_runs
@@ -935,9 +936,13 @@ fn report_frequencies(
     project: Option<&str>,
     mut progress: impl FnMut(usize, usize, String),
 ) -> Result<(FrequencySection, HashMap<String, Vec<TermCount>>)> {
+    const CHUNK_MESSAGES: usize = 65_536;
+    const CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
     let stopwords = english_stopwords();
     let project_noise = project_noise_words();
-    let (unigrams, bigrams, trigrams, project_unigrams) = store.with_conn(|conn| {
+    let worker_count = std::thread::available_parallelism().map_or(1, |value| value.get().min(8));
+    let counts = store.with_conn(|conn| {
         let total = conn.query_row(
             "SELECT COUNT(*)
              FROM message_provenance p
@@ -972,22 +977,124 @@ fn report_frequencies(
                AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
         )?;
         let mut rows = stmt.query(params![after, before, project])?;
-        let mut unigrams = HashMap::new();
-        let mut bigrams = HashMap::new();
-        let mut trigrams = HashMap::new();
-        let mut project_unigrams = HashMap::<String, HashMap<String, u64>>::new();
+        let mut counts = FrequencyCounts::default();
+        let mut chunk = Vec::with_capacity(CHUNK_MESSAGES);
+        let mut chunk_bytes = 0;
         let mut processed = 0;
         while let Some(row) = rows.next()? {
             let text = row.get::<_, String>(0)?;
             let usable = row.get::<_, String>(1)?;
             let rule = row.get::<_, String>(2)?;
             let workspace_path = row.get::<_, String>(3)?;
-            let text = if usable == "strip_wrapper" {
-                provenance::strip_human_wrapper(&text, &rule)
-            } else {
-                text
-            };
-            let tokens = tokenize_frequency_text(&text);
+            chunk_bytes += text.len() + usable.len() + rule.len() + workspace_path.len();
+            chunk.push(FrequencyMessage {
+                text,
+                strip_rule: (usable == "strip_wrapper").then_some(rule),
+                workspace_path,
+            });
+            if chunk.len() >= CHUNK_MESSAGES || chunk_bytes >= CHUNK_BYTES {
+                let completed = chunk.len();
+                merge_frequency_counts(
+                    &mut counts,
+                    aggregate_frequency_chunk(&chunk, worker_count, &stopwords, &project_noise)?,
+                );
+                processed += completed;
+                progress(
+                    processed,
+                    total,
+                    format!("tokenized {processed}/{total} frequency messages"),
+                );
+                chunk.clear();
+                chunk_bytes = 0;
+            }
+        }
+        if !chunk.is_empty() {
+            let completed = chunk.len();
+            merge_frequency_counts(
+                &mut counts,
+                aggregate_frequency_chunk(&chunk, worker_count, &stopwords, &project_noise)?,
+            );
+            processed += completed;
+            progress(
+                processed,
+                total,
+                format!("tokenized {processed}/{total} frequency messages"),
+            );
+        }
+        Ok(counts)
+    })?;
+    Ok((
+        FrequencySection {
+            unigrams: top_terms(counts.unigrams, 3, 20),
+            bigrams: top_terms(counts.bigrams, 3, 20),
+            trigrams: top_terms(counts.trigrams, 3, 20),
+        },
+        distinctive_project_terms(counts.project_unigrams),
+    ))
+}
+
+#[derive(Debug)]
+struct FrequencyMessage {
+    text: String,
+    strip_rule: Option<String>,
+    workspace_path: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FrequencyCounts {
+    unigrams: HashMap<String, u64>,
+    bigrams: HashMap<String, u64>,
+    trigrams: HashMap<String, u64>,
+    project_unigrams: HashMap<String, HashMap<String, u64>>,
+}
+
+fn aggregate_frequency_chunk(
+    messages: &[FrequencyMessage],
+    worker_count: usize,
+    stopwords: &HashSet<&'static str>,
+    project_noise: &HashSet<&'static str>,
+) -> Result<FrequencyCounts> {
+    let worker_count = worker_count.max(1).min(messages.len());
+    if worker_count <= 1 {
+        return Ok(aggregate_frequency_messages(
+            messages,
+            stopwords,
+            project_noise,
+        ));
+    }
+    let messages_per_worker = messages.len().div_ceil(worker_count);
+    std::thread::scope(|scope| -> Result<FrequencyCounts> {
+        let handles = messages
+            .chunks(messages_per_worker)
+            .map(|messages| {
+                scope
+                    .spawn(move || aggregate_frequency_messages(messages, stopwords, project_noise))
+            })
+            .collect::<Vec<_>>();
+        let mut counts = FrequencyCounts::default();
+        for handle in handles {
+            let worker_counts = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("frequency aggregation worker panicked"))?;
+            merge_frequency_counts(&mut counts, worker_counts);
+        }
+        Ok(counts)
+    })
+}
+
+fn aggregate_frequency_messages(
+    messages: &[FrequencyMessage],
+    stopwords: &HashSet<&'static str>,
+    project_noise: &HashSet<&'static str>,
+) -> FrequencyCounts {
+    let mut counts = FrequencyCounts::default();
+    for message in messages {
+        let stripped = message
+            .strip_rule
+            .as_deref()
+            .map(|rule| provenance::strip_human_wrapper(&message.text, rule));
+        let text = stripped.as_deref().unwrap_or(&message.text);
+        let tokens = tokenize_frequency_text(text);
             let mut message_unigrams = HashMap::<&str, u8>::new();
             let mut project_message_unigrams = HashMap::<&str, u8>::new();
             let mut message_bigrams = HashMap::<String, u8>::new();
@@ -1024,47 +1131,57 @@ fn report_frequencies(
                 }
             }
             for (term, count) in message_unigrams {
-                if let Some(total) = unigrams.get_mut(term) {
+            if let Some(total) = counts.unigrams.get_mut(term) {
                     *total += u64::from(count);
                 } else {
-                    unigrams.insert(term.to_owned(), u64::from(count));
+                counts.unigrams.insert(term.to_owned(), u64::from(count));
                 }
             }
             if !project_message_unigrams.is_empty() {
-                let counts = project_unigrams.entry(workspace_path).or_default();
+            if let Some(project_counts) = counts
+                .project_unigrams
+                .get_mut(message.workspace_path.as_str())
+            {
                 for (term, count) in project_message_unigrams {
-                    if let Some(total) = counts.get_mut(term) {
+                    if let Some(total) = project_counts.get_mut(term) {
                         *total += u64::from(count);
                     } else {
-                        counts.insert(term.to_owned(), u64::from(count));
+                        project_counts.insert(term.to_owned(), u64::from(count));
                     }
                 }
-            }
-            for (term, count) in message_bigrams {
-                *bigrams.entry(term).or_default() += u64::from(count);
-            }
-            for (term, count) in message_trigrams {
-                *trigrams.entry(term).or_default() += u64::from(count);
-            }
-            processed += 1;
-            if processed == total || processed % 100 == 0 {
-                progress(
-                    processed,
-                    total,
-                    format!("tokenized {processed}/{total} frequency messages"),
+            } else {
+                counts.project_unigrams.insert(
+                    message.workspace_path.clone(),
+                    project_message_unigrams
+                        .into_iter()
+                        .map(|(term, count)| (term.to_owned(), u64::from(count)))
+                        .collect(),
                 );
             }
+            }
+            for (term, count) in message_bigrams {
+            *counts.bigrams.entry(term).or_default() += u64::from(count);
+            }
+            for (term, count) in message_trigrams {
+            *counts.trigrams.entry(term).or_default() += u64::from(count);
+            }
+            }
+    counts
+}
+
+fn merge_frequency_counts(target: &mut FrequencyCounts, source: FrequencyCounts) {
+    merge_term_counts(&mut target.unigrams, source.unigrams);
+    merge_term_counts(&mut target.bigrams, source.bigrams);
+    merge_term_counts(&mut target.trigrams, source.trigrams);
+    for (project, counts) in source.project_unigrams {
+        merge_term_counts(target.project_unigrams.entry(project).or_default(), counts);
+    }
+}
+
+fn merge_term_counts(target: &mut HashMap<String, u64>, source: HashMap<String, u64>) {
+    for (term, count) in source {
+        *target.entry(term).or_default() += count;
         }
-        Ok((unigrams, bigrams, trigrams, project_unigrams))
-    })?;
-    Ok((
-        FrequencySection {
-            unigrams: top_terms(unigrams, 3, 20),
-            bigrams: top_terms(bigrams, 3, 20),
-            trigrams: top_terms(trigrams, 3, 20),
-        },
-        distinctive_project_terms(project_unigrams),
-    ))
 }
 
 fn project_noise_words() -> HashSet<&'static str> {
@@ -1327,116 +1444,150 @@ fn report_comparisons(
         return Ok(Vec::new());
     }
     let today = Local::now().date_naive();
-    let mut windows = Vec::new();
-    for days in [7u16, 14, 28] {
+    let dates = [7u16, 14, 28].map(|days| {
         let current_start = today - ChronoDuration::days(i64::from(days - 1));
-        let current_end = today;
         let previous_end = current_start - ChronoDuration::days(1);
-        let previous_start = previous_end - ChronoDuration::days(i64::from(days - 1));
-        let dates = (
-            current_start.to_string(),
-            current_end.to_string(),
-            previous_start.to_string(),
-            previous_end.to_string(),
-        );
-        let (current_sessions, previous_sessions, current_tokens, previous_tokens) =
-            store.with_conn(|conn| {
-            conn.query_row(
-                "SELECT
-                   COALESCE(SUM(date(last_event_at, 'localtime') BETWEEN ?1 AND ?2), 0),
-                   COALESCE(SUM(date(last_event_at, 'localtime') BETWEEN ?3 AND ?4), 0),
-                   COALESCE(SUM(CASE WHEN date(last_event_at, 'localtime') BETWEEN ?1 AND ?2
-                                     THEN COALESCE(input_tokens, 0)
-                                        + COALESCE(cached_input_tokens, 0)
-                                        + COALESCE(output_tokens, 0) ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN date(last_event_at, 'localtime') BETWEEN ?3 AND ?4
-                                     THEN COALESCE(input_tokens, 0)
-                                        + COALESCE(cached_input_tokens, 0)
-                                        + COALESCE(output_tokens, 0) ELSE 0 END), 0)
+        ComparisonDates {
+            days,
+            current_start,
+            current_end: today,
+            previous_start: previous_end - ChronoDuration::days(i64::from(days - 1)),
+            previous_end,
+        }
+    });
+    let earliest = dates[2].previous_start.to_string();
+    let latest = today.to_string();
+    let (session_counts, message_counts, project_counts) = store.with_conn(|conn| {
+        let mut session_counts = [ComparisonCounts::default(); 3];
+        let mut stmt = conn.prepare(
+            "SELECT date(last_event_at, 'localtime'),
+                    COALESCE(input_tokens, 0) + COALESCE(cached_input_tokens, 0)
+                      + COALESCE(output_tokens, 0)
                  FROM session_facts
-                 WHERE (?5 IS NULL OR workspace_path LIKE ?5)",
-                params![dates.0, dates.1, dates.2, dates.3, project],
-                |row| {
-                    Ok((
-                        nonnegative(row.get(0)?),
-                        nonnegative(row.get(1)?),
-                        nonnegative(row.get(2)?),
-                        nonnegative(row.get(3)?),
-                    ))
-                },
-            )
-            .map_err(Into::into)
+             WHERE last_event_at IS NOT NULL
+               AND date(last_event_at, 'localtime') BETWEEN ?1 AND ?2
+               AND (?3 IS NULL OR workspace_path LIKE ?3)",
+        )?;
+        let rows = stmt.query_map(params![earliest, latest, project], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
-        let (current_messages, previous_messages) = store.with_conn(|conn| {
-            conn.query_row(
-            "SELECT
-               COALESCE(SUM(date(p.occurred_at, 'localtime') BETWEEN ?1 AND ?2), 0),
-               COALESCE(SUM(date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?4), 0)
+        for row in rows {
+            let (day, tokens) = row?;
+            let day = NaiveDate::parse_from_str(&day, "%Y-%m-%d")?;
+            for (index, window) in dates.iter().enumerate() {
+                if let Some(current) = window.period(day) {
+                    session_counts[index].sessions[current] += 1;
+                    session_counts[index].tokens[current] += tokens;
+                }
+            }
+        }
+
+        let mut message_counts = [[0u64; 2]; 3];
+        let mut project_counts = [
+            BTreeMap::<String, [u64; 2]>::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ];
+        let mut stmt = conn.prepare(
+            "SELECT date(p.occurred_at, 'localtime'),
+                    COALESCE(sf.workspace_path, 'unknown')
              FROM message_provenance p
              JOIN session_facts sf ON sf.session_id = p.session_id
              WHERE p.authored_by = 'human'
-               AND (?5 IS NULL OR sf.workspace_path LIKE ?5)",
-            params![dates.0, dates.1, dates.2, dates.3, project],
-            |row| Ok((nonnegative(row.get(0)?), nonnegative(row.get(1)?))),
-        )
-        .map_err(Into::into)
+               AND p.occurred_at IS NOT NULL
+               AND date(p.occurred_at, 'localtime') BETWEEN ?1 AND ?2
+               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)",
+        )?;
+        let rows = stmt.query_map(params![earliest, latest, project], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
+        for row in rows {
+            let (day, workspace_path) = row?;
+            let day = NaiveDate::parse_from_str(&day, "%Y-%m-%d")?;
+            for (index, window) in dates.iter().enumerate() {
+                if let Some(current) = window.period(day) {
+                    message_counts[index][current] += 1;
+                    project_counts[index]
+                        .entry(workspace_path.clone())
+                        .or_default()[current] += 1;
+                }
+            }
+        }
+        Ok((session_counts, message_counts, project_counts))
+    })?;
+
+    Ok(dates
+        .into_iter()
+        .enumerate()
+        .map(|(index, dates)| {
+            let sessions = &session_counts[index];
+            let messages = &message_counts[index];
         let metrics = [
-            ("sessions", current_sessions, previous_sessions),
-            ("human turns", current_messages, previous_messages),
-            ("tokens", current_tokens, previous_tokens),
+                ("sessions", sessions.sessions[1], sessions.sessions[0]),
+                ("human turns", messages[1], messages[0]),
+                (
+                    "tokens",
+                    sessions.tokens[1].max(0) as u64,
+                    sessions.tokens[0].max(0) as u64,
+                ),
         ]
         .into_iter()
         .map(|(metric, current, previous)| change_row(metric, None, current, previous))
         .collect();
-        let projects = store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-            "SELECT COALESCE(sf.workspace_path, 'unknown'),
-                    SUM(date(p.occurred_at, 'localtime') BETWEEN ?1 AND ?2),
-                    SUM(date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?4)
-             FROM message_provenance p
-             JOIN session_facts sf ON sf.session_id = p.session_id
-             WHERE p.authored_by = 'human'
-               AND date(p.occurred_at, 'localtime') BETWEEN ?3 AND ?2
-               AND (?5 IS NULL OR sf.workspace_path LIKE ?5)
-             GROUP BY sf.workspace_path",
-        )?;
-            let rows = stmt.query_map(params![dates.0, dates.1, dates.2, dates.3, project], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                nonnegative(row.get(1)?),
-                nonnegative(row.get(2)?),
-            ))
-        })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })?;
+
         let mut project_ranked = Vec::new();
-        for (workspace_path, current, previous) in projects {
+            for (workspace_path, [previous, current]) in &project_counts[index] {
             push_change(
                 &mut project_ranked,
                 "human turns",
-                Some(project_label(&workspace_path)),
-                current,
-                previous,
+                    Some(project_label(workspace_path)),
+                    *current,
+                    *previous,
             );
         }
         project_ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
-        windows.push(ComparisonWindow {
-            days,
-            current_start: dates.0,
-            current_end: dates.1,
-            previous_start: dates.2,
-            previous_end: dates.3,
+            ComparisonWindow {
+                days: dates.days,
+                current_start: dates.current_start.to_string(),
+                current_end: dates.current_end.to_string(),
+                previous_start: dates.previous_start.to_string(),
+                previous_end: dates.previous_end.to_string(),
             metrics,
             project_changes: project_ranked
                 .into_iter()
                 .take(PROJECT_INSIGHT_LIMIT)
                 .map(|(_, insight)| insight)
                 .collect(),
-        });
     }
-    Ok(windows)
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComparisonDates {
+    days: u16,
+    current_start: NaiveDate,
+    current_end: NaiveDate,
+    previous_start: NaiveDate,
+    previous_end: NaiveDate,
+}
+
+impl ComparisonDates {
+    fn period(self, day: NaiveDate) -> Option<usize> {
+        if (self.previous_start..=self.previous_end).contains(&day) {
+            Some(0)
+        } else if (self.current_start..=self.current_end).contains(&day) {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ComparisonCounts {
+    sessions: [u64; 2],
+    tokens: [i64; 2],
 }
 
 fn change_row(metric: &str, subject: Option<String>, current: u64, previous: u64) -> ChangeInsight {
