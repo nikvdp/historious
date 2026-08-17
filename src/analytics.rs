@@ -185,6 +185,7 @@ pub(crate) fn rebuild_all_with_progress(
             completed: index,
             total,
         });
+        let _profile_phase = store.report_sql_profile_phase(projection.name);
         rebuild_projection(store, projection, |detail| {
             progress(RebuildProgress::Detail {
                 projection: projection.name,

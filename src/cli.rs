@@ -1505,6 +1505,18 @@ impl Cli {
             return Ok(());
         }
 
+        let mut report_sql_profile = if matches!(
+            &command,
+            Command::Report {
+                update: true,
+                command: None,
+                ..
+            }
+        ) {
+            crate::storage::ReportSqlProfileSession::from_env()?
+        } else {
+            None
+        };
         emit_startup_progress(&command, robot);
         let mut config = AppConfig::load(data_dir)?;
         let store = Store::open(&config.data_dir)?;
@@ -2909,6 +2921,9 @@ impl Cli {
             Command::Config { .. } => unreachable!("config returns before storage setup"),
             Command::Service { .. } => unreachable!("service returns before storage setup"),
             Command::Completion { .. } => unreachable!("completion returns before storage setup"),
+        }
+        if let Some(profile) = report_sql_profile.take() {
+            profile.finish(true)?;
         }
         Ok(())
     }

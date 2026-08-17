@@ -10,11 +10,14 @@ use rusqlite::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::CStr;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
 const SQLITE_BIND_CHUNK_SIZE: usize = 500;
@@ -26,10 +29,328 @@ const SOURCE_STATUS_CONFIDENCE_APPROXIMATE: &str = "approximate";
 const SOURCE_STATUS_CONFIDENCE_EXACT: &str = "exact";
 const SOURCE_STATUS_CONFIDENCE_STALE: &str = "stale";
 
+pub(crate) const REPORT_SQL_PROFILE_ENV: &str = "HISTO_REPORT_SQL_PROFILE";
+
+#[derive(Default)]
+struct ReportSqlStatementAggregate {
+    sql: String,
+    calls: u64,
+    total_duration_ns: u64,
+    max_duration_ns: u64,
+    full_scan_steps: u64,
+    vm_steps: u64,
+}
+
+struct ReportSqlProfileState {
+    output_path: PathBuf,
+    statements: BTreeMap<(String, String), ReportSqlStatementAggregate>,
+    phase_duration_ns: BTreeMap<String, u64>,
+}
+
+struct ActiveReportSqlProfilePhase {
+    name: String,
+    started: Instant,
+}
+
+static REPORT_SQL_PROFILE: LazyLock<Mutex<Option<ReportSqlProfileState>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+thread_local! {
+    static REPORT_SQL_PROFILE_PHASE: RefCell<Option<ActiveReportSqlProfilePhase>> =
+        const { RefCell::new(None) };
+}
+
+pub(crate) struct ReportSqlProfileSession {
+    phase: Option<ReportSqlProfilePhaseGuard>,
+    finished: bool,
+}
+
+pub(crate) struct ReportSqlProfilePhaseGuard {
+    previous: Option<ActiveReportSqlProfilePhase>,
+}
+
+impl ReportSqlProfileSession {
+    pub(crate) fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os(REPORT_SQL_PROFILE_ENV) else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            bail!("{REPORT_SQL_PROFILE_ENV} must name a JSONL output path");
+        }
+        begin_report_sql_profile(PathBuf::from(path)).map(Some)
+    }
+
+    pub(crate) fn finish(mut self, success: bool) -> Result<()> {
+        self.phase.take();
+        let result = flush_report_sql_profile(if success { "success" } else { "failed" });
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for ReportSqlProfileSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.phase.take();
+            let _ = flush_report_sql_profile("failed");
+        }
+    }
+}
+
+impl ReportSqlProfilePhaseGuard {
+    fn new(phase: &str) -> Self {
+        let previous = REPORT_SQL_PROFILE_PHASE.with(|current| {
+            let previous = current.replace(Some(ActiveReportSqlProfilePhase {
+                name: phase.to_string(),
+                started: Instant::now(),
+            }));
+            if let Some(previous) = previous.as_ref() {
+                record_report_sql_phase(&previous.name, previous.started.elapsed());
+            }
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for ReportSqlProfilePhaseGuard {
+    fn drop(&mut self) {
+        REPORT_SQL_PROFILE_PHASE.with(|current| {
+            if let Some(active) = current.take() {
+                record_report_sql_phase(&active.name, active.started.elapsed());
+            }
+            if let Some(previous) = self.previous.take() {
+                current.replace(Some(ActiveReportSqlProfilePhase {
+                    name: previous.name,
+                    started: Instant::now(),
+                }));
+            }
+        });
+    }
+}
+
+fn report_sql_profile_state() -> &'static Mutex<Option<ReportSqlProfileState>> {
+    &REPORT_SQL_PROFILE
+}
+
+fn begin_report_sql_profile(output_path: PathBuf) -> Result<ReportSqlProfileSession> {
+    let mut state = report_sql_profile_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("report SQL profiler lock is poisoned"))?;
+    if state.is_some() {
+        bail!("report SQL profiling is already active");
+    }
+    *state = Some(ReportSqlProfileState {
+        output_path,
+        statements: BTreeMap::new(),
+        phase_duration_ns: BTreeMap::new(),
+    });
+    drop(state);
+    Ok(ReportSqlProfileSession {
+        phase: Some(ReportSqlProfilePhaseGuard::new("preflight")),
+        finished: false,
+    })
+}
+
+fn report_sql_profile_active() -> bool {
+    report_sql_profile_state()
+        .lock()
+        .map(|state| state.is_some())
+        .unwrap_or(false)
+}
+
+fn record_report_sql_phase(phase: &str, duration: Duration) {
+    let Ok(mut state) = report_sql_profile_state().lock() else {
+        return;
+    };
+    let Some(state) = state.as_mut() else {
+        return;
+    };
+    let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+    let total = state.phase_duration_ns.entry(phase.to_string()).or_default();
+    *total = total.saturating_add(duration_ns);
+}
+
+fn flush_report_sql_profile(status: &str) -> Result<()> {
+    let state = report_sql_profile_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("report SQL profiler lock is poisoned"))?
+        .take()
+        .context("report SQL profiling is not active")?;
+    let file = File::create(&state.output_path)
+        .with_context(|| format!("creating report SQL profile {}", state.output_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "run",
+            "instrumented": true,
+            "status": status,
+        }),
+    )?;
+    writeln!(writer)?;
+    for (phase, duration_ns) in state.phase_duration_ns {
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "type": "phase",
+                "instrumented": true,
+                "phase": phase,
+                "duration_ns": duration_ns,
+            }),
+        )?;
+        writeln!(writer)?;
+    }
+    for ((phase, fingerprint), aggregate) in state.statements {
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "type": "statement",
+                "instrumented": true,
+                "phase": phase,
+                "fingerprint": fingerprint,
+                "sql": aggregate.sql,
+                "calls": aggregate.calls,
+                "total_duration_ns": aggregate.total_duration_ns,
+                "max_duration_ns": aggregate.max_duration_ns,
+                "full_scan_steps": aggregate.full_scan_steps,
+                "vm_steps": aggregate.vm_steps,
+            }),
+        )?;
+        writeln!(writer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn normalize_report_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut pending_space = false;
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        if ch == '\'' {
+            normalized.push('?');
+            while let Some(quoted) = chars.next() {
+                if quoted == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    normalized.trim().trim_end_matches(';').trim().to_string()
+}
+
+fn report_sql_fingerprint(sql: &str) -> String {
+    blake3::hash(sql.as_bytes()).to_hex()[..16].to_string()
+}
+
+unsafe extern "C" fn report_sql_profile_callback(
+    event: u32,
+    _context: *mut std::ffi::c_void,
+    statement: *mut std::ffi::c_void,
+    elapsed_ns: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    if event != rusqlite::ffi::SQLITE_TRACE_PROFILE as u32
+        || statement.is_null()
+        || elapsed_ns.is_null()
+    {
+        return 0;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let statement = statement.cast::<rusqlite::ffi::sqlite3_stmt>();
+        let sql = rusqlite::ffi::sqlite3_sql(statement);
+        if sql.is_null() {
+            return;
+        }
+        let Ok(sql) = CStr::from_ptr(sql).to_str() else {
+            return;
+        };
+        let sql = normalize_report_sql(sql);
+        let fingerprint = report_sql_fingerprint(&sql);
+        let duration_ns = *(elapsed_ns.cast::<u64>());
+        let full_scan_steps = rusqlite::ffi::sqlite3_stmt_status(
+            statement,
+            rusqlite::ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
+            1,
+        )
+        .max(0) as u64;
+        let vm_steps = rusqlite::ffi::sqlite3_stmt_status(
+            statement,
+            rusqlite::ffi::SQLITE_STMTSTATUS_VM_STEP,
+            1,
+        )
+        .max(0) as u64;
+        let phase = REPORT_SQL_PROFILE_PHASE.with(|phase| {
+            phase
+                .borrow()
+                .as_ref()
+                .map(|phase| phase.name.clone())
+        });
+        let Some(phase) = phase else {
+            return;
+        };
+        let Ok(mut state) = report_sql_profile_state().lock() else {
+            return;
+        };
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        let aggregate = state
+            .statements
+            .entry((phase, fingerprint))
+            .or_insert_with(|| ReportSqlStatementAggregate {
+                sql,
+                ..Default::default()
+            });
+        aggregate.calls = aggregate.calls.saturating_add(1);
+        aggregate.total_duration_ns =
+            aggregate.total_duration_ns.saturating_add(duration_ns);
+        aggregate.max_duration_ns = aggregate.max_duration_ns.max(duration_ns);
+        aggregate.full_scan_steps = aggregate.full_scan_steps.saturating_add(full_scan_steps);
+        aggregate.vm_steps = aggregate.vm_steps.saturating_add(vm_steps);
+    }));
+    0
+}
+
+fn install_report_sql_profile(conn: &Connection) -> Result<()> {
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_trace_v2(
+            conn.handle(),
+            rusqlite::ffi::SQLITE_TRACE_PROFILE as u32,
+            Some(report_sql_profile_callback),
+            std::ptr::null_mut(),
+        )
+    };
+    if code == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        )
+        .into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     db_path: PathBuf,
     blob_dir: PathBuf,
+    report_sql_profile: bool,
 }
 
 #[allow(dead_code)]
@@ -576,7 +897,11 @@ impl Store {
         let blob_dir = data_dir.join("blobs");
         std::fs::create_dir_all(&blob_dir)
             .with_context(|| format!("creating blob dir {}", blob_dir.display()))?;
-        let store = Self { db_path, blob_dir };
+        let store = Self {
+            db_path,
+            blob_dir,
+            report_sql_profile: report_sql_profile_active(),
+        };
         store.with_conn(|conn| {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -615,7 +940,18 @@ impl Store {
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("opening database {}", self.db_path.display()))?;
         conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+        if self.report_sql_profile {
+            install_report_sql_profile(&conn)?;
+        }
         f(&conn)
+    }
+
+    pub(crate) fn report_sql_profile_phase(
+        &self,
+        phase: &'static str,
+    ) -> Option<ReportSqlProfilePhaseGuard> {
+        self.report_sql_profile
+            .then(|| ReportSqlProfilePhaseGuard::new(phase))
     }
 
     pub fn db_path(&self) -> &Path {
@@ -7612,6 +7948,110 @@ mod tests {
         SessionRecord, SourceRecord,
     };
     use serde_json::json;
+
+    #[test]
+    fn report_sql_profile_aggregates_phases_without_bound_values_or_counter_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile_path = dir.path().join("profile.jsonl");
+        let session = begin_report_sql_profile(profile_path.clone()).expect("start profile");
+        let store = Store::open(&dir.path().join("store")).expect("open profiled store");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE report_sql_profile_fixture (
+                         id INTEGER PRIMARY KEY,
+                         label TEXT NOT NULL
+                     );
+                     INSERT INTO report_sql_profile_fixture (label)
+                     VALUES ('row-a'), ('row-b'), ('row-c');",
+                )?;
+                Ok(())
+            })
+            .expect("create profile fixture");
+
+        {
+            let _phase = store
+                .report_sql_profile_phase("profile_phase_a")
+                .expect("profile phase");
+            store
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT id FROM report_sql_profile_fixture
+                         WHERE label > ?1
+                         ORDER BY id",
+                    )?;
+                    for bound in ["private-alpha", "private-beta"] {
+                        let rows = statement.query_map([bound], |row| row.get::<_, i64>(0))?;
+                        let _: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+                    }
+                    Ok(())
+                })
+                .expect("profile repeated statement");
+        }
+        {
+            let _phase = store
+                .report_sql_profile_phase("profile_phase_b")
+                .expect("profile phase");
+            store
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT id FROM report_sql_profile_fixture
+                         WHERE label > ?1
+                         ORDER BY id",
+                    )?;
+                    let rows =
+                        statement.query_map(["private-alpha"], |row| row.get::<_, i64>(0))?;
+                    let _: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+                    Ok(())
+                })
+                .expect("profile second phase");
+        }
+        session.finish(false).expect("flush failed profile");
+
+        let output = std::fs::read_to_string(profile_path).expect("read profile");
+        assert!(!output.contains("private-alpha"));
+        assert!(!output.contains("private-beta"));
+        assert!(!output.contains("row-a"));
+        let records = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("profile JSON"))
+            .collect::<Vec<_>>();
+        assert!(records
+            .iter()
+            .any(|record| record["type"] == "run" && record["status"] == "failed"));
+
+        let statement_for = |phase: &str| {
+            records
+                .iter()
+                .find(|record| {
+                    record["type"] == "statement"
+                        && record["phase"] == phase
+                        && record["sql"]
+                            .as_str()
+                            .is_some_and(|sql| sql.contains("FROM report_sql_profile_fixture"))
+                })
+                .expect("profiled statement")
+        };
+        let phase_a = statement_for("profile_phase_a");
+        let phase_b = statement_for("profile_phase_b");
+        assert_eq!(phase_a["fingerprint"], phase_b["fingerprint"]);
+        assert_eq!(phase_a["calls"], 2);
+        assert_eq!(phase_b["calls"], 1);
+        assert_eq!(
+            phase_a["full_scan_steps"].as_u64(),
+            phase_b["full_scan_steps"].as_u64().map(|steps| steps * 2)
+        );
+        assert_eq!(
+            phase_a["vm_steps"].as_u64(),
+            phase_b["vm_steps"].as_u64().map(|steps| steps * 2)
+        );
+        assert!(records
+            .iter()
+            .any(|record| record["type"] == "phase" && record["phase"] == "profile_phase_a"));
+        assert!(records
+            .iter()
+            .any(|record| record["type"] == "phase" && record["phase"] == "profile_phase_b"));
+    }
 
     #[test]
     fn message_model_context_schema_exists_on_fresh_store() {
