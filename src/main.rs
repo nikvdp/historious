@@ -12,6 +12,7 @@ mod provenance;
 mod report;
 mod search;
 mod self_update;
+mod service;
 mod server;
 mod skills;
 mod source;

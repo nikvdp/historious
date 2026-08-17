@@ -710,6 +710,11 @@ pub enum Command {
         )]
         no_embeddings: bool,
     },
+    /// Install, inspect, or remove scheduled background maintenance.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Serve already-indexed local history over HTTP.
     Serve {
         #[arg(
@@ -853,6 +858,16 @@ pub enum Command {
         #[arg(value_enum, help = "Shell to generate completions for")]
         shell: Shell,
     },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum ServiceCommand {
+    /// Install hourly updates and a daily report refresh.
+    Install,
+    /// Remove the scheduled Historious maintenance jobs.
+    Uninstall,
+    /// Show whether both scheduled jobs are installed and active.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1462,6 +1477,21 @@ impl Cli {
         }
         if let Command::Config { command } = command {
             run_config_command(data_dir, command, robot)?;
+            return Ok(());
+        }
+        if let Command::Service { command } = command {
+            let action = match command {
+                ServiceCommand::Install => crate::service::Action::Install,
+                ServiceCommand::Uninstall => crate::service::Action::Uninstall,
+                ServiceCommand::Status => crate::service::Action::Status,
+            };
+            let service_data_dir = if matches!(command, ServiceCommand::Install) {
+                crate::config::resolve_data_dir(data_dir)?
+            } else {
+                data_dir.unwrap_or_default()
+            };
+            let status = crate::service::manage(action, &service_data_dir)?;
+            print_service_status(action, &status);
             return Ok(());
         }
         if let Command::Status { json, all: false } = &command {
@@ -2877,6 +2907,7 @@ impl Cli {
             Command::Version { .. } => unreachable!("version returns before storage setup"),
             Command::SelfUpdate { .. } => unreachable!("self-update returns before storage setup"),
             Command::Config { .. } => unreachable!("config returns before storage setup"),
+            Command::Service { .. } => unreachable!("service returns before storage setup"),
             Command::Completion { .. } => unreachable!("completion returns before storage setup"),
         }
         Ok(())
@@ -2901,6 +2932,7 @@ impl Command {
             Command::Prune { .. } => "prune",
             Command::RawBlobs { .. } => "raw-blobs",
             Command::Daemon { .. } => "daemon",
+            Command::Service { .. } => "service",
             Command::Serve { .. } => "serve",
             Command::Status { .. } => "status",
             Command::Report { .. } => "report",
@@ -2945,6 +2977,30 @@ impl Command {
                     ..
                 }
         )
+    }
+}
+
+fn print_service_status(action: crate::service::Action, status: &crate::service::ServiceStatus) {
+    let heading = match action {
+        crate::service::Action::Install => "Persistent maintenance installed",
+        crate::service::Action::Uninstall => "Persistent maintenance removed",
+        crate::service::Action::Status => "Persistent maintenance status",
+    };
+    println!("{heading}");
+    println!("  backend  {}", status.backend);
+    for job in [&status.update, &status.report] {
+        let state = match (job.installed, job.active) {
+            (true, true) => "installed · active",
+            (true, false) => "installed · inactive",
+            (false, true) => "active · definition missing",
+            (false, false) => "not installed",
+        };
+        println!(
+            "  {:<8} {} · {}",
+            job.name,
+            state,
+            job.schedule
+        );
     }
 }
 
@@ -11237,6 +11293,22 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn service_lifecycle_subcommands_parse() {
+        for (name, expected) in [
+            ("install", ServiceCommand::Install),
+            ("uninstall", ServiceCommand::Uninstall),
+            ("status", ServiceCommand::Status),
+        ] {
+            let cli = Cli::try_parse_from(["histo", "service", name])
+                .expect("parse service command");
+            let Command::Service { command } = cli.command else {
+                panic!("expected service command");
+            };
+            assert_eq!(std::mem::discriminant(&command), std::mem::discriminant(&expected));
+        }
     }
 
     #[test]
