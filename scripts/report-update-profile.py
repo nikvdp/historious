@@ -227,19 +227,39 @@ def write_archive(path: Path, session_count: int) -> None:
 
 
 def run_checked(args: list[str], env: dict[str, str] | None = None) -> None:
-    completed = subprocess.run(
+    proc = subprocess.Popen(
         args,
         cwd=ROOT,
         env=env,
         text=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        check=False,
+        bufsize=1,
     )
-    if completed.returncode != 0:
+    assert proc.stderr is not None
+    stderr_lines = []
+    last_emit = 0.0
+    last_phase: str | None = None
+    for line in proc.stderr:
+        stderr_lines.append(line)
+        now = time.monotonic()
+        emit = True
+        try:
+            payload = json.loads(line)
+            phase = payload.get("phase")
+            status = payload.get("data", {}).get("status")
+            emit = phase != last_phase or now - last_emit >= 1.0 or status == "finished"
+            last_phase = phase
+        except json.JSONDecodeError:
+            pass
+        if emit:
+            print(f"  {line}", end="", flush=True)
+            last_emit = now
+    returncode = proc.wait()
+    if returncode != 0:
         raise RuntimeError(
-            f"command failed with exit {completed.returncode}: {' '.join(args)}\n"
-            f"{completed.stderr}"
+            f"command failed with exit {returncode}: {' '.join(args)}\n"
+            f"{''.join(stderr_lines)}"
         )
 
 
@@ -289,6 +309,7 @@ def run_report(
             stderr_lines.append(line)
             stderr_stream.write(line)
             stderr_stream.flush()
+            print(f"  {line}", end="", flush=True)
             for marker, phase in PHASE_MARKERS:
                 if marker in line:
                     if current is not None and current not in phase_finished:
