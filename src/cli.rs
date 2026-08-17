@@ -11516,6 +11516,48 @@ mod tests {
 
         automatic_store
             .with_conn(|conn| {
+                let state = conn.query_row(
+                    "SELECT input_high_watermark
+                     FROM projection_status
+                     WHERE projection_name = ?1",
+                    [analytics::REPORT_SNAPSHOT_PROJECTION],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let mut state = serde_json::from_str::<serde_json::Value>(&state)?;
+                state["version"] = serde_json::json!(analytics::REPORT_SNAPSHOT_VERSION - 1);
+                conn.execute(
+                    "UPDATE projection_status
+                     SET input_high_watermark = ?1
+                     WHERE projection_name = ?2",
+                    rusqlite::params![
+                        serde_json::to_string(&state)?,
+                        analytics::REPORT_SNAPSHOT_PROJECTION
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("downgrade stored report version");
+        assert!(
+            analytics::report_refresh_status(&automatic_store)
+                .expect("outdated report status")
+                .stale
+        );
+        refresh_report_for_command(&automatic_store, false, false, false)
+            .expect("upgrade outdated report snapshot");
+        let upgraded_at = automatic_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("load upgraded timestamp");
+        assert_ne!(upgraded_at, unchanged_at);
+
+        automatic_store
+            .with_conn(|conn| {
                 conn.execute("DELETE FROM report_snapshot", [])?;
                 Ok(())
             })
@@ -11536,7 +11578,7 @@ mod tests {
                 .map_err(Into::into)
             })
             .expect("load restored generated timestamp");
-        assert_ne!(restored_at, unchanged_at);
+        assert_ne!(restored_at, upgraded_at);
 
         refresh_report_for_command(&automatic_store, true, false, false)
             .expect("force report analytics rebuild");

@@ -2776,6 +2776,18 @@ fn render_frustration(
         );
         return;
     }
+    let Some(overall_wtfs_per_hour) = summary.wtfs_per_hour else {
+        push_wrapped(
+            out,
+            "WTFs/hr unavailable in this stored snapshot; run `histo report --update`.",
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
+        return;
+    };
+
 
     push_wrapped(
         out,
@@ -2792,18 +2804,13 @@ fn render_frustration(
         .saturating_sub(4)
         .min(FRUSTRATION_CHART_WIDTH);
     let overall_bar = horizontal_bar(
-        summary.wtfs_per_hour.unwrap_or(0.0),
+        overall_wtfs_per_hour,
         summary.scale_wtfs_per_hour,
         chart_width,
     );
-    let overall_detail = summary.wtfs_per_hour.map_or_else(
-        || "n/a wtfs/hr · no recorded duration".to_string(),
-        |rate| {
-            format!(
-                "{rate:.2} wtfs/hr · baseline · {}",
-                format_hours(summary.duration_secs)
-            )
-        },
+    let overall_detail = format!(
+        "{overall_wtfs_per_hour:.2} wtfs/hr · baseline · {}",
+        format_hours(summary.duration_secs)
     );
 
     if width >= 80 {
@@ -4829,6 +4836,18 @@ mod tests {
         let mut empty = String::new();
         render_frustration(&mut empty, &[], false, false, 80, false);
         assert!(empty.contains("No frustration signals recorded"));
+
+        let mut legacy_points = points.clone();
+        for point in &mut legacy_points {
+            point.duration_secs = 0;
+        }
+        let mut legacy = String::new();
+        render_frustration(&mut legacy, &legacy_points, false, false, 80, false);
+        assert!(legacy.contains(
+            "WTFs/hr unavailable in this stored snapshot; run `histo report --update`."
+        ));
+        assert!(!legacy.contains("Bar scale"));
+        assert!(!legacy.contains("n/a wtfs/hr"));
     }
 
     #[test]
