@@ -812,7 +812,7 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Show primary-model share and monthly composition")]
         models: bool,
-        #[arg(long, help = "Show every frustration model and month without truncation")]
+        #[arg(long, help = "Show complete model lists and all frustration months")]
         full: bool,
         #[arg(long, help = "Print stable unstyled text without terminal color")]
         plain: bool,

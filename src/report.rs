@@ -18,7 +18,7 @@ const MIN_DAYPART_SHARE_GAP: f64 = 5.0;
 const FRUSTRATION_TARGET_MESSAGES: u64 = 2_000;
 const FRUSTRATION_MAX_MONTHS: usize = 6;
 const FRUSTRATION_MIN_MODEL_MESSAGES: u64 = 150;
-const FRUSTRATION_MAX_MODELS: usize = 5;
+const MODEL_LIST_MAX_ROWS: usize = 5;
 const FRUSTRATION_CHART_WIDTH: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
@@ -189,15 +189,17 @@ pub struct FrustrationPoint {
     pub model: String,
     pub matches: u64,
     pub human_messages: u64,
+    #[serde(default)]
+    pub duration_secs: u64,
 }
 
 #[derive(Debug, Clone)]
 struct FrustrationModelSummary {
     model: String,
     matches: u64,
-    human_messages: u64,
-    rate_percent: f64,
-    delta_points: f64,
+    duration_secs: u64,
+    wtfs_per_hour: Option<f64>,
+    delta_wtfs_per_hour: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,11 +210,12 @@ struct FrustrationSummary {
     filtered: bool,
     matches: u64,
     human_messages: u64,
-    rate_percent: f64,
+    duration_secs: u64,
+    wtfs_per_hour: Option<f64>,
     models: Vec<FrustrationModelSummary>,
     hidden_models: usize,
     largest_model: Option<(String, u64)>,
-    scale_percent: f64,
+    scale_wtfs_per_hour: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1853,43 +1856,68 @@ fn report_frustration(
                     model,
                     matches,
                     human_messages: 0,
+                    duration_secs: 0,
                 },
             );
         }
         drop(matches_stmt);
 
-        // Denominators: all human messages with a model attribution, so rates
-        // can be derived later and quiet months still render.
+        // Denominators: all attributed human follow-ups and their share of
+        // each session's recorded duration. Proportional allocation keeps
+        // model-switching sessions additive instead of counting their time
+        // once for every model.
         let mut totals_stmt = conn.prepare(
-            "SELECT strftime('%Y-%m', mc.occurred_at, 'localtime'), mc.model, COUNT(*)
-             FROM message_provenance p
-             JOIN message_model_context mc ON mc.item_id = p.item_id
-             JOIN session_facts sf ON sf.session_id = mc.session_id
-             WHERE p.authored_by = 'human'
-               AND mc.occurred_at IS NOT NULL
-               AND (?1 IS NULL OR mc.occurred_at >= ?1)
-               AND (?2 IS NULL OR mc.occurred_at < ?2)
-               AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
-             GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2",
+            "WITH attributed AS (
+               SELECT strftime('%Y-%m', mc.occurred_at, 'localtime') AS month,
+                      mc.model, mc.session_id, COUNT(*) AS human_messages
+               FROM message_provenance p
+               JOIN message_model_context mc ON mc.item_id = p.item_id
+               JOIN session_facts sf ON sf.session_id = mc.session_id
+               WHERE p.authored_by = 'human'
+                 AND mc.occurred_at IS NOT NULL
+                 AND (?1 IS NULL OR mc.occurred_at >= ?1)
+                 AND (?2 IS NULL OR mc.occurred_at < ?2)
+                 AND (?3 IS NULL OR sf.workspace_path LIKE ?3)
+               GROUP BY 1, 2, 3
+             ),
+             session_totals AS (
+               SELECT session_id, SUM(human_messages) AS human_messages
+               FROM attributed
+               GROUP BY session_id
+             )
+             SELECT a.month, a.model, SUM(a.human_messages),
+                    CAST(ROUND(SUM(
+                      COALESCE(sf.duration_secs, 0)
+                      * CAST(a.human_messages AS REAL)
+                      / st.human_messages
+                    )) AS INTEGER)
+             FROM attributed a
+             JOIN session_totals st ON st.session_id = a.session_id
+             JOIN session_facts sf ON sf.session_id = a.session_id
+             GROUP BY 1, 2
+             ORDER BY 1, 3 DESC, 2",
         )?;
         let total_rows = totals_stmt.query_map(params![after, before, project], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 nonnegative(row.get(2)?),
+                nonnegative(row.get(3)?),
             ))
         })?;
         for row in total_rows {
-            let (month, model, human_messages) = row?;
-            points
+            let (month, model, human_messages, duration_secs) = row?;
+            let point = points
                 .entry((month.clone(), model.clone()))
                 .or_insert_with(|| FrustrationPoint {
                     month,
                     model,
                     matches: 0,
                     human_messages: 0,
-                })
-                .human_messages = human_messages;
+                    duration_secs: 0,
+                });
+            point.human_messages = human_messages;
+            point.duration_secs = duration_secs;
         }
         Ok(points.into_values().collect())
     })
@@ -2312,7 +2340,7 @@ pub fn render_terminal_window(
         }
     }
 
-    render_tokens_by_model(&mut out, &report.tokens_by_model, width, color);
+    render_tokens_by_model(&mut out, &report.tokens_by_model, full, width, color);
 
     if !report.rhythms.by_hour.is_empty() {
         out.push('\n');
@@ -2385,6 +2413,7 @@ pub fn render_terminal_window(
 fn render_tokens_by_model(
     out: &mut String,
     rows: &[TokenModelRow],
+    full: bool,
     width: usize,
     color: bool,
 ) {
@@ -2407,6 +2436,11 @@ fn render_tokens_by_model(
         );
         return;
     }
+    let visible_rows = &rows[..if full {
+        rows.len()
+    } else {
+        rows.len().min(MODEL_LIST_MAX_ROWS)
+    }];
     push_wrapped(
         out,
         &format!("total {} tokens", compact_number(total)),
@@ -2416,7 +2450,7 @@ fn render_tokens_by_model(
         color,
     );
     if width >= 64 {
-        for row in rows {
+        for row in visible_rows {
             let label = ellipsize_middle(&row.model, LABEL_WIDTH);
             let bar = horizontal_bar(row.tokens as f64, total as f64, chart_width);
             let share = row.tokens as f64 * 100.0 / total as f64;
@@ -2424,7 +2458,7 @@ fn render_tokens_by_model(
             push_working_hours_row(out, &label, &bar, Some(&detail), color);
         }
     } else {
-        for row in rows {
+        for row in visible_rows {
             let share = row.tokens as f64 * 100.0 / total as f64;
             push_wrapped(
                 out,
@@ -2442,6 +2476,21 @@ fn render_tokens_by_model(
             ));
             out.push('\n');
         }
+    }
+    let hidden = rows.len().saturating_sub(visible_rows.len());
+    if hidden > 0 {
+        push_wrapped(
+            out,
+            &format!(
+                "{} models hidden · {} highest-token shown · use --full to show all",
+                exact_number(hidden as u64),
+                MODEL_LIST_MAX_ROWS
+            ),
+            width,
+            2,
+            StyleRole::Muted,
+            color,
+        );
     }
 }
 
@@ -2503,12 +2552,8 @@ fn slice_at(slices: &[ModelSlice], position: u64) -> usize {
     slices.len().saturating_sub(1)
 }
 
-fn frustration_rate(matches: u64, human_messages: u64) -> f64 {
-    if human_messages == 0 {
-        0.0
-    } else {
-        matches as f64 * 100.0 / human_messages as f64
-    }
+fn wtfs_per_hour(matches: u64, duration_secs: u64) -> Option<f64> {
+    (duration_secs > 0).then(|| matches as f64 * 3_600.0 / duration_secs as f64)
 }
 
 fn summarize_frustration(
@@ -2544,18 +2589,26 @@ fn summarize_frustration(
     let window_start = selected_months.iter().min()?.clone();
     let window_end = selected_months.iter().max()?.clone();
 
-    let mut by_model = HashMap::<String, (u64, u64)>::new();
+    let mut by_model = HashMap::<String, (u64, u64, u64)>::new();
     for point in points.iter().filter(|point| selected.contains(&point.month)) {
         let totals = by_model.entry(point.model.clone()).or_default();
         totals.0 = totals.0.saturating_add(point.matches);
         totals.1 = totals.1.saturating_add(point.human_messages);
+        totals.2 = totals.2.saturating_add(point.duration_secs);
     }
-    let matches = by_model.values().map(|(matches, _)| *matches).sum();
+    let matches = by_model
+        .values()
+        .map(|(matches, _, _)| *matches)
+        .sum();
     let human_messages = by_model
         .values()
-        .map(|(_, human_messages)| *human_messages)
+        .map(|(_, human_messages, _)| *human_messages)
         .sum();
-    let rate_percent = frustration_rate(matches, human_messages);
+    let duration_secs = by_model
+        .values()
+        .map(|(_, _, duration_secs)| *duration_secs)
+        .sum();
+    let overall_wtfs_per_hour = wtfs_per_hour(matches, duration_secs);
     let largest_model = by_model
         .iter()
         .max_by(|(left_name, left), (right_name, right)| {
@@ -2563,41 +2616,47 @@ fn summarize_frustration(
                 .cmp(&right.1)
                 .then_with(|| right_name.cmp(left_name))
         })
-        .map(|(model, (_, messages))| (model.clone(), *messages));
+        .map(|(model, (_, messages, _))| (model.clone(), *messages));
 
     let model_count = by_model.len();
     let mut models = by_model
         .into_iter()
-        .filter(|(_, (_, messages))| full || *messages >= FRUSTRATION_MIN_MODEL_MESSAGES)
-        .map(|(model, (matches, human_messages))| {
-            let model_rate = frustration_rate(matches, human_messages);
-            let delta = model_rate - rate_percent;
+        .filter(|(_, (_, messages, _))| full || *messages >= FRUSTRATION_MIN_MODEL_MESSAGES)
+        .map(|(model, (matches, _, duration_secs))| {
+            let model_wtfs_per_hour = wtfs_per_hour(matches, duration_secs);
+            let delta = model_wtfs_per_hour
+                .zip(overall_wtfs_per_hour)
+                .map(|(model_rate, overall_rate)| model_rate - overall_rate)
+                .map(|delta| if delta.abs() < 0.005 { 0.0 } else { delta });
             FrustrationModelSummary {
                 model,
                 matches,
-                human_messages,
-                rate_percent: model_rate,
-                delta_points: if delta.abs() < 0.05 { 0.0 } else { delta },
+                duration_secs,
+                wtfs_per_hour: model_wtfs_per_hour,
+                delta_wtfs_per_hour: delta,
             }
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| {
-        left
-            .rate_percent
-            .total_cmp(&right.rate_percent)
-            .then_with(|| right.matches.cmp(&left.matches))
-            .then_with(|| left.model.cmp(&right.model))
+        match (left.wtfs_per_hour, right.wtfs_per_hour) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| right.matches.cmp(&left.matches))
+        .then_with(|| left.model.cmp(&right.model))
     });
     if !full {
-        models.truncate(FRUSTRATION_MAX_MODELS);
+        models.truncate(MODEL_LIST_MAX_ROWS);
     }
     let hidden_models = model_count.saturating_sub(models.len());
-    let scale_percent = models
+    let max_wtfs_per_hour = models
         .iter()
-        .map(|model| model.rate_percent)
-        .fold(rate_percent, f64::max)
-        .ceil()
-        .max(1.0);
+        .filter_map(|model| model.wtfs_per_hour)
+        .chain(overall_wtfs_per_hour)
+        .fold(0.0, f64::max);
+    let scale_wtfs_per_hour = ((max_wtfs_per_hour * 10.0).ceil() / 10.0).max(0.1);
 
     Some(FrustrationSummary {
         window_start,
@@ -2606,11 +2665,12 @@ fn summarize_frustration(
         filtered,
         matches,
         human_messages,
-        rate_percent,
+        duration_secs,
+        wtfs_per_hour: overall_wtfs_per_hour,
         models,
         hidden_models,
         largest_model,
-        scale_percent,
+        scale_wtfs_per_hour,
     })
 }
 
@@ -2630,8 +2690,13 @@ fn frustration_window_label(summary: &FrustrationSummary) -> String {
     }
 }
 
-fn rounded_tenth(value: f64) -> f64 {
-    (value * 10.0).round() / 10.0
+fn format_hours(duration_secs: u64) -> String {
+    let hours = duration_secs as f64 / 3_600.0;
+    if hours < 10.0 {
+        format!("{hours:.1}h")
+    } else {
+        format!("{}h", compact_number(hours.round() as u64))
+    }
 }
 
 fn render_frustration(
@@ -2659,11 +2724,10 @@ fn render_frustration(
     push_wrapped(
         out,
         &format!(
-            "{} · {} follow-ups · {} signals · overall {:.1}%",
+            "{} · {} follow-ups · {} signals",
             frustration_window_label(&summary),
             exact_number(summary.human_messages),
-            exact_number(summary.matches),
-            rounded_tenth(summary.rate_percent)
+            exact_number(summary.matches)
         ),
         width,
         2,
@@ -2715,7 +2779,10 @@ fn render_frustration(
 
     push_wrapped(
         out,
-        &format!("Bar scale 0–{:.0}%", summary.scale_percent),
+        &format!(
+            "Bar scale 0–{:.2} wtfs/hr",
+            summary.scale_wtfs_per_hour
+        ),
         width,
         2,
         StyleRole::Muted,
@@ -2725,14 +2792,18 @@ fn render_frustration(
         .saturating_sub(4)
         .min(FRUSTRATION_CHART_WIDTH);
     let overall_bar = horizontal_bar(
-        summary.rate_percent,
-        summary.scale_percent,
+        summary.wtfs_per_hour.unwrap_or(0.0),
+        summary.scale_wtfs_per_hour,
         chart_width,
     );
-    let overall_detail = format!(
-        "{:.1}% · baseline · n={}",
-        rounded_tenth(summary.rate_percent),
-        exact_number(summary.human_messages)
+    let overall_detail = summary.wtfs_per_hour.map_or_else(
+        || "n/a wtfs/hr · no recorded duration".to_string(),
+        |rate| {
+            format!(
+                "{rate:.2} wtfs/hr · baseline · {}",
+                format_hours(summary.duration_secs)
+            )
+        },
     );
 
     if width >= 80 {
@@ -2744,12 +2815,20 @@ fn render_frustration(
             color,
         );
         for model in &summary.models {
-            let bar = horizontal_bar(model.rate_percent, summary.scale_percent, chart_width);
-            let detail = format!(
-                "{:.1}% · {:+.1}pp · n={}",
-                rounded_tenth(model.rate_percent),
-                rounded_tenth(model.delta_points),
-                exact_number(model.human_messages)
+            let bar = horizontal_bar(
+                model.wtfs_per_hour.unwrap_or(0.0),
+                summary.scale_wtfs_per_hour,
+                chart_width,
+            );
+            let detail = model.wtfs_per_hour.map_or_else(
+                || "n/a wtfs/hr · no recorded duration".to_string(),
+                |rate| {
+                    format!(
+                        "{rate:.2} wtfs/hr · {:+.2} vs overall · {}",
+                        model.delta_wtfs_per_hour.unwrap_or(0.0),
+                        format_hours(model.duration_secs)
+                    )
+                },
             );
             push_working_hours_row(
                 out,
@@ -2772,23 +2851,25 @@ fn render_frustration(
         out.push_str(&styled_role(&overall_bar, StyleRole::Count, color));
         out.push('\n');
         for model in &summary.models {
-            push_wrapped(
-                out,
-                &format!(
-                    "{} · {:.1}% · {:+.1}pp · n={}",
-                    model.model,
-                    rounded_tenth(model.rate_percent),
-                    rounded_tenth(model.delta_points),
-                    exact_number(model.human_messages)
-                ),
-                width,
-                2,
-                StyleRole::Time,
-                color,
+            let detail = model.wtfs_per_hour.map_or_else(
+                || format!("{} · n/a wtfs/hr · no recorded duration", model.model),
+                |rate| {
+                    format!(
+                        "{} · {rate:.2} wtfs/hr · {:+.2} vs overall · {}",
+                        model.model,
+                        model.delta_wtfs_per_hour.unwrap_or(0.0),
+                        format_hours(model.duration_secs)
+                    )
+                },
             );
+            push_wrapped(out, &detail, width, 2, StyleRole::Time, color);
             out.push_str("    ");
             out.push_str(&styled_role(
-                &horizontal_bar(model.rate_percent, summary.scale_percent, chart_width),
+                &horizontal_bar(
+                    model.wtfs_per_hour.unwrap_or(0.0),
+                    summary.scale_wtfs_per_hour,
+                    chart_width,
+                ),
                 StyleRole::Count,
                 color,
             ));
@@ -2800,11 +2881,11 @@ fn render_frustration(
         push_wrapped(
             out,
             &format!(
-                "{} model{} hidden · minimum {} follow-ups · {} lowest-rate shown",
+                "{} model{} hidden · min {} follow-ups · {} lowest shown · --full shows all",
                 exact_number(summary.hidden_models as u64),
                 if summary.hidden_models == 1 { "" } else { "s" },
                 exact_number(FRUSTRATION_MIN_MODEL_MESSAGES),
-                FRUSTRATION_MAX_MODELS
+                MODEL_LIST_MAX_ROWS
             ),
             width,
             2,
@@ -4203,8 +4284,25 @@ mod tests {
         );
 
         let mut out = String::new();
-        render_tokens_by_model(&mut out, &[], 80, false);
+        render_tokens_by_model(&mut out, &[], false, 80, false);
         assert!(out.contains("No token usage recorded for this report window."));
+
+        let many_models = (0..7)
+            .map(|index| TokenModelRow {
+                model: format!("model-{index}"),
+                tokens: 100 - index,
+            })
+            .collect::<Vec<_>>();
+        let mut compact = String::new();
+        render_tokens_by_model(&mut compact, &many_models, false, 80, false);
+        assert!(compact.contains("model-4"));
+        assert!(!compact.contains("model-5"));
+        assert!(compact.contains("2 models hidden · 5 highest-token shown"));
+        let mut full = String::new();
+        render_tokens_by_model(&mut full, &many_models, true, 80, false);
+        assert!(full.contains("model-5"));
+        assert!(full.contains("model-6"));
+        assert!(!full.contains("models hidden"));
     }
 
     #[test]
@@ -4421,8 +4519,8 @@ mod tests {
         conn.execute(
             "INSERT INTO session_facts
              (session_id, source_kind, workspace_path, session_class, models_json,
-              primary_model, first_event_at, last_event_at)
-             VALUES (?1, 'claude_code', ?2, 'interactive', '[]', ?3, ?4, ?4)",
+              primary_model, first_event_at, last_event_at, duration_secs)
+             VALUES (?1, 'claude_code', ?2, 'interactive', '[]', ?3, ?4, ?4, 3600)",
             params![session_id, workspace, model, occurred_at],
         )
         .expect("insert session facts");
@@ -4493,9 +4591,11 @@ mod tests {
         assert_eq!(alpha.month, "2026-07");
         assert_eq!(alpha.matches, 1);
         assert_eq!(alpha.human_messages, 2);
+        assert_eq!(alpha.duration_secs, 7_200);
         let beta = points.iter().find(|p| p.model == "model-beta").unwrap();
         assert_eq!(beta.matches, 1);
         assert_eq!(beta.human_messages, 2);
+        assert_eq!(beta.duration_secs, 7_200);
     }
 
     #[test]
@@ -4522,6 +4622,7 @@ mod tests {
         assert_eq!(points[0].month, "2026-07");
         assert_eq!(points[0].matches, 1);
         assert_eq!(points[0].human_messages, 1);
+        assert_eq!(points[0].duration_secs, 3_600);
     }
 
     #[test]
@@ -4567,6 +4668,7 @@ mod tests {
             model: "model-a".to_string(),
             matches,
             human_messages,
+            duration_secs: 3_600,
         };
         let points = vec![
             point("2026-05", 100, 1_000),
@@ -4580,14 +4682,14 @@ mod tests {
         assert_eq!(recent.months, 2);
         assert_eq!(recent.matches, 92);
         assert_eq!(recent.human_messages, 2_000);
-        assert_eq!(rounded_tenth(recent.rate_percent), 4.6);
+        assert_eq!(recent.wtfs_per_hour, Some(46.0));
 
         let filtered = summarize_frustration(&points, true, false).expect("filtered summary");
         assert_eq!(filtered.window_start, "2026-05");
         assert_eq!(filtered.months, 3);
         assert_eq!(filtered.matches, 192);
         assert_eq!(filtered.human_messages, 3_000);
-        assert_eq!(rounded_tenth(filtered.rate_percent), 6.4);
+        assert_eq!(filtered.wtfs_per_hour, Some(64.0));
 
         let capped = (1..=7)
             .map(|month| point(&format!("2026-{month:02}"), 1, 100))
@@ -4603,24 +4705,28 @@ mod tests {
                 model: "alpha-floor".to_string(),
                 matches: 15,
                 human_messages: FRUSTRATION_MIN_MODEL_MESSAGES,
+                duration_secs: 54_000,
             },
             FrustrationPoint {
                 month: "2026-07".to_string(),
                 model: "beta-floor".to_string(),
                 matches: 15,
                 human_messages: FRUSTRATION_MIN_MODEL_MESSAGES,
+                duration_secs: 54_000,
             },
             FrustrationPoint {
                 month: "2026-07".to_string(),
                 model: "more-matches".to_string(),
                 matches: 20,
                 human_messages: 200,
+                duration_secs: 144_000,
             },
             FrustrationPoint {
                 month: "2026-07".to_string(),
                 model: "below-floor".to_string(),
                 matches: 149,
                 human_messages: FRUSTRATION_MIN_MODEL_MESSAGES - 1,
+                duration_secs: 3_600,
             },
         ];
         let threshold = summarize_frustration(&threshold, true, false).expect("threshold summary");
@@ -4637,25 +4743,26 @@ mod tests {
 
     #[test]
     fn frustration_rendering_is_compact_ranked_and_graphical() {
-        let point = |model: &str, matches, human_messages| FrustrationPoint {
+        let point = |model: &str, matches, human_messages, duration_hours: u64| FrustrationPoint {
             month: "2026-07".to_string(),
             model: model.to_string(),
             matches,
             human_messages,
+            duration_secs: duration_hours * 3_600,
         };
         let points = vec![
-            point("model-f", 18, 300),
-            point("model-c", 9, 300),
-            point("model-a", 3, 300),
-            point("model-e", 15, 300),
-            point("model-b", 6, 300),
-            point("model-d", 12, 300),
-            point("low-volume", 1, 149),
+            point("model-f", 18, 300, 3),
+            point("model-c", 9, 300, 3),
+            point("model-a", 3, 300, 3),
+            point("model-e", 15, 300, 3),
+            point("model-b", 6, 300, 3),
+            point("model-d", 12, 300, 3),
+            point("low-volume", 1, 149, 1),
         ];
         let summary = summarize_frustration(&points, false, false).expect("summary");
         assert_eq!(summary.matches, 64);
         assert_eq!(summary.human_messages, 1_949);
-        assert_eq!(summary.scale_percent, 5.0);
+        assert_eq!(summary.scale_wtfs_per_hour, 5.0);
         assert_eq!(
             summary
                 .models
@@ -4667,32 +4774,32 @@ mod tests {
         assert_eq!(summary.hidden_models, 2);
         assert_eq!(
             horizontal_bar(
-                summary.rate_percent,
-                summary.scale_percent,
+                summary.wtfs_per_hour.unwrap(),
+                summary.scale_wtfs_per_hour,
                 FRUSTRATION_CHART_WIDTH
             ),
             "█████████████░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
-                summary.models[0].rate_percent,
-                summary.scale_percent,
+                summary.models[0].wtfs_per_hour.unwrap(),
+                summary.scale_wtfs_per_hour,
                 FRUSTRATION_CHART_WIDTH
             ),
             "████░░░░░░░░░░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
-                summary.models[1].rate_percent,
-                summary.scale_percent,
+                summary.models[1].wtfs_per_hour.unwrap(),
+                summary.scale_wtfs_per_hour,
                 FRUSTRATION_CHART_WIDTH
             ),
             "████████░░░░░░░░░░░░"
         );
         assert_eq!(
             horizontal_bar(
-                summary.models[4].rate_percent,
-                summary.scale_percent,
+                summary.models[4].wtfs_per_hour.unwrap(),
+                summary.scale_wtfs_per_hour,
                 FRUSTRATION_CHART_WIDTH
             ),
             "████████████████████"
@@ -4701,12 +4808,13 @@ mod tests {
         let mut out = String::new();
         render_frustration(&mut out, &points, false, false, 80, false);
         assert!(out.contains("Frustration signals"));
-        assert!(out.contains("2026-07 · 1,949 follow-ups · 64 signals · overall 3.3%"));
-        assert!(out.contains("Bar scale 0–5%"));
-        assert!(out.contains("1.0% · -2.3pp · n=300"));
-        assert!(out.contains("5.0% · +1.7pp · n=300"));
-        assert!(out.contains("2 models hidden · minimum 150 follow-ups · 5 lowest-rate shown"));
-        assert!(!out.contains("about 1 in"));
+        assert!(out.contains("2026-07 · 1,949 follow-ups · 64 signals"));
+        assert!(out.contains("Bar scale 0–5.00 wtfs/hr"));
+        assert!(out.contains("1.00 wtfs/hr · -2.37 vs overall · 3.0h"));
+        assert!(out.contains("5.00 wtfs/hr · +1.63 vs overall · 3.0h"));
+        assert!(out.contains(
+            "2 models hidden · min 150 follow-ups · 5 lowest shown · --full shows all"
+        ));
         assert!(out.lines().count() <= 13);
         assert!(!out.contains('\x1b'));
 
@@ -4730,6 +4838,7 @@ mod tests {
             model: model.to_string(),
             matches,
             human_messages,
+            duration_secs: 3_600,
         };
         let months = [
             "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07",
@@ -4759,7 +4868,7 @@ mod tests {
         }
         model_points.push(month_point("2026-07", "model-rare", 1, 10));
         let recent = summarize_frustration(&model_points, false, false).expect("recent summary");
-        assert_eq!(recent.models.len(), FRUSTRATION_MAX_MODELS);
+        assert_eq!(recent.models.len(), MODEL_LIST_MAX_ROWS);
         assert_eq!(recent.hidden_models, 3);
         assert!(!recent
             .models
@@ -4773,7 +4882,7 @@ mod tests {
         let mut out = String::new();
         render_frustration(&mut out, &model_points, false, false, 80, false);
         assert!(!out.contains("model-rare"));
-        assert!(out.contains("3 models hidden · minimum 150 follow-ups · 5 lowest-rate shown"));
+        assert!(out.contains("3 models hidden · min 150 follow-ups · 5 lowest shown"));
         assert!(!out.contains("model-6"));
         let mut full_out = String::new();
         render_frustration(&mut full_out, &model_points, false, true, 80, false);
