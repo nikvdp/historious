@@ -5459,6 +5459,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_message_provenance_author_time
           ON message_provenance(authored_by, occurred_at);
 
+        CREATE INDEX IF NOT EXISTS idx_message_provenance_session_author
+          ON message_provenance(session_id, authored_by);
+
         CREATE TABLE IF NOT EXISTS session_relationships (
           session_id TEXT PRIMARY KEY,
           parent_session_id TEXT,
