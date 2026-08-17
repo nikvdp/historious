@@ -80,6 +80,23 @@ Check what Historious found:
 histo status
 ```
 
+### Persistent maintenance
+
+Install user-level scheduled maintenance after the first update:
+
+```bash
+histo service install
+histo service status
+```
+
+This installs an hourly `histo update` and a daily `histo report --update` at
+03:00 local time. Historious uses LaunchAgents on macOS and systemd user timers
+on Linux; neither requires root access. Remove both jobs with:
+
+```bash
+histo service uninstall
+```
+
 Search for a concrete clue you remember:
 
 ```bash
