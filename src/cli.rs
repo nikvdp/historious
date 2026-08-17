@@ -4191,15 +4191,12 @@ fn report_refresh_progress_from_rebuild(
             completed,
             total,
             detail,
-        } => {
-            let (completed, total) = parse_progress_fraction(&detail).unwrap_or((completed, total));
-            analytics::ReportRefreshProgress {
-                phase: projection,
-                completed,
-                total,
-                detail: format_progress_fraction(detail),
-            }
-        }
+        } => analytics::ReportRefreshProgress {
+            phase: projection,
+            completed,
+            total,
+            detail: format_progress_fraction(detail),
+        },
         analytics::RebuildProgress::Completed {
             projection,
             completed,
@@ -5538,26 +5535,30 @@ enum ReportMaintenanceMessage<T> {
 fn copy_report_progress(
     event: &analytics::ReportRefreshProgress,
 ) -> analytics::ReportRefreshProgress {
-    let (completed, total) =
-        parse_progress_fraction(&event.detail).unwrap_or((event.completed, event.total));
     analytics::ReportRefreshProgress {
         phase: event.phase,
-        completed,
-        total,
+        completed: event.completed,
+        total: event.total,
         detail: format_progress_fraction(event.detail.clone()),
     }
 }
 
 fn report_progress_count_detail(event: &analytics::ReportRefreshProgress) -> String {
     let detail = format_progress_fraction(event.detail.clone());
-    if parse_progress_fraction(&detail).is_none() && event.total > 0 {
+    if event.total == 0 {
+        detail
+    } else if parse_progress_fraction(&detail).is_some() {
         format!(
-            "{detail} ({}/{})",
+            "overall {}/{} · phase {detail}",
             format_count(event.completed),
             format_count(event.total)
         )
     } else {
-        detail
+        format!(
+            "overall {}/{} · {detail}",
+            format_count(event.completed),
+            format_count(event.total)
+        )
     }
 }
 
@@ -5579,6 +5580,7 @@ fn report_progress_payload(
     elapsed: Duration,
     outcome: Option<&analytics::ReportRefreshOutcome>,
 ) -> serde_json::Value {
+    let phase_progress = parse_progress_fraction(&event.detail);
     serde_json::json!({
         "status": status,
         "mode": mode,
@@ -5586,6 +5588,8 @@ fn report_progress_payload(
         "detail": report_progress_detail(event, elapsed),
         "completed": event.completed,
         "total": event.total,
+        "phase_completed": phase_progress.map(|(completed, _)| completed),
+        "phase_total": phase_progress.map(|(_, total)| total),
         "elapsed_seconds": elapsed.as_secs(),
         "affected_sessions": outcome.map(|outcome| outcome.affected_sessions),
         "affected_events": outcome.map(|outcome| outcome.affected_events),
@@ -5656,8 +5660,10 @@ where
             let wait = heartbeat_interval.saturating_sub(last_emit.elapsed());
             match receiver.recv_timeout(wait) {
                 Ok(ReportMaintenanceMessage::Progress(event)) => {
-                    latest = copy_report_progress(&event);
-                    if last_emit.elapsed() >= heartbeat_interval {
+                    let next = copy_report_progress(&event);
+                    let phase_changed = next.phase != latest.phase;
+                    latest = next;
+                    if phase_changed || last_emit.elapsed() >= heartbeat_interval {
                         on_progress(&latest, elapsed(), true);
                         last_emit = Instant::now();
                     }
@@ -6461,10 +6467,8 @@ impl UpdateProgressView {
         }
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = event.phase;
-        let (current, total) =
-            parse_progress_fraction(&event.detail).unwrap_or((event.completed, event.total));
-        row.current = Some(current);
-        row.total = Some(total);
+        row.current = Some(event.completed);
+        row.total = Some(event.total);
         row.detail = report_progress_count_detail(event);
         self.render(false);
     }
@@ -10529,7 +10533,7 @@ mod tests {
             phase: "provenance",
             completed: 7,
             total: 11,
-            detail: "refreshing report provenance".to_string(),
+            detail: "classified 70/110 messages".to_string(),
         };
         view.report_event(&event);
 
@@ -10561,9 +10565,11 @@ mod tests {
                 "status": "refreshing",
                 "mode": "incremental",
                 "phase": "provenance",
-                "detail": "refreshing report provenance (7/11) (3s elapsed)",
+                "detail": "overall 7/11 · phase classified 70/110 messages (3s elapsed)",
                 "completed": 7,
                 "total": 11,
+                "phase_completed": 70,
+                "phase_total": 110,
                 "elapsed_seconds": 3,
                 "affected_sessions": null,
                 "affected_events": null,
@@ -10715,13 +10721,73 @@ mod tests {
         assert_eq!(payload["status"], "rebuilding");
         assert_eq!(payload["mode"], "full_rebuild");
         assert_eq!(payload["phase"], analytics::MESSAGE_PROVENANCE_PROJECTION);
-        assert_eq!(payload["detail"], "classified 500/1,000 messages (2s elapsed)");
-        assert_eq!(payload["completed"], 500);
-        assert_eq!(payload["total"], 1000);
+        assert_eq!(
+            payload["detail"],
+            "overall 1/4 · phase classified 500/1,000 messages (2s elapsed)"
+        );
+        assert_eq!(payload["completed"], 1);
+        assert_eq!(payload["total"], 4);
+        assert_eq!(payload["phase_completed"], 500);
+        assert_eq!(payload["phase_total"], 1000);
         assert_eq!(payload["elapsed_seconds"], 2);
         assert!(payload["affected_sessions"].is_null());
         assert!(payload["affected_events"].is_null());
-        assert_eq!(payload.as_object().expect("payload object").len(), 9);
+        assert_eq!(payload.as_object().expect("payload object").len(), 11);
+    }
+
+    #[test]
+    fn rebuild_progress_keeps_overall_coordinates_across_phase_counts() {
+        let events = [
+            analytics::RebuildProgress::Started {
+                projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+                completed: 0,
+                total: 5,
+            },
+            analytics::RebuildProgress::Detail {
+                projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+                completed: 0,
+                total: 5,
+                detail: "streamed 800/1000 sessions".to_string(),
+            },
+            analytics::RebuildProgress::Completed {
+                projection: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+                completed: 1,
+                total: 5,
+            },
+            analytics::RebuildProgress::Started {
+                projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
+                completed: 1,
+                total: 5,
+            },
+            analytics::RebuildProgress::Detail {
+                projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
+                completed: 1,
+                total: 5,
+                detail: "classified 50/10000 messages".to_string(),
+            },
+            analytics::RebuildProgress::Completed {
+                projection: analytics::MESSAGE_PROVENANCE_PROJECTION,
+                completed: 2,
+                total: 5,
+            },
+        ];
+
+        let progress = events
+            .into_iter()
+            .map(report_refresh_progress_from_rebuild)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress
+                .iter()
+                .map(|event| (event.completed, event.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 5), (0, 5), (1, 5), (1, 5), (1, 5), (2, 5)]
+        );
+        assert_eq!(progress[1].detail, "streamed 800/1,000 sessions");
+        assert_eq!(progress[4].detail, "classified 50/10,000 messages");
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].completed <= pair[1].completed));
     }
 
     #[test]
@@ -10753,7 +10819,7 @@ mod tests {
                     phase: "provenance",
                     completed: 4,
                     total: 10,
-                    detail: "classified 4/10 messages".to_string(),
+                    detail: "classified 40/100 messages".to_string(),
                 });
                 release_receiver.recv().expect("release result");
                 worker_finished_ref.store(true, Ordering::SeqCst);
@@ -10794,7 +10860,7 @@ mod tests {
             .iter()
             .position(|observation| observation.0 == "provenance")
             .expect("real progress event");
-        assert!(real_index >= 2);
+        assert_eq!(real_index, 2);
         for (index, observation) in observations[1..real_index].iter().enumerate() {
             assert_eq!(observation.0, "preflight");
             assert_eq!((observation.1, observation.2), (2, 10));
@@ -10804,6 +10870,7 @@ mod tests {
         }
         let real = &observations[real_index];
         assert_eq!((real.1, real.2), (4, 10));
+        assert_eq!(real.3, "classified 40/100 messages");
         assert!(real.5);
     }
 
