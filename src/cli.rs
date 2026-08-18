@@ -6252,6 +6252,7 @@ struct UpdateProgressView {
     phase: UpdateDisplayPhase,
     sources: BTreeMap<String, UpdateSourceProgress>,
     data_rows: BTreeMap<String, UpdateDataProgress>,
+    report_phase_rows: Vec<(String, UpdateDataProgress)>,
     drawn_rows: usize,
     last_emit: Instant,
 }
@@ -6263,6 +6264,7 @@ impl UpdateProgressView {
             phase: UpdateDisplayPhase::LocalLogs,
             sources: BTreeMap::new(),
             data_rows: BTreeMap::new(),
+            report_phase_rows: Vec::new(),
             drawn_rows: 0,
             last_emit: Instant::now(),
         }
@@ -6380,6 +6382,7 @@ impl UpdateProgressView {
     fn start_search_data(&mut self, repair: bool, embeddings_disabled: bool) {
         self.phase = UpdateDisplayPhase::SearchData;
         self.data_rows.clear();
+        self.report_phase_rows.clear();
         self.data_rows.insert(
             "search".to_string(),
             UpdateDataProgress {
@@ -6498,8 +6501,60 @@ impl UpdateProgressView {
         row.state = report_row_state(event.phase);
         row.current = Some(event.completed);
         row.total = Some(event.total);
-        row.detail = report_progress_detail(event, elapsed);
+        row.detail = report_overall_progress_detail(event, elapsed);
+
+        if !matches!(event.phase, "report" | "preflight") {
+            if let Some(previous) = self.report_phase_rows.last().map(|(phase, _)| phase.clone()) {
+                if previous != event.phase {
+                    self.finish_report_phase(&previous);
+                }
+            }
+            let phase_row = self.report_phase_row_mut(event.phase);
+            let detail = format_progress_fraction(event.detail.clone());
+            if let Some((current, total)) = parse_progress_fraction(&detail) {
+                phase_row.current = Some(current);
+                phase_row.total = Some(total);
+            }
+            phase_row.state = "updating";
+            phase_row.detail = format!("{} ({}s elapsed)", detail, elapsed.as_secs());
+        }
         self.render(force);
+    }
+
+    fn report_phase_row_mut(&mut self, phase: &str) -> &mut UpdateDataProgress {
+        let index = if let Some(index) = self
+            .report_phase_rows
+            .iter()
+            .position(|(name, _)| name == phase)
+        {
+            index
+        } else {
+            self.report_phase_rows
+                .push((phase.to_string(), UpdateDataProgress::default()));
+            self.report_phase_rows.len() - 1
+        };
+        &mut self.report_phase_rows[index].1
+    }
+
+    fn finish_report_phase(&mut self, phase: &str) {
+        if let Some((_, row)) = self
+            .report_phase_rows
+            .iter_mut()
+            .find(|(name, _)| name == phase)
+        {
+            row.state = "ready";
+            if let Some(total) = row.total {
+                row.current = Some(total);
+                row.detail = format!(
+                    "{}/{} · {} ready",
+                    format_count(total),
+                    format_count(total),
+                    report_phase_label(phase)
+                );
+            } else {
+                row.detail = format!("{} ready", report_phase_label(phase));
+            }
+        }
     }
 
     fn finish_report_maintenance(
@@ -6509,6 +6564,7 @@ impl UpdateProgressView {
         elapsed: Duration,
     ) {
         self.phase = UpdateDisplayPhase::ReportData;
+        self.finish_report_phase(latest.phase);
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = if report.refreshed { "refreshed" } else { "current" };
         row.current = Some(latest.completed);
@@ -6529,6 +6585,7 @@ impl UpdateProgressView {
         elapsed: Duration,
     ) {
         self.phase = UpdateDisplayPhase::ReportData;
+        self.finish_report_phase(latest.phase);
         let row = self.data_rows.entry("report".to_string()).or_default();
         row.state = "refreshed";
         row.current = Some(latest.completed);
@@ -6734,6 +6791,19 @@ impl UpdateProgressView {
                     "  {key:<label_width$}  {:<10} {meter}  {}",
                     row.state, row.detail
                 ));
+                if *key == "report" {
+                    for (phase, row) in &self.report_phase_rows {
+                        let meter = match (row.current, row.total) {
+                            (Some(current), Some(total)) => progress_meter(current, total, 20),
+                            _ => " ".repeat(20),
+                        };
+                        let label = report_phase_label(phase);
+                        lines.push(format!(
+                            "  {label:<label_width$}  {:<10} {meter}  {}",
+                            row.state, row.detail
+                        ));
+                    }
+                }
             }
         }
         lines
@@ -6752,17 +6822,62 @@ impl UpdateProgressView {
         self.data_rows
             .keys()
             .map(|key| key.chars().count())
+            .chain(
+                self.report_phase_rows
+                    .iter()
+                    .map(|(phase, _)| report_phase_label(phase).chars().count()),
+            )
             .max()
             .unwrap_or(7)
             .max(7)
     }
 }
 
+fn report_overall_progress_detail(
+    event: &analytics::ReportRefreshProgress,
+    elapsed: Duration,
+) -> String {
+    if event.total == 0 {
+        format!(
+            "{} ({}s elapsed)",
+            format_progress_fraction(event.detail.clone()),
+            elapsed.as_secs()
+        )
+    } else if event.phase == "report" {
+        format!(
+            "overall {}/{} · {} ({}s elapsed)",
+            format_count(event.completed),
+            format_count(event.total),
+            event.detail,
+            elapsed.as_secs()
+        )
+    } else {
+        format!(
+            "overall {}/{} ({}s elapsed)",
+            format_count(event.completed),
+            format_count(event.total),
+            elapsed.as_secs()
+        )
+    }
+}
+
+fn report_phase_label(phase: &str) -> &str {
+    match phase {
+        analytics::SESSION_RELATIONSHIPS_PROJECTION | "relationship" => "relations",
+        analytics::MESSAGE_PROVENANCE_PROJECTION | "provenance" => "provenance",
+        analytics::SESSION_FACTS_PROJECTION => "facts",
+        analytics::MESSAGE_MODEL_CONTEXT_PROJECTION | "model_context" => "models",
+        analytics::REPORT_SNAPSHOT_PROJECTION => "snapshot",
+        phase => phase,
+    }
+}
+
 fn report_row_state(phase: &'static str) -> &'static str {
     match phase {
-        analytics::SESSION_RELATIONSHIPS_PROJECTION => "relations",
-        analytics::MESSAGE_PROVENANCE_PROJECTION => "provenance",
+        analytics::SESSION_RELATIONSHIPS_PROJECTION | "relationship" => "relations",
+        analytics::MESSAGE_PROVENANCE_PROJECTION | "provenance" => "provenance",
         analytics::SESSION_FACTS_PROJECTION => "facts",
+        analytics::MESSAGE_MODEL_CONTEXT_PROJECTION | "model_context" => "models",
         analytics::REPORT_SNAPSHOT_PROJECTION => "snapshot",
         "preflight" => "checking",
         phase => phase,
@@ -10636,6 +10751,82 @@ mod tests {
             "report refresh skipped: snapshot already current"
         );
     }
+    #[test]
+    fn report_maintenance_progress_stacks_overall_and_phase_rows() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+
+        view.report_maintenance_event(
+            &analytics::ReportRefreshProgress {
+                phase: "preflight",
+                completed: 0,
+                total: 5,
+                detail: "checking report analytics".to_string(),
+            },
+            Duration::ZERO,
+            true,
+        );
+        assert!(view.report_phase_rows.is_empty());
+
+        view.report_maintenance_event(
+            &analytics::ReportRefreshProgress {
+                phase: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+                completed: 0,
+                total: 5,
+                detail: "resolved 3/9 session relationships".to_string(),
+            },
+            Duration::from_secs(1),
+            true,
+        );
+        view.report_maintenance_event(
+            &analytics::ReportRefreshProgress {
+                phase: analytics::SESSION_RELATIONSHIPS_PROJECTION,
+                completed: 0,
+                total: 5,
+                detail: "resolved 9/9 session relationships".to_string(),
+            },
+            Duration::from_secs(2),
+            true,
+        );
+        view.report_maintenance_event(
+            &analytics::ReportRefreshProgress {
+                phase: analytics::MESSAGE_PROVENANCE_PROJECTION,
+                completed: 1,
+                total: 5,
+                detail: "classified 4/17 messages".to_string(),
+            },
+            Duration::from_secs(3),
+            true,
+        );
+
+        let overall = view.data_rows.get("report").expect("overall report row");
+        assert_eq!((overall.current, overall.total), (Some(1), Some(5)));
+        assert!(overall.detail.contains("overall 1/5"));
+        assert!(!overall.detail.contains("4/17"));
+        let relationship = &view.report_phase_rows[0];
+        assert_eq!(relationship.0, analytics::SESSION_RELATIONSHIPS_PROJECTION);
+        assert_eq!(relationship.1.state, "ready");
+        assert_eq!((relationship.1.current, relationship.1.total), (Some(9), Some(9)));
+        assert!(relationship.1.detail.contains("9/9"));
+        let provenance = &view.report_phase_rows[1];
+        assert_eq!(provenance.0, analytics::MESSAGE_PROVENANCE_PROJECTION);
+        assert_eq!(provenance.1.state, "updating");
+        assert_eq!((provenance.1.current, provenance.1.total), (Some(4), Some(17)));
+        assert!(provenance.1.detail.contains("4/17"));
+
+        assert_eq!(
+            view.lines()
+                .iter()
+                .skip(1)
+                .map(|line| line.split_whitespace().next().expect("row label"))
+                .collect::<Vec<_>>(),
+            vec!["report", "relations", "provenance"]
+        );
+        let terminal_lines = view.lines_for_terminal(48);
+        assert_eq!(terminal_lines.len(), 4);
+        assert!(terminal_lines.iter().all(|line| line.chars().count() < 48));
+    }
+
     #[test]
     fn scoped_progress_runner_replays_latest_truth_and_preserves_event_order() {
         let (release_sender, release_receiver) = mpsc::channel();
