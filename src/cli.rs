@@ -11785,6 +11785,17 @@ mod tests {
     #[test]
     fn report_update_controls_parse_and_conflict() {
         assert!(matches!(
+            Cli::try_parse_from(["histo", "report"])
+                .expect("parse default report")
+                .command,
+            Command::Report {
+                update: false,
+                no_update: false,
+                command: None,
+                ..
+            }
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["histo", "report", "--update"])
                 .expect("parse forced report update")
                 .command,
@@ -11815,51 +11826,30 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn report_refresh_controls_build_missing_and_preserve_current_snapshot() {
-        let skipped_dir = tempfile::tempdir().expect("skipped tempdir");
-        let skipped_store = Store::open(skipped_dir.path()).expect("open skipped store");
-        refresh_report_for_command(&skipped_store, false, true, false)
-            .expect("skip missing report refresh");
+    fn report_refresh_is_explicit_and_preserves_stored_snapshot_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+
+        refresh_report_for_command(&store, false, false, false)
+            .expect("leave missing report snapshot untouched");
         assert!(
-            analytics::report_refresh_status(&skipped_store)
-                .expect("skipped report status")
+            analytics::report_refresh_status(&store)
+                .expect("missing report status")
                 .snapshot_missing
         );
 
-        let automatic_dir = tempfile::tempdir().expect("automatic tempdir");
-        let automatic_store = Store::open(automatic_dir.path()).expect("open automatic store");
-        refresh_report_for_command(&automatic_store, false, false, false)
-            .expect("build missing report snapshot");
-        let status = analytics::report_refresh_status(&automatic_store)
-            .expect("automatic report status");
+        refresh_report_for_command(&store, true, false, false)
+            .expect("build report snapshot explicitly");
+        let status = analytics::report_refresh_status(&store).expect("current report status");
         assert!(!status.stale);
         assert!(!status.snapshot_missing);
-        let generated_at = automatic_store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(Into::into)
-            })
-            .expect("load generated timestamp");
+        let generated_at = report_snapshot_generated_at(&store);
 
-        refresh_report_for_command(&automatic_store, false, false, false)
-            .expect("keep current report snapshot");
-        let unchanged_at = automatic_store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(Into::into)
-            })
-            .expect("reload generated timestamp");
-        assert_eq!(unchanged_at, generated_at);
+        refresh_report_for_command(&store, false, false, false)
+            .expect("preserve current report snapshot");
+        assert_eq!(report_snapshot_generated_at(&store), generated_at);
 
-        automatic_store
+        store
             .with_conn(|conn| {
                 let state = conn.query_row(
                     "SELECT input_high_watermark
@@ -11882,52 +11872,38 @@ mod tests {
                 Ok(())
             })
             .expect("downgrade stored report version");
+
+        refresh_report_for_command(&store, false, false, false)
+            .expect("leave stale report snapshot untouched");
         assert!(
-            analytics::report_refresh_status(&automatic_store)
-                .expect("outdated report status")
+            analytics::report_refresh_status(&store)
+                .expect("stale report status")
                 .stale
         );
-        refresh_report_for_command(&automatic_store, false, false, false)
-            .expect("upgrade outdated report snapshot");
-        let upgraded_at = automatic_store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(Into::into)
-            })
-            .expect("load upgraded timestamp");
-        assert_ne!(upgraded_at, unchanged_at);
+        let stale_at = report_snapshot_generated_at(&store);
+        assert_eq!(stale_at, generated_at);
 
-        automatic_store
+        refresh_report_for_command(&store, true, false, false)
+            .expect("rebuild stale report snapshot explicitly");
+        assert_ne!(report_snapshot_generated_at(&store), stale_at);
+
+        store
             .with_conn(|conn| {
                 conn.execute("DELETE FROM report_snapshot", [])?;
                 Ok(())
             })
             .expect("remove current report snapshot");
-        refresh_report_for_command(&automatic_store, false, false, false)
-            .expect("restore missing report snapshot");
-        let restored_status = analytics::report_refresh_status(&automatic_store)
-            .expect("restored report status");
-        assert!(!restored_status.stale);
-        assert!(!restored_status.snapshot_missing);
-        let restored_at = automatic_store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(Into::into)
-            })
-            .expect("load restored generated timestamp");
-        assert_ne!(restored_at, upgraded_at);
+        refresh_report_for_command(&store, false, false, false)
+            .expect("leave missing snapshot untouched");
+        assert!(
+            analytics::report_refresh_status(&store)
+                .expect("missing snapshot status")
+                .snapshot_missing
+        );
+    }
 
-        refresh_report_for_command(&automatic_store, true, false, false)
-            .expect("force report analytics rebuild");
-        let forced_at = automatic_store
+    fn report_snapshot_generated_at(store: &Store) -> String {
+        store
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT generated_at FROM report_snapshot WHERE singleton = 1",
@@ -11936,8 +11912,7 @@ mod tests {
                 )
                 .map_err(Into::into)
             })
-            .expect("load forced generated timestamp");
-        assert_ne!(forced_at, restored_at);
+            .expect("load report snapshot timestamp")
     }
 
     #[test]

@@ -4202,6 +4202,21 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("report snapshot is") && warning.contains("stale")));
+        let stale_terminal = render_terminal(&unfiltered);
+        assert_eq!(
+            stale_terminal
+                .matches("STALE REPORT — STORED SNAPSHOT SHOWN")
+                .count(),
+            2
+        );
+        assert_eq!(stale_terminal.matches("Note: report snapshot is").count(), 0);
+        let styled_stale_terminal = render_terminal_themed(&unfiltered, 80, true);
+        assert_eq!(
+            styled_stale_terminal
+                .matches("\x1b[1mSTALE REPORT — STORED SNAPSHOT SHOWN")
+                .count(),
+            2
+        );
         assert_eq!(
             unfiltered
                 .comparisons
