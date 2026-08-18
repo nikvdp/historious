@@ -802,13 +802,13 @@ pub enum Command {
         #[arg(
             long,
             conflicts_with = "no_update",
-            help = "Refresh report analytics even when the stored snapshot is current"
+            help = "Rebuild report analytics and replace the stored snapshot"
         )]
         update: bool,
         #[arg(
             long,
             conflicts_with = "update",
-            help = "Do not refresh missing or stale report analytics"
+            help = "Do not refresh report data (the default)"
         )]
         no_update: bool,
         #[arg(long, value_enum, default_value_t = ReportSortArg::Tokens)]
@@ -5741,7 +5741,7 @@ fn refresh_report_for_command(
     skip: bool,
     machine_output: bool,
 ) -> Result<()> {
-    if skip {
+    if skip || !force {
         return Ok(());
     }
 

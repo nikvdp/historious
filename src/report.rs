@@ -335,17 +335,24 @@ pub fn compute(store: &Store, options: &ReportOptions) -> Result<UsageReport> {
             "report snapshot is unavailable; run `histo report --update` to build it",
         )?;
         sort_projects(&mut report.projects, options.sort);
-        let freshness = analytics::report_snapshot_freshness(store)?;
-        if freshness.stale {
-            report.warnings.push(format!(
-                "report snapshot is {} old and stale by {} event rows; run `histo report --update`",
-                snapshot_age(&report.generated_at),
-                freshness.new_event_rows
-            ));
-        }
+        add_stale_snapshot_warning(store, &mut report)?;
         return Ok(report);
     }
-    compute_live(store, options, true)
+    let mut report = compute_live(store, options, true)?;
+    add_stale_snapshot_warning(store, &mut report)?;
+    Ok(report)
+}
+
+fn add_stale_snapshot_warning(store: &Store, report: &mut UsageReport) -> Result<()> {
+    let freshness = analytics::report_snapshot_freshness(store)?;
+    if freshness.stale {
+        report.warnings.push(format!(
+            "report snapshot is {} old and stale by {} event rows; run `histo report --update`",
+            snapshot_age(&report.generated_at),
+            freshness.new_event_rows
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2243,6 +2250,15 @@ pub fn render_terminal_window(
         StyleRole::Muted,
         color,
     );
+    let stale_warning = report
+        .warnings
+        .iter()
+        .find(|warning| is_stale_snapshot_warning(warning))
+        .map(String::as_str);
+    if let Some(warning) = stale_warning {
+        out.push('\n');
+        render_stale_snapshot_banner(&mut out, warning, width, color);
+    }
     if report.filters.after.is_some()
         || report.filters.before.is_some()
         || report.filters.project.is_some()
@@ -2261,7 +2277,11 @@ pub fn render_terminal_window(
             color,
         );
     }
-    for warning in &report.warnings {
+    for warning in report
+        .warnings
+        .iter()
+        .filter(|warning| !is_stale_snapshot_warning(warning))
+    {
         push_wrapped(
             &mut out,
             &format!("Note: {warning}"),
@@ -2407,7 +2427,27 @@ pub fn render_terminal_window(
     }) {
         out.push_str("\nTopics\n  Coherent topic data is ready for ranked integration.\n");
     }
+    if let Some(warning) = stale_warning {
+        out.push('\n');
+        render_stale_snapshot_banner(&mut out, warning, width, color);
+    }
     out
+}
+
+fn is_stale_snapshot_warning(warning: &str) -> bool {
+    warning.starts_with("report snapshot is ") && warning.contains(" stale by ")
+}
+
+fn render_stale_snapshot_banner(out: &mut String, warning: &str, width: usize, color: bool) {
+    push_wrapped(
+        out,
+        "STALE REPORT — STORED SNAPSHOT SHOWN",
+        width,
+        0,
+        StyleRole::Title,
+        color,
+    );
+    push_wrapped(out, warning, width, 0, StyleRole::Title, color);
 }
 
 fn render_tokens_by_model(
