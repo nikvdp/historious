@@ -4385,10 +4385,10 @@ mod tests {
                        semantic_policy, metadata_json, hash)
                     VALUES
                       ('item_a', 'event_a', 'session_a', 'source', 'machine', 'codex', 0, 0,
-                       'conversation', 'user', 'a', 'hash_a', '2026-05-01T00:00:00Z',
+                       'conversation', 'user', 'a', 'hash_a', '2026-05-15T12:00:00Z',
                        1, 'required', '{}', 'item_hash_a'),
                       ('item_b', 'event_b', 'session_b', 'source', 'machine', 'codex', 0, 0,
-                       'conversation', 'user', 'b', 'hash_b', '2026-06-01T00:00:00Z',
+                       'conversation', 'user', 'b', 'hash_b', '2026-06-15T12:00:00Z',
                        1, 'required', '{}', 'item_hash_b');
 
                     INSERT INTO topic_runs
