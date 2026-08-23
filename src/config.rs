@@ -485,15 +485,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_machine_name_is_initialized_in_config() {
+    fn missing_machine_identity_is_initialized_in_config() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
+        let first = AppConfig::load(Some(dir.path().to_path_buf())).expect("first config");
+        let second = AppConfig::load(Some(dir.path().to_path_buf())).expect("second config");
         let text = fs::read_to_string(dir.path().join("config.toml")).expect("config text");
 
-        assert!(!config.machine_name.trim().is_empty());
-        assert_eq!(config.machine_id, machine_id_for_name(&config.machine_name));
+        assert!(!first.machine_name.trim().is_empty());
+        assert_eq!(first.machine_id, second.machine_id);
+        assert_eq!(
+            uuid::Uuid::parse_str(&first.machine_id)
+                .expect("machine UUID")
+                .hyphenated()
+                .to_string(),
+            first.machine_id
+        );
         assert!(text.contains("[machine]"));
+        assert!(text.contains("id = "));
         assert!(text.contains("name = "));
     }
 
@@ -509,18 +518,33 @@ mod tests {
         let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
 
         assert_eq!(config.machine_name, "Dev Box");
-        assert_eq!(config.machine_id, "machine_dev_box");
+        uuid::Uuid::parse_str(&config.machine_id).expect("machine UUID");
     }
 
     #[test]
-    fn set_machine_name_updates_the_configured_source_of_truth() {
+    fn set_machine_name_keeps_the_machine_uuid() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let original = AppConfig::load(Some(dir.path().to_path_buf())).expect("original config");
 
         set_machine_name(dir.path(), "Laptop 2").expect("set machine name");
+        let renamed = AppConfig::load(Some(dir.path().to_path_buf())).expect("renamed config");
+
+        assert_eq!(renamed.machine_name, "Laptop 2");
+        assert_eq!(renamed.machine_id, original.machine_id);
+    }
+
+    #[test]
+    fn legacy_machine_id_suffix_is_recovered_as_uuid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("machine-id"),
+            "machine_unknown_host_d9150d3051ef413ab79f94e1d8c6eb54\n",
+        )
+        .expect("legacy machine id");
+
         let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
 
-        assert_eq!(config.machine_name, "Laptop 2");
-        assert_eq!(config.machine_id, "machine_laptop_2");
+        assert_eq!(config.machine_id, "d9150d30-51ef-413a-b79f-94e1d8c6eb54");
     }
 }
 
