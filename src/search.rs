@@ -205,7 +205,7 @@ pub struct SearchOptions {
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
     pub machine_id: Option<String>,
-    pub machine_id_prefix: Option<String>,
+    pub machine_name: Option<String>,
     pub workspace_scope: Option<String>,
     pub corpus: SearchCorpus,
     pub show_duplicates: bool,
@@ -223,7 +223,7 @@ impl SearchOptions {
             after: None,
             before: None,
             machine_id: None,
-            machine_id_prefix: None,
+            machine_name: None,
             workspace_scope: None,
             corpus: SearchCorpus::default(),
             show_duplicates: false,
@@ -253,9 +253,7 @@ impl SearchOptions {
         hostname: Option<String>,
     ) -> Self {
         self.machine_id = machine_id.filter(|value| !value.trim().is_empty());
-        self.machine_id_prefix = hostname
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| machine_id_prefix_for_hostname(&value));
+        self.machine_name = hostname.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -296,6 +294,7 @@ pub struct SearchResult {
     pub event_id: String,
     pub session_id: String,
     pub machine_id: String,
+    pub machine_name: Option<String>,
     pub source_kind: String,
     pub tier: Option<String>,
     pub kind: String,
@@ -316,6 +315,7 @@ pub struct DuplicateSearchMember {
     pub event_id: String,
     pub session_id: String,
     pub machine_id: String,
+    pub machine_name: Option<String>,
     pub source_kind: String,
     pub tier: Option<String>,
     pub kind: String,
@@ -912,9 +912,6 @@ fn is_memory_like_error(err: &anyhow::Error) -> bool {
         .any(|needle| text.contains(needle))
 }
 
-pub fn machine_id_prefix_for_hostname(hostname: &str) -> String {
-    crate::config::machine_id_prefix_for_name(hostname)
-}
 
 pub(crate) fn embedding_input(text: &str) -> String {
     text.chars()
@@ -991,7 +988,7 @@ pub fn search(
                 options.after,
                 options.before,
                 options.machine_id.as_deref(),
-                options.machine_id_prefix.as_deref(),
+                options.machine_name.as_deref(),
                 options.workspace_scope.as_deref(),
             )?
         } else {
@@ -1002,7 +999,7 @@ pub fn search(
                 options.after,
                 options.before,
                 options.machine_id.as_deref(),
-                options.machine_id_prefix.as_deref(),
+                options.machine_name.as_deref(),
                 options.workspace_scope.as_deref(),
             )?
         }
@@ -1019,7 +1016,7 @@ pub fn search(
             options.after,
             options.before,
             options.machine_id.as_deref(),
-            options.machine_id_prefix.as_deref(),
+            options.machine_name.as_deref(),
             options.workspace_scope.as_deref(),
             &tier_names,
         )?
@@ -1066,7 +1063,7 @@ fn semantic_search(
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     machine_id: Option<&str>,
-    machine_id_prefix: Option<&str>,
+    machine_name: Option<&str>,
     workspace_scope: Option<&str>,
     selected_tiers: &[&str],
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
@@ -1099,7 +1096,7 @@ fn semantic_search(
         after,
         before,
         machine_id,
-        machine_id_prefix,
+        machine_name,
         workspace_scope,
     )?;
     let rows = vector_rows
@@ -1270,6 +1267,7 @@ fn fuse(
                 event_id: row.event_id,
                 session_id: row.session_id,
                 machine_id: row.machine_id,
+                machine_name: row.machine_name,
                 source_kind: row.source_kind,
                 tier: row.tier,
                 kind: row.search_kind,
@@ -1332,6 +1330,7 @@ fn duplicate_member_from_result(result: SearchResult) -> DuplicateSearchMember {
         event_id: result.event_id,
         session_id: result.session_id,
         machine_id: result.machine_id,
+        machine_name: result.machine_name,
         source_kind: result.source_kind,
         tier: result.tier,
         kind: result.kind,
@@ -1359,6 +1358,7 @@ fn search_row_from_vector(row: VectorSearchRow) -> SearchRow {
         event_id: row.event_id,
         session_id: row.session_id,
         machine_id: row.machine_id,
+        machine_name: row.machine_name,
         source_kind: row.source_kind,
         tier: Some(row.tier),
         search_kind: row.search_kind,

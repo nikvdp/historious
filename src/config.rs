@@ -645,24 +645,3 @@ fn normalize_machine_name(input: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-pub fn machine_id_for_name(name: &str) -> String {
-    format!("machine_{}", sanitize_machine_name(name))
-}
-
-pub fn machine_id_prefix_for_name(name: &str) -> String {
-    machine_id_for_name(name)
-}
-
-fn sanitize_machine_name(input: &str) -> String {
-    input
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}

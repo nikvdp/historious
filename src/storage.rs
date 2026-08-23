@@ -699,6 +699,7 @@ pub struct SearchRow {
     pub event_id: String,
     pub session_id: String,
     pub machine_id: String,
+    pub machine_name: Option<String>,
     pub source_kind: String,
     pub tier: Option<String>,
     pub search_kind: String,
@@ -738,6 +739,7 @@ pub struct VectorSearchRow {
     pub history_item_id: String,
     pub session_id: String,
     pub machine_id: String,
+    pub machine_name: Option<String>,
     pub source_kind: String,
     pub tier: String,
     pub search_kind: String,
@@ -761,7 +763,7 @@ pub struct SessionFilter {
     pub workspace_scope: Option<String>,
     pub workspace_basename: Option<String>,
     pub machine_id: Option<String>,
-    pub machine_id_prefix: Option<String>,
+    pub machine_name: Option<String>,
 }
 
 impl Default for SessionFilter {
@@ -771,7 +773,7 @@ impl Default for SessionFilter {
             workspace_scope: None,
             workspace_basename: None,
             machine_id: None,
-            machine_id_prefix: None,
+            machine_name: None,
         }
     }
 }
@@ -792,7 +794,7 @@ impl SessionFilter {
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
             || self
-                .machine_id_prefix
+                .machine_name
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
     }
@@ -810,6 +812,7 @@ pub struct ThreadListOptions {
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
     pub session: SessionRecord,
+    pub machine_name: Option<String>,
     pub event_count: u64,
     pub today_message_count: u64,
     pub first_event_at: Option<DateTime<Utc>>,
@@ -886,6 +889,7 @@ struct PruneSessionFilterRow {
     id: String,
     source_kind: String,
     machine_id: String,
+    machine_name: Option<String>,
     started_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     latest_event_at: Option<DateTime<Utc>>,
@@ -2693,7 +2697,7 @@ impl Store {
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
-        machine_id_prefix: Option<&str>,
+        machine_name: Option<&str>,
         workspace_scope: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query(query);
@@ -2704,7 +2708,7 @@ impl Store {
             after,
             before,
             machine_id,
-            machine_id_prefix,
+            machine_name,
             workspace_scope,
         )
     }
@@ -2718,7 +2722,7 @@ impl Store {
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
-        machine_id_prefix: Option<&str>,
+        machine_name: Option<&str>,
         workspace_scope: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         let fts_query = fts_query_terms(terms.iter().map(String::as_str), match_mode);
@@ -2729,7 +2733,7 @@ impl Store {
             after,
             before,
             machine_id,
-            machine_id_prefix,
+            machine_name,
             workspace_scope,
         )
     }
@@ -2742,7 +2746,7 @@ impl Store {
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
-        machine_id_prefix: Option<&str>,
+        machine_name: Option<&str>,
         workspace_scope: Option<&str>,
     ) -> Result<Vec<SearchRow>> {
         if fts_query.is_empty() {
@@ -2773,6 +2777,7 @@ impl Store {
                         {fts_table}.event_id,
                         {fts_table}.session_id,
                         e.machine_id,
+                        m.name,
                         e.source_kind,
                         hi.tier,
                         hi.kind,
@@ -2783,12 +2788,13 @@ impl Store {
                  FROM {fts_table}
                  JOIN history_items hi ON hi.id = {fts_table}.item_id
                  JOIN events e ON e.id = {fts_table}.event_id
+                 LEFT JOIN machines m ON m.id = e.machine_id
                  LEFT JOIN sessions s ON s.id = {fts_table}.session_id
                  WHERE {fts_table} MATCH ?
                    AND (? IS NULL OR hi.occurred_at >= ?)
                    AND (? IS NULL OR hi.occurred_at < ?)
                    AND (? IS NULL OR e.machine_id = ?)
-                   AND (? IS NULL OR substr(e.machine_id, 1, length(?)) = ?)
+                   AND (? IS NULL OR m.name = ? COLLATE NOCASE)
                    AND (? IS NULL OR {workspace_filter})
                    {tier_clause}
                  ORDER BY bm25({fts_table})
@@ -2802,9 +2808,8 @@ impl Store {
                 opt_sql_text(before),
                 opt_sql_text(machine_id.map(str::to_string)),
                 opt_sql_text(machine_id.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_name.map(str::to_string)),
+                opt_sql_text(machine_name.map(str::to_string)),
             ];
             push_workspace_scope_filter_params(&mut values, workspace_scope);
             if !use_conversation_fts {
@@ -2818,14 +2823,15 @@ impl Store {
                     event_id: row.get(1)?,
                     session_id: row.get(2)?,
                     machine_id: row.get(3)?,
-                    source_kind: row.get(4)?,
-                    tier: Some(row.get(5)?),
-                    search_kind: row.get(6)?,
-                    content: row.get(7)?,
-                    occurred_at: parse_opt_dt(row.get(8)?),
-                    session_title: row.get(9)?,
+                    machine_name: row.get(4)?,
+                    source_kind: row.get(5)?,
+                    tier: Some(row.get(6)?),
+                    search_kind: row.get(7)?,
+                    content: row.get(8)?,
+                    occurred_at: parse_opt_dt(row.get(9)?),
+                    session_title: row.get(10)?,
                     workspace_values: session_workspace_values(&parse_metadata_json(
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
                     )),
                     rank: 0,
                 })
@@ -3035,9 +3041,11 @@ impl Store {
                         COALESCE(a.event_count, 0),
                         a.first_event_at,
                         a.last_event_at,
-                        {last_activity} AS last_activity_at
+                        {last_activity} AS last_activity_at,
+                        m.name
                  FROM sessions s
                  LEFT JOIN session_activity a ON a.session_id = s.id
+                 LEFT JOIN machines m ON m.id = s.machine_id
                  WHERE {where_sql}
                  ORDER BY {order}
                  LIMIT ?"
@@ -3065,6 +3073,7 @@ impl Store {
                 let last_activity_at = parse_opt_dt(row.get(14)?);
                 let workspace_values = session_workspace_values(&metadata);
                 Ok(ThreadRow {
+                    machine_name: row.get(15)?,
                     session,
                     event_count: row.get::<_, i64>(11)?.max(0) as u64,
                     today_message_count: 0,
@@ -3527,7 +3536,7 @@ impl Store {
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         machine_id: Option<&str>,
-        machine_id_prefix: Option<&str>,
+        machine_name: Option<&str>,
         workspace_scope: Option<&str>,
     ) -> Result<Vec<VectorSearchRow>> {
         if query_vector.len() != 384 || tiers.is_empty() {
@@ -3543,6 +3552,7 @@ impl Store {
                         hi.id,
                         hi.session_id,
                         hi.machine_id,
+                        m.name,
                         hi.source_kind,
                         hi.tier,
                         hi.kind,
@@ -3554,6 +3564,7 @@ impl Store {
                  FROM vec_embeddings_384
                  JOIN embeddings e ON e.rowid = vec_embeddings_384.rowid
                  JOIN history_items hi ON hi.id = e.unit_id
+                 LEFT JOIN machines m ON m.id = hi.machine_id
                  LEFT JOIN sessions s ON s.id = hi.session_id
                  WHERE vec_embeddings_384.embedding MATCH ?
                    AND k = ?
@@ -3561,7 +3572,7 @@ impl Store {
                    AND (? IS NULL OR hi.occurred_at >= ?)
                    AND (? IS NULL OR hi.occurred_at < ?)
                    AND (? IS NULL OR hi.machine_id = ?)
-                   AND (? IS NULL OR substr(hi.machine_id, 1, length(?)) = ?)
+                   AND (? IS NULL OR m.name = ? COLLATE NOCASE)
                    AND (? IS NULL OR {workspace_filter})
                    AND hi.semantic_policy != 'never'
                    AND length(trim(hi.text)) >= ?
@@ -3578,9 +3589,8 @@ impl Store {
                 opt_sql_text(before),
                 opt_sql_text(machine_id.map(str::to_string)),
                 opt_sql_text(machine_id.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
-                opt_sql_text(machine_id_prefix.map(str::to_string)),
+                opt_sql_text(machine_name.map(str::to_string)),
+                opt_sql_text(machine_name.map(str::to_string)),
             ];
             push_workspace_scope_filter_params(&mut values, workspace_scope);
             values.push(SqlValue::Integer(SEMANTIC_EMBEDDING_MIN_TEXT_CHARS as i64));
@@ -3592,16 +3602,17 @@ impl Store {
                     history_item_id: row.get(1)?,
                     session_id: row.get(2)?,
                     machine_id: row.get(3)?,
-                    source_kind: row.get(4)?,
-                    tier: row.get(5)?,
-                    search_kind: row.get(6)?,
-                    content: row.get(7)?,
-                    occurred_at: parse_opt_dt(row.get(8)?),
-                    session_title: row.get(9)?,
+                    machine_name: row.get(4)?,
+                    source_kind: row.get(5)?,
+                    tier: row.get(6)?,
+                    search_kind: row.get(7)?,
+                    content: row.get(8)?,
+                    occurred_at: parse_opt_dt(row.get(9)?),
+                    session_title: row.get(10)?,
                     workspace_values: session_workspace_values(&parse_metadata_json(
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
                     )),
-                    distance: row.get(11)?,
+                    distance: row.get(12)?,
                     rank: 0,
                 })
             })?;
@@ -3662,9 +3673,9 @@ fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<Stri
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let machine_id_prefix = filter
+    let machine_name = filter
         .session_filter
-        .machine_id_prefix
+        .machine_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -3672,23 +3683,26 @@ fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<Stri
         "SELECT s.id,
                 s.source_kind,
                 s.machine_id,
+                m.name,
                 s.started_at,
                 s.updated_at,
                 a.last_event_at,
                 s.metadata_json
          FROM sessions s
          LEFT JOIN session_activity a ON a.session_id = s.id
+         LEFT JOIN machines m ON m.id = s.machine_id
          ORDER BY s.id",
     )?;
     let rows = stmt.query_map([], |row| {
-        let metadata: String = row.get(6)?;
+        let metadata: String = row.get(7)?;
         Ok(PruneSessionFilterRow {
             id: row.get(0)?,
             source_kind: row.get(1)?,
             machine_id: row.get(2)?,
-            started_at: parse_opt_dt(row.get(3)?),
-            updated_at: parse_opt_dt(row.get(4)?),
-            latest_event_at: parse_opt_dt(row.get(5)?),
+            machine_name: row.get(3)?,
+            started_at: parse_opt_dt(row.get(4)?),
+            updated_at: parse_opt_dt(row.get(5)?),
+            latest_event_at: parse_opt_dt(row.get(6)?),
             metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
         })
     })?;
@@ -3702,7 +3716,7 @@ fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<Stri
             workspace_scope,
             workspace_basename,
             machine_id,
-            machine_id_prefix,
+            machine_name,
             filter.after,
             filter.before,
         ) {
@@ -4918,7 +4932,7 @@ fn prune_session_matches(
     workspace_scope: Option<&str>,
     workspace_basename: Option<&str>,
     machine_id: Option<&str>,
-    machine_id_prefix: Option<&str>,
+    machine_name: Option<&str>,
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
 ) -> bool {
@@ -4933,8 +4947,12 @@ fn prune_session_matches(
             return false;
         }
     }
-    if let Some(machine_id_prefix) = machine_id_prefix {
-        if !row.machine_id.starts_with(machine_id_prefix) {
+    if let Some(machine_name) = machine_name {
+        if row
+            .machine_name
+            .as_deref()
+            .is_none_or(|value| !value.eq_ignore_ascii_case(machine_name))
+        {
             return false;
         }
     }
@@ -5035,15 +5053,20 @@ fn push_session_filter_sql(
         where_clauses.push("s.machine_id = ?".to_string());
         values.push(SqlValue::Text(machine_id.to_string()));
     }
-    if let Some(machine_id_prefix) = filter
-        .machine_id_prefix
+    if let Some(machine_name) = filter
+        .machine_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        where_clauses.push("substr(s.machine_id, 1, length(?)) = ?".to_string());
-        values.push(SqlValue::Text(machine_id_prefix.to_string()));
-        values.push(SqlValue::Text(machine_id_prefix.to_string()));
+        where_clauses.push(
+            "EXISTS (
+               SELECT 1 FROM machines m
+               WHERE m.id = s.machine_id AND m.name = ? COLLATE NOCASE
+             )"
+            .to_string(),
+        );
+        values.push(SqlValue::Text(machine_name.to_string()));
     }
     if filter
         .workspace_scope

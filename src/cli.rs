@@ -221,7 +221,7 @@ pub enum Command {
         #[arg(
             long,
             alias = "host",
-            help = "Only show results from machine ids generated for this hostname"
+            help = "Only show results from this machine name"
         )]
         hostname: Option<String>,
         #[arg(long, help = "Disable colored output")]
@@ -321,7 +321,7 @@ pub enum Command {
         #[arg(
             long,
             alias = "host",
-            help = "Only show results from machine ids generated for this hostname"
+            help = "Only show results from this machine name"
         )]
         hostname: Option<String>,
         #[arg(long, help = "Disable colored preview output")]
@@ -1290,7 +1290,7 @@ struct MachineFilterArgs {
     #[arg(
         long,
         alias = "host",
-        help = "Only include sessions from machine ids generated for this hostname"
+        help = "Only include sessions with this machine name"
     )]
     hostname: Option<String>,
 }
@@ -1607,6 +1607,12 @@ impl Cli {
                     embedder.as_deref(),
                     degraded_reason,
                 )?;
+                let machine_filter_active =
+                    machine_filter_active(machine.as_deref(), hostname.as_deref());
+                let machine_identity = unresolved_machine_identity_diagnostic(
+                    &store,
+                    machine_filter_active && response.results.is_empty(),
+                )?;
                 if fzf {
                     if let Some(reason) = &response.degraded_reason {
                         eprintln!("search degraded: {reason}");
@@ -1636,13 +1642,18 @@ impl Cli {
                         &resolved_query.terms,
                         &response,
                         &refs,
+                        machine_identity.clone(),
                     );
                     crate::output::write_success(
                         "search",
                         output,
                         crate::output::EnvelopeOptions {
                             degraded_reason: response.degraded_reason.clone(),
-                            hints: search_hints(&response.results, &refs),
+                            hints: search_hints(
+                                &response.results,
+                                &refs,
+                                machine_filter_active,
+                            ),
                             ..Default::default()
                         },
                     )?;
@@ -1660,6 +1671,7 @@ impl Cli {
                     let columns = resolve_columns(verbose, cols, include, exclude)?;
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
                     print_search_results(&query, &response.results, &refs, &columns, color);
+                    print_machine_identity_diagnostic(machine_identity.as_ref());
                 }
             }
             Command::Tui {
@@ -1761,6 +1773,14 @@ impl Cli {
                     filter: resolved_filters.filter.clone(),
                 };
                 let threads = store.list_threads(&options)?;
+                let machine_identity = unresolved_machine_identity_diagnostic(
+                    &store,
+                    threads.is_empty()
+                        && machine_filter_active(
+                            resolved_filters.filter.machine_id.as_deref(),
+                            resolved_filters.filter.machine_name.as_deref(),
+                        ),
+                )?;
                 if json || robot {
                     crate::output::write_success(
                         "threads",
@@ -1773,12 +1793,14 @@ impl Cli {
                             &resolved_filters,
                             implicit_update,
                             &threads,
+                            machine_identity.clone(),
                         ),
                         Default::default(),
                     )?;
                 } else {
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
                     print_threads_output(&scope, &resolved_filters, &threads, color);
+                    print_machine_identity_diagnostic(machine_identity.as_ref());
                 }
             }
             Command::Show {
@@ -3412,6 +3434,8 @@ struct SearchOutput {
     degraded_reason: Option<String>,
     results: Vec<SearchResultOutput>,
     next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_identity: Option<MachineIdentityDiagnosticOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3447,6 +3471,7 @@ struct SearchResultOutput {
     event_id: String,
     session_id: String,
     machine_id: String,
+    machine_name: Option<String>,
     source_kind: String,
     tier: Option<String>,
     kind: String,
@@ -3464,6 +3489,8 @@ struct SearchResultOutput {
 struct ThreadsOutput {
     options: ThreadsOptionsOutput,
     results: Vec<ThreadOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_identity: Option<MachineIdentityDiagnosticOutput>,
     next_commands: Vec<String>,
 }
 
@@ -3489,7 +3516,7 @@ struct ThreadScopeOutput {
 struct SessionFilterOutput {
     source: Vec<String>,
     machine: Option<String>,
-    machine_prefix: Option<String>,
+    hostname: Option<String>,
     project_basename: Option<String>,
 }
 
@@ -3497,6 +3524,8 @@ struct SessionFilterOutput {
 struct ThreadOutput {
     session_id: String,
     provider_thread_id: String,
+    machine_id: String,
+    machine_name: Option<String>,
     source_kind: String,
     title: Option<String>,
     started_at: Option<DateTime<Utc>>,
@@ -3508,6 +3537,12 @@ struct ThreadOutput {
     today_message_count: u64,
     workspace_path: Option<String>,
     workspace_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MachineIdentityDiagnosticOutput {
+    unresolved_ids: usize,
+    unresolved_sessions: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -4504,11 +4539,14 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
         },
     )?;
     import.finish(format!(
-        "{} new records, {} duplicates, read {} records, {}",
+        "{} new records, {} duplicates, read {} records, {}; {} machine sessions repaired; {} unresolved machine ids across {} sessions",
         format_count(stats.inserted),
         format_count(stats.duplicates),
         format_count(last.records),
-        format_bytes(last.bytes)
+        format_bytes(last.bytes),
+        format_count(stats.repaired_machine_sessions),
+        format_count(stats.unresolved_machine_ids),
+        format_count(stats.unresolved_machine_sessions),
     ));
 
     let mut index = progress.phase("Updating search index");
@@ -8017,8 +8055,8 @@ fn print_thread_filter_summary(filters: &ResolvedSessionFilter) {
     if let Some(machine) = &filter.machine_id {
         println!("machine: {machine}");
     }
-    if let Some(machine_prefix) = &filter.machine_id_prefix {
-        println!("machine prefix: {machine_prefix}");
+    if let Some(hostname) = &filter.machine_name {
+        println!("hostname: {hostname}");
     }
     if let Some(basename) = &filter.workspace_basename {
         println!("project basename: {basename}");
@@ -8145,6 +8183,7 @@ fn threads_output(
     filters: &ResolvedSessionFilter,
     implicit_update: bool,
     threads: &[crate::storage::ThreadRow],
+    machine_identity: Option<MachineIdentityDiagnosticOutput>,
 ) -> ThreadsOutput {
     let results = threads.iter().map(thread_output).collect::<Vec<_>>();
     ThreadsOutput {
@@ -8161,10 +8200,11 @@ fn threads_output(
             filters: session_filter_output(filters),
             implicit_update,
         },
+        machine_identity,
         next_commands: results
             .first()
             .map(|thread| vec![format!("histo transcript {} --json", thread.session_id)])
-            .unwrap_or_else(|| vec!["histo update --json".to_string()]),
+            .unwrap_or_default(),
         results,
     }
 }
@@ -8173,7 +8213,7 @@ fn session_filter_output(filters: &ResolvedSessionFilter) -> SessionFilterOutput
     SessionFilterOutput {
         source: filters.filter.sources.clone(),
         machine: filters.filter.machine_id.clone(),
-        machine_prefix: filters.filter.machine_id_prefix.clone(),
+        hostname: filters.filter.machine_name.clone(),
         project_basename: filters.filter.workspace_basename.clone(),
     }
 }
@@ -8182,6 +8222,8 @@ fn thread_output(thread: &crate::storage::ThreadRow) -> ThreadOutput {
     ThreadOutput {
         session_id: thread.session.id.clone(),
         provider_thread_id: thread.session.external_id.clone(),
+        machine_id: thread.session.machine_id.clone(),
+        machine_name: thread.machine_name.clone(),
         source_kind: thread.session.source_kind.clone(),
         title: thread.session.title.clone(),
         started_at: thread.session.started_at,
@@ -8328,7 +8370,11 @@ fn search_output(
     match_terms: &[String],
     response: &search::SearchResponse,
     refs: &[String],
+    machine_identity: Option<MachineIdentityDiagnosticOutput>,
 ) -> SearchOutput {
+    let machine_filter_active =
+        machine_filter_active(machine.as_deref(), hostname.as_deref());
+    let next_commands = search_hints(&response.results, refs, machine_filter_active);
     SearchOutput {
         query: query.to_string(),
         options: SearchOptionsOutput {
@@ -8358,6 +8404,7 @@ fn search_output(
                 event_id: result.event_id.clone(),
                 session_id: result.session_id.clone(),
                 machine_id: result.machine_id.clone(),
+                machine_name: result.machine_name.clone(),
                 source_kind: result.source_kind.clone(),
                 tier: result.tier.clone(),
                 kind: result.kind.clone(),
@@ -8371,13 +8418,22 @@ fn search_output(
                 duplicate_group: result.duplicate_group.clone(),
             })
             .collect(),
-        next_commands: search_hints(&response.results, refs),
+        next_commands,
+        machine_identity,
     }
 }
 
-fn search_hints(results: &[search::SearchResult], refs: &[String]) -> Vec<String> {
+fn search_hints(
+    results: &[search::SearchResult],
+    refs: &[String],
+    machine_filter_active: bool,
+) -> Vec<String> {
     let Some(result) = results.first() else {
-        return vec!["histo update --json".to_string()];
+        return if machine_filter_active {
+            Vec::new()
+        } else {
+            vec!["histo update --json".to_string()]
+        };
     };
     let Some(ref_id) = refs.first() else {
         return Vec::new();
@@ -8389,6 +8445,36 @@ fn search_hints(results: &[search::SearchResult], refs: &[String]) -> Vec<String
             result.session_id
         ),
     ]
+}
+
+fn machine_filter_active(machine: Option<&str>, hostname: Option<&str>) -> bool {
+    machine.is_some_and(|value| !value.trim().is_empty())
+        || hostname.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn unresolved_machine_identity_diagnostic(
+    store: &Store,
+    enabled: bool,
+) -> Result<Option<MachineIdentityDiagnosticOutput>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let (unresolved_ids, unresolved_sessions) = store.unresolved_machine_identity_counts()?;
+    Ok(Some(MachineIdentityDiagnosticOutput {
+        unresolved_ids,
+        unresolved_sessions,
+    }))
+}
+
+fn print_machine_identity_diagnostic(diagnostic: Option<&MachineIdentityDiagnosticOutput>) {
+    let Some(diagnostic) = diagnostic.filter(|value| value.unresolved_sessions > 0) else {
+        return;
+    };
+    eprintln!(
+        "{} sessions use {} unresolved machine ids; re-import from each source after updating it to restore machine identity.",
+        format_count(diagnostic.unresolved_sessions),
+        format_count(diagnostic.unresolved_ids),
+    );
 }
 
 impl SearchSort {
@@ -8468,12 +8554,11 @@ fn resolve_session_filter(
                 .machine
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
-            machine_id_prefix: args
+            machine_name: args
                 .machine
                 .hostname
                 .clone()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| search::machine_id_prefix_for_hostname(&value)),
+                .filter(|value| !value.trim().is_empty()),
         },
         workspace_inferred,
     })
@@ -11371,13 +11456,13 @@ mod tests {
             false,
             None,
             None,
-            None,
             Some("machine_devbox_123".to_string()),
             Some("devbox".to_string()),
             None,
             &[],
             &response,
             &["ab3f".to_string()],
+            None,
         );
         let value = serde_json::to_value(output).expect("serialize search output");
 
