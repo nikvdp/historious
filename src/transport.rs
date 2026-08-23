@@ -375,19 +375,7 @@ fn import_jsonl_reader_records_with_options_and_progress(
         }
         let envelope: ArchiveEnvelope = serde_json::from_str(&line)
             .with_context(|| format!("parsing archive JSONL line {line_no}"))?;
-        if !matches!(
-            envelope.schema.as_str(),
-            ARCHIVE_SCHEMA | LEGACY_ARCHIVE_SCHEMA
-        ) {
-            bail!(
-                "unsupported archive schema on line {}: {}",
-                line_no,
-                envelope.schema
-            );
-        }
-        if envelope.id != envelope.record.id() || envelope.hash != envelope.record.hash() {
-            bail!("envelope identity mismatch on line {line_no}");
-        }
+        validate_archive_envelope(&envelope, line_no)?;
         let is_inline_raw_artifact =
             matches!(&envelope.record, ArchiveRecord::RawArtifact(raw) if !raw.content.is_empty());
         if !options.include_embeddings && matches!(envelope.record, ArchiveRecord::Embedding(_)) {
@@ -528,7 +516,10 @@ fn stream_jsonl_stdin_to_import_queue(
 }
 
 fn validate_archive_envelope(envelope: &ArchiveEnvelope, line_no: usize) -> Result<()> {
-    if envelope.schema != ARCHIVE_SCHEMA {
+    if !matches!(
+        envelope.schema.as_str(),
+        ARCHIVE_SCHEMA | LEGACY_ARCHIVE_SCHEMA
+    ) {
         bail!(
             "unsupported archive schema on line {}: {}",
             line_no,
