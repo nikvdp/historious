@@ -10255,6 +10255,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_source_reassignment_preserves_foreign_machine_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let mut local_session = fixture_session("session_local_machine", "source_local_machine");
+        let mut foreign_session =
+            fixture_session("session_foreign_machine", "source_foreign_machine");
+        local_session.machine_id = "machine_unknown_host".to_string();
+        foreign_session.machine_id = "machine_unknown_host_remote".to_string();
+        let mut local_event = fixture_event(
+            "event_local_machine",
+            &local_session.id,
+            &local_session.source_id,
+            0,
+            None,
+            "event_hash_local_machine",
+        );
+        let mut foreign_event = fixture_event(
+            "event_foreign_machine",
+            &foreign_session.id,
+            &foreign_session.source_id,
+            0,
+            None,
+            "event_hash_foreign_machine",
+        );
+        local_event.machine_id = local_session.machine_id.clone();
+        foreign_event.machine_id = foreign_session.machine_id.clone();
+        store
+            .import_records(&[
+                ArchiveRecord::Source(fixture_source(&local_session.source_id)),
+                ArchiveRecord::Source(fixture_source(&foreign_session.source_id)),
+                ArchiveRecord::Session(local_session.clone()),
+                ArchiveRecord::Session(foreign_session.clone()),
+                ArchiveRecord::Event(local_event),
+                ArchiveRecord::Event(foreign_event),
+            ])
+            .expect("legacy records");
+        store.refresh_history_items().expect("history projection");
+        let machine_id = "11111111-1111-4111-8111-111111111111";
+        store.upsert_machine(machine_id, "workstation").expect("machine");
+
+        let repaired = store
+            .reassign_machine_for_source(&local_session.source_id, machine_id)
+            .expect("reassign local source");
+
+        assert_eq!(repaired, 1);
+        store
+            .with_conn(|conn| {
+                for table in ["sessions", "events", "history_items"] {
+                    let local: String = conn.query_row(
+                        &format!("SELECT machine_id FROM {table} WHERE source_id = ?1 LIMIT 1"),
+                        params![local_session.source_id],
+                        |row| row.get(0),
+                    )?;
+                    let foreign: String = conn.query_row(
+                        &format!("SELECT machine_id FROM {table} WHERE source_id = ?1 LIMIT 1"),
+                        params![foreign_session.source_id],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(local, machine_id);
+                    assert_eq!(foreign, "machine_unknown_host_remote");
+                }
+                Ok(())
+            })
+            .expect("machine assignments");
+    }
+
+    #[test]
+    fn corrected_session_reimport_repairs_existing_machine_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let source = fixture_source("source_reimport_machine");
+        let mut session = fixture_session("session_reimport_machine", &source.id);
+        session.machine_id = "machine_unknown_host".to_string();
+        let mut event = fixture_event(
+            "event_reimport_machine",
+            &session.id,
+            &source.id,
+            0,
+            None,
+            "event_hash_reimport_machine",
+        );
+        event.machine_id = session.machine_id.clone();
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session.clone()),
+                ArchiveRecord::Event(event),
+            ])
+            .expect("legacy records");
+        store.refresh_history_items().expect("history projection");
+        assert_eq!(
+            store
+                .unresolved_machine_identity_counts()
+                .expect("unresolved counts"),
+            (1, 1)
+        );
+        let machine_id = "22222222-2222-4222-8222-222222222222";
+        let machine_name = "source-host";
+        let machine = MachineRecord {
+            id: machine_id.to_string(),
+            name: machine_name.to_string(),
+            hash: stable_hash(&(machine_id, machine_name)).expect("machine hash"),
+        };
+        session.machine_id = machine_id.to_string();
+
+        let stats = store
+            .import_archive_records(&[
+                ArchiveRecord::Machine(machine),
+                ArchiveRecord::Session(session.clone()),
+            ])
+            .expect("corrected reimport");
+
+        assert_eq!(stats.repaired_machine_sessions, 1);
+        assert_eq!(
+            store
+                .unresolved_machine_identity_counts()
+                .expect("resolved counts"),
+            (0, 0)
+        );
+        store
+            .with_conn(|conn| {
+                let stored_session: String = conn.query_row(
+                    "SELECT machine_id FROM sessions WHERE id = ?1",
+                    params![session.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(stored_session, machine_id);
+                for table in ["events", "history_items"] {
+                    let actual: String = conn.query_row(
+                        &format!("SELECT machine_id FROM {table} WHERE session_id = ?1 LIMIT 1"),
+                        params![session.id],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(actual, machine_id);
+                }
+                Ok(())
+            })
+            .expect("corrected machine ids");
+        let exported = store.export_records().expect("export records");
+        let machine_position = exported
+            .iter()
+            .position(|record| matches!(record, ArchiveRecord::Machine(_)))
+            .expect("machine record");
+        let session_position = exported
+            .iter()
+            .position(|record| matches!(record, ArchiveRecord::Session(_)))
+            .expect("session record");
+        assert!(machine_position < session_position);
+    }
+
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
         records.iter().any(|record| record.id() == id)
     }

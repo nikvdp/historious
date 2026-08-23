@@ -690,12 +690,64 @@ fn normalized_hashes(hashes: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::archive::{
-        stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, RawArtifact,
-        SearchUnitRecord, SessionRecord, SourceRecord,
+        stable_hash, stable_id, ArchiveRecord, EmbeddingRecord, EventRecord, MachineRecord,
+        RawArtifact, SearchUnitRecord, SessionRecord, SourceRecord,
     };
     use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn machine_uuid_and_name_round_trip_through_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let machine_id = "33333333-3333-4333-8333-333333333333";
+        let machine_name = "source-host";
+        let source = fixture_source("source_machine_round_trip");
+        let mut session =
+            fixture_session("session_machine_round_trip", &source.id, "/tmp/project");
+        session.machine_id = machine_id.to_string();
+        store.upsert_machine(machine_id, machine_name).expect("machine");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+            ])
+            .expect("records");
+
+        let mut body = Vec::new();
+        export_jsonl(&store, &mut body).expect("export");
+        let lines = String::from_utf8(body.clone()).expect("JSONL");
+        let machine_position = lines
+            .lines()
+            .position(|line| line.contains(r#""kind":"machine""#))
+            .expect("machine line");
+        let session_position = lines
+            .lines()
+            .position(|line| line.contains(r#""kind":"session""#))
+            .expect("session line");
+        assert!(machine_position < session_position);
+        assert!(lines
+            .lines()
+            .all(|line| line.contains(r#""schema":"historious.archive.v2""#)));
+
+        let imported_dir = tempfile::tempdir().expect("import tempdir");
+        let imported = Store::open(imported_dir.path()).expect("import store");
+        let stats = import_jsonl_reader(&imported, body.as_slice()).expect("import");
+
+        assert_eq!(stats.inserted, 3);
+        assert_eq!(stats.unresolved_machine_ids, 0);
+        assert_eq!(stats.unresolved_machine_sessions, 0);
+        assert!(imported
+            .export_records()
+            .expect("imported records")
+            .iter()
+            .any(|record| matches!(
+                record,
+                ArchiveRecord::Machine(MachineRecord { id, name, .. })
+                    if id == machine_id && name == machine_name
+            )));
+    }
 
     #[test]
     fn embedding_records_round_trip_through_jsonl() {

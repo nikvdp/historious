@@ -12350,7 +12350,8 @@ mod tests {
         let resolved = resolve_tail_session_with_refresh(&store, session_id, || {
             let stats = ingest::update_source_path_with_progress_and_cancel(
                 &store,
-                "machine_tail",
+                "11111111-1111-4111-8111-111111111111",
+                "test-host",
                 "omp",
                 &log_path,
                 |_| {},
@@ -12403,7 +12404,8 @@ mod tests {
         std::fs::write(&log_path, &first).expect("write initial Claude log");
         let stats = ingest::update_source_path_with_progress_and_cancel(
             &store,
-            "machine_transcript",
+            "22222222-2222-4222-8222-222222222222",
+            "test-host",
             "claude_code",
             &log_path,
             |_| {},
@@ -12434,8 +12436,13 @@ mod tests {
         );
         std::fs::write(&log_path, resumed).expect("append resumed Claude turn");
 
-        let refreshed = refresh_transcript_session(&store, "machine_transcript", &session)
-            .expect("refresh transcript source");
+        let refreshed = refresh_transcript_session(
+            &store,
+            "22222222-2222-4222-8222-222222222222",
+            "test-host",
+            &session,
+        )
+        .expect("refresh transcript source");
         let context = store
             .history_items_for_transcript_session(&refreshed.id)
             .expect("transcript lookup")
