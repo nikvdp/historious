@@ -11292,6 +11292,7 @@ mod tests {
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
+            machine_name: Some("devbox".to_string()),
             source_kind: "codex".to_string(),
             tier: Some("conversation".to_string()),
             kind: "user".to_string(),
@@ -11413,6 +11414,7 @@ mod tests {
             event_id: "event_1".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
+            machine_name: Some("devbox".to_string()),
             source_kind: "codex".to_string(),
             tier: Some("conversation".to_string()),
             kind: "user".to_string(),
@@ -11429,6 +11431,7 @@ mod tests {
                 event_id: "event_2".to_string(),
                 session_id: "session_2".to_string(),
                 machine_id: "machine_devbox_123".to_string(),
+                machine_name: Some("devbox".to_string()),
                 source_kind: "codex".to_string(),
                 tier: Some("conversation".to_string()),
                 kind: "user".to_string(),
@@ -11454,6 +11457,7 @@ mod tests {
             0.25,
             &search::SearchCorpus::conversation_with_tools(),
             false,
+            None,
             None,
             None,
             Some("machine_devbox_123".to_string()),
@@ -11482,6 +11486,7 @@ mod tests {
         assert_eq!(value["results"][0]["history_item_id"], "hi_1");
         assert_eq!(value["results"][0]["event_id"], "event_1");
         assert_eq!(value["results"][0]["machine_id"], "machine_devbox_123");
+        assert_eq!(value["results"][0]["machine_name"], "devbox");
         assert_eq!(value["results"][0]["tier"], "conversation");
         assert_eq!(value["results"][0]["kind"], "user");
         assert_eq!(
@@ -11496,6 +11501,15 @@ mod tests {
         assert_eq!(
             value["next_commands"][1],
             "histo transcript session_1 --at ab3f --json"
+        );
+    }
+
+    #[test]
+    fn machine_filtered_search_miss_omits_local_update_hint() {
+        assert!(search_hints(&[], &[], true).is_empty());
+        assert_eq!(
+            search_hints(&[], &[], false),
+            vec!["histo update --json".to_string()]
         );
     }
 

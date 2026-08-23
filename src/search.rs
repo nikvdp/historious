@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_filters_by_hostname_prefix() {
+    fn semantic_search_filters_by_stored_machine_name_and_exact_uuid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
         let target = import_event_and_project_with_kind_at_machine(
@@ -2670,15 +2670,21 @@ mod tests {
             "shared semantic machine target with enough surrounding context for useful vector retrieval",
             "user",
             None,
-            "machine_dev_box_111",
+            "11111111-1111-4111-8111-111111111111",
         );
         let other = import_event_and_project_with_kind_at_machine(
             &store,
             "shared semantic machine other with enough surrounding context for useful vector retrieval",
             "user",
             None,
-            "machine_other_222",
+            "22222222-2222-4222-8222-222222222222",
         );
+        store
+            .upsert_machine("11111111-1111-4111-8111-111111111111", "Dev-Box")
+            .expect("target machine");
+        store
+            .upsert_machine("22222222-2222-4222-8222-222222222222", "Other")
+            .expect("other machine");
         for unit in [&target, &other] {
             store
                 .import_record(&ArchiveRecord::Embedding(fixture_embedding(
@@ -2708,7 +2714,27 @@ mod tests {
 
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].event_id, target.event_id);
-        assert_eq!(response.results[0].machine_id, "machine_dev_box_111");
+        assert_eq!(
+            response.results[0].machine_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(response.results[0].machine_name.as_deref(), Some("Dev-Box"));
+
+        let exact = search(
+            &store,
+            "conceptual neighbor",
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Semantic)
+                .with_machine_filter(
+                    Some("22222222-2222-4222-8222-222222222222".to_string()),
+                    None,
+                ),
+            Some(&embedder),
+            None,
+        )
+        .expect("exact UUID search");
+        assert_eq!(exact.results.len(), 1);
+        assert_eq!(exact.results[0].event_id, other.event_id);
     }
 
     #[test]
@@ -3121,6 +3147,7 @@ mod tests {
             event_id: event_id.to_string(),
             session_id: "session".to_string(),
             machine_id: "machine_fixture".to_string(),
+            machine_name: Some("fixture".to_string()),
             source_kind: "fixture".to_string(),
             tier: Some("conversation".to_string()),
             search_kind: search_kind.to_string(),

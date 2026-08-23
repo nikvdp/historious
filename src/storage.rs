@@ -10398,6 +10398,35 @@ mod tests {
                 .expect("resolved counts"),
             (0, 0)
         );
+        let by_name = store
+            .list_threads(&ThreadListOptions {
+                limit: 10,
+                sort: ThreadSortMode::Newest,
+                after: None,
+                before: None,
+                filter: SessionFilter {
+                    machine_name: Some("SOURCE-HOST".to_string()),
+                    ..SessionFilter::default()
+                },
+            })
+            .expect("threads by machine name");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].session.id, session.id);
+        assert_eq!(by_name[0].machine_name.as_deref(), Some(machine_name));
+        let by_id = store
+            .list_threads(&ThreadListOptions {
+                limit: 10,
+                sort: ThreadSortMode::Newest,
+                after: None,
+                before: None,
+                filter: SessionFilter {
+                    machine_id: Some(machine_id.to_string()),
+                    ..SessionFilter::default()
+                },
+            })
+            .expect("threads by machine UUID");
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].session.id, session.id);
         store
             .with_conn(|conn| {
                 let stored_session: String = conn.query_row(

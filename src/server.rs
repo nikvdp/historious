@@ -741,6 +741,7 @@ mod tests {
             event_id: "sc_1234567890abcdef".to_string(),
             session_id: "session_1".to_string(),
             machine_id: "machine_devbox_123".to_string(),
+            machine_name: Some("devbox".to_string()),
             source_kind: "codex".to_string(),
             tier: Some("conversation".to_string()),
             kind: "user".to_string(),
