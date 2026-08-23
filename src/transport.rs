@@ -1,4 +1,6 @@
-use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA};
+use crate::archive::{
+    ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA, LEGACY_ARCHIVE_SCHEMA,
+};
 use crate::storage::{ArchiveExportFilter, ImportStats, Store};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -335,6 +337,7 @@ fn import_jsonl_stdin_with_options_and_import_progress(
                 )?;
                 stats.inserted += spilled.inserted;
                 stats.duplicates += spilled.duplicates;
+                stats.repaired_machine_sessions += spilled.repaired_machine_sessions;
                 stats.delta.merge(spilled.delta);
             }
         }
@@ -372,7 +375,10 @@ fn import_jsonl_reader_records_with_options_and_progress(
         }
         let envelope: ArchiveEnvelope = serde_json::from_str(&line)
             .with_context(|| format!("parsing archive JSONL line {line_no}"))?;
-        if envelope.schema != ARCHIVE_SCHEMA {
+        if !matches!(
+            envelope.schema.as_str(),
+            ARCHIVE_SCHEMA | LEGACY_ARCHIVE_SCHEMA
+        ) {
             bail!(
                 "unsupported archive schema on line {}: {}",
                 line_no,
@@ -449,6 +455,9 @@ fn finalize_import_stats_with_options_and_progress(
             vectors_indexed: stats.vectors_indexed,
         });
     }
+    let (unresolved_ids, unresolved_sessions) = store.unresolved_machine_identity_counts()?;
+    stats.unresolved_machine_ids = unresolved_ids;
+    stats.unresolved_machine_sessions = unresolved_sessions;
     Ok(())
 }
 
@@ -581,6 +590,7 @@ fn flush_import_batch_with_options(
     let delta = store.import_archive_records(batch)?;
     stats.inserted += delta.inserted;
     stats.duplicates += delta.duplicates;
+    stats.repaired_machine_sessions += delta.repaired_machine_sessions;
     stats.delta.merge(delta.delta);
     batch.clear();
     Ok(())

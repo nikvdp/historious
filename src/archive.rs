@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const ARCHIVE_SCHEMA: &str = "historious.archive.v1";
+pub const ARCHIVE_SCHEMA: &str = "historious.archive.v2";
+pub const LEGACY_ARCHIVE_SCHEMA: &str = "historious.archive.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawArtifact {
@@ -25,6 +26,13 @@ pub struct SourceRecord {
     pub path: Option<String>,
     pub first_seen_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineRecord {
+    pub id: String,
+    pub name: String,
     pub hash: String,
 }
 
@@ -97,6 +105,7 @@ pub struct EmbeddingRecord {
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ArchiveRecord {
     Source(SourceRecord),
+    Machine(MachineRecord),
     RawArtifact(RawArtifact),
     Session(SessionRecord),
     Event(EventRecord),
@@ -108,6 +117,7 @@ impl ArchiveRecord {
     pub fn id(&self) -> &str {
         match self {
             Self::Source(record) => &record.id,
+            Self::Machine(record) => &record.id,
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.id,
             Self::Event(record) => &record.id,
@@ -119,6 +129,7 @@ impl ArchiveRecord {
     pub fn hash(&self) -> &str {
         match self {
             Self::Source(record) => &record.hash,
+            Self::Machine(record) => &record.hash,
             Self::RawArtifact(record) => &record.hash,
             Self::Session(record) => &record.hash,
             Self::Event(record) => &record.hash,

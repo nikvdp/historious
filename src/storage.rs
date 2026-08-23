@@ -1,6 +1,6 @@
 use crate::archive::{
-    ArchiveRecord, EmbeddingRecord, EventRecord, RawArtifact, SearchUnitRecord, SessionRecord,
-    SourceRecord,
+    stable_hash, ArchiveRecord, EmbeddingRecord, EventRecord, MachineRecord, RawArtifact,
+    SearchUnitRecord, SessionRecord, SourceRecord,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
@@ -368,6 +368,9 @@ pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
     pub vectors_indexed: usize,
+    pub repaired_machine_sessions: usize,
+    pub unresolved_machine_ids: usize,
+    pub unresolved_machine_sessions: usize,
     #[serde(skip)]
     pub delta: ImportDelta,
 }
@@ -1093,6 +1096,62 @@ impl Store {
         self.with_conn(|conn| raw_event_bytes(conn, &self.blob_dir, event_id))
     }
 
+    pub fn upsert_machine(&self, id: &str, name: &str) -> Result<()> {
+        let machine = MachineRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            hash: stable_hash(&(id, name))?,
+        };
+        self.with_conn(|conn| {
+            insert_machine(conn, &machine)?;
+            Ok(())
+        })
+    }
+
+    pub fn reassign_machine_for_source(&self, source_id: &str, machine_id: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            with_immediate_write_tx(conn, |tx| {
+                let machine_exists = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM machines WHERE id = ?1)",
+                    params![machine_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !machine_exists {
+                    bail!("cannot assign unresolved machine id {machine_id}");
+                }
+                let repaired = tx.execute(
+                    "UPDATE sessions SET machine_id = ?2
+                     WHERE source_id = ?1 AND machine_id != ?2",
+                    params![source_id, machine_id],
+                )?;
+                for table in ["events", "history_items", "search_units"] {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET machine_id = ?2
+                             WHERE source_id = ?1 AND machine_id != ?2"
+                        ),
+                        params![source_id, machine_id],
+                    )?;
+                }
+                Ok(repaired)
+            })
+        })
+    }
+
+    pub fn unresolved_machine_identity_counts(&self) -> Result<(usize, usize)> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(DISTINCT s.machine_id), COUNT(*)
+                 FROM sessions s
+                 LEFT JOIN machines m ON m.id = s.machine_id
+                 WHERE m.id IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+    }
+
     pub fn upsert_source(
         &self,
         id: &str,
@@ -1186,16 +1245,25 @@ impl Store {
             with_immediate_write_tx(conn, |tx| {
                 let mut stats = ImportStats::default();
                 for record in records {
-                    let inserted = match record {
-                        ArchiveRecord::Source(source) => insert_source(&tx, source)?,
+                    let (inserted, repaired_machine_session) = match record {
+                        ArchiveRecord::Source(source) => (insert_source(&tx, source)?, false),
+                        ArchiveRecord::Machine(machine) => (insert_machine(&tx, machine)?, false),
                         ArchiveRecord::RawArtifact(raw) => {
-                            insert_raw_artifact(&tx, raw, &self.blob_dir)?
+                            (insert_raw_artifact(&tx, raw, &self.blob_dir)?, false)
                         }
-                        ArchiveRecord::Session(session) => insert_session(&tx, session)?,
-                        ArchiveRecord::Event(event) => insert_event(&tx, event)?,
-                        ArchiveRecord::SearchUnit(unit) => insert_search_unit(&tx, unit)?,
-                        ArchiveRecord::Embedding(embedding) => insert_embedding(&tx, embedding)?,
+                        ArchiveRecord::Session(session) => {
+                            let outcome = insert_session(&tx, session)?;
+                            (outcome.inserted, outcome.repaired_machine_identity)
+                        }
+                        ArchiveRecord::Event(event) => (insert_event(&tx, event)?, false),
+                        ArchiveRecord::SearchUnit(unit) => (insert_search_unit(&tx, unit)?, false),
+                        ArchiveRecord::Embedding(embedding) => {
+                            (insert_embedding(&tx, embedding)?, false)
+                        }
                     };
+                    if repaired_machine_session {
+                        stats.repaired_machine_sessions += 1;
+                    }
                     if inserted {
                         stats.inserted += 1;
                     } else {
@@ -1247,6 +1315,13 @@ impl Store {
     ) -> Result<Vec<ArchiveRecord>> {
         self.with_conn(|conn| {
             let mut records = Vec::new();
+            {
+                let mut stmt = conn.prepare("SELECT id, name, hash FROM machines ORDER BY id")?;
+                let rows = stmt.query_map([], row_machine)?;
+                for row in rows {
+                    records.push(ArchiveRecord::Machine(row?));
+                }
+            }
             {
                 let mut stmt = conn.prepare(
                     "SELECT id, kind, identity, path, first_seen_at, updated_at, hash
@@ -1340,6 +1415,24 @@ impl Store {
         self.with_conn(|conn| {
             let mut records = Vec::new();
             let placeholders = placeholders(session_ids.len());
+            {
+                let sql = format!(
+                    "SELECT id, name, hash
+                     FROM machines
+                     WHERE id IN (
+                       SELECT machine_id FROM sessions WHERE id IN ({placeholders})
+                     )
+                     ORDER BY id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params_from_iter(session_ids.iter().map(String::as_str)),
+                    row_machine,
+                )?;
+                for row in rows {
+                    records.push(ArchiveRecord::Machine(row?));
+                }
+            }
             {
                 let sql = format!(
                     "SELECT id, kind, identity, path, first_seen_at, updated_at, hash
@@ -5173,6 +5266,12 @@ fn migrate(conn: &Connection) -> Result<()> {
           value TEXT NOT NULL
         );
 
+
+        CREATE TABLE IF NOT EXISTS machines (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          hash TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sources (
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL,
@@ -6016,7 +6115,42 @@ fn blob_path(blob_dir: &Path, hash: &str) -> PathBuf {
     blob_dir.join(shard).join(clean)
 }
 
-fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
+fn insert_machine(conn: &Connection, machine: &MachineRecord) -> Result<bool> {
+    let canonical_id = uuid::Uuid::parse_str(&machine.id)
+        .with_context(|| format!("parsing machine UUID {}", machine.id))?
+        .hyphenated()
+        .to_string();
+    if canonical_id != machine.id {
+        bail!("machine id must be a canonical UUID: {}", machine.id);
+    }
+    if machine.name.trim().is_empty() || machine.name.trim() != machine.name {
+        bail!("machine name must be non-empty and trimmed");
+    }
+    let expected_hash = stable_hash(&(machine.id.as_str(), machine.name.as_str()))?;
+    if machine.hash != expected_hash {
+        bail!("machine record hash mismatch for {}", machine.id);
+    }
+    let existed = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machines WHERE id = ?1)",
+        params![machine.id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    conn.execute(
+        "INSERT INTO machines (id, name, hash) VALUES (?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, hash = excluded.hash
+         WHERE machines.name != excluded.name OR machines.hash != excluded.hash",
+        params![machine.id, machine.name, machine.hash],
+    )?;
+    Ok(!existed)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionImportOutcome {
+    inserted: bool,
+    repaired_machine_identity: bool,
+}
+
+fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<SessionImportOutcome> {
     ensure_same_hash(conn, "sessions", "id", &session.id, &session.hash)?;
     let changed = conn.execute(
         "INSERT OR IGNORE INTO sessions
@@ -6037,15 +6171,50 @@ fn insert_session(conn: &Connection, session: &SessionRecord) -> Result<bool> {
             session.hash
         ],
     )?;
-    if changed == 0 {
+    let repaired_machine_identity = if changed == 0 {
         update_session_title(conn, session)?;
         enrich_session_metadata(conn, session)?;
         update_session_timestamp(conn, session)?;
+        repair_session_machine_identity(conn, session)?
     } else {
         ensure_session_activity_row(conn, &session.id)?;
         update_source_status_count_delta(conn, &session.source_kind, 1, 0, 0, 0, 0)?;
+        false
+    };
+    Ok(SessionImportOutcome {
+        inserted: changed > 0,
+        repaired_machine_identity,
+    })
+}
+
+fn repair_session_machine_identity(conn: &Connection, session: &SessionRecord) -> Result<bool> {
+    let current_id = conn.query_row(
+        "SELECT machine_id FROM sessions WHERE id = ?1",
+        params![session.id],
+        |row| row.get::<_, String>(0),
+    )?;
+    if current_id == session.machine_id {
+        return Ok(false);
     }
-    Ok(changed > 0)
+    let resolved = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machines WHERE id = ?1)",
+        params![session.machine_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !resolved {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE sessions SET machine_id = ?2 WHERE id = ?1",
+        params![session.id, session.machine_id],
+    )?;
+    for table in ["events", "history_items", "search_units"] {
+        conn.execute(
+            &format!("UPDATE {table} SET machine_id = ?2 WHERE session_id = ?1"),
+            params![session.id, session.machine_id],
+        )?;
+    }
+    Ok(true)
 }
 
 fn update_session_timestamp(conn: &Connection, session: &SessionRecord) -> Result<()> {
@@ -6848,6 +7017,7 @@ fn record_delta(
                 push_unique(&mut delta.inserted_sources, source.id.clone());
             }
         }
+        ArchiveRecord::Machine(_) => {}
         ArchiveRecord::RawArtifact(raw) => {
             if track_touched {
                 push_unique(&mut delta.touched_paths, raw.path.clone());
@@ -7708,6 +7878,14 @@ fn row_raw_artifact_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArti
         size: row.get::<_, u64>(2)?,
         media_type: row.get(3)?,
         first_seen_at: parse_dt(row.get(4)?),
+    })
+}
+
+fn row_machine(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRecord> {
+    Ok(MachineRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        hash: row.get(2)?,
     })
 }
 

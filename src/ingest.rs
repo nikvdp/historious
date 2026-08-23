@@ -31,6 +31,7 @@ pub struct UpdateStats {
     pub inserted: usize,
     pub duplicates: usize,
     pub errors: usize,
+    pub repaired_machine_sessions: usize,
     #[serde(skip)]
     pub delta: ImportDelta,
 }
@@ -889,15 +890,24 @@ struct OmpSessionIdentity {
 pub fn update_local_with_progress(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     options: UpdateOptions,
     mut progress: impl FnMut(&UpdateProgress),
 ) -> Result<UpdateStats> {
-    update_local_with_progress_and_cancel(store, machine_id, options, &mut progress, || false)
+    update_local_with_progress_and_cancel(
+        store,
+        machine_id,
+        machine_name,
+        options,
+        &mut progress,
+        || false,
+    )
 }
 
 pub fn update_local_with_progress_and_cancel(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     options: UpdateOptions,
     mut progress: impl FnMut(&UpdateProgress),
     should_cancel: impl Fn() -> bool,
@@ -912,6 +922,7 @@ pub fn update_local_with_progress_and_cancel(
             .map(|adapter| adapter.kind().to_string())
             .collect(),
     });
+    store.upsert_machine(machine_id, machine_name)?;
     let discoveries = discover_selected_sources(&registry, &options, &should_cancel)?;
     for discovery in discoveries {
         match discovery.result {
@@ -1010,6 +1021,12 @@ pub fn update_local_with_progress_and_cancel(
             });
             continue;
         };
+        if let Some(source_path) = candidate.path.as_deref() {
+            let source_path = source_path.to_string_lossy();
+            let source_id = stable_id(&["source", &candidate.kind, &source_path]);
+            stats.repaired_machine_sessions +=
+                store.reassign_machine_for_source(&source_id, machine_id)?;
+        }
         if adapter.is_current(&context, &candidate)? {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
@@ -1290,6 +1307,7 @@ fn prepare_pending_import_batch(
 pub fn update_source_path_with_progress_and_cancel(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     kind: &str,
     path: &Path,
     mut progress: impl FnMut(&UpdateProgress),
@@ -1299,6 +1317,7 @@ pub fn update_source_path_with_progress_and_cancel(
     if should_cancel() {
         return Ok(stats);
     }
+    store.upsert_machine(machine_id, machine_name)?;
     let native_titles = NativeTitleIndex::load();
     refresh_existing_native_titles(store, &native_titles)?;
     if should_cancel() {
@@ -1342,6 +1361,9 @@ pub fn update_source_path_with_progress_and_cancel(
     let size = metadata.len();
     let mtime_ms = file_mtime_ms(&metadata);
     let path_text = path.to_string_lossy().to_string();
+    let source_id = stable_id(&["source", kind, &path_text]);
+    stats.repaired_machine_sessions +=
+        store.reassign_machine_for_source(&source_id, machine_id)?;
     let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
     if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
         stats.skipped_unchanged += 1;

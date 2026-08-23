@@ -2033,8 +2033,12 @@ impl Cli {
                 let session_record = store
                     .session_by_id(&session)?
                     .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
-                let session_record =
-                    refresh_transcript_session(&store, &config.machine_id, &session_record)?;
+                let session_record = refresh_transcript_session(
+                    &store,
+                    &config.machine_id,
+                    &config.machine_name,
+                    &session_record,
+                )?;
                 let target_event = target_event_id
                     .as_deref()
                     .map(|event_id| {
@@ -2654,6 +2658,7 @@ impl Cli {
                 run_daemon(
                     &store,
                     &config.machine_id,
+                    &config.machine_name,
                     config.embedder.clone(),
                     config.sources.clone(),
                     interval_secs,
@@ -2692,6 +2697,7 @@ impl Cli {
                     run_daemon(
                         &store,
                         &config.machine_id,
+                        &config.machine_name,
                         config.embedder.clone(),
                         config.sources.clone(),
                         interval_secs,
@@ -3711,6 +3717,7 @@ fn run_update_once_machine(
             ingest::update_local_with_progress(
                 store,
                 &config.machine_id,
+                &config.machine_name,
                 ingest::UpdateOptions {
                     max_files,
                     source_selection,
@@ -3897,6 +3904,7 @@ fn run_update_once_human(
             ingest::update_local_with_progress(
                 store,
                 &config.machine_id,
+                &config.machine_name,
                 ingest::UpdateOptions {
                     max_files,
                     source_selection,
@@ -8044,6 +8052,7 @@ fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Res
     let stats = ingest::update_local_with_progress(
         store,
         &config.machine_id,
+        &config.machine_name,
         ingest::UpdateOptions {
             max_files: None,
             source_selection: ingest::SourceSelection::default(),
@@ -8895,6 +8904,7 @@ fn view_metadata_for_session(
 fn refresh_transcript_session(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     session: &crate::archive::SessionRecord,
 ) -> Result<crate::archive::SessionRecord> {
     let Some(source_path) = store
@@ -8908,6 +8918,7 @@ fn refresh_transcript_session(
     let stats = ingest::update_source_path_with_progress_and_cancel(
         store,
         machine_id,
+        machine_name,
         &session.source_kind,
         &source_path,
         |_| {},
@@ -8964,6 +8975,7 @@ async fn run_transcript_tail(
     if refresh_tail_inputs(
         store,
         &config.machine_id,
+        &config.machine_name,
         &session_record.source_kind,
         tail_source_path.as_deref(),
         &config.sources,
@@ -8984,6 +8996,7 @@ async fn run_transcript_tail(
         if !refresh_tail_inputs(
             store,
             &config.machine_id,
+            &config.machine_name,
             &session_record.source_kind,
             tail_source_path.as_deref(),
             &config.sources,
@@ -9000,6 +9013,7 @@ fn resolve_tail_session(store: &Store, config: &AppConfig, target: &str) -> Resu
         let stats = ingest::update_local_with_progress_and_cancel(
             store,
             &config.machine_id,
+            &config.machine_name,
             ingest::UpdateOptions {
                 max_files: None,
                 source_selection: ingest::SourceSelection::single("agent_logs")?,
@@ -9080,6 +9094,7 @@ fn append_tail_updates(
 fn refresh_tail_inputs(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     source_kind: &str,
     source_path: Option<&Path>,
     sources: &crate::config::SourceConfigs,
@@ -9088,6 +9103,7 @@ fn refresh_tail_inputs(
         Some(path) => ingest::update_source_path_with_progress_and_cancel(
             store,
             machine_id,
+            machine_name,
             source_kind,
             path,
             |_| {},
@@ -9096,6 +9112,7 @@ fn refresh_tail_inputs(
         None => ingest::update_local_with_progress_and_cancel(
             store,
             machine_id,
+            machine_name,
             ingest::UpdateOptions {
                 max_files: None,
                 source_selection: ingest::SourceSelection::single(source_kind)?,
@@ -10409,6 +10426,7 @@ fn highlight_terms(input: &str, terms: &[String], color: bool) -> String {
 async fn run_daemon(
     store: &Store,
     machine_id: &str,
+    machine_name: &str,
     embedder_config: crate::embed::EmbedderConfig,
     source_configs: crate::config::SourceConfigs,
     interval_secs: u64,
@@ -10423,6 +10441,7 @@ async fn run_daemon(
         let stats = ingest::update_local_with_progress(
             store,
             machine_id,
+            machine_name,
             ingest::UpdateOptions {
                 max_files,
                 source_selection: source_selection.clone(),
