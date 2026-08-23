@@ -24,7 +24,7 @@ impl AppConfig {
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         let file_config = load_file_config(&data_dir)?;
         let machine_name = ensure_machine_name(&data_dir, file_config.machine.name)?;
-        let machine_id = machine_id_for_name(&machine_name);
+        let machine_id = ensure_machine_id(&data_dir, file_config.machine.id)?;
         let embedder =
             EmbedderConfig::from_config_and_env(&data_dir, file_config.embeddings.enabled);
         Ok(Self {
@@ -88,6 +88,7 @@ impl EnrichmentConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct MachineConfig {
+    id: Option<String>,
     name: Option<String>,
 }
 
@@ -152,6 +153,10 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
 pub fn set_machine_name(data_dir: &Path, name: &str) -> Result<PathBuf> {
     let name = normalize_machine_name(name)?;
     set_config_string(data_dir, &["machine", "name"], &name)
+}
+
+fn set_machine_id(data_dir: &Path, id: &str) -> Result<PathBuf> {
+    set_config_string(data_dir, &["machine", "id"], id)
 }
 
 pub fn set_embeddings_enabled(data_dir: &Path, enabled: bool) -> Result<PathBuf> {
@@ -546,9 +551,66 @@ fn ensure_machine_name(data_dir: &Path, configured: Option<String>) -> Result<St
 }
 
 fn default_machine_name() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string())
+    os_machine_name()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+#[cfg(unix)]
+fn os_machine_name() -> Option<String> {
+    let mut bytes = [0_u8; 256];
+    let result = unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) };
+    if result != 0 {
+        return None;
+    }
+    let len = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len])
+        .ok()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(not(unix))]
+fn os_machine_name() -> Option<String> {
+    None
+}
+
+fn ensure_machine_id(data_dir: &Path, configured: Option<String>) -> Result<String> {
+    if let Some(id) = configured {
+        let id = uuid::Uuid::parse_str(id.trim())
+            .context("machine.id must be a UUID")?
+            .hyphenated()
+            .to_string();
+        set_machine_id(data_dir, &id)?;
+        return Ok(id);
+    }
+
+    let legacy_path = data_dir.join("machine-id");
+    let recovered = if legacy_path.exists() {
+        let legacy = fs::read_to_string(&legacy_path)
+            .with_context(|| format!("reading legacy machine id {}", legacy_path.display()))?;
+        parse_legacy_machine_uuid(&legacy)
+    } else {
+        None
+    };
+    let id = recovered
+        .unwrap_or_else(uuid::Uuid::new_v4)
+        .hyphenated()
+        .to_string();
+    set_machine_id(data_dir, &id)?;
+    Ok(id)
+}
+
+fn parse_legacy_machine_uuid(input: &str) -> Option<uuid::Uuid> {
+    let input = input.trim();
+    uuid::Uuid::parse_str(input).ok().or_else(|| {
+        input
+            .rsplit('_')
+            .next()
+            .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+    })
 }
 
 fn normalize_machine_name(input: &str) -> Result<String> {
