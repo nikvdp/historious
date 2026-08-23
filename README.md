@@ -171,6 +171,27 @@ histo search "cargo zigbuild release" --include-tools
 histo search "exact_function_name" --mode lexical
 ```
 
+### Filter by machine
+
+Historious stores two independent machine fields:
+
+- A machine ID is a stable UUID for one Historious installation.
+- A machine name is a human-readable label, usually discovered from the host.
+
+Changing a machine name does not change its ID. Two installations with the
+same name still have different IDs.
+
+Use `--hostname` (or `--host`) to match the machine name. Use `--machine` to
+match the exact UUID:
+
+```bash
+histo threads --all --hostname <machine_name>
+histo search "query terms" --all --machine <machine_uuid>
+```
+
+Run `histo --robot status` on a machine to read its `machine_name` and
+`machine_id`.
+
 Multiple unquoted query terms match with AND behavior by default. Use
 `--match or` when any term may match. The older `--match all` and `--match any`
 spellings still work as aliases.
@@ -240,6 +261,34 @@ histo export --jsonl \
   | ssh <remote> 'histo import --jsonl --json -'
 ```
 
+Current exports preserve both the source machine UUID and its name. Import
+keeps that identity instead of assigning the receiving machine's identity.
+Reimporting the same session with corrected machine metadata updates the
+existing session and its derived records.
+
+### Repair machine identity from an older import
+
+An archive imported by an older Historious version might contain
+`machine_unknown_host` or another unresolved legacy ID. The receiving machine
+cannot safely determine which source owns those sessions.
+
+Repair the identity from each source machine:
+
+1. Upgrade Historious on the source machine.
+2. Run `histo update` on the source machine to assign its stable UUID to its
+   local sessions.
+3. Export from the source and import the corrected archive into the receiving
+   machine:
+
+   ```bash
+   ssh <remote> 'histo update'
+   ssh <remote> 'histo export --jsonl' \
+     | histo import --jsonl --json -
+   ```
+
+The corrected reimport repairs matching sessions in place. You don't need to
+delete the receiving database.
+
 Omit embeddings when bandwidth or storage is constrained:
 
 ```bash
@@ -265,8 +314,9 @@ histo export --jsonl --session <session_id>
 histo export --jsonl --since 2026-06-01
 ```
 
-Do not add `histo update` to these exchange flows. `update` scans local agent log
-files; export/import moves records already stored in Historious.
+Do not run `histo update` on the receiving machine to repair imported identity.
+`update` scans local agent log files; it cannot infer ownership for records
+that came from another machine.
 
 ## Embeddings
 

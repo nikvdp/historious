@@ -216,7 +216,7 @@ pub enum Command {
         project: Option<PathBuf>,
         #[arg(long, conflicts_with = "project", help = "Search across every project")]
         all: bool,
-        #[arg(long, help = "Only show results from this exact machine id")]
+        #[arg(long, help = "Only show results from this exact machine UUID")]
         machine: Option<String>,
         #[arg(
             long,
@@ -316,7 +316,7 @@ pub enum Command {
         project: Option<PathBuf>,
         #[arg(long, conflicts_with = "project", help = "Search across every project")]
         all: bool,
-        #[arg(long, help = "Only show results from this exact machine id")]
+        #[arg(long, help = "Only show results from this exact machine UUID")]
         machine: Option<String>,
         #[arg(
             long,
@@ -1285,7 +1285,7 @@ struct WorkspaceFilterArgs {
 
 #[derive(Debug, Clone, Args, Default)]
 struct MachineFilterArgs {
-    #[arg(long, help = "Only include sessions from this exact machine id")]
+    #[arg(long, help = "Only include sessions from this exact machine UUID")]
     machine: Option<String>,
     #[arg(
         long,
