@@ -522,6 +522,29 @@ mod tests {
     }
 
     #[test]
+    fn identical_machine_names_receive_distinct_uuids() {
+        let first_dir = tempfile::tempdir().expect("first tempdir");
+        let second_dir = tempfile::tempdir().expect("second tempdir");
+        for dir in [&first_dir, &second_dir] {
+            fs::write(
+                dir.path().join("config.toml"),
+                "[machine]\nname = \"unknown-host\"\n",
+            )
+            .expect("write config");
+        }
+
+        let first =
+            AppConfig::load(Some(first_dir.path().to_path_buf())).expect("first config");
+        let second =
+            AppConfig::load(Some(second_dir.path().to_path_buf())).expect("second config");
+
+        assert_eq!(first.machine_name, second.machine_name);
+        assert_ne!(first.machine_id, second.machine_id);
+        uuid::Uuid::parse_str(&first.machine_id).expect("first UUID");
+        uuid::Uuid::parse_str(&second.machine_id).expect("second UUID");
+    }
+
+    #[test]
     fn set_machine_name_keeps_the_machine_uuid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let original = AppConfig::load(Some(dir.path().to_path_buf())).expect("original config");
