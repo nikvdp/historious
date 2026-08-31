@@ -1508,7 +1508,7 @@ mod tests {
         let response = search(
             &store,
             "conceptual neighbor",
-            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Hybrid),
             Some(&embedder),
             None,
         )
@@ -1546,7 +1546,8 @@ mod tests {
         let response = search(
             &store,
             "semantic neighbor",
-            SearchOptions::new(1000, SortMode::Relevance, 0.0),
+            SearchOptions::new(1000, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Hybrid),
             Some(&embedder),
             None,
         )
@@ -1583,7 +1584,7 @@ mod tests {
         let response = search(
             &store,
             "alpha",
-            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Hybrid),
             Some(&embedder),
             None,
         )
@@ -2850,14 +2851,16 @@ mod tests {
         let response = search(
             &store,
             "conceptual neighbor",
-            SearchOptions::new(10, SortMode::Relevance, 0.0).with_time_window(
-                Some(
-                    DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
-                        .expect("after")
-                        .with_timezone(&Utc),
+            SearchOptions::new(10, SortMode::Relevance, 0.0)
+                .with_mode(SearchMode::Hybrid)
+                .with_time_window(
+                    Some(
+                        DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+                            .expect("after")
+                            .with_timezone(&Utc),
+                    ),
+                    None,
                 ),
-                None,
-            ),
             Some(&embedder),
             None,
         )

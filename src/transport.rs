@@ -1048,7 +1048,8 @@ mod tests {
         let response = crate::search::search(
             &machine_a,
             "offline convergence",
-            crate::search::SearchOptions::new(5, crate::search::SortMode::Relevance, 0.0),
+            crate::search::SearchOptions::new(5, crate::search::SortMode::Relevance, 0.0)
+                .with_mode(crate::search::SearchMode::Hybrid),
             None,
             Some("query embedder disabled".to_string()),
         )
