@@ -37,15 +37,15 @@ Pick the asset for your machine:
 | Platform | Asset |
 | --- | --- |
 | macOS Apple Silicon | `histo-macos-aarch64` |
-| Linux x86_64, modern glibc with embeddings | `histo-linux-x86_64-gnu` |
-| Linux ARM64, modern glibc with embeddings | `histo-linux-aarch64-gnu` |
+| Linux x86_64, modern glibc, FastEmbed-capable | `histo-linux-x86_64-gnu` |
+| Linux ARM64, modern glibc, FastEmbed-capable | `histo-linux-aarch64-gnu` |
 | Linux x86_64, portable fallback | `histo-linux-x86_64-musl` |
 | Linux ARM64, portable fallback | `histo-linux-aarch64-musl` |
 | Windows x86_64 | `histo-windows-x86_64.exe` |
 
 Use the `gnu` Linux builds on modern glibc distros such as Ubuntu 24.04 or
-newer; those builds include FastEmbed support. Use the `musl` builds on older
-Linux distros or Alpine; those portable builds do not include FastEmbed yet.
+newer; those builds include FastEmbed support. Runtime embeddings remain off
+until you enable them. The portable `musl` builds do not include FastEmbed yet.
 
 Or build from source:
 
@@ -100,7 +100,7 @@ histo service uninstall
 Search for a concrete clue you remember:
 
 ```bash
-histo search "429 reqwest retry"
+histo search 429 reqwest
 histo show <ref> --before 5 --after 8
 histo transcript <session_id> --at <ref>
 ```
@@ -117,7 +117,7 @@ For scripts and agents, use `--robot` so output is stable JSON:
 
 ```bash
 histo --robot status
-histo --robot search "Cargo.lock toml_edit" --limit 20
+histo --robot search Cargo.lock toml_edit --mode lexical --limit 20
 histo --robot show <ref> --before 5 --after 8
 ```
 
@@ -141,9 +141,9 @@ histo skill install search-agent-history-historious --claude
 histo skill install search-agent-history-historious --pi
 ```
 
-Good agent behavior is simple: start broad, use `--robot`, group hits by
-`session_id`, then inspect promising refs with `show` or `transcript`. Use full
-transcripts when exact commands, file paths, or decisions matter.
+Good agent behavior is simple: start with one distinctive literal, use
+`--robot`, and add project, date, or machine filters before another keyword.
+Group hits by `session_id`, then inspect promising refs with `show` or `transcript`.
 
 ## Browse Recent Threads
 
@@ -158,17 +158,16 @@ histo threads --project /absolute/repo/path
 
 ## Search History
 
-By default, `search` is mainly lexical. Use words and symbols that actually
-appeared in the transcript: error codes, command names, file paths, function
-names, branch names, package names, ports, hosts, or log text.
+By default, `search` is lexical. Use words and symbols that actually appeared
+in the transcript: error codes, command names, file paths, function names,
+branch names, package names, ports, hosts, or log text.
 
 ```bash
-histo search "migration rollback sqlite" --project /absolute/repo/path
-histo search dog parade
-histo search --match or dog parade
-histo search "rate limit 429" --all --after 2026-06-01
-histo search "cargo zigbuild release" --include-tools
-histo search "exact_function_name" --mode lexical
+histo search migration rollback --project /absolute/repo/path
+histo search timeout --all --after 2026-06-01
+histo search --match or rollback revert
+histo search 429 reqwest --include-tools
+histo search exact_function_name --mode lexical
 ```
 
 ### Filter by machine
@@ -186,15 +185,15 @@ match the exact UUID:
 
 ```bash
 histo threads --all --hostname <machine_name>
-histo search "query terms" --all --machine <machine_uuid>
+histo search sqlite --all --machine <machine_uuid>
 ```
 
 Run `histo --robot status` on a machine to read its `machine_name` and
 `machine_id`.
 
-Multiple unquoted query terms match with AND behavior by default. Use
-`--match or` when any term may match. The older `--match all` and `--match any`
-spellings still work as aliases.
+Multiple keywords use AND matching by default. Use `--match or` when any
+keyword may match. Shell quotes only group arguments; they do not request
+phrase matching. The older `--match all` and `--match any` spellings remain aliases.
 
 Inspect results:
 
@@ -240,7 +239,7 @@ not need to run `histo serve` by hand.
 For a fixed result set instead of live search, use:
 
 ```bash
-histo search "query terms" --fzf
+histo search 429 reqwest --fzf
 ```
 
 ## Sync Machines
@@ -318,10 +317,10 @@ Do not run `histo update` on the receiving machine to repair imported identity.
 `update` scans local agent log files; it cannot infer ownership for records
 that came from another machine.
 
-## Embeddings
+## Optional Semantic Search
 
-Embeddings are off by default. That keeps first indexing quick and avoids model
-downloads unless you ask for them.
+Embeddings are off by default, and normal search remains lexical. This keeps
+first indexing quick and avoids model downloads unless you ask for them.
 
 Turn embeddings on for this data directory:
 
@@ -330,12 +329,13 @@ histo config embeddings on
 ```
 
 Then run `histo update` so Historious can index embedding vectors into its
-database. After that, semantic search can help with fuzzy, concept-shaped
-queries:
+database. Select semantic mode for natural-language intent, or hybrid mode to
+combine vector and lexical results:
 
 ```bash
 histo update
 histo search "why did the sync loop repeat" --mode semantic
+histo search retry timeout --mode hybrid
 ```
 
 Turn them back off:
@@ -350,10 +350,10 @@ Check the current setting and config path:
 histo config show
 ```
 
-Use `--embeddings` or `-e` on commands such as `update`, `import`, `search`,
-`tui`, `daemon`, or `serve` to force embeddings on for a single run even when
-config has them off. Use `--no-embeddings` or `-E` for a one-off lexical-only
-run.
+Use `--embeddings` or `-e` to enable embeddings for one command when config has
+them off. Pair it with `--mode hybrid` or `--mode semantic` for vector results.
+Use `--no-embeddings --mode lexical` for a search that neither loads nor uses
+embeddings.
 
 ## Serve Mode
 
