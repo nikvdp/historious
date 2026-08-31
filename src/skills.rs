@@ -10,7 +10,7 @@ pub struct PackagedSkill {
 
 const SEARCH_AGENT_HISTORY_HISTORIOUS: &str = r#"---
 name: search-agent-history-historious
-description: Search coding-agent conversation history with Historious across Codex, Claude Code, OpenCode, pi, Oh My Pi (OMP), OpenClaw, Hermes, and other indexed local agent logs; use Historious transcript retrieval for exact content and backend raw logs only as a stated last resort.
+description: Search coding-agent conversation history with short lexical keywords in Historious across Codex, Claude Code, OpenCode, pi, Oh My Pi (OMP), OpenClaw, Hermes, and other indexed local agent logs; use explicit semantic mode only when embeddings are enabled.
 ---
 
 # Search Agent History With Historious
@@ -33,8 +33,8 @@ If you use a backend raw-log fallback, say so explicitly and name the Historious
 
 - Prefer `histo --robot` for agent usage. It emits stable JSON envelopes and disables interactive behavior.
 - Do not add a separate search command; the canonical entry point is `histo search`.
-- Assume embeddings may be disabled. Search like an investigator: exact lexical anchors first, then triangulate.
-- Start with one distinctive anchor, then add repo/date/source filters before trying raw history.
+- Normal searches are lexical. Start with one distinctive literal, then add project, date, or machine filters before adding another keyword.
+- Assume embeddings may be disabled. Use `--mode lexical` for predictable literal matching.
 - Use returned `ref` values for `show` and `transcript` follow-ups.
 - Group candidates by `session_id`; do not treat every matching event as a separate conversation.
 - Use transcript JSON for exact content. Do not parse human transcript markers when JSON is available.
@@ -80,7 +80,7 @@ Then search or inspect likely sessions from that timeline.
 ## Search
 
 ```bash
-histo --robot search "distinctive anchor" --limit 20
+histo --robot search sqlite --mode lexical --limit 20
 ```
 
 Each result includes:
@@ -96,20 +96,19 @@ Each result includes:
 Focused search options that matter most for agents:
 
 ```bash
-histo --robot search "trybasis" --all --mode lexical
-histo --robot search "2056881705269580023" --all --mode lexical
-histo --robot search "Making Our Monorepo Ergonomic for Agents" --all --mode lexical
-histo --robot search "canonicality localization verifiability" --project /absolute/repo/path --mode lexical
-histo --robot search "docs/agent-context-authority" --project /absolute/repo/path --mode lexical
-histo --robot search "exact error or command" --project /absolute/repo/path --include-tools
+histo --robot search trybasis --all --mode lexical
+histo --robot search 2056881705269580023 --all --mode lexical
+histo --robot search Monorepo Ergonomic --all --mode lexical
+histo --robot search canonicality --project /absolute/repo/path --mode lexical
+histo --robot search agent-context-authority --project /absolute/repo/path --mode lexical
+histo --robot search 429 reqwest --project /absolute/repo/path --include-tools --mode lexical
 ```
 
-Use `--project` for the current repo, `--all` only when cross-project recall
-matters, `--today` or `--after` for recent work, `--mode lexical` when exact
-words matter or embeddings are disabled, `--mode hybrid|semantic` when semantic
-search is available, `--include-tools` when commands or tool output matter, and
-`--raw` only for Historious's indexed raw corpus. `--raw` is not permission to
-inspect backend log files.
+Lexical search is the default. Multiple keywords use AND matching; use `--match or` for alternatives.
+Shell quotes group arguments but do not request phrase matching. Use `--project` for the current repo, `--all` only when cross-project
+recall matters, `--today` or `--after` for recent work, `--include-tools` when
+commands or tool output matter, and `--raw` only for Historious's indexed raw
+corpus. `--raw` is not permission to inspect backend log files.
 
 Prefer refs for interactive follow-up:
 
@@ -234,9 +233,9 @@ Then connect to the remote address:
 histo tui --server-url http://<remote-ip>:7391
 ```
 
-### Embedding Mode
+### Optional Semantic Search
 
-Historious can run with embeddings enabled or disabled. Embeddings are disabled by default so first indexing stays lightweight and predictable.
+Embeddings are disabled by default so first indexing stays lightweight and predictable. Normal search remains lexical.
 
 Persistently enable embeddings for this data directory:
 
@@ -256,7 +255,14 @@ Inspect the current setting and config file path:
 histo config show
 ```
 
-Use `--no-embeddings` on commands such as `update`, `import`, `search`, `tui`, `daemon`, or `serve` for a one-off lexical-only run without changing `config.toml`. This can speed up maintenance or sync work when semantic search is not needed right away; a later embedding-enabled `histo update` can backfill skipped embeddings.
+After enabling embeddings, index vectors and select semantic or hybrid mode explicitly:
+
+```bash
+histo update
+histo --robot search "why did the sync loop repeat" --mode semantic
+```
+
+Use `--no-embeddings --mode lexical` for a one-off search that neither loads nor uses embeddings. A later embedding-enabled `histo update` can backfill skipped embeddings.
 
 ### Embedding Transfer
 
@@ -283,18 +289,18 @@ Do not add `histo update` to these exchange flows. `update` scans local agent lo
 
 ## Search Strategy
 
-- Start with the most distinctive literal from the user's memory: URL slug, tweet id, branch name, commit hash, file path, command, error text, repo path, org/product name, model name, or exact phrase.
-- Search anchor classes separately before combining them: one search for a URL/id, one for a title phrase, one for repo/branch/path, one for domain words.
-- If results are noisy, add `--project`, `--after`, `--before`, `--mode lexical`, or one more distinctive anchor.
-- If results are sparse, remove exact path fragments and search for adjacent words.
-- For timeline-style questions, search terms from the topic and then group by `session_id` and timestamps.
+- Start with one distinctive literal likely to appear in the transcript: an error code, identifier, command, URL slug, branch name, package, port, host, or model name.
+- Add `--project`, `--after`, `--before`, or a machine filter before adding more keywords.
+- If results are noisy, add one more literal keyword.
+- If results are sparse, try a different literal in a separate query; use `--match or` only for true alternatives.
+- For timeline-style questions, use `threads` first, then search one remembered keyword in likely sessions.
 
 Useful lexical probes:
 
 ```bash
-histo --robot search "trybasis" --all --mode lexical
-histo --robot search "agent-native codebase" --project /absolute/repo/path --mode lexical
-histo --robot search "AGENTS.md .agents/skills context authority" --project /absolute/repo/path --mode lexical
+histo --robot search trybasis --all --mode lexical
+histo --robot search agent-native --project /absolute/repo/path --mode lexical
+histo --robot search context authority --project /absolute/repo/path --mode lexical
 ```
 
 ## Answer Shape
@@ -321,7 +327,7 @@ Preferred agent pattern:
 ```bash
 histo --robot status
 histo --robot threads --all --today
-histo --robot search "distinctive query terms" --limit 20
+histo --robot search sqlite --mode lexical --limit 20
 histo --robot show <ref> --before 5 --after 8
 histo --robot transcript <session_id> --at <ref>
 ```
@@ -329,6 +335,11 @@ histo --robot transcript <session_id> --at <ref>
 Rules:
 
 - Use `--robot` for machine-friendly JSON and structured errors.
+- Lexical keyword search is the default. Start with one distinctive literal.
+- Add project, date, or machine filters before adding another keyword.
+- Multiple keywords use AND; use `--match or` for alternatives.
+- Shell quotes group arguments but do not request phrase matching.
+- Use `--mode hybrid|semantic` only after embeddings are enabled and indexed.
 - Group search hits by `session_id`.
 - Use returned `ref` values for `show` and `transcript` follow-ups.
 - Use `transcript` JSON when exact wording, commands, or file paths matter.

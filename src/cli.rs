@@ -118,11 +118,11 @@ pub enum Command {
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
-    /// Search indexed transcripts.
+    /// Search indexed transcripts with lexical keywords.
     Search {
         #[arg(
             value_name = "QUERY",
-            help = "Words, paths, errors, or other details to search for"
+            help = "Short literal keywords, identifiers, paths, or errors; all keywords match by default"
         )]
         query: Vec<String>,
         #[arg(
@@ -149,26 +149,26 @@ pub enum Command {
         exclude: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
-        #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
+        #[arg(long, value_enum, help = "Search mode override: lexical (default), hybrid, or semantic")]
         mode: Option<SearchModeArg>,
         #[arg(
             long = "match",
             value_enum,
-            help = "How to combine multiple query terms: 'and' or 'or'"
+            help = "How to combine multiple keywords: 'and' or 'or'"
         )]
         match_mode: Option<SearchMatchArg>,
         #[arg(
             short = 'e',
             long,
             conflicts_with = "no_embeddings",
-            help = "Use embedding-backed semantic search for this run"
+            help = "Enable optional embeddings for this run; use --mode hybrid or semantic for vector results"
         )]
         embeddings: bool,
         #[arg(
             short = 'E',
             long,
             conflicts_with = "embeddings",
-            help = "Skip embedding-backed semantic search for this run"
+            help = "Disable optional embeddings for this run; lexical search remains available"
         )]
         no_embeddings: bool,
         #[arg(
@@ -236,7 +236,7 @@ pub enum Command {
     },
     /// Open the interactive terminal search UI.
     Tui {
-        #[arg(help = "Initial query for the picker")]
+        #[arg(help = "Initial short keyword query for the picker")]
         query: Option<String>,
         #[arg(
             short,
@@ -255,20 +255,20 @@ pub enum Command {
         server_url: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
-        #[arg(long, value_enum, help = "Search mode: hybrid, lexical, or semantic")]
+        #[arg(long, value_enum, help = "Search mode override: lexical (default), hybrid, or semantic")]
         mode: Option<SearchModeArg>,
         #[arg(
             short = 'e',
             long,
             conflicts_with = "no_embeddings",
-            help = "Use embedding-backed semantic search for this run"
+            help = "Enable optional embeddings for this run; use --mode hybrid or semantic for vector results"
         )]
         embeddings: bool,
         #[arg(
             short = 'E',
             long,
             conflicts_with = "embeddings",
-            help = "Skip embedding-backed semantic search for this run"
+            help = "Disable optional embeddings for this run; lexical search remains available"
         )]
         no_embeddings: bool,
         #[arg(
@@ -1304,8 +1304,8 @@ pub enum SearchSort {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SearchModeArg {
-    Hybrid,
     Lexical,
+    Hybrid,
     Semantic,
 }
 
@@ -7594,7 +7594,7 @@ fn print_status_attention(query_embedder: &crate::embed::EmbedderStatus, color: 
     if let Some(reason) = query_embedder.degraded_reason.as_deref() {
         print_section(
             "Attention",
-            &[("Semantic fallback", reason.to_string())],
+            &[("Semantic search", reason.to_string())],
             color,
         );
     }
@@ -7835,7 +7835,7 @@ fn status_summary(stats: &StatusStatsOutput) -> String {
             format_count_u64(events)
         )
     } else {
-        "No indexed history yet. Run `histo update` when you are ready to ingest local sessions."
+        "No indexed history yet. Run `histo update`, then search with `histo search <keyword> --mode lexical`."
             .to_string()
     }
 }
@@ -7859,7 +7859,7 @@ fn semantic_status(
     } else if config.default_search_mode == search::SearchMode::Semantic {
         "unavailable for semantic-only searches".to_string()
     } else {
-        "not available; lexical search is available".to_string()
+        "optional; disabled".to_string()
     }
 }
 
@@ -10309,6 +10309,7 @@ fn print_search_results(
 ) {
     if results.is_empty() {
         println!("No results for: \"{query}\"");
+        println!("Try one distinctive keyword, then narrow with --project or --after.");
         return;
     }
     let rows = results
