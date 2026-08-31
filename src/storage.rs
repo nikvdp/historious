@@ -8175,6 +8175,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn lexical_query_uses_punctuation_boundaries_and_prefix_terms() {
+        assert_eq!(
+            fts_query("Cargo.lock error:timeout"),
+            "\"Cargo\"* \"lock\"* \"error\"* \"timeout\"*"
+        );
+        assert_eq!(
+            fts_query("\"sqlite export\" 429"),
+            "\"sqlite\"* \"export\"* \"429\""
+        );
+        assert_eq!(
+            fts_query_terms(["rollback", "revert"], FtsMatchMode::Any),
+            "\"rollback\"* OR \"revert\"*"
+        );
+    }
+
+    #[test]
     fn report_sql_profile_aggregates_phases_without_bound_values_or_counter_reuse() {
         let dir = tempfile::tempdir().expect("tempdir");
         let profile_path = dir.path().join("profile.jsonl");

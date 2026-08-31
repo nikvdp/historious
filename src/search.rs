@@ -1724,6 +1724,15 @@ mod tests {
     }
 
     #[test]
+    fn search_options_default_to_lexical() {
+        assert_eq!(SearchMode::default(), SearchMode::Lexical);
+        assert_eq!(
+            SearchOptions::new(5, SortMode::Relevance, 0.0).mode,
+            SearchMode::Lexical
+        );
+    }
+
+    #[test]
     fn disabled_semantic_search_reports_degraded_fts_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -1732,7 +1741,7 @@ mod tests {
         let response = search(
             &store,
             "plain lexical",
-            SearchOptions::new(5, SortMode::Relevance, 0.0),
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Hybrid),
             None,
             Some("query embedder disabled".to_string()),
         )
@@ -1787,6 +1796,52 @@ mod tests {
             Some("query embedder disabled")
         );
         assert!(response.results.is_empty());
+    }
+
+    #[test]
+    fn semantic_mode_explains_missing_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+
+        let response = search(
+            &store,
+            "payment failure",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            None,
+            None,
+        )
+        .expect("search");
+
+        assert!(response.results.is_empty());
+        assert!(response
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("histo config embeddings on")));
+    }
+
+    #[test]
+    fn semantic_mode_explains_missing_model_vectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let embedder = FixtureEmbedder {
+            model_id: "fixture-semantic-384",
+            vector: unit_vector(13),
+        };
+
+        let response = search(
+            &store,
+            "payment failure",
+            SearchOptions::new(5, SortMode::Relevance, 0.0).with_mode(SearchMode::Semantic),
+            Some(&embedder),
+            None,
+        )
+        .expect("search");
+
+        assert!(response.results.is_empty());
+        assert!(response
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no indexed vectors are available")));
     }
 
     #[test]

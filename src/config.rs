@@ -339,11 +339,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_config_defaults_search_mode_to_hybrid() {
+    fn missing_config_defaults_search_mode_to_lexical() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = AppConfig::load(Some(dir.path().to_path_buf())).expect("config");
 
-        assert_eq!(config.default_search_mode, SearchMode::Hybrid);
+        assert_eq!(config.default_search_mode, SearchMode::Lexical);
     }
 
     #[test]
