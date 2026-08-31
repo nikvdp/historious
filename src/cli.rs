@@ -1670,7 +1670,14 @@ impl Cli {
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let columns = resolve_columns(verbose, cols, include, exclude)?;
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
-                    print_search_results(&query, &response.results, &refs, &columns, color);
+                    print_search_results(
+                        &query,
+                        &response.results,
+                        &refs,
+                        &columns,
+                        mode,
+                        color,
+                    );
                     print_machine_identity_diagnostic(machine_identity.as_ref());
                 }
             }
@@ -10308,11 +10315,18 @@ fn print_search_results(
     results: &[search::SearchResult],
     refs: &[String],
     columns: &[Column],
+    mode: search::SearchMode,
     color: bool,
 ) {
     if results.is_empty() {
         println!("No results for: \"{query}\"");
-        println!("Try one distinctive keyword, then narrow with --project or --after.");
+        if mode == search::SearchMode::Semantic {
+            println!(
+                "Try a different semantic description, or use --mode lexical with literal keywords."
+            );
+        } else {
+            println!("Try one distinctive keyword, then narrow with --project or --after.");
+        }
         return;
     }
     let rows = results
