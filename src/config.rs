@@ -101,7 +101,7 @@ struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_mode: SearchMode::Hybrid,
+            default_mode: SearchMode::Lexical,
         }
     }
 }

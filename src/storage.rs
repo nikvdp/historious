@@ -3527,6 +3527,24 @@ impl Store {
         self.with_conn(vector_projection_needs_repair)
     }
 
+    pub fn vector_model_available(&self, model_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM embeddings e
+                   JOIN vec_embeddings_384 v ON v.rowid = e.rowid
+                   WHERE e.model_id = ?1
+                     AND e.dims = 384
+                   LIMIT 1
+                 )",
+                params![model_id],
+                |row| row.get(0),
+            )?;
+            Ok(exists != 0)
+        })
+    }
+
     pub fn vector_search(
         &self,
         model_id: &str,
@@ -5880,6 +5898,9 @@ fn fts_query_terms<'a>(
     terms
         .into_iter()
         .flat_map(str::split_whitespace)
+        .flat_map(|term| {
+            term.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        })
         .filter_map(fts_query_term)
         .collect::<Vec<_>>()
         .join(joiner)

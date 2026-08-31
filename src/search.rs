@@ -174,7 +174,7 @@ impl SearchCorpus {
 
 impl Default for SearchMode {
     fn default() -> Self {
-        Self::Hybrid
+        Self::Lexical
     }
 }
 
@@ -218,7 +218,7 @@ impl SearchOptions {
         Self {
             limit,
             sort,
-            mode: SearchMode::Hybrid,
+            mode: SearchMode::Lexical,
             recency_bias: recency_bias.clamp(0.0, 1.0),
             after: None,
             before: None,
@@ -1068,12 +1068,20 @@ fn semantic_search(
     selected_tiers: &[&str],
 ) -> Result<(Vec<SearchRow>, Option<String>)> {
     let Some(embedder) = query_embedder else {
-        return Ok((Vec::new(), degraded_reason));
+        return Ok((
+            Vec::new(),
+            degraded_reason.or_else(|| {
+                Some(
+                    "semantic search requires embeddings; enable them with `--embeddings` or `histo config embeddings on`, then run `histo update`"
+                        .to_string(),
+                )
+            }),
+        ));
     };
     if !embedder.is_semantic() {
         return Ok((
             Vec::new(),
-            Some("query embedder is not semantic; using lexical search only".to_string()),
+            Some("query embedder is not semantic; semantic search is unavailable".to_string()),
         ));
     }
     if embedder.dims() != crate::embed::DEFAULT_SEMANTIC_DIMS {
@@ -1082,6 +1090,15 @@ fn semantic_search(
             Some(format!(
                 "query embedder dimensions {} are not supported by the local vector index",
                 embedder.dims()
+            )),
+        ));
+    }
+    if !store.vector_model_available(embedder.model_id())? {
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "no indexed vectors are available for model {}; enable embeddings and run `histo update`",
+                embedder.model_id()
             )),
         ));
     }
