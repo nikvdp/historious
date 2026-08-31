@@ -7591,6 +7591,9 @@ fn print_status_diagnostics(diagnostics: &StatusDiagnosticsOutput, color: bool) 
 }
 
 fn print_status_attention(query_embedder: &crate::embed::EmbedderStatus, color: bool) {
+    if query_embedder.provider == "disabled" {
+        return;
+    }
     if let Some(reason) = query_embedder.degraded_reason.as_deref() {
         print_section(
             "Attention",
