@@ -416,7 +416,7 @@ histo skill install search-agent-history-historious --codex
 
 const SKILLS: &[PackagedSkill] = &[PackagedSkill {
     name: "search-agent-history-historious",
-    description: "Search coding-agent conversation history through Historious robot JSON.",
+    description: "Search coding-agent history with short lexical keywords through Historious robot JSON.",
     skill_md: SEARCH_AGENT_HISTORY_HISTORIOUS,
 }];
 
