@@ -11547,6 +11547,28 @@ mod tests {
     }
 
     #[test]
+    fn search_and_tui_help_lead_with_lexical_keywords() {
+        let mut command = Cli::command();
+        let search_help = command
+            .find_subcommand_mut("search")
+            .expect("search command")
+            .render_long_help()
+            .to_string();
+        assert!(search_help.contains("Search indexed transcripts with lexical keywords"));
+        assert!(search_help.contains("all keywords match by default"));
+        assert!(search_help.contains("possible values: lexical, hybrid, semantic"));
+        assert!(search_help.contains("Enable optional embeddings"));
+
+        let tui_help = command
+            .find_subcommand_mut("tui")
+            .expect("tui command")
+            .render_long_help()
+            .to_string();
+        assert!(tui_help.contains("Initial short keyword query"));
+        assert!(tui_help.contains("lexical (default), hybrid, or semantic"));
+    }
+
+    #[test]
     fn search_match_mode_accepts_and_or_with_all_any_aliases() {
         for value in ["and", "all"] {
             let cli = Cli::try_parse_from(["histo", "search", "--match", value, "needle"])

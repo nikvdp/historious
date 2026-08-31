@@ -455,3 +455,26 @@ pub fn skill_names_for_arg(name: &str) -> Result<Vec<&'static str>> {
     }
     Ok(vec![get_skill(name).expect("checked").name])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_guidance_teaches_lexical_queries_before_semantic_search() {
+        let skill = get_skill("search-agent-history-historious")
+            .expect("packaged skill")
+            .skill_md;
+        for text in [skill, onboard_agents_md()] {
+            assert!(text.contains("histo --robot search sqlite --mode lexical --limit 20"));
+            assert!(text.contains("Lexical keyword search is the default")
+                || text.contains("Lexical search is the default"));
+            assert!(text.contains("Shell quotes group arguments but do not request phrase matching"));
+            assert!(!text.contains("distinctive query terms"));
+            assert!(!text.contains("Start with 3-8"));
+        }
+        assert!(skill.contains("### Optional Semantic Search"));
+        assert!(skill.contains("histo config embeddings on"));
+        assert!(skill.contains("--mode semantic"));
+    }
+}
