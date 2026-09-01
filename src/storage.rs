@@ -1113,6 +1113,28 @@ impl Store {
     }
 
     pub fn reassign_machine_for_source(&self, source_id: &str, machine_id: &str) -> Result<usize> {
+        let needs_repair = self.with_conn(|conn| {
+            let machine_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM machines WHERE id = ?1)",
+                params![machine_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !machine_exists {
+                bail!("cannot assign unresolved machine id {machine_id}");
+            }
+            conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sessions
+                   WHERE source_id = ?1 AND machine_id != ?2
+                 )",
+                params![source_id, machine_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })?;
+        if !needs_repair {
+            return Ok(0);
+        }
         self.with_conn(|conn| {
             with_immediate_write_tx(conn, |tx| {
                 let machine_exists = tx.query_row(
@@ -10554,6 +10576,33 @@ mod tests {
                 Ok(())
             })
             .expect("machine assignments");
+    }
+
+    #[test]
+    fn matching_machine_reassignment_does_not_take_writer_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        let source = fixture_source("source_matching_machine");
+        let mut session = fixture_session("session_matching_machine", &source.id);
+        let machine_id = "11111111-1111-4111-8111-111111111111";
+        session.machine_id = machine_id.to_string();
+        store.upsert_machine(machine_id, "workstation").expect("machine");
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source.clone()),
+                ArchiveRecord::Session(session),
+            ])
+            .expect("matching records");
+        let lock = Connection::open(store.db_path()).expect("lock connection");
+        lock.execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+
+        let repaired = store
+            .reassign_machine_for_source(&source.id, machine_id)
+            .expect("no-op reassignment");
+
+        assert_eq!(repaired, 0);
+        lock.execute_batch("ROLLBACK").expect("release writer lock");
     }
 
     #[test]
