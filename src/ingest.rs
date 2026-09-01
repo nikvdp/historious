@@ -794,6 +794,14 @@ pub enum UpdateProgress {
         sources: Vec<UpdateSourceSummary>,
         selected_files: usize,
     },
+    CheckingStatus {
+        checked_files: usize,
+        total_files: usize,
+    },
+    RefreshingTitles {
+        refreshed_titles: usize,
+        total_titles: usize,
+    },
     Processing {
         adapter_kind: String,
         kind: String,
@@ -968,11 +976,22 @@ pub fn update_local_with_progress_and_cancel(
     });
 
     let native_titles = NativeTitleIndex::load();
-    refresh_existing_native_titles(store, &native_titles)?;
+    refresh_existing_native_titles(store, &native_titles, |refreshed_titles, total_titles| {
+        progress(&UpdateProgress::RefreshingTitles {
+            refreshed_titles,
+            total_titles,
+        });
+    })?;
     let total_files = candidates.len();
     let mut source_seen = Vec::new();
     let mut pending_imports = Vec::new();
-    let source_file_statuses = precompute_local_source_file_statuses(store, &candidates)?;
+    let source_file_statuses =
+        precompute_local_source_file_statuses(store, &candidates, |checked_files, total_files| {
+            progress(&UpdateProgress::CheckingStatus {
+                checked_files,
+                total_files,
+            });
+        })?;
     let context = SourceSyncContext::new(store).with_source_file_statuses(&source_file_statuses);
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
@@ -1110,6 +1129,7 @@ pub fn update_local_with_progress_and_cancel(
 fn precompute_local_source_file_statuses(
     store: &Store,
     candidates: &[SourceCandidate],
+    progress: impl FnMut(usize, usize),
 ) -> Result<HashMap<String, SourceFileStatus>> {
     let fingerprints = candidates
         .iter()
@@ -1123,7 +1143,7 @@ fn precompute_local_source_file_statuses(
             })
         })
         .collect::<Vec<_>>();
-    store.source_checkpoint_statuses(&fingerprints)
+    store.source_checkpoint_statuses_with_progress(&fingerprints, progress)
 }
 
 struct AdapterDiscovery {
@@ -1319,7 +1339,12 @@ pub fn update_source_path_with_progress_and_cancel(
     }
     store.upsert_machine(machine_id, machine_name)?;
     let native_titles = NativeTitleIndex::load();
-    refresh_existing_native_titles(store, &native_titles)?;
+    refresh_existing_native_titles(store, &native_titles, |refreshed_titles, total_titles| {
+        progress(&UpdateProgress::RefreshingTitles {
+            refreshed_titles,
+            total_titles,
+        });
+    })?;
     if should_cancel() {
         return Ok(stats);
     }
@@ -2452,12 +2477,13 @@ impl NativeTitleIndex {
 fn refresh_existing_native_titles(
     store: &Store,
     native_titles: &NativeTitleIndex,
+    progress: impl FnMut(usize, usize),
 ) -> Result<usize> {
-    let mut changed = 0;
-    for (kind, external_session_id, title) in native_titles.iter() {
-        changed += store.update_session_title_for_external_id(kind, external_session_id, title)?;
-    }
-    Ok(changed)
+    store.update_session_titles_with_progress(
+        native_titles.iter(),
+        native_titles.titles.len(),
+        progress,
+    )
 }
 
 fn native_title_key(kind: &str, external_session_id: &str) -> String {

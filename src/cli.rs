@@ -1527,7 +1527,7 @@ impl Cli {
                         progress.startup_event(event);
                         progress.render(true);
                     }
-                    ScopedProgressEmission::Heartbeat => progress.render(true),
+                    ScopedProgressEmission::Heartbeat => progress.heartbeat(),
                 })?;
             progress.finish_startup();
             (config, store, Some(progress))
@@ -4063,7 +4063,7 @@ fn run_update_once_human(
                 progress.render(true);
             }
             ScopedProgressEmission::Event => progress.ingest_event(event),
-            ScopedProgressEmission::Heartbeat => progress.render(true),
+            ScopedProgressEmission::Heartbeat => progress.heartbeat(),
         },
     )?;
     progress.finish_ingest();
@@ -4101,7 +4101,7 @@ fn run_update_once_human(
                 progress.render(true);
             }
             ScopedProgressEmission::Event => progress.search_detail(detail.clone()),
-            ScopedProgressEmission::Heartbeat => progress.render(true),
+            ScopedProgressEmission::Heartbeat => progress.heartbeat(),
         },
     )?;
     progress.finish_search_index(projected);
@@ -6176,6 +6176,22 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
                 )
             }
         }
+        ingest::UpdateProgress::CheckingStatus {
+            checked_files,
+            total_files,
+        } => format!(
+            "checked {}/{} file checkpoints",
+            format_count(*checked_files),
+            format_count(*total_files)
+        ),
+        ingest::UpdateProgress::RefreshingTitles {
+            refreshed_titles,
+            total_titles,
+        } => format!(
+            "refreshed {}/{} saved session titles",
+            format_count(*refreshed_titles),
+            format_count(*total_titles)
+        ),
         ingest::UpdateProgress::Processing {
             adapter_kind: _,
             kind,
@@ -6286,6 +6302,22 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
                 })
             }).collect::<Vec<_>>(),
         }),
+        ingest::UpdateProgress::CheckingStatus {
+            checked_files,
+            total_files,
+        } => serde_json::json!({
+            "status": "checking_status",
+            "checked_files": checked_files,
+            "total_files": total_files,
+        }),
+        ingest::UpdateProgress::RefreshingTitles {
+            refreshed_titles,
+            total_titles,
+        } => serde_json::json!({
+            "status": "refreshing_titles",
+            "refreshed_titles": refreshed_titles,
+            "total_titles": total_titles,
+        }),
         ingest::UpdateProgress::Processing {
             adapter_kind,
             kind,
@@ -6379,6 +6411,8 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateDisplayPhase {
     Startup,
+    CheckpointStatus,
+    NativeTitles,
     LocalLogs,
     ChangedLogs,
     SearchData,
@@ -6408,8 +6442,14 @@ struct UpdateProgressView {
     phase: UpdateDisplayPhase,
     sources: BTreeMap<String, UpdateSourceProgress>,
     data_rows: BTreeMap<String, UpdateDataProgress>,
+    status_checked_files: usize,
+    status_total_files: usize,
+    refreshed_titles: usize,
+    total_titles: usize,
     report_phase_rows: Vec<(String, UpdateDataProgress)>,
     drawn_rows: usize,
+    started: Instant,
+    heartbeat_frame: usize,
     last_emit: Instant,
 }
 
@@ -6454,6 +6494,12 @@ impl UpdateProgressView {
             sources: BTreeMap::new(),
             data_rows: BTreeMap::new(),
             report_phase_rows: Vec::new(),
+            refreshed_titles: 0,
+            total_titles: 0,
+            status_checked_files: 0,
+            status_total_files: 0,
+            started: Instant::now(),
+            heartbeat_frame: 0,
             drawn_rows: 0,
             last_emit: Instant::now(),
         }
@@ -6492,6 +6538,28 @@ impl UpdateProgressView {
                 row.checked_files = source_file_index.saturating_sub(1);
                 row.state = "checking";
                 row.current_path = Some(path.clone());
+            }
+            ingest::UpdateProgress::CheckingStatus {
+                checked_files,
+                total_files,
+            } => {
+                self.phase = UpdateDisplayPhase::CheckpointStatus;
+                self.status_checked_files = *checked_files;
+                self.status_total_files = *total_files;
+                for row in self.sources.values_mut() {
+                    row.state = "waiting";
+                }
+            }
+            ingest::UpdateProgress::RefreshingTitles {
+                refreshed_titles,
+                total_titles,
+            } => {
+                self.phase = UpdateDisplayPhase::NativeTitles;
+                self.refreshed_titles = *refreshed_titles;
+                self.total_titles = *total_titles;
+                for row in self.sources.values_mut() {
+                    row.state = "waiting";
+                }
             }
             ingest::UpdateProgress::CompletedFile {
                 kind,
@@ -6852,6 +6920,11 @@ impl UpdateProgressView {
         self.render(true);
     }
 
+    fn heartbeat(&mut self) {
+        self.heartbeat_frame = self.heartbeat_frame.wrapping_add(1);
+        self.render(true);
+    }
+
     fn finish_all(&mut self) {
         self.settle_rendering();
     }
@@ -6902,13 +6975,24 @@ impl UpdateProgressView {
     }
 
     fn lines(&self) -> Vec<String> {
-        match self.phase {
+        let mut lines = match self.phase {
             UpdateDisplayPhase::Startup => self.data_lines("update: starting"),
+            UpdateDisplayPhase::CheckpointStatus => self.checkpoint_status_lines(),
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
+            UpdateDisplayPhase::NativeTitles => self.native_title_lines(),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
             UpdateDisplayPhase::ReportData => self.data_lines("report data: updating"),
+        };
+        if self.interactive {
+            let frames = ["-", "\\", "|", "/"];
+            lines[0].push_str(&format!(
+                "  {} {}s elapsed",
+                frames[self.heartbeat_frame % frames.len()],
+                self.started.elapsed().as_secs()
+            ));
         }
+        lines
     }
 
     fn lines_for_terminal(&self, columns: usize) -> Vec<String> {
@@ -6916,6 +7000,30 @@ impl UpdateProgressView {
             .into_iter()
             .map(|line| fit_terminal_line(&line, columns))
             .collect()
+    }
+
+    fn native_title_lines(&self) -> Vec<String> {
+        vec![
+            "local logs: refreshing saved session titles".to_string(),
+            format!(
+                "  titles       refreshing {}  {}/{} titles",
+                progress_meter(self.refreshed_titles, self.total_titles, 20),
+                format_count(self.refreshed_titles),
+                format_count(self.total_titles)
+            ),
+        ]
+    }
+
+    fn checkpoint_status_lines(&self) -> Vec<String> {
+        vec![
+            "local logs: checking saved file status".to_string(),
+            format!(
+                "  checkpoints  checking   {}  {}/{} files",
+                progress_meter(self.status_checked_files, self.status_total_files, 20),
+                format_count(self.status_checked_files),
+                format_count(self.status_total_files)
+            ),
+        ]
     }
 
     fn source_lines(&self, heading: &str, checking: bool) -> Vec<String> {
@@ -10890,7 +10998,67 @@ mod tests {
         view.finish_startup();
         assert!(view.lines()[1].contains("2/2 · configuration loaded and database open"));
     }
+    #[test]
+    fn update_checkpoint_progress_changes_visible_meter() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
 
+        view.ingest_event(&ingest::UpdateProgress::CheckingStatus {
+            checked_files: 0,
+            total_files: 10,
+        });
+        let initial = view.lines();
+        assert!(initial[0].contains("checking saved file status"));
+        assert!(initial[1].contains("0/10 files"));
+
+        view.ingest_event(&ingest::UpdateProgress::CheckingStatus {
+            checked_files: 5,
+            total_files: 10,
+        });
+        let advanced = view.lines();
+        assert!(advanced[1].contains("5/10 files"));
+        assert_ne!(initial[1], advanced[1]);
+    }
+
+    #[test]
+    fn update_title_progress_changes_visible_meter() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+
+        view.ingest_event(&ingest::UpdateProgress::RefreshingTitles {
+            refreshed_titles: 0,
+            total_titles: 10,
+        });
+        let initial = view.lines();
+        assert!(initial[0].contains("refreshing saved session titles"));
+        assert!(initial[1].contains("0/10 titles"));
+
+        view.ingest_event(&ingest::UpdateProgress::RefreshingTitles {
+            refreshed_titles: 5,
+            total_titles: 10,
+        });
+        let advanced = view.lines();
+        assert!(advanced[1].contains("5/10 titles"));
+        assert_ne!(initial[1], advanced[1]);
+    }
+    #[test]
+    fn update_heartbeat_changes_heading_without_changing_counts() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.ingest_event(&ingest::UpdateProgress::CheckingStatus {
+            checked_files: 5,
+            total_files: 10,
+        });
+        view.interactive = true;
+        let initial = view.lines();
+
+        view.heartbeat_frame += 1;
+        let heartbeat = view.lines();
+
+        assert_ne!(initial[0], heartbeat[0]);
+        assert_eq!(initial[1], heartbeat[1]);
+        assert!(heartbeat[1].contains("5/10 files"));
+    }
 
     #[test]
     fn default_update_progress_omits_report_work() {

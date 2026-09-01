@@ -2119,26 +2119,99 @@ impl Store {
         self.with_conn(|conn| source_checkpoint_status(conn, source_kind, source_identity, cursor))
     }
 
-    pub fn source_checkpoint_statuses(
+    pub fn source_checkpoint_statuses_with_progress(
         &self,
         files: &[SourceCheckpointFingerprint],
+        mut progress: impl FnMut(usize, usize),
     ) -> Result<HashMap<String, SourceFileStatus>> {
         if files.is_empty() {
             return Ok(HashMap::new());
         }
+        let total = files.len();
+        progress(0, total);
         self.with_conn(|conn| {
-            let mut out = HashMap::with_capacity(files.len());
-            for file in files {
-                out.insert(
-                    file.source_identity.clone(),
-                    source_checkpoint_status(
-                        conn,
-                        &file.source_kind,
-                        &file.source_identity,
-                        &file.cursor,
-                    )?,
-                );
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS temp_source_checkpoint_scope;
+                 DROP TABLE IF EXISTS temp_missing_workspace_paths;
+                 CREATE TEMP TABLE temp_source_checkpoint_scope (
+                   ordinal INTEGER PRIMARY KEY,
+                   source_kind TEXT NOT NULL,
+                   source_identity TEXT NOT NULL,
+                   cursor TEXT NOT NULL
+                 );
+                 CREATE INDEX temp_source_checkpoint_scope_identity
+                   ON temp_source_checkpoint_scope(source_identity);
+                 CREATE TEMP TABLE temp_missing_workspace_paths (
+                   source_identity TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;",
+            )?;
+            let mut insert = tx.prepare(
+                "INSERT INTO temp_source_checkpoint_scope(
+                   ordinal, source_kind, source_identity, cursor
+                 ) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (index, file) in files.iter().enumerate() {
+                insert.execute(params![
+                    index as i64,
+                    file.source_kind,
+                    file.source_identity,
+                    file.cursor,
+                ])?;
             }
+            drop(insert);
+
+            tx.execute(
+                "INSERT OR IGNORE INTO temp_missing_workspace_paths(source_identity)
+                 SELECT json_extract(s.metadata_json, '$.path')
+                 FROM sessions s
+                 JOIN temp_source_checkpoint_scope f
+                   ON f.source_identity = json_extract(s.metadata_json, '$.path')
+                 WHERE json_extract(s.metadata_json, '$.workspace_path') IS NULL",
+                [],
+            )?;
+
+            let mut stmt = tx.prepare(
+                "SELECT f.source_identity,
+                        coalesce(cp.cursor = f.cursor, 0) AS raw_current,
+                        coalesce(m.source_identity IS NOT NULL, 0) AS needs_workspace_refresh
+                 FROM temp_source_checkpoint_scope f
+                 LEFT JOIN source_checkpoints cp
+                   ON cp.source_kind = f.source_kind
+                  AND cp.source_identity = f.source_identity
+                 LEFT JOIN temp_missing_workspace_paths m
+                   ON m.source_identity = f.source_identity
+                  AND cp.cursor = f.cursor
+                 ORDER BY f.ordinal",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut out = HashMap::with_capacity(total);
+            let mut completed = 0;
+            let mut last_emit = Instant::now();
+            while let Some(row) = rows.next()? {
+                out.insert(
+                    row.get::<_, String>(0)?,
+                    SourceFileStatus {
+                        raw_current: row.get::<_, i64>(1)? != 0,
+                        needs_workspace_refresh: row.get::<_, i64>(2)? != 0,
+                    },
+                );
+                completed += 1;
+                if completed == total
+                    || completed % SQLITE_BIND_CHUNK_SIZE == 0
+                    || last_emit.elapsed() >= Duration::from_millis(900)
+                {
+                    progress(completed, total);
+                    last_emit = Instant::now();
+                }
+            }
+            drop(rows);
+            drop(stmt);
+            tx.execute_batch(
+                "DROP TABLE temp_missing_workspace_paths;
+                 DROP TABLE temp_source_checkpoint_scope;",
+            )?;
+            tx.commit()?;
             Ok(out)
         })
     }
@@ -3094,26 +3167,66 @@ impl Store {
         })
     }
 
-    pub fn update_session_title_for_external_id(
+    pub fn update_session_titles_with_progress<'a>(
         &self,
-        source_kind: &str,
-        external_id: &str,
-        title: &str,
+        titles: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+        total: usize,
+        mut progress: impl FnMut(usize, usize),
     ) -> Result<usize> {
-        let title = title.trim();
-        if title.is_empty() {
-            return Ok(0);
-        }
+        progress(0, total);
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE sessions
-                 SET title = ?3
-                 WHERE source_kind = ?1
-                   AND external_id = ?2
-                   AND coalesce(title, '') != ?3",
-                params![source_kind, external_id, title],
-            )
-            .map_err(Into::into)
+            with_immediate_write_tx(conn, |tx| {
+                tx.execute_batch(
+                    "DROP TABLE IF EXISTS temp_native_session_titles;
+                     CREATE TEMP TABLE temp_native_session_titles (
+                       source_kind TEXT NOT NULL,
+                       external_id TEXT NOT NULL,
+                       title TEXT NOT NULL,
+                       PRIMARY KEY (source_kind, external_id)
+                     ) WITHOUT ROWID;",
+                )?;
+                let mut stmt = tx.prepare(
+                    "INSERT INTO temp_native_session_titles(source_kind, external_id, title)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(source_kind, external_id) DO UPDATE SET title = excluded.title",
+                )?;
+                let mut completed = 0;
+                let mut last_emit = Instant::now();
+                for (source_kind, external_id, title) in titles {
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        stmt.execute(params![source_kind, external_id, title])?;
+                    }
+                    completed += 1;
+                    if completed == total
+                        || completed % SQLITE_BIND_CHUNK_SIZE == 0
+                        || last_emit.elapsed() >= Duration::from_millis(900)
+                    {
+                        progress(completed, total);
+                        last_emit = Instant::now();
+                    }
+                }
+                drop(stmt);
+                let changed = tx.execute(
+                    "UPDATE sessions AS s
+                     SET title = (
+                       SELECT t.title
+                       FROM temp_native_session_titles t
+                       WHERE t.source_kind = s.source_kind
+                         AND t.external_id = s.external_id
+                     )
+                     WHERE EXISTS (
+                       SELECT 1
+                       FROM temp_native_session_titles t
+                       WHERE t.source_kind = s.source_kind
+                         AND t.external_id = s.external_id
+                         AND coalesce(s.title, '') != t.title
+                     )",
+                    [],
+                )?;
+                tx.execute("DROP TABLE temp_native_session_titles", [])?;
+                Ok(changed)
+            })
         })
     }
 
@@ -9600,6 +9713,67 @@ mod tests {
         assert!(batched[current_path].needs_workspace_refresh);
         assert!(!batched[changed_path].raw_current);
         assert!(!batched[missing_path].raw_current);
+    }
+    #[test]
+    fn source_checkpoint_status_progress_advances_for_each_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let files = vec![
+            SourceCheckpointFingerprint {
+                source_kind: "codex".to_string(),
+                source_identity: "/tmp/checkpoint-a.jsonl".to_string(),
+                cursor: "file_metadata_v1:1:1".to_string(),
+            },
+            SourceCheckpointFingerprint {
+                source_kind: "codex".to_string(),
+                source_identity: "/tmp/checkpoint-b.jsonl".to_string(),
+                cursor: "file_metadata_v1:1:1".to_string(),
+            },
+        ];
+        let mut observations = Vec::new();
+        let statuses = store
+            .source_checkpoint_statuses_with_progress(&files, |completed, total| {
+                observations.push((completed, total));
+            })
+            .expect("checkpoint statuses");
+
+        assert_eq!(observations, vec![(0, 2), (2, 2)]);
+        assert_eq!(statuses.len(), 2);
+    }
+
+    #[test]
+    fn session_title_batch_uses_one_progress_sequence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_title_batch");
+        let mut first = fixture_session("session_title_batch_a", &source.id);
+        first.source_kind = "codex".to_string();
+        first.external_id = "title-a".to_string();
+        first.title = Some("old".to_string());
+        let mut second = fixture_session("session_title_batch_b", &source.id);
+        second.source_kind = "codex".to_string();
+        second.external_id = "title-b".to_string();
+        second.title = Some("old".to_string());
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(first),
+                ArchiveRecord::Session(second),
+            ])
+            .expect("import title fixtures");
+        let titles = [
+            ("codex", "title-a", "First"),
+            ("codex", "title-b", "Second"),
+        ];
+        let mut observations = Vec::new();
+        let changed = store
+            .update_session_titles_with_progress(titles, 2, |completed, total| {
+                observations.push((completed, total));
+            })
+            .expect("update titles");
+
+        assert_eq!(changed, 2);
+        assert_eq!(observations, vec![(0, 2), (2, 2)]);
     }
 
     #[test]
