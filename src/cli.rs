@@ -1517,9 +1517,50 @@ impl Cli {
         } else {
             None
         };
-        emit_startup_progress(&command, robot);
-        let mut config = AppConfig::load(data_dir)?;
-        let store = Store::open(&config.data_dir)?;
+        let update_human = matches!(&command, Command::Update { json: false, .. }) && !robot;
+        let update_machine = matches!(&command, Command::Update { .. }) && !update_human;
+        let (mut config, store, mut update_progress) = if update_human {
+            let mut progress = UpdateProgressView::startup();
+            let (config, store) =
+                load_update_resources_with_progress(data_dir, |event, emission| match emission {
+                    ScopedProgressEmission::Initial | ScopedProgressEmission::Event => {
+                        progress.startup_event(event);
+                        progress.render(true);
+                    }
+                    ScopedProgressEmission::Heartbeat => progress.render(true),
+                })?;
+            progress.finish_startup();
+            (config, store, Some(progress))
+        } else if update_machine {
+            let (config, store) =
+                load_update_resources_with_progress(data_dir, |event, _emission| {
+                    write_update_progress(
+                        "scan",
+                        update_startup_progress_detail(*event),
+                        serde_json::json!({
+                            "status": "starting",
+                            "stage": event.stage(),
+                            "completed": event.completed(),
+                            "total": UpdateStartupProgress::TOTAL,
+                        }),
+                    );
+                })?;
+            write_update_progress(
+                "scan",
+                update_startup_completion_detail(),
+                serde_json::json!({
+                    "status": "ready",
+                    "stage": "database",
+                    "completed": UpdateStartupProgress::TOTAL,
+                    "total": UpdateStartupProgress::TOTAL,
+                }),
+            );
+            (config, store, None)
+        } else {
+            let config = AppConfig::load(data_dir)?;
+            let store = Store::open(&config.data_dir)?;
+            (config, store, None)
+        };
         match command {
             Command::Update {
                 max_files,
@@ -1535,7 +1576,16 @@ impl Cli {
                         run_update_once_machine(&store, &config, max_files, source, repair)?;
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
-                    let output = run_update_once_human(&store, &config, max_files, source, repair)?;
+                    let output = run_update_once_human(
+                        &store,
+                        &config,
+                        max_files,
+                        source,
+                        repair,
+                        update_progress
+                            .take()
+                            .expect("human update progress initialized"),
+                    )?;
                     print_update_output(&output, std::io::stdout().is_terminal());
                 }
             }
@@ -3059,16 +3109,68 @@ fn print_completion(shell: Shell) {
     clap_complete::generate(shell, &mut command, "histo", &mut io::stdout());
 }
 
-fn emit_startup_progress(command: &Command, robot: bool) {
-    if robot {
-        return;
-    }
-    if let Command::Update { json, .. } = command {
-        if !json {
-            eprintln!("starting update: loading config and opening database");
-            let _ = io::stderr().flush();
+#[derive(Clone, Copy, Debug)]
+enum UpdateStartupProgress {
+    LoadingConfig,
+    OpeningDatabase,
+}
+
+impl UpdateStartupProgress {
+    const TOTAL: usize = 2;
+
+    fn stage(self) -> &'static str {
+        match self {
+            Self::LoadingConfig => "config",
+            Self::OpeningDatabase => "database",
         }
     }
+
+    fn completed(self) -> usize {
+        match self {
+            Self::LoadingConfig => 0,
+            Self::OpeningDatabase => 1,
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::LoadingConfig => "loading configuration",
+            Self::OpeningDatabase => "opening database",
+        }
+    }
+}
+
+fn update_startup_progress_detail(event: UpdateStartupProgress) -> String {
+    format!(
+        "{}/{} · {}",
+        event.completed(),
+        UpdateStartupProgress::TOTAL,
+        event.detail()
+    )
+}
+
+fn update_startup_completion_detail() -> String {
+    format!(
+        "{0}/{0} · configuration loaded and database open",
+        UpdateStartupProgress::TOTAL
+    )
+}
+
+fn load_update_resources_with_progress(
+    data_dir: Option<PathBuf>,
+    progress: impl FnMut(&UpdateStartupProgress, ScopedProgressEmission),
+) -> Result<(AppConfig, Store)> {
+    run_scoped_progress_with_timeout(
+        UpdateStartupProgress::LoadingConfig,
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        move |send| {
+            let config = AppConfig::load(data_dir)?;
+            send(UpdateStartupProgress::OpeningDatabase);
+            let store = Store::open(&config.data_dir)?;
+            Ok((config, store))
+        },
+        progress,
+    )
 }
 
 fn apply_embeddings_override(config: &mut AppConfig, embeddings: bool, no_embeddings: bool) {
@@ -3934,9 +4036,9 @@ fn run_update_once_human(
     max_files: Option<usize>,
     source: Vec<String>,
     repair: bool,
+    mut progress: UpdateProgressView,
 ) -> Result<UpdateOutput> {
     let source_selection = ingest::SourceSelection::parse(source)?;
-    let mut progress = UpdateProgressView::new();
     let ingest = run_scoped_progress_with_timeout(
         ingest::UpdateProgress::Discovering {
             sources: Vec::new(),
@@ -6276,6 +6378,7 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateDisplayPhase {
+    Startup,
     LocalLogs,
     ChangedLogs,
     SearchData,
@@ -6311,6 +6414,39 @@ struct UpdateProgressView {
 }
 
 impl UpdateProgressView {
+    fn startup() -> Self {
+        let mut view = Self::new();
+        view.phase = UpdateDisplayPhase::Startup;
+        view.data_rows.insert(
+            "startup".to_string(),
+            UpdateDataProgress {
+                state: "starting",
+                current: Some(0),
+                total: Some(UpdateStartupProgress::TOTAL),
+                detail: update_startup_progress_detail(UpdateStartupProgress::LoadingConfig),
+            },
+        );
+        view
+    }
+
+    fn startup_event(&mut self, event: &UpdateStartupProgress) {
+        self.phase = UpdateDisplayPhase::Startup;
+        let row = self.data_rows.entry("startup".to_string()).or_default();
+        row.state = "starting";
+        row.current = Some(event.completed());
+        row.total = Some(UpdateStartupProgress::TOTAL);
+        row.detail = update_startup_progress_detail(*event);
+    }
+
+    fn finish_startup(&mut self) {
+        let row = self.data_rows.entry("startup".to_string()).or_default();
+        row.state = "ready";
+        row.current = Some(UpdateStartupProgress::TOTAL);
+        row.total = Some(UpdateStartupProgress::TOTAL);
+        row.detail = update_startup_completion_detail();
+        self.render(true);
+    }
+
     fn new() -> Self {
         Self {
             interactive: std::io::stderr().is_terminal(),
@@ -6767,6 +6903,7 @@ impl UpdateProgressView {
 
     fn lines(&self) -> Vec<String> {
         match self.phase {
+            UpdateDisplayPhase::Startup => self.data_lines("update: starting"),
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
@@ -6833,7 +6970,7 @@ impl UpdateProgressView {
     fn data_lines(&self, heading: &str) -> Vec<String> {
         let mut lines = vec![heading.to_string()];
         let label_width = self.data_label_width();
-        let keys: &[&str] = &["search", "history", "report", "vectors"];
+        let keys: &[&str] = &["startup", "search", "history", "report", "vectors"];
         for key in keys {
             if let Some(row) = self.data_rows.get(*key) {
                 let meter = match (row.current, row.total) {
@@ -10738,6 +10875,22 @@ mod tests {
         assert_eq!(value["data"]["status"], "batch");
         assert_eq!(value["data"]["pending"], 128);
     }
+    #[test]
+    fn update_startup_progress_uses_truthful_meter_counts() {
+        let mut view = UpdateProgressView::startup();
+        view.interactive = false;
+
+        let initial = view.lines();
+        assert!(initial[0].contains("update: starting"));
+        assert!(initial[1].contains("0/2 · loading configuration"));
+
+        view.startup_event(&UpdateStartupProgress::OpeningDatabase);
+        assert!(view.lines()[1].contains("1/2 · opening database"));
+
+        view.finish_startup();
+        assert!(view.lines()[1].contains("2/2 · configuration loaded and database open"));
+    }
+
 
     #[test]
     fn default_update_progress_omits_report_work() {
