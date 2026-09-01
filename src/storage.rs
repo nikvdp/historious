@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 const RECENT_RESULT_REF_LIMIT: usize = 10_000;
 const SQLITE_BIND_CHUNK_SIZE: usize = 500;
+const MACHINE_REPAIR_SOURCE_CHUNK_SIZE: usize = 50;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 const HISTORY_ITEMS_PROJECTION: &str = "history_items_v2";
@@ -167,7 +168,10 @@ fn record_report_sql_phase(phase: &str, duration: Duration) {
         return;
     };
     let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
-    let total = state.phase_duration_ns.entry(phase.to_string()).or_default();
+    let total = state
+        .phase_duration_ns
+        .entry(phase.to_string())
+        .or_default();
     *total = total.saturating_add(duration_ns);
 }
 
@@ -177,8 +181,12 @@ fn flush_report_sql_profile(status: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("report SQL profiler lock is poisoned"))?
         .take()
         .context("report SQL profiling is not active")?;
-    let file = File::create(&state.output_path)
-        .with_context(|| format!("creating report SQL profile {}", state.output_path.display()))?;
+    let file = File::create(&state.output_path).with_context(|| {
+        format!(
+            "creating report SQL profile {}",
+            state.output_path.display()
+        )
+    })?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer(
         &mut writer,
@@ -294,12 +302,8 @@ unsafe extern "C" fn report_sql_profile_callback(
             1,
         )
         .max(0) as u64;
-        let phase = REPORT_SQL_PROFILE_PHASE.with(|phase| {
-            phase
-                .borrow()
-                .as_ref()
-                .map(|phase| phase.name.clone())
-        });
+        let phase = REPORT_SQL_PROFILE_PHASE
+            .with(|phase| phase.borrow().as_ref().map(|phase| phase.name.clone()));
         let Some(phase) = phase else {
             return;
         };
@@ -317,8 +321,7 @@ unsafe extern "C" fn report_sql_profile_callback(
                 ..Default::default()
             });
         aggregate.calls = aggregate.calls.saturating_add(1);
-        aggregate.total_duration_ns =
-            aggregate.total_duration_ns.saturating_add(duration_ns);
+        aggregate.total_duration_ns = aggregate.total_duration_ns.saturating_add(duration_ns);
         aggregate.max_duration_ns = aggregate.max_duration_ns.max(duration_ns);
         aggregate.full_scan_steps = aggregate.full_scan_steps.saturating_add(full_scan_steps);
         aggregate.vm_steps = aggregate.vm_steps.saturating_add(vm_steps);
@@ -338,11 +341,7 @@ fn install_report_sql_profile(conn: &Connection) -> Result<()> {
     if code == rusqlite::ffi::SQLITE_OK {
         Ok(())
     } else {
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(code),
-            None,
-        )
-        .into())
+        Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into())
     }
 }
 
@@ -1112,6 +1111,109 @@ impl Store {
         })
     }
 
+    pub fn source_ids_needing_machine_reassignment(
+        &self,
+        source_ids: &[String],
+        machine_id: &str,
+    ) -> Result<HashSet<String>> {
+        if source_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.with_conn(|conn| {
+            let mut out = HashSet::new();
+            for chunk in source_ids.chunks(SQLITE_BIND_CHUNK_SIZE) {
+                let sql = format!(
+                    "SELECT DISTINCT source_id
+                     FROM sessions
+                     WHERE source_id IN ({}) AND machine_id != ?",
+                    placeholders(chunk.len())
+                );
+                let values = chunk
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(machine_id));
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    out.insert(row?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn reassign_machine_for_sources_with_progress(
+        &self,
+        source_ids: &[String],
+        machine_id: &str,
+        mut progress: impl FnMut(usize, usize, usize),
+    ) -> Result<usize> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let total = source_ids.len();
+        progress(0, total, 0);
+        self.with_conn(|conn| {
+            let machine_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM machines WHERE id = ?1)",
+                params![machine_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !machine_exists {
+                bail!("cannot assign unresolved machine id {machine_id}");
+            }
+
+            let mut repaired_sessions = 0;
+            let mut completed = 0;
+            for chunk in source_ids.chunks(MACHINE_REPAIR_SOURCE_CHUNK_SIZE) {
+                let source_placeholders = placeholders(chunk.len());
+                let repaired = with_immediate_write_tx(conn, |tx| {
+                    let values = || {
+                        std::iter::once(machine_id)
+                            .chain(chunk.iter().map(String::as_str))
+                            .chain(std::iter::once(machine_id))
+                    };
+                    let repaired = tx.execute(
+                        &format!(
+                            "UPDATE sessions SET machine_id = ?
+                             WHERE source_id IN ({source_placeholders}) AND machine_id != ?"
+                        ),
+                        params_from_iter(values()),
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "UPDATE events SET machine_id = ?
+                             WHERE source_id IN ({source_placeholders}) AND machine_id != ?"
+                        ),
+                        params_from_iter(values()),
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "UPDATE history_items SET machine_id = ?
+                             WHERE session_id IN (
+                               SELECT id FROM sessions WHERE source_id IN ({source_placeholders})
+                             )
+                             AND machine_id != ?"
+                        ),
+                        params_from_iter(values()),
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "UPDATE search_units SET machine_id = ?
+                             WHERE source_id IN ({source_placeholders}) AND machine_id != ?"
+                        ),
+                        params_from_iter(values()),
+                    )?;
+                    Ok(repaired)
+                })?;
+                repaired_sessions += repaired;
+                completed += chunk.len();
+                progress(completed, total, repaired_sessions);
+            }
+            Ok(repaired_sessions)
+        })
+    }
+
     pub fn reassign_machine_for_source(&self, source_id: &str, machine_id: &str) -> Result<usize> {
         let needs_repair = self.with_conn(|conn| {
             let machine_exists = conn.query_row(
@@ -1150,15 +1252,24 @@ impl Store {
                      WHERE source_id = ?1 AND machine_id != ?2",
                     params![source_id, machine_id],
                 )?;
-                for table in ["events", "history_items", "search_units"] {
-                    tx.execute(
-                        &format!(
-                            "UPDATE {table} SET machine_id = ?2
-                             WHERE source_id = ?1 AND machine_id != ?2"
-                        ),
-                        params![source_id, machine_id],
-                    )?;
-                }
+                tx.execute(
+                    "UPDATE events SET machine_id = ?2
+                     WHERE source_id = ?1 AND machine_id != ?2",
+                    params![source_id, machine_id],
+                )?;
+                tx.execute(
+                    "UPDATE history_items SET machine_id = ?2
+                     WHERE session_id IN (
+                       SELECT id FROM sessions WHERE source_id = ?1
+                     )
+                     AND machine_id != ?2",
+                    params![source_id, machine_id],
+                )?;
+                tx.execute(
+                    "UPDATE search_units SET machine_id = ?2
+                     WHERE source_id = ?1 AND machine_id != ?2",
+                    params![source_id, machine_id],
+                )?;
                 Ok(repaired)
             })
         })
@@ -1321,7 +1432,8 @@ impl Store {
                 )?;
                 let mut repaired = Vec::new();
                 for event in events {
-                    if stmt.execute(params![event.id, event.metadata.to_string(), event.hash])? > 0 {
+                    if stmt.execute(params![event.id, event.metadata.to_string(), event.hash])? > 0
+                    {
                         repaired.push(event.id.clone());
                     }
                 }
@@ -2000,10 +2112,7 @@ impl Store {
         self.with_conn(history_items_projection_health)
     }
 
-    pub fn history_items_for_event(
-        &self,
-        event_id: &str,
-    ) -> Result<Vec<HistoryItemRecord>> {
+    pub fn history_items_for_event(&self, event_id: &str) -> Result<Vec<HistoryItemRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, event_id, session_id, source_id, machine_id, source_kind,
@@ -2286,6 +2395,26 @@ impl Store {
                      AND json_extract(metadata_json, '$.workspace_path') IS NULL
                  )",
                 ["/tmp/fixture.jsonl"],
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn machine_reassignment_history_items_query_plan(
+        &self,
+        source_id: &str,
+        machine_id: &str,
+    ) -> Result<String> {
+        self.with_conn(|conn| {
+            query_plan(
+                conn,
+                "EXPLAIN QUERY PLAN
+                 UPDATE history_items SET machine_id = ?2
+                 WHERE session_id IN (
+                   SELECT id FROM sessions WHERE source_id = ?1
+                 )
+                 AND machine_id != ?2",
+                [source_id, machine_id],
             )
         })
     }
@@ -2976,10 +3105,7 @@ impl Store {
 
     /// Look up pi-compatible sessions whose timestamp-prefixed external_id ends with
     /// `_<native_id>`. This lets users pass the bare UUID displayed by pi or OMP.
-    pub fn sessions_by_pi_native_id(
-        &self,
-        native_id: &str,
-    ) -> Result<Vec<SessionRecord>> {
+    pub fn sessions_by_pi_native_id(&self, native_id: &str) -> Result<Vec<SessionRecord>> {
         let escaped = native_id
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -5961,7 +6087,9 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !columns.iter().any(|name| name == column) {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
     }
     Ok(())
 }
@@ -8240,7 +8368,10 @@ fn populate_thread_today_message_counts(
         values.push(opt_sql_text(Some(today_before.to_rfc3339())));
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
         })?;
         for row in rows {
             let (session_id, count) = row?;
@@ -9529,6 +9660,12 @@ mod tests {
         let history_plan = store
             .incremental_history_items_event_lookup_query_plan(&[event.id])
             .expect("history item event lookup plan");
+        let machine_repair_plan = store
+            .machine_reassignment_history_items_query_plan(
+                "source_query_plan",
+                "machine_query_plan",
+            )
+            .expect("machine reassignment history items plan");
 
         assert!(
             raw_plan.contains("SEARCH raw_artifacts"),
@@ -9549,6 +9686,14 @@ mod tests {
         assert!(
             history_plan.contains("SEARCH e"),
             "incremental history projection should look up events by id:\n{history_plan}"
+        );
+        assert!(
+            machine_repair_plan.contains("idx_history_items_session_order"),
+            "machine repair should look up history items by session:\n{machine_repair_plan}"
+        );
+        assert!(
+            machine_repair_plan.contains("idx_sessions_source"),
+            "machine repair should look up sessions by source:\n{machine_repair_plan}"
         );
     }
 
@@ -10094,8 +10239,7 @@ mod tests {
             started_at: None,
             updated_at: None,
             metadata: json!({}),
-            hash: stable_hash(&("session_pi", source.id.as_str(), "pi"))
-                .expect("session hash"),
+            hash: stable_hash(&("session_pi", source.id.as_str(), "pi")).expect("session hash"),
         };
         let omp_session = SessionRecord {
             id: "session_omp".to_string(),
@@ -10550,7 +10694,9 @@ mod tests {
             .expect("legacy records");
         store.refresh_history_items().expect("history projection");
         let machine_id = "11111111-1111-4111-8111-111111111111";
-        store.upsert_machine(machine_id, "workstation").expect("machine");
+        store
+            .upsert_machine(machine_id, "workstation")
+            .expect("machine");
 
         let repaired = store
             .reassign_machine_for_source(&local_session.source_id, machine_id)
@@ -10586,7 +10732,9 @@ mod tests {
         let mut session = fixture_session("session_matching_machine", &source.id);
         let machine_id = "11111111-1111-4111-8111-111111111111";
         session.machine_id = machine_id.to_string();
-        store.upsert_machine(machine_id, "workstation").expect("machine");
+        store
+            .upsert_machine(machine_id, "workstation")
+            .expect("machine");
         store
             .import_records(&[
                 ArchiveRecord::Source(source.clone()),

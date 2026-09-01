@@ -149,7 +149,11 @@ pub enum Command {
         exclude: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
-        #[arg(long, value_enum, help = "Search mode override: lexical (default), hybrid, or semantic")]
+        #[arg(
+            long,
+            value_enum,
+            help = "Search mode override: lexical (default), hybrid, or semantic"
+        )]
         mode: Option<SearchModeArg>,
         #[arg(
             long = "match",
@@ -255,7 +259,11 @@ pub enum Command {
         server_url: Option<String>,
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance, help = "Sort results by relevance or time")]
         sort: SearchSort,
-        #[arg(long, value_enum, help = "Search mode override: lexical (default), hybrid, or semantic")]
+        #[arg(
+            long,
+            value_enum,
+            help = "Search mode override: lexical (default), hybrid, or semantic"
+        )]
         mode: Option<SearchModeArg>,
         #[arg(
             short = 'e',
@@ -938,7 +946,10 @@ pub enum EnrichCommand {
         concurrency: usize,
         #[arg(long, default_value = "sentiment-v1")]
         annotator_version: String,
-        #[arg(long, help = "Explicitly approve the displayed transmission without prompting")]
+        #[arg(
+            long,
+            help = "Explicitly approve the displayed transmission without prompting"
+        )]
         yes: bool,
     },
     /// Add provider-generated labels over coherent local topic clusters.
@@ -947,7 +958,10 @@ pub enum EnrichCommand {
         limit: Option<usize>,
         #[arg(long, default_value = "topic-label-v1")]
         labeler_version: String,
-        #[arg(long, help = "Explicitly approve the displayed transmission without prompting")]
+        #[arg(
+            long,
+            help = "Explicitly approve the displayed transmission without prompting"
+        )]
         yes: bool,
     },
     /// Preview or remove one version of derived enrichment data.
@@ -956,7 +970,10 @@ pub enum EnrichCommand {
         kind: EnrichmentKindArg,
         #[arg(long)]
         version: String,
-        #[arg(long, help = "Delete the selected derived rows after previewing the count")]
+        #[arg(
+            long,
+            help = "Delete the selected derived rows after previewing the count"
+        )]
         yes: bool,
     },
 }
@@ -1699,11 +1716,7 @@ impl Cli {
                         output,
                         crate::output::EnvelopeOptions {
                             degraded_reason: response.degraded_reason.clone(),
-                            hints: search_hints(
-                                &response.results,
-                                &refs,
-                                machine_filter_active,
-                            ),
+                            hints: search_hints(&response.results, &refs, machine_filter_active),
                             ..Default::default()
                         },
                     )?;
@@ -1720,14 +1733,7 @@ impl Cli {
                         store.record_recent_result_refs(&recent_ref_inputs(&response.results))?;
                     let columns = resolve_columns(verbose, cols, include, exclude)?;
                     let color = !no_color && !robot && std::io::stdout().is_terminal();
-                    print_search_results(
-                        &query,
-                        &response.results,
-                        &refs,
-                        &columns,
-                        mode,
-                        color,
-                    );
+                    print_search_results(&query, &response.results, &refs, &columns, mode, color);
                     print_machine_identity_diagnostic(machine_identity.as_ref());
                 }
             }
@@ -1889,127 +1895,112 @@ impl Cli {
                 only,
             } => {
                 let has_explicit_event = event.is_some() || search_unit.is_some();
-                let event_id = match resolve_context_event_id(
-                    &store,
-                    target.clone(),
-                    event,
-                    search_unit,
-                ) {
-                    Ok(id) => id,
-                    Err(original_err) => {
-                        if !has_explicit_event {
-                            if let Some(ref target_str) = target {
-                                if let Some(session) =
-                                    resolve_session_target(&store, target_str)?
-                                {
-                                    if only {
-                                        bail!(
-                                            "--only requires a specific event; \
+                let event_id =
+                    match resolve_context_event_id(&store, target.clone(), event, search_unit) {
+                        Ok(id) => id,
+                        Err(original_err) => {
+                            if !has_explicit_event {
+                                if let Some(ref target_str) = target {
+                                    if let Some(session) =
+                                        resolve_session_target(&store, target_str)?
+                                    {
+                                        if only {
+                                            bail!(
+                                                "--only requires a specific event; \
                                              '{target_str}' resolved as a session, not an event"
-                                        );
-                                    }
-                                    eprintln!(
-                                        "warning: '{}' is a session, not an event; \
+                                            );
+                                        }
+                                        eprintln!(
+                                            "warning: '{}' is a session, not an event; \
                                          showing transcript for session {}",
-                                        target_str,
-                                        session.id
-                                    );
-                                    let session_record = store
-                                        .session_by_id(&session.id)?
-                                        .ok_or_else(|| {
-                                            anyhow::anyhow!(
-                                                "session not found: {}",
-                                                session.id
-                                            )
-                                        })?;
-                                    if json || robot {
-                                        if full {
-                                            let events =
-                                                store.events_for_session(&session.id)?;
-                                            crate::output::write_success(
-                                                "transcript",
-                                                transcript_output(
-                                                    &store,
-                                                    &session_record,
-                                                    &events,
-                                                    None,
-                                                    None,
-                                                )?,
-                                                Default::default(),
+                                            target_str, session.id
+                                        );
+                                        let session_record =
+                                            store.session_by_id(&session.id)?.ok_or_else(|| {
+                                                anyhow::anyhow!("session not found: {}", session.id)
+                                            })?;
+                                        if json || robot {
+                                            if full {
+                                                let events =
+                                                    store.events_for_session(&session.id)?;
+                                                crate::output::write_success(
+                                                    "transcript",
+                                                    transcript_output(
+                                                        &store,
+                                                        &session_record,
+                                                        &events,
+                                                        None,
+                                                        None,
+                                                    )?,
+                                                    Default::default(),
+                                                )?;
+                                            } else {
+                                                let context = store
+                                                    .history_items_for_transcript_session(
+                                                        &session.id,
+                                                    )?
+                                                    .ok_or_else(|| {
+                                                        anyhow::anyhow!(
+                                                            "session not found: {}",
+                                                            session.id
+                                                        )
+                                                    })?;
+                                                crate::output::write_success(
+                                                    "transcript",
+                                                    history_transcript_output(
+                                                        &store, &context, None,
+                                                    )?,
+                                                    Default::default(),
+                                                )?;
+                                            }
+                                        } else if full {
+                                            let events = store.events_for_session(&session.id)?;
+                                            let mut metadata = view_metadata_for_session(
+                                                &store,
+                                                &session_record,
+                                                None,
+                                                verbose,
                                             )?;
+                                            metadata.timestamps = !no_timestamps;
+                                            let color = should_color(no_color, color, robot);
+                                            let rendered = crate::transcript::render_session(
+                                                &session_record,
+                                                &events,
+                                                None,
+                                                &metadata,
+                                                color,
+                                            );
+                                            page_or_print_markdown(&rendered, None, false, color)?;
                                         } else {
+                                            let mut metadata = view_metadata_for_session(
+                                                &store,
+                                                &session_record,
+                                                None,
+                                                verbose,
+                                            )?;
+                                            metadata.timestamps = !no_timestamps;
+                                            let color = should_color(no_color, color, robot);
                                             let context = store
-                                                .history_items_for_transcript_session(
-                                                    &session.id,
-                                                )?
+                                                .history_items_for_transcript_session(&session.id)?
                                                 .ok_or_else(|| {
                                                     anyhow::anyhow!(
                                                         "session not found: {}",
                                                         session.id
                                                     )
                                                 })?;
-                                            crate::output::write_success(
-                                                "transcript",
-                                                history_transcript_output(
-                                                    &store,
-                                                    &context,
-                                                    None,
-                                                )?,
-                                                Default::default(),
-                                            )?;
+                                            let rendered =
+                                                crate::transcript::render_history_session(
+                                                    &context, &metadata, color,
+                                                );
+                                            page_or_print_markdown(&rendered, None, false, color)?;
                                         }
-                                    } else if full {
-                                        let events =
-                                            store.events_for_session(&session.id)?;
-                                        let mut metadata = view_metadata_for_session(
-                                            &store,
-                                            &session_record,
-                                            None,
-                                            verbose,
-                                        )?;
-                                        metadata.timestamps = !no_timestamps;
-                                        let color = should_color(no_color, color, robot);
-                                        let rendered = crate::transcript::render_session(
-                                            &session_record,
-                                            &events,
-                                            None,
-                                            &metadata,
-                                            color,
-                                        );
-                                        page_or_print_markdown(&rendered, None, false, color)?;
-                                    } else {
-                                        let mut metadata = view_metadata_for_session(
-                                            &store,
-                                            &session_record,
-                                            None,
-                                            verbose,
-                                        )?;
-                                        metadata.timestamps = !no_timestamps;
-                                        let color = should_color(no_color, color, robot);
-                                        let context = store
-                                            .history_items_for_transcript_session(
-                                                &session.id,
-                                            )?
-                                            .ok_or_else(|| {
-                                                anyhow::anyhow!(
-                                                    "session not found: {}",
-                                                    session.id
-                                                )
-                                            })?;
-                                        let rendered = crate::transcript::render_history_session(
-                                            &context,
-                                            &metadata,
-                                            color,
-                                        );
-                                        page_or_print_markdown(&rendered, None, false, color)?;
+                                        return Ok(());
                                     }
-                                    return Ok(());
                                 }
                             }
+                            return Err(original_err);
                         }
-                        return Err(original_err);
-                    }
-                };
+                    };
                 if json || robot {
                     if full {
                         let context = store
@@ -2055,12 +2046,15 @@ impl Cli {
                         );
                     }
                     let color = should_color(no_color, color, robot);
-                    print_markdown(&crate::transcript::render_history_items(
-                        &items,
+                    print_markdown(
+                        &crate::transcript::render_history_items(
+                            &items,
+                            color,
+                            verbose,
+                            !no_timestamps,
+                        ),
                         color,
-                        verbose,
-                        !no_timestamps,
-                    ), color)?;
+                    )?;
                 } else if full {
                     let context = store
                         .events_around_event(&event_id, before, after)?
@@ -2069,9 +2063,10 @@ impl Cli {
                         view_metadata_for_event(&store, &context.target_event, verbose)?;
                     metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
-                    print_markdown(&crate::transcript::render_context(
-                        &context, &metadata, color,
-                    ), color)?;
+                    print_markdown(
+                        &crate::transcript::render_context(&context, &metadata, color),
+                        color,
+                    )?;
                 } else {
                     let context = store
                         .history_items_around_event(&event_id, before, after)?
@@ -2083,9 +2078,10 @@ impl Cli {
                     };
                     metadata.timestamps = !no_timestamps;
                     let color = should_color(no_color, color, robot);
-                    print_markdown(&crate::transcript::render_history_context(
-                        &context, &metadata, color,
-                    ), color)?;
+                    print_markdown(
+                        &crate::transcript::render_history_context(&context, &metadata, color),
+                        color,
+                    )?;
                 }
             }
             Command::Transcript {
@@ -2180,12 +2176,15 @@ impl Cli {
                         );
                     }
                     let color = should_color(no_color, color, robot);
-                    print_markdown(&crate::transcript::render_history_items(
-                        &items,
+                    print_markdown(
+                        &crate::transcript::render_history_items(
+                            &items,
+                            color,
+                            verbose,
+                            !no_timestamps,
+                        ),
                         color,
-                        verbose,
-                        !no_timestamps,
-                    ), color)?;
+                    )?;
                 } else if last || last_answer {
                     let context = store
                         .history_items_for_transcript_session(&session)?
@@ -2200,20 +2199,20 @@ impl Cli {
                                 anyhow::anyhow!("no assistant answer found in session {session}")
                             })?
                     } else {
-                        context
-                            .items
-                            .last()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("no conversation items found in session {session}")
-                            })?
+                        context.items.last().ok_or_else(|| {
+                            anyhow::anyhow!("no conversation items found in session {session}")
+                        })?
                     };
                     let color = should_color(no_color, color, robot);
-                    print_markdown(&crate::transcript::render_single_history_item(
-                        selected,
+                    print_markdown(
+                        &crate::transcript::render_single_history_item(
+                            selected,
+                            color,
+                            verbose,
+                            !no_timestamps,
+                        ),
                         color,
-                        verbose,
-                        !no_timestamps,
-                    ), color)?;
+                    )?;
                 } else if full {
                     let events = store.events_for_session(&session)?;
                     let events = if let Some(grep) = &grep {
@@ -2236,7 +2235,12 @@ impl Cli {
                         &metadata,
                         color,
                     );
-                    page_or_print_markdown(&rendered, target_event_id.as_deref(), no_pager || robot, color)?;
+                    page_or_print_markdown(
+                        &rendered,
+                        target_event_id.as_deref(),
+                        no_pager || robot,
+                        color,
+                    )?;
                 } else {
                     let mut metadata = view_metadata_for_session(
                         &store,
@@ -2260,7 +2264,12 @@ impl Cli {
                     }
                     let rendered =
                         crate::transcript::render_history_session(&context, &metadata, color);
-                    page_or_print_markdown(&rendered, target_event_id.as_deref(), no_pager || robot, color)?;
+                    page_or_print_markdown(
+                        &rendered,
+                        target_event_id.as_deref(),
+                        no_pager || robot,
+                        color,
+                    )?;
                 }
             }
             Command::Tail {
@@ -2637,37 +2646,34 @@ impl Cli {
                     }
                 }
             },
-            Command::Enrich { command } => {
-                match command {
-                    EnrichCommand::Sentiment {
+            Command::Enrich { command } => match command {
+                EnrichCommand::Sentiment {
+                    limit,
+                    batch_size,
+                    concurrency,
+                    annotator_version,
+                    yes,
+                } => {
+                    let llm = crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
+                    if limit == Some(0) {
+                        bail!("annotation limit must be greater than zero");
+                    }
+                    let options = crate::annotate::AnnotateOptions {
                         limit,
                         batch_size,
                         concurrency,
                         annotator_version,
-                        yes,
-                    } => {
-                        let llm =
-                            crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
-                        if limit == Some(0) {
-                            bail!("annotation limit must be greater than zero");
-                        }
-                        let options = crate::annotate::AnnotateOptions {
-                            limit,
-                            batch_size,
-                            concurrency,
-                            annotator_version,
-                        };
-                        let preflight =
-                            crate::annotate::sentiment_preflight(&store, &llm, &options)?;
-                        approve_enrichment(&preflight, yes)?;
-                        crate::annotate::record_enrichment_run(
-                            &store,
-                            "sentiment",
-                            &options.annotator_version,
-                            &preflight,
-                        )?;
-                        let outcome = crate::annotate::annotate_messages(&store, &llm, &options)?;
-                        println!(
+                    };
+                    let preflight = crate::annotate::sentiment_preflight(&store, &llm, &options)?;
+                    approve_enrichment(&preflight, yes)?;
+                    crate::annotate::record_enrichment_run(
+                        &store,
+                        "sentiment",
+                        &options.annotator_version,
+                        &preflight,
+                    )?;
+                    let outcome = crate::annotate::annotate_messages(&store, &llm, &options)?;
+                    println!(
                             "Sentiment annotations {} ({}): {} messages, {} scores added, {} messages reused, {} pending",
                             outcome.annotator_version,
                             outcome.model,
@@ -2676,56 +2682,53 @@ impl Cli {
                             outcome.skipped_messages,
                             outcome.pending_messages
                         );
+                }
+                EnrichCommand::Topics {
+                    limit,
+                    labeler_version,
+                    yes,
+                } => {
+                    let llm = crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
+                    if limit == Some(0) {
+                        bail!("topic label limit must be greater than zero");
                     }
-                    EnrichCommand::Topics {
-                        limit,
-                        labeler_version,
-                        yes,
-                    } => {
-                        let llm =
-                            crate::annotate::ConfiguredJsonLlm::from_config(&config.enrichment)?;
-                        if limit == Some(0) {
-                            bail!("topic label limit must be greater than zero");
-                        }
-                        let preflight =
-                            topics::topic_label_preflight(&store, &llm, &labeler_version, limit)?;
-                        approve_enrichment(&preflight, yes)?;
-                        crate::annotate::record_enrichment_run(
-                            &store,
-                            "topics",
-                            &labeler_version,
-                            &preflight,
-                        )?;
-                        let outcome = topics::label_topics(&store, &llm, &labeler_version, limit)?;
-                        println!(
-                            "Topic labels {} ({}): {} added, {} reused, {} pending",
-                            outcome.version,
-                            outcome.model,
-                            outcome.labeled,
-                            outcome.skipped,
-                            outcome.pending
-                        );
-                    }
-                    EnrichCommand::Delete { kind, version, yes } => {
-                        let kind = kind.as_str();
-                        let rows = crate::annotate::enrichment_row_count(&store, kind, &version)?;
-                        println!(
+                    let preflight =
+                        topics::topic_label_preflight(&store, &llm, &labeler_version, limit)?;
+                    approve_enrichment(&preflight, yes)?;
+                    crate::annotate::record_enrichment_run(
+                        &store,
+                        "topics",
+                        &labeler_version,
+                        &preflight,
+                    )?;
+                    let outcome = topics::label_topics(&store, &llm, &labeler_version, limit)?;
+                    println!(
+                        "Topic labels {} ({}): {} added, {} reused, {} pending",
+                        outcome.version,
+                        outcome.model,
+                        outcome.labeled,
+                        outcome.skipped,
+                        outcome.pending
+                    );
+                }
+                EnrichCommand::Delete { kind, version, yes } => {
+                    let kind = kind.as_str();
+                    let rows = crate::annotate::enrichment_row_count(&store, kind, &version)?;
+                    println!(
                             "Enrichment deletion preview: {rows} derived {kind} rows for version {version}"
                         );
-                        if !yes {
-                            bail!(
+                    if !yes {
+                        bail!(
                                 "nothing deleted; rerun with `histo enrich delete --kind {kind} --version {version} --yes`"
                             );
-                        }
-                        let outcome =
-                            crate::annotate::delete_enrichment(&store, kind, &version)?;
-                        println!(
-                            "Deleted {} derived {} rows for version {}",
-                            outcome.derived_rows, outcome.kind, outcome.version
-                        );
                     }
+                    let outcome = crate::annotate::delete_enrichment(&store, kind, &version)?;
+                    println!(
+                        "Deleted {} derived {} rows for version {}",
+                        outcome.derived_rows, outcome.kind, outcome.version
+                    );
                 }
-            }
+            },
             Command::Daemon {
                 interval_secs,
                 max_files,
@@ -2894,12 +2897,8 @@ impl Cli {
                         bail!("topic embedding limit must be greater than zero");
                     }
                     let embedder = topics::load_embedder(&config.data_dir)?;
-                    let outcome = topics::backfill(
-                        &store,
-                        &config.machine_id,
-                        embedder.as_ref(),
-                        limit,
-                    )?;
+                    let outcome =
+                        topics::backfill(&store, &config.machine_id, embedder.as_ref(), limit)?;
                     println!(
                         "Topic embeddings ({}): {} added, {} reused, {} pending, {} vectors indexed ({:.1}/s)",
                         outcome.model_id,
@@ -3095,12 +3094,7 @@ fn print_service_status(action: crate::service::Action, status: &crate::service:
             (false, true) => "active · definition missing",
             (false, false) => "not installed",
         };
-        println!(
-            "  {:<8} {} · {}",
-            job.name,
-            state,
-            job.schedule
-        );
+        println!("  {:<8} {} · {}", job.name, state, job.schedule);
     }
 }
 
@@ -3314,10 +3308,7 @@ fn print_config_output(output: &ConfigOutput) {
     );
 }
 
-fn approve_enrichment(
-    preflight: &crate::annotate::EnrichmentPreflight,
-    yes: bool,
-) -> Result<()> {
+fn approve_enrichment(preflight: &crate::annotate::EnrichmentPreflight, yes: bool) -> Result<()> {
     println!("Enrichment transmission preflight");
     println!("  provider: {}", preflight.provider);
     println!("  model: {}", preflight.model);
@@ -3852,6 +3843,7 @@ fn run_update_once_machine(
     repair: bool,
 ) -> Result<UpdateOutput> {
     let source_selection = ingest::SourceSelection::parse(source)?;
+    let mut last_scan_emit = Instant::now() - UPDATE_PROGRESS_HEARTBEAT_INTERVAL;
     let ingest = run_scoped_progress_with_timeout(
         ingest::UpdateProgress::Discovering {
             sources: Vec::new(),
@@ -3866,16 +3858,22 @@ fn run_update_once_machine(
                     max_files,
                     source_selection,
                     sources: config.sources.clone(),
+                    repair_machine_assignments: repair,
                 },
                 |event| send(event.clone()),
             )
         },
-        |event, _emission| {
-            write_update_progress(
-                "scan",
-                update_progress_detail(event),
-                update_progress_payload(event),
-            );
+        |event, emission| {
+            if emission != ScopedProgressEmission::Event
+                || last_scan_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
+            {
+                write_update_progress(
+                    "scan",
+                    update_progress_detail(event),
+                    update_progress_payload(event),
+                );
+                last_scan_emit = Instant::now();
+            }
         },
     )?;
     write_update_progress(
@@ -4053,6 +4051,7 @@ fn run_update_once_human(
                     max_files,
                     source_selection,
                     sources: config.sources.clone(),
+                    repair_machine_assignments: repair,
                 },
                 |event| send(event.clone()),
             )
@@ -4939,7 +4938,10 @@ fn path_bytes(path: &Path) -> u64 {
 
 fn print_update_output(output: &UpdateOutput, color: bool) {
     println!();
-    println!("{}", styled_role("Update complete", StyleRole::Header, color));
+    println!(
+        "{}",
+        styled_role("Update complete", StyleRole::Header, color)
+    );
     print_section(
         "Files",
         &[
@@ -4960,7 +4962,11 @@ fn print_update_output(output: &UpdateOutput, color: bool) {
 }
 
 fn print_report_summary(report: &analytics::ReportRefreshOutcome, color: bool) {
-    let status = if report.refreshed { "Refreshed" } else { "Current" };
+    let status = if report.refreshed {
+        "Refreshed"
+    } else {
+        "Current"
+    };
     let mode = if !report.refreshed {
         "no refresh"
     } else if report.full_rebuild {
@@ -4973,10 +4979,7 @@ fn print_report_summary(report: &analytics::ReportRefreshOutcome, color: bool) {
         &[
             ("Status", status.to_string()),
             ("Mode", mode.to_string()),
-            (
-                "Affected sessions",
-                format_count(report.affected_sessions),
-            ),
+            ("Affected sessions", format_count(report.affected_sessions)),
             ("Affected events", format_count(report.affected_events)),
         ],
         color,
@@ -4985,7 +4988,10 @@ fn print_report_summary(report: &analytics::ReportRefreshOutcome, color: bool) {
 
 fn print_import_output(output: &ImportOutput, color: bool) {
     println!();
-    println!("{}", styled_role("Import complete", StyleRole::Header, color));
+    println!(
+        "{}",
+        styled_role("Import complete", StyleRole::Header, color)
+    );
     print_section(
         "Records",
         &[
@@ -5732,10 +5738,7 @@ fn report_progress_count_detail(event: &analytics::ReportRefreshProgress) -> Str
     }
 }
 
-fn report_progress_detail(
-    event: &analytics::ReportRefreshProgress,
-    elapsed: Duration,
-) -> String {
+fn report_progress_detail(event: &analytics::ReportRefreshProgress, elapsed: Duration) -> String {
     format!(
         "{} ({}s elapsed)",
         report_progress_count_detail(event),
@@ -5868,7 +5871,6 @@ fn report_refresh_mode(report: &analytics::ReportRefreshOutcome) -> &'static str
     }
 }
 
-
 fn prior_hash_progress_detail(completed: usize, total: usize) -> String {
     format!(
         "capturing prior message templates {}/{}",
@@ -5966,7 +5968,11 @@ fn refresh_report_incrementally_for_command(
                     total: latest.total,
                     detail: report_completion_detail(outcome),
                 };
-                let status = if outcome.refreshed { "refreshed" } else { "current" };
+                let status = if outcome.refreshed {
+                    "refreshed"
+                } else {
+                    "current"
+                };
                 write_machine_progress(
                     "report",
                     "refresh",
@@ -6192,6 +6198,16 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(*refreshed_titles),
             format_count(*total_titles)
         ),
+        ingest::UpdateProgress::RepairingMachineAssignments {
+            completed_sources,
+            total_sources,
+            repaired_sessions,
+        } => format!(
+            "repaired {}/{} source machine assignments; {} sessions updated",
+            format_count(*completed_sources),
+            format_count(*total_sources),
+            format_count(*repaired_sessions)
+        ),
         ingest::UpdateProgress::Processing {
             adapter_kind: _,
             kind,
@@ -6318,6 +6334,16 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "refreshed_titles": refreshed_titles,
             "total_titles": total_titles,
         }),
+        ingest::UpdateProgress::RepairingMachineAssignments {
+            completed_sources,
+            total_sources,
+            repaired_sessions,
+        } => serde_json::json!({
+            "status": "repairing_machine_assignments",
+            "completed_sources": completed_sources,
+            "total_sources": total_sources,
+            "repaired_sessions": repaired_sessions,
+        }),
         ingest::UpdateProgress::Processing {
             adapter_kind,
             kind,
@@ -6413,6 +6439,7 @@ enum UpdateDisplayPhase {
     Startup,
     CheckpointStatus,
     NativeTitles,
+    MachineAssignments,
     LocalLogs,
     ChangedLogs,
     SearchData,
@@ -6446,6 +6473,9 @@ struct UpdateProgressView {
     status_total_files: usize,
     refreshed_titles: usize,
     total_titles: usize,
+    repaired_machine_sources: usize,
+    total_machine_sources: usize,
+    repaired_machine_sessions: usize,
     report_phase_rows: Vec<(String, UpdateDataProgress)>,
     drawn_rows: usize,
     started: Instant,
@@ -6498,6 +6528,9 @@ impl UpdateProgressView {
             total_titles: 0,
             status_checked_files: 0,
             status_total_files: 0,
+            repaired_machine_sources: 0,
+            total_machine_sources: 0,
+            repaired_machine_sessions: 0,
             started: Instant::now(),
             heartbeat_frame: 0,
             drawn_rows: 0,
@@ -6557,6 +6590,19 @@ impl UpdateProgressView {
                 self.phase = UpdateDisplayPhase::NativeTitles;
                 self.refreshed_titles = *refreshed_titles;
                 self.total_titles = *total_titles;
+                for row in self.sources.values_mut() {
+                    row.state = "waiting";
+                }
+            }
+            ingest::UpdateProgress::RepairingMachineAssignments {
+                completed_sources,
+                total_sources,
+                repaired_sessions,
+            } => {
+                self.phase = UpdateDisplayPhase::MachineAssignments;
+                self.repaired_machine_sources = *completed_sources;
+                self.total_machine_sources = *total_sources;
+                self.repaired_machine_sessions = *repaired_sessions;
                 for row in self.sources.values_mut() {
                     row.state = "waiting";
                 }
@@ -6682,7 +6728,6 @@ impl UpdateProgressView {
         self.render(true);
     }
 
-
     fn report_preparation(&mut self, completed: usize, total: usize) {
         self.phase = UpdateDisplayPhase::SearchData;
         let row = self.data_rows.entry("report".to_string()).or_default();
@@ -6761,7 +6806,11 @@ impl UpdateProgressView {
         row.detail = report_overall_progress_detail(event, elapsed);
 
         if !matches!(event.phase, "report" | "preflight") {
-            if let Some(previous) = self.report_phase_rows.last().map(|(phase, _)| phase.clone()) {
+            if let Some(previous) = self
+                .report_phase_rows
+                .last()
+                .map(|(phase, _)| phase.clone())
+            {
                 if previous != event.phase {
                     self.finish_report_phase(&previous);
                 }
@@ -6823,7 +6872,11 @@ impl UpdateProgressView {
         self.phase = UpdateDisplayPhase::ReportData;
         self.finish_report_phase(latest.phase);
         let row = self.data_rows.entry("report".to_string()).or_default();
-        row.state = if report.refreshed { "refreshed" } else { "current" };
+        row.state = if report.refreshed {
+            "refreshed"
+        } else {
+            "current"
+        };
         row.current = Some(latest.completed);
         row.total = Some(latest.total);
         let completion = analytics::ReportRefreshProgress {
@@ -6868,8 +6921,6 @@ impl UpdateProgressView {
         row.detail = report_completion_detail(report);
         self.render(true);
     }
-
-
 
     fn embedding_event(&mut self, event: &search::EmbeddingProgress) {
         self.phase = UpdateDisplayPhase::SearchData;
@@ -6936,7 +6987,7 @@ impl UpdateProgressView {
     }
 
     fn render(&mut self, force: bool) {
-        if !self.interactive && !force && self.last_emit.elapsed() < Duration::from_secs(1) {
+        if !force && self.last_emit.elapsed() < UPDATE_PROGRESS_HEARTBEAT_INTERVAL {
             return;
         }
         if self.interactive {
@@ -6978,6 +7029,7 @@ impl UpdateProgressView {
         let mut lines = match self.phase {
             UpdateDisplayPhase::Startup => self.data_lines("update: starting"),
             UpdateDisplayPhase::CheckpointStatus => self.checkpoint_status_lines(),
+            UpdateDisplayPhase::MachineAssignments => self.machine_assignment_lines(),
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::NativeTitles => self.native_title_lines(),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
@@ -7010,6 +7062,23 @@ impl UpdateProgressView {
                 progress_meter(self.refreshed_titles, self.total_titles, 20),
                 format_count(self.refreshed_titles),
                 format_count(self.total_titles)
+            ),
+        ]
+    }
+
+    fn machine_assignment_lines(&self) -> Vec<String> {
+        vec![
+            "local logs: repairing machine assignments".to_string(),
+            format!(
+                "  machines     repairing {}  {}/{} sources, {} sessions",
+                progress_meter(
+                    self.repaired_machine_sources,
+                    self.total_machine_sources,
+                    20
+                ),
+                format_count(self.repaired_machine_sources),
+                format_count(self.total_machine_sources),
+                format_count(self.repaired_machine_sessions)
             ),
         ]
     }
@@ -7706,7 +7775,10 @@ fn format_elapsed(duration: Duration) -> String {
 fn print_status_output(output: &StatusOutput) {
     let color = std::io::stdout().is_terminal();
     println!();
-    println!("{}", styled_role("Historious status", StyleRole::Header, color));
+    println!(
+        "{}",
+        styled_role("Historious status", StyleRole::Header, color)
+    );
     println!("  {}", status_summary(&output.stats));
     print_status_diagnostics(&output.diagnostics, color);
     print_status_search(&output.config, &output.query_embedder, color);
@@ -7729,7 +7801,10 @@ fn print_status_output_live(store: &Store, config: &AppConfig, all: bool) -> Res
     let spinner = std::io::stderr().is_terminal();
 
     println!();
-    println!("{}", styled_role("Historious status", StyleRole::Header, color));
+    println!(
+        "{}",
+        styled_role("Historious status", StyleRole::Header, color)
+    );
     if all {
         println!("  {STATUS_ALL_WARNING}");
     } else {
@@ -8159,7 +8234,10 @@ fn print_threads_output(
     println!(
         "{}",
         styled_role(
-            &format!("Threads — {scope_label} · {} shown", format_count(threads.len())),
+            &format!(
+                "Threads — {scope_label} · {} shown",
+                format_count(threads.len())
+            ),
             StyleRole::Header,
             color,
         )
@@ -8188,7 +8266,9 @@ fn print_threads_grouped_by_project(threads: &[crate::storage::ThreadRow], color
         let label = thread_project_label(path.as_deref());
         if let Some((_, _, rows)) = groups
             .iter_mut()
-            .find(|(existing_label, existing_path, _)| *existing_label == label && *existing_path == path)
+            .find(|(existing_label, existing_path, _)| {
+                *existing_label == label && *existing_path == path
+            })
         {
             rows.push(thread);
         } else {
@@ -8208,7 +8288,11 @@ fn print_threads_grouped_by_project(threads: &[crate::storage::ThreadRow], color
                 &format!(
                     "{label} · {} {} · {} msgs today",
                     format_count(thread_total),
-                    if thread_total == 1 { "thread" } else { "threads" },
+                    if thread_total == 1 {
+                        "thread"
+                    } else {
+                        "threads"
+                    },
                     format_count(today_total as usize)
                 ),
                 StyleRole::Project,
@@ -8232,7 +8316,10 @@ fn print_thread_card(thread: &crate::storage::ThreadRow, show_project_path: bool
         "{}  {} · {} events · {} · {}",
         styled_role(&when, StyleRole::Time, color),
         styled_role(
-            &format!("{} msgs today", format_count(thread.today_message_count as usize)),
+            &format!(
+                "{} msgs today",
+                format_count(thread.today_message_count as usize)
+            ),
             StyleRole::Count,
             color,
         ),
@@ -8297,7 +8384,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
-    let mut out = value.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
     out.push('…');
     out
 }
@@ -8350,6 +8440,7 @@ fn refresh_threads_inputs(store: &Store, config: &AppConfig, quiet: bool) -> Res
             max_files: None,
             source_selection: ingest::SourceSelection::default(),
             sources: config.sources.clone(),
+            repair_machine_assignments: false,
         },
         |_| {},
     )?;
@@ -8627,8 +8718,7 @@ fn search_output(
     refs: &[String],
     machine_identity: Option<MachineIdentityDiagnosticOutput>,
 ) -> SearchOutput {
-    let machine_filter_active =
-        machine_filter_active(machine.as_deref(), hostname.as_deref());
+    let machine_filter_active = machine_filter_active(machine.as_deref(), hostname.as_deref());
     let next_commands = search_hints(&response.results, refs, machine_filter_active);
     SearchOutput {
         query: query.to_string(),
@@ -9265,7 +9355,10 @@ fn refresh_transcript_session(
         || false,
     )?;
     if stats.errors > 0 {
-        bail!("failed to refresh transcript source {}", source_path.display());
+        bail!(
+            "failed to refresh transcript source {}",
+            source_path.display()
+        );
     }
     if !stats.delta.touched_events.is_empty() {
         refresh_tail_history_items(store, &stats.delta.touched_events)?;
@@ -9304,11 +9397,10 @@ async fn run_transcript_tail(
         .history_items_for_transcript_session(&session)?
         .ok_or_else(|| anyhow::anyhow!("session not found: {session}"))?;
     let initial_context = tail_initial_context(context.clone(), initial_lines);
-    print_markdown(&crate::transcript::render_history_session(
-        &initial_context,
-        &metadata,
+    print_markdown(
+        &crate::transcript::render_history_session(&initial_context, &metadata, color),
         color,
-    ), color)?;
+    )?;
     flush_stdout()?;
     let mut last_cursor = context.items.last().map(history_item_cursor);
 
@@ -9358,6 +9450,7 @@ fn resolve_tail_session(store: &Store, config: &AppConfig, target: &str) -> Resu
                 max_files: None,
                 source_selection: ingest::SourceSelection::single("agent_logs")?,
                 sources: config.sources.clone(),
+                repair_machine_assignments: false,
             },
             |_| {},
             tail_cancelled,
@@ -9424,9 +9517,10 @@ fn append_tail_updates(
         return Ok(true);
     }
     *last_cursor = new_items.last().map(history_item_cursor);
-    print_markdown(&crate::transcript::render_history_items(
-        &new_items, color, verbose, true,
-    ), color)?;
+    print_markdown(
+        &crate::transcript::render_history_items(&new_items, color, verbose, true),
+        color,
+    )?;
     flush_stdout()?;
     Ok(!tail_cancelled())
 }
@@ -9457,6 +9551,7 @@ fn refresh_tail_inputs(
                 max_files: None,
                 source_selection: ingest::SourceSelection::single(source_kind)?,
                 sources: sources.clone(),
+                repair_machine_assignments: false,
             },
             |_| {},
             tail_cancelled,
@@ -10794,6 +10889,7 @@ async fn run_daemon(
                 max_files,
                 source_selection: source_selection.clone(),
                 sources: source_configs.clone(),
+                repair_machine_assignments: false,
             },
             |event| scan.update(update_progress_detail(event)),
         )?;
@@ -10880,16 +10976,25 @@ mod tests {
     #[test]
     fn theme_text_heuristics_detect_common_theme_names() {
         assert_eq!(theme_mode_from_text("GitHub"), Some(ThemeMode::Light));
-        assert_eq!(theme_mode_from_text("Catppuccin Latte"), Some(ThemeMode::Light));
+        assert_eq!(
+            theme_mode_from_text("Catppuccin Latte"),
+            Some(ThemeMode::Light)
+        );
         assert_eq!(theme_mode_from_text("Dracula"), Some(ThemeMode::Dark));
-        assert_eq!(theme_mode_from_text("Catppuccin Mocha"), Some(ThemeMode::Dark));
+        assert_eq!(
+            theme_mode_from_text("Catppuccin Mocha"),
+            Some(ThemeMode::Dark)
+        );
         assert_eq!(theme_mode_from_text("something custom"), None);
     }
 
     #[test]
     fn bat_theme_treats_github_as_light() {
         assert_eq!(theme_mode_from_bat_theme("GitHub"), Some(ThemeMode::Light));
-        assert_eq!(theme_mode_from_bat_theme("GitHub Dark"), Some(ThemeMode::Dark));
+        assert_eq!(
+            theme_mode_from_bat_theme("GitHub Dark"),
+            Some(ThemeMode::Dark)
+        );
     }
 
     #[test]
@@ -10998,6 +11103,7 @@ mod tests {
         view.finish_startup();
         assert!(view.lines()[1].contains("2/2 · configuration loaded and database open"));
     }
+
     #[test]
     fn update_checkpoint_progress_changes_visible_meter() {
         let mut view = UpdateProgressView::new();
@@ -11096,7 +11202,10 @@ mod tests {
         view.report_preparation(0, 10_742);
         assert!(view.last_emit > previous_emit);
         view.report_preparation(500, 10_742);
-        let row = view.data_rows.get("report").expect("report preparation row");
+        let row = view
+            .data_rows
+            .get("report")
+            .expect("report preparation row");
 
         assert_eq!(row.state, "preparing");
         assert_eq!((row.current, row.total), (Some(500), Some(10_742)));
@@ -11124,7 +11233,10 @@ mod tests {
         let terminal_lines = view.lines_for_terminal(48);
         assert_eq!(terminal_lines.len(), 5);
         assert!(terminal_lines.iter().all(|line| line.chars().count() < 48));
-        assert_eq!(terminal_rows_for_lines(&terminal_lines, 48), terminal_lines.len());
+        assert_eq!(
+            terminal_rows_for_lines(&terminal_lines, 48),
+            terminal_lines.len()
+        );
 
         assert_eq!(
             report_progress_payload(
@@ -11249,12 +11361,18 @@ mod tests {
         let relationship = &view.report_phase_rows[0];
         assert_eq!(relationship.0, analytics::SESSION_RELATIONSHIPS_PROJECTION);
         assert_eq!(relationship.1.state, "ready");
-        assert_eq!((relationship.1.current, relationship.1.total), (Some(9), Some(9)));
+        assert_eq!(
+            (relationship.1.current, relationship.1.total),
+            (Some(9), Some(9))
+        );
         assert!(relationship.1.detail.contains("9/9"));
         let provenance = &view.report_phase_rows[1];
         assert_eq!(provenance.0, analytics::MESSAGE_PROVENANCE_PROJECTION);
         assert_eq!(provenance.1.state, "updating");
-        assert_eq!((provenance.1.current, provenance.1.total), (Some(4), Some(17)));
+        assert_eq!(
+            (provenance.1.current, provenance.1.total),
+            (Some(4), Some(17))
+        );
         assert!(provenance.1.detail.contains("4/17"));
 
         assert_eq!(
@@ -11316,8 +11434,7 @@ mod tests {
         let event_index = observations
             .iter()
             .position(|observation| {
-                observation
-                    == &(ScopedProgressEmission::Event, "working".to_string())
+                observation == &(ScopedProgressEmission::Event, "working".to_string())
             })
             .expect("real worker event");
         assert!(observations[1..event_index].iter().all(|observation| {
@@ -11348,8 +11465,6 @@ mod tests {
         .expect_err("worker panic error");
         assert_eq!(panic_error.to_string(), "scoped progress worker panicked");
     }
-
-
 
     #[test]
     fn forced_report_machine_progress_keeps_one_truthful_schema() {
@@ -11503,7 +11618,14 @@ mod tests {
         assert!(observations.len() >= 3);
         assert_eq!(
             &observations[0],
-            &("preflight", 2, 10, "checking report analytics".to_string(), 0, true)
+            &(
+                "preflight",
+                2,
+                10,
+                "checking report analytics".to_string(),
+                0,
+                true
+            )
         );
         let real_index = observations
             .iter()
@@ -11553,7 +11675,10 @@ mod tests {
             |_value, _latest, _elapsed| completed.set(true),
         )
         .expect_err("worker panic error");
-        assert_eq!(panic_error.to_string(), "report maintenance worker panicked");
+        assert_eq!(
+            panic_error.to_string(),
+            "report maintenance worker panicked"
+        );
         assert!(!completed.get());
     }
 
@@ -12004,15 +12129,8 @@ mod tests {
             }
         ));
 
-        let enrich = Cli::try_parse_from([
-            "histo",
-            "enrich",
-            "sentiment",
-            "--limit",
-            "5",
-            "--yes",
-        ])
-        .expect("parse consent-gated sentiment enrichment");
+        let enrich = Cli::try_parse_from(["histo", "enrich", "sentiment", "--limit", "5", "--yes"])
+            .expect("parse consent-gated sentiment enrichment");
         assert!(matches!(
             enrich.command,
             Command::Enrich {
@@ -12054,12 +12172,15 @@ mod tests {
             ("uninstall", ServiceCommand::Uninstall),
             ("status", ServiceCommand::Status),
         ] {
-            let cli = Cli::try_parse_from(["histo", "service", name])
-                .expect("parse service command");
+            let cli =
+                Cli::try_parse_from(["histo", "service", name]).expect("parse service command");
             let Command::Service { command } = cli.command else {
                 panic!("expected service command");
             };
-            assert_eq!(std::mem::discriminant(&command), std::mem::discriminant(&expected));
+            assert_eq!(
+                std::mem::discriminant(&command),
+                std::mem::discriminant(&expected)
+            );
         }
     }
 
@@ -12105,10 +12226,8 @@ mod tests {
 
     #[test]
     fn report_topic_embedding_limit_parses() {
-        let cli = Cli::try_parse_from([
-            "histo", "report", "topics", "embed", "--limit", "25",
-        ])
-        .expect("parse topic embedding command");
+        let cli = Cli::try_parse_from(["histo", "report", "topics", "embed", "--limit", "25"])
+            .expect("parse topic embedding command");
         assert!(matches!(
             cli.command,
             Command::Report {
@@ -12164,7 +12283,10 @@ mod tests {
             &["histo", "report", "rebuild"][..],
             &["histo", "report", "topics", "label"][..],
         ] {
-            assert!(Cli::try_parse_from(args.iter().copied()).is_err(), "{args:?}");
+            assert!(
+                Cli::try_parse_from(args.iter().copied()).is_err(),
+                "{args:?}"
+            );
         }
     }
 
@@ -12207,9 +12329,7 @@ mod tests {
     #[test]
     fn report_display_flags_conflict_with_subcommands() {
         assert!(Cli::try_parse_from(["histo", "report", "--json", "audit"]).is_err());
-        assert!(
-            Cli::try_parse_from(["histo", "report", "--today", "topics", "embed"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["histo", "report", "--today", "topics", "embed"]).is_err());
     }
 
     #[test]
@@ -12256,8 +12376,7 @@ mod tests {
             }
         ));
         assert!(
-            Cli::try_parse_from(["histo", "report", "--today", "--after", "yesterday"])
-                .is_err()
+            Cli::try_parse_from(["histo", "report", "--today", "--after", "yesterday"]).is_err()
         );
     }
 
@@ -12296,13 +12415,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(Cli::try_parse_from([
-            "histo",
-            "report",
-            "--update",
-            "--no-update"
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["histo", "report", "--update", "--no-update"]).is_err());
     }
     #[test]
     fn report_refresh_is_explicit_and_preserves_stored_snapshot_by_default() {
@@ -12396,14 +12509,8 @@ mod tests {
 
     #[test]
     fn report_plain_and_color_controls_parse() {
-        let cli = Cli::try_parse_from([
-            "histo",
-            "report",
-            "--plain",
-            "--color",
-            "always",
-        ])
-        .expect("parse report rendering controls");
+        let cli = Cli::try_parse_from(["histo", "report", "--plain", "--color", "always"])
+            .expect("parse report rendering controls");
         assert!(matches!(
             cli.command,
             Command::Report {
@@ -12589,26 +12696,22 @@ mod tests {
 
     #[test]
     fn transcript_last_conflicts_with_at() {
-        let error =
-            Cli::try_parse_from(["histo", "transcript", "sess", "--last", "--at", "ref"])
-                .expect_err("--last should conflict with --at");
+        let error = Cli::try_parse_from(["histo", "transcript", "sess", "--last", "--at", "ref"])
+            .expect_err("--last should conflict with --at");
         assert!(error.to_string().contains("cannot be used with"));
     }
 
     #[test]
     fn transcript_last_answer_conflicts_with_last() {
-        let error = Cli::try_parse_from([
-            "histo", "transcript", "sess", "--last", "--last-answer",
-        ])
-        .expect_err("--last should conflict with --last-answer");
+        let error = Cli::try_parse_from(["histo", "transcript", "sess", "--last", "--last-answer"])
+            .expect_err("--last should conflict with --last-answer");
         assert!(error.to_string().contains("cannot be used with"));
     }
 
     #[test]
     fn transcript_only_conflicts_with_last() {
-        let error =
-            Cli::try_parse_from(["histo", "transcript", "sess", "--only", "--last"])
-                .expect_err("--only should conflict with --last");
+        let error = Cli::try_parse_from(["histo", "transcript", "sess", "--only", "--last"])
+            .expect_err("--only should conflict with --last");
         assert!(error.to_string().contains("cannot be used with"));
     }
 
@@ -13036,10 +13139,8 @@ mod tests {
             .iter()
             .any(|detail| detail == "resuming incomplete analytics repair"));
         let mut fresh_progress = Vec::new();
-        rebuild_analytics_after_event_repairs(&store, &delta, |detail| {
-            fresh_progress.push(detail)
-        })
-        .expect("skip fresh analytics");
+        rebuild_analytics_after_event_repairs(&store, &delta, |detail| fresh_progress.push(detail))
+            .expect("skip fresh analytics");
         assert!(fresh_progress.is_empty());
     }
 
@@ -13291,18 +13392,13 @@ mod tests {
         let (_dir, store) = fixture_store_with_viewer_ref();
 
         // A session id cannot be resolved as an event ref or event id.
-        let event_err = resolve_context_event_id(
-            &store,
-            Some("session_view".to_string()),
-            None,
-            None,
-        )
-        .expect_err("session id should not resolve as event");
+        let event_err =
+            resolve_context_event_id(&store, Some("session_view".to_string()), None, None)
+                .expect_err("session id should not resolve as event");
         assert!(event_err.to_string().contains("not found"));
 
         // But it CAN be resolved as a session — the fallback condition.
-        let session =
-            resolve_session_target(&store, "session_view").expect("session resolve");
+        let session = resolve_session_target(&store, "session_view").expect("session resolve");
         assert!(session.is_some());
         assert_eq!(session.unwrap().id, "session_view");
     }
@@ -13311,13 +13407,9 @@ mod tests {
     fn show_falls_back_to_session_when_target_is_external_id() {
         let (_dir, store) = fixture_store_with_viewer_ref();
 
-        let event_err = resolve_context_event_id(
-            &store,
-            Some("agent_session_view".to_string()),
-            None,
-            None,
-        )
-        .expect_err("external id should not resolve as event");
+        let event_err =
+            resolve_context_event_id(&store, Some("agent_session_view".to_string()), None, None)
+                .expect_err("external id should not resolve as event");
         assert!(event_err.to_string().contains("not found"));
 
         let session =
@@ -13362,18 +13454,12 @@ mod tests {
         let (_dir, store) = fixture_store_with_viewer_ref();
 
         // An event ref resolves as an event — no fallback needed.
-        let event_id = resolve_context_event_id(
-            &store,
-            Some("event_view".to_string()),
-            None,
-            None,
-        )
-        .expect("event id should resolve");
+        let event_id = resolve_context_event_id(&store, Some("event_view".to_string()), None, None)
+            .expect("event id should resolve");
         assert_eq!(event_id, "event_view");
 
         // The event id should NOT resolve as a session.
-        let session =
-            resolve_session_target(&store, "event_view").expect("session resolve");
+        let session = resolve_session_target(&store, "event_view").expect("session resolve");
         assert!(session.is_none());
     }
 
@@ -13381,13 +13467,9 @@ mod tests {
     fn show_unresolvable_target_errors_for_both_event_and_session() {
         let (_dir, store) = fixture_store_with_viewer_ref();
 
-        let event_err = resolve_context_event_id(
-            &store,
-            Some("nonexistent_target".to_string()),
-            None,
-            None,
-        )
-        .expect_err("unresolvable target should error");
+        let event_err =
+            resolve_context_event_id(&store, Some("nonexistent_target".to_string()), None, None)
+                .expect_err("unresolvable target should error");
         assert!(event_err.to_string().contains("not found"));
 
         let session =
@@ -13416,8 +13498,7 @@ mod tests {
             omitted_target: false,
         };
 
-        let output =
-            history_transcript_output(&store, &context, None).expect("transcript output");
+        let output = history_transcript_output(&store, &context, None).expect("transcript output");
         let value = serde_json::to_value(output).expect("serialize");
 
         // Transcript JSON shape has "items", not the show-specific "before/target/after".

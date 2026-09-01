@@ -47,6 +47,7 @@ pub struct UpdateOptions {
     pub max_files: Option<usize>,
     pub source_selection: SourceSelection,
     pub sources: SourceConfigs,
+    pub repair_machine_assignments: bool,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -375,9 +376,7 @@ fn parse_relevant_fields(raw: &RawValue) -> Option<CodexRelevantFields> {
                     "thread_source" => fields.thread_source = parse_raw_string(raw),
                     "source" => fields.source = parse_source_fields(raw),
                     "originator" => fields.originator = parse_raw_string(raw),
-                    "base_instructions" => {
-                        fields.base_instructions = parse_base_instructions(raw)
-                    }
+                    "base_instructions" => fields.base_instructions = parse_base_instructions(raw),
                     "model" => fields.model = parse_raw_string(raw),
                     "info" => fields.usage = parse_info_fields(raw),
                     _ => {}
@@ -452,7 +451,10 @@ fn parse_base_instructions(raw: &RawValue) -> Option<String> {
     }
 
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    deserializer.deserialize_map(InstructionsVisitor).ok().flatten()
+    deserializer
+        .deserialize_map(InstructionsVisitor)
+        .ok()
+        .flatten()
 }
 
 fn parse_info_fields(raw: &RawValue) -> Option<CodexUsageFields> {
@@ -503,9 +505,7 @@ fn parse_usage_fields(raw: &RawValue) -> Option<CodexUsageFields> {
                 let raw = map.next_value::<&RawValue>()?;
                 match key.as_str() {
                     "input_tokens" => usage.input_tokens = parse_raw_token(raw),
-                    "cached_input_tokens" => {
-                        usage.cached_input_tokens = parse_raw_token(raw)
-                    }
+                    "cached_input_tokens" => usage.cached_input_tokens = parse_raw_token(raw),
                     "output_tokens" => usage.output_tokens = parse_raw_token(raw),
                     _ => {}
                 }
@@ -802,6 +802,11 @@ pub enum UpdateProgress {
         refreshed_titles: usize,
         total_titles: usize,
     },
+    RepairingMachineAssignments {
+        completed_sources: usize,
+        total_sources: usize,
+        repaired_sessions: usize,
+    },
     Processing {
         adapter_kind: String,
         kind: String,
@@ -993,6 +998,35 @@ pub fn update_local_with_progress_and_cancel(
             });
         })?;
     let context = SourceSyncContext::new(store).with_source_file_statuses(&source_file_statuses);
+    if options.repair_machine_assignments {
+        let mut source_ids = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate.path.as_deref().map(|source_path| {
+                    let source_path = source_path.to_string_lossy();
+                    stable_id(&["source", &candidate.kind, &source_path])
+                })
+            })
+            .collect::<Vec<_>>();
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        let mut sources_needing_machine_reassignment = store
+            .source_ids_needing_machine_reassignment(&source_ids, machine_id)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        sources_needing_machine_reassignment.sort_unstable();
+        stats.repaired_machine_sessions += store.reassign_machine_for_sources_with_progress(
+            &sources_needing_machine_reassignment,
+            machine_id,
+            |completed_sources, total_sources, repaired_sessions| {
+                progress(&UpdateProgress::RepairingMachineAssignments {
+                    completed_sources,
+                    total_sources,
+                    repaired_sessions,
+                });
+            },
+        )?;
+    }
     for (idx, candidate) in candidates.into_iter().enumerate() {
         if should_cancel() {
             return Ok(stats);
@@ -1040,12 +1074,7 @@ pub fn update_local_with_progress_and_cancel(
             });
             continue;
         };
-        if let Some(source_path) = candidate.path.as_deref() {
-            let source_path = source_path.to_string_lossy();
-            let source_id = stable_id(&["source", &candidate.kind, &source_path]);
-            stats.repaired_machine_sessions +=
-                store.reassign_machine_for_source(&source_id, machine_id)?;
-        }
+
         if adapter.is_current(&context, &candidate)? {
             stats.skipped_unchanged += 1;
             progress(&UpdateProgress::CompletedFile {
@@ -1387,8 +1416,7 @@ pub fn update_source_path_with_progress_and_cancel(
     let mtime_ms = file_mtime_ms(&metadata);
     let path_text = path.to_string_lossy().to_string();
     let source_id = stable_id(&["source", kind, &path_text]);
-    stats.repaired_machine_sessions +=
-        store.reassign_machine_for_source(&source_id, machine_id)?;
+    stats.repaired_machine_sessions += store.reassign_machine_for_source(&source_id, machine_id)?;
     let file_status = store.source_file_status(&path_text, size, mtime_ms)?;
     if kind != "opencode" && file_status.raw_current && !file_status.needs_workspace_refresh {
         stats.skipped_unchanged += 1;
@@ -1520,13 +1548,7 @@ fn selected_treechat_source(selection: &SourceSelection) -> Option<&'static str>
 fn is_local_transcript_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "codex"
-            | "claude_code"
-            | "pi_agent"
-            | "omp"
-            | "openclaw"
-            | "hermes"
-            | "opencode"
+        "codex" | "claude_code" | "pi_agent" | "omp" | "openclaw" | "hermes" | "opencode"
     )
 }
 
@@ -1733,7 +1755,10 @@ fn add_omp_profile_session_roots(
         return;
     };
     for profile in profiles.flatten() {
-        if profile.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+        if profile
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir())
+        {
             let profile_root = profile.path();
             paths.insert(if agent_subdir {
                 profile_root.join("agent/sessions")
@@ -2032,7 +2057,6 @@ fn classify_codex_session(event_contents: &[&str]) -> SessionClass {
         .unwrap_or(SessionClass::Interactive)
 }
 
-
 fn is_reviewer_instructions(instructions: &str) -> bool {
     instructions
         .trim_start()
@@ -2302,7 +2326,8 @@ fn backfill_opencode_usage(store: &Store, path: &Path) -> Result<OpencodeUsageBa
                     params![patch, event_id],
                 )?;
             }
-            tx.commit().context("committing OpenCode usage backfill batch")?;
+            tx.commit()
+                .context("committing OpenCode usage backfill batch")?;
             Ok(updated)
         })?;
     }
@@ -2663,7 +2688,10 @@ fn instruction_marker_density(lower: &str) -> usize {
         "preamble",
         "bootstrap",
     ];
-    markers.iter().filter(|marker| lower.contains(*marker)).count()
+    markers
+        .iter()
+        .filter(|marker| lower.contains(*marker))
+        .count()
 }
 
 fn looks_like_session_metadata(content: &str) -> bool {
@@ -2804,7 +2832,10 @@ fn classify_claude_session(event_contents: &[&str]) -> SessionClass {
             string_at(value, &["entrypoint"])
                 .or_else(|| string_at(value, &["payload", "entrypoint"]))
                 .is_some_and(|entrypoint| {
-                    matches!(entrypoint.to_ascii_lowercase().as_str(), "claude-desktop" | "cli")
+                    matches!(
+                        entrypoint.to_ascii_lowercase().as_str(),
+                        "claude-desktop" | "cli"
+                    )
                 })
         })
     {
@@ -3396,14 +3427,9 @@ mod tests {
             );
         }
 
-        let direct_thread_source =
-            json!({"payload": {"thread_source": "subagent"}}).to_string();
+        let direct_thread_source = json!({"payload": {"thread_source": "subagent"}}).to_string();
         assert_eq!(
-            classify_session(
-                "codex",
-                &json!({}),
-                &[direct_thread_source.as_str()]
-            ),
+            classify_session("codex", &json!({}), &[direct_thread_source.as_str()]),
             SessionClass::Subagent
         );
 
@@ -3412,7 +3438,10 @@ mod tests {
                 json!({"source": {"subagent": {"thread_spawn": {"agent_nickname": "reviewer"}}}}),
                 SessionClass::Subagent,
             ),
-            (json!({"originator": "codex_exec"}), SessionClass::Automation),
+            (
+                json!({"originator": "codex_exec"}),
+                SessionClass::Automation,
+            ),
             (
                 json!({"originator": "codex_chatgpt_ios_remote"}),
                 SessionClass::Interactive,
@@ -3437,7 +3466,8 @@ mod tests {
 
     #[test]
     fn extracts_codex_subagent_paths_from_embedded_and_structured_notifications() {
-        let embedded = r#"<subagent_notification>{"agent_path":"child-one"}</subagent_notification>"#;
+        let embedded =
+            r#"<subagent_notification>{"agent_path":"child-one"}</subagent_notification>"#;
         assert_eq!(codex_subagent_paths(embedded), vec!["child-one"]);
 
         let structured = json!({
@@ -3471,7 +3501,10 @@ mod tests {
             &json!({"opencode_parent_id": "ses_parent"}),
             &[],
         );
-        assert_eq!(relationship.parent_external_id.as_deref(), Some("ses_parent"));
+        assert_eq!(
+            relationship.parent_external_id.as_deref(),
+            Some("ses_parent")
+        );
         assert_eq!(relationship.relationship, SessionRelationshipKind::Subagent);
         assert_eq!(relationship.rule, "opencode.parent_id");
 
@@ -3635,9 +3668,11 @@ mod tests {
 
         let omp = extract_session_usage(
             "omp",
-            &[usage_event(json!({"message": {"model": "claude-sonnet", "usage": {
-                "input": 120, "cacheRead": 40, "output": 18
-            }}}))],
+            &[usage_event(
+                json!({"message": {"model": "claude-sonnet", "usage": {
+                    "input": 120, "cacheRead": 40, "output": 18
+                }}}),
+            )],
         );
         assert_eq!(omp.models, vec!["claude-sonnet"]);
         assert_eq!(omp.input_tokens, Some(120));
@@ -4003,10 +4038,7 @@ mod tests {
         ));
         let pi_override = temp.path().join(".pi/agent");
         fs::create_dir_all(pi_override.join("sessions")).expect("pi sessions");
-        assert!(!omp_agent_dir_is_recognizable(
-            &pi_override,
-            &config_roots
-        ));
+        assert!(!omp_agent_dir_is_recognizable(&pi_override, &config_roots));
     }
 
     #[test]
@@ -4042,15 +4074,9 @@ mod tests {
 
         for kind in ["pi_agent", "omp"] {
             let context = SourceSyncContext::new(&store);
-            prepare_file_import(
-                &context,
-                "machine_fixture",
-                kind,
-                &log_path,
-                &native_titles,
-            )
-            .and_then(|prepared| prepared.commit(&store))
-            .expect("import compatible transcript");
+            prepare_file_import(&context, "machine_fixture", kind, &log_path, &native_titles)
+                .and_then(|prepared| prepared.commit(&store))
+                .expect("import compatible transcript");
         }
 
         let external_id = file_stem(&log_path);
@@ -4235,8 +4261,7 @@ mod tests {
         )];
 
         assert_eq!(
-            session_title("claude_code", "claude-bad-native", &lines, &native_titles)
-                .as_deref(),
+            session_title("claude_code", "claude-bad-native", &lines, &native_titles).as_deref(),
             Some("actual user question")
         );
     }
@@ -4358,11 +4383,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data)
                  VALUES (?1, 'ses_fixture', ?2, ?2, ?3)",
-                (
-                    message_id,
-                    time,
-                    data.to_string(),
-                ),
+                (message_id, time, data.to_string()),
             )
             .expect("insert message");
         }
@@ -5238,6 +5259,7 @@ mod tests {
             max_files: None,
             source_selection: SourceSelection::single("codex").expect("selection"),
             sources,
+            repair_machine_assignments: false,
         };
 
         let registry = built_in_source_adapters(&options).expect("registry");
