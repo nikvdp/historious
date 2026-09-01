@@ -5681,8 +5681,10 @@ where
             let _ = sender.send(message);
         });
 
+        let mut last_heartbeat = Instant::now();
         loop {
-            match receiver.recv_timeout(heartbeat_interval) {
+            let wait = heartbeat_interval.saturating_sub(last_heartbeat.elapsed());
+            match receiver.recv_timeout(wait) {
                 Ok(ScopedProgressMessage::Progress(event)) => {
                     latest = event;
                     on_progress(&latest, ScopedProgressEmission::Event);
@@ -5693,6 +5695,7 @@ where
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     on_progress(&latest, ScopedProgressEmission::Heartbeat);
+                    last_heartbeat = Instant::now();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     bail!("scoped progress worker disconnected");
@@ -6240,6 +6243,34 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.skipped_unchanged),
             format_count(stats.errors)
         ),
+        ingest::UpdateProgress::PreparedFile {
+            kind,
+            path,
+            prepared_file_index,
+            prepared_file_count,
+            stats,
+        } => format!(
+            "prepared changed {} {}/{} {}; {} new records, {} unchanged, {} errors",
+            kind,
+            format_count(*prepared_file_index),
+            format_count(*prepared_file_count),
+            compact_path(path),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
+        ingest::UpdateProgress::PreparingSource {
+            kind,
+            preparing_file_count,
+            stats,
+        } => format!(
+            "preparing changed {} 0/{} files; {} new records, {} unchanged, {} errors",
+            kind,
+            format_count(*preparing_file_count),
+            format_count(stats.inserted),
+            format_count(stats.skipped_unchanged),
+            format_count(stats.errors)
+        ),
         ingest::UpdateProgress::ImportingFile {
             adapter_kind: _,
             kind,
@@ -6379,6 +6410,31 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             }).collect::<Vec<_>>(),
             "stats": stats,
         }),
+        ingest::UpdateProgress::PreparedFile {
+            kind,
+            path,
+            prepared_file_index,
+            prepared_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "prepared_file",
+            "kind": kind,
+            "path": path.display().to_string(),
+            "prepared_file_index": prepared_file_index,
+            "prepared_file_count": prepared_file_count,
+            "stats": stats,
+        }),
+        ingest::UpdateProgress::PreparingSource {
+            kind,
+            preparing_file_count,
+            stats,
+        } => serde_json::json!({
+            "status": "preparing_source",
+            "kind": kind,
+            "prepared_file_index": 0,
+            "prepared_file_count": preparing_file_count,
+            "stats": stats,
+        }),
         ingest::UpdateProgress::ImportingFile {
             adapter_kind,
             kind,
@@ -6451,7 +6507,8 @@ struct UpdateSourceProgress {
     total_files: usize,
     checked_files: usize,
     changed_files: usize,
-    read_files: usize,
+    prepared_files: usize,
+    imported_files: usize,
     state: &'static str,
     current_path: Option<PathBuf>,
 }
@@ -6628,34 +6685,60 @@ impl UpdateProgressView {
                 for source in sources {
                     let row = self.sources.entry(source.kind.clone()).or_default();
                     row.changed_files = source.changed_files;
-                    row.read_files = 0;
-                    row.state = "preparing";
+                    row.prepared_files = 0;
+                    row.imported_files = 0;
+                    row.state = "waiting";
                     row.current_path = None;
                 }
-                for row in self.sources.values_mut() {
-                    if row.checked_files >= row.total_files {
-                        row.state = "checked";
-                    }
-                }
                 self.phase = UpdateDisplayPhase::ChangedLogs;
+            }
+            ingest::UpdateProgress::PreparingSource {
+                kind,
+                preparing_file_count,
+                ..
+            } => {
+                self.phase = UpdateDisplayPhase::ChangedLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.changed_files = *preparing_file_count;
+                row.prepared_files = 0;
+                row.state = "preparing";
+                row.current_path = None;
+            }
+            ingest::UpdateProgress::PreparedFile {
+                kind,
+                path,
+                prepared_file_index,
+                prepared_file_count,
+                ..
+            } => {
+                self.phase = UpdateDisplayPhase::ChangedLogs;
+                let row = self.sources.entry(kind.clone()).or_default();
+                row.changed_files = *prepared_file_count;
+                row.prepared_files = *prepared_file_index;
+                row.state = if row.prepared_files >= row.changed_files {
+                    "prepared"
+                } else {
+                    "preparing"
+                };
+                row.current_path = Some(path.clone());
             }
             ingest::UpdateProgress::ImportingFile { kind, path, .. } => {
                 self.phase = UpdateDisplayPhase::ChangedLogs;
                 let row = self.sources.entry(kind.clone()).or_default();
-                row.state = "reading";
+                row.state = "importing";
                 row.current_path = Some(path.clone());
             }
             ingest::UpdateProgress::ImportedFile { kind, .. } => {
                 self.phase = UpdateDisplayPhase::ChangedLogs;
                 let row = self.sources.entry(kind.clone()).or_default();
-                row.read_files = row
-                    .read_files
+                row.imported_files = row
+                    .imported_files
                     .saturating_add(1)
-                    .min(row.changed_files.max(row.read_files.saturating_add(1)));
-                row.state = if row.changed_files > 0 && row.read_files >= row.changed_files {
-                    "read"
+                    .min(row.changed_files.max(row.imported_files.saturating_add(1)));
+                row.state = if row.changed_files > 0 && row.imported_files >= row.changed_files {
+                    "imported"
                 } else {
-                    "reading"
+                    "importing"
                 };
                 row.current_path = None;
             }
@@ -6674,8 +6757,8 @@ impl UpdateProgressView {
         } else {
             self.phase = UpdateDisplayPhase::ChangedLogs;
             for row in self.sources.values_mut() {
-                if row.changed_files > 0 && row.read_files >= row.changed_files {
-                    row.state = "read";
+                if row.changed_files > 0 && row.imported_files >= row.changed_files {
+                    row.state = "imported";
                 }
             }
         }
@@ -7113,13 +7196,29 @@ impl UpdateProgressView {
                         format_count(row.changed_files)
                     ),
                 )
-            } else {
+            } else if row.state == "waiting" {
                 (
-                    row.read_files,
+                    0,
+                    row.changed_files,
+                    format!("waiting · {} files", format_count(row.changed_files)),
+                )
+            } else if row.state == "preparing" || row.state == "prepared" {
+                (
+                    row.prepared_files,
                     row.changed_files,
                     format!(
-                        "{}/{} files",
-                        format_count(row.read_files),
+                        "{}/{} files prepared",
+                        format_count(row.prepared_files),
+                        format_count(row.changed_files)
+                    ),
+                )
+            } else {
+                (
+                    row.imported_files,
+                    row.changed_files,
+                    format!(
+                        "{}/{} files imported",
+                        format_count(row.imported_files),
                         format_count(row.changed_files)
                     ),
                 )
@@ -11105,6 +11204,50 @@ mod tests {
     }
 
     #[test]
+    fn changed_log_preparation_reports_real_completed_files() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.ingest_event(&ingest::UpdateProgress::Discovered {
+            sources: vec![ingest::UpdateSourceSummary {
+                kind: "omp".to_string(),
+                found_files: 166,
+                selected_files: 166,
+            }],
+            selected_files: 166,
+        });
+        view.ingest_event(&ingest::UpdateProgress::PreparingImports {
+            changed_files: 166,
+            sources: vec![ingest::UpdateChangedSourceSummary {
+                kind: "omp".to_string(),
+                changed_files: 166,
+            }],
+            stats: ingest::UpdateStats::default(),
+        });
+        assert!(view.lines()[1].contains("waiting"));
+        assert!(view.lines()[1].contains("166 files"));
+
+        view.ingest_event(&ingest::UpdateProgress::PreparingSource {
+            kind: "omp".to_string(),
+            preparing_file_count: 166,
+            stats: ingest::UpdateStats::default(),
+        });
+        assert!(view.lines()[1].contains("preparing"));
+        assert!(view.lines()[1].contains("0/166 files prepared"));
+
+        view.ingest_event(&ingest::UpdateProgress::PreparedFile {
+            kind: "omp".to_string(),
+            path: PathBuf::from("session.jsonl"),
+            prepared_file_index: 1,
+            prepared_file_count: 166,
+            stats: ingest::UpdateStats::default(),
+        });
+        let advanced = view.lines();
+        assert!(advanced[1].contains("preparing"));
+        assert!(advanced[1].contains("1/166 files prepared"));
+        assert!(advanced[2].contains("current session.jsonl"));
+    }
+
+    #[test]
     fn update_checkpoint_progress_changes_visible_meter() {
         let mut view = UpdateProgressView::new();
         view.interactive = false;
@@ -11443,6 +11586,29 @@ mod tests {
         assert!(observations[event_index + 1..].iter().any(|observation| {
             observation == &(ScopedProgressEmission::Heartbeat, "working".to_string())
         }));
+    }
+
+    #[test]
+    fn scoped_progress_events_do_not_postpone_heartbeat() {
+        let observations = std::cell::RefCell::new(Vec::new());
+        run_scoped_progress_with_timeout(
+            0usize,
+            Duration::from_millis(5),
+            |progress| {
+                for current in 1..=20 {
+                    progress(current);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            },
+            |current, emission| observations.borrow_mut().push((emission, *current)),
+        )
+        .expect("scoped progress result");
+
+        let observations = observations.into_inner();
+        assert!(observations
+            .iter()
+            .any(|(emission, current)| *emission == ScopedProgressEmission::Heartbeat && *current > 0));
     }
 
     #[test]

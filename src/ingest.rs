@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use walkdir::WalkDir;
 
@@ -822,6 +823,18 @@ pub enum UpdateProgress {
         sources: Vec<UpdateChangedSourceSummary>,
         stats: UpdateStats,
     },
+    PreparingSource {
+        kind: String,
+        preparing_file_count: usize,
+        stats: UpdateStats,
+    },
+    PreparedFile {
+        kind: String,
+        path: PathBuf,
+        prepared_file_index: usize,
+        prepared_file_count: usize,
+        stats: UpdateStats,
+    },
     ImportingFile {
         adapter_kind: String,
         kind: String,
@@ -1112,6 +1125,27 @@ pub fn update_local_with_progress_and_cancel(
         machine_id,
         pending_imports,
         &should_cancel,
+        |event| match event {
+            PreparePendingProgress::Started {
+                kind,
+                preparing_file_count,
+            } => progress(&UpdateProgress::PreparingSource {
+                kind: kind.to_string(),
+                preparing_file_count,
+                stats: stats.clone(),
+            }),
+            PreparePendingProgress::Completed {
+                prepared,
+                prepared_file_index,
+                prepared_file_count,
+            } => progress(&UpdateProgress::PreparedFile {
+                kind: prepared.kind.clone(),
+                path: prepared.path.clone(),
+                prepared_file_index,
+                prepared_file_count,
+                stats: stats.clone(),
+            }),
+        },
     )?;
     let changed_file_count = prepared_imports.len();
     for (changed_idx, prepared) in prepared_imports.into_iter().enumerate() {
@@ -1242,17 +1276,35 @@ struct PreparedPendingImport {
     result: Result<PreparedImport>,
 }
 
+enum PreparePendingProgress<'a> {
+    Started {
+        kind: &'a str,
+        preparing_file_count: usize,
+    },
+    Completed {
+        prepared: &'a PreparedPendingImport,
+        prepared_file_index: usize,
+        prepared_file_count: usize,
+    },
+}
+
 fn prepare_pending_imports(
     registry: &SourceAdapterRegistry,
     context: &SourceSyncContext<'_>,
     machine_id: &str,
     pending_imports: Vec<PendingImport>,
     should_cancel: &impl Fn() -> bool,
+    mut progress: impl FnMut(PreparePendingProgress<'_>),
 ) -> Result<Vec<PreparedPendingImport>> {
     if pending_imports.is_empty() || should_cancel() {
         return Ok(Vec::new());
     }
 
+    let mut totals = HashMap::new();
+    for pending in &pending_imports {
+        *totals.entry(pending.kind.clone()).or_insert(0usize) += 1;
+    }
+    let mut completed = HashMap::new();
     let mut groups: Vec<(&'static str, Vec<PendingImport>)> = Vec::new();
     for pending in pending_imports {
         if let Some((_, items)) = groups
@@ -1270,20 +1322,40 @@ fn prepare_pending_imports(
         if should_cancel() {
             break;
         }
+        let source_counts = imports.iter().fold(HashMap::new(), |mut counts, pending| {
+            *counts.entry(pending.kind.clone()).or_insert(0usize) += 1;
+            counts
+        });
+        for (kind, count) in source_counts {
+            progress(PreparePendingProgress::Started {
+                kind: &kind,
+                preparing_file_count: count,
+            });
+        }
         let Some(adapter) = registry
             .iter()
             .find(|adapter| adapter.kind() == adapter_kind)
         else {
-            prepared.extend(imports.into_iter().map(|pending| PreparedPendingImport {
-                order: pending.order,
-                adapter_kind: pending.adapter_kind,
-                kind: pending.kind,
-                path: pending.path,
-                result: Err(anyhow::anyhow!(
-                    "source adapter {} disappeared during import preparation",
-                    pending.adapter_kind
-                )),
-            }));
+            for pending in imports {
+                let result = PreparedPendingImport {
+                    order: pending.order,
+                    adapter_kind: pending.adapter_kind,
+                    kind: pending.kind,
+                    path: pending.path,
+                    result: Err(anyhow::anyhow!(
+                        "source adapter {} disappeared during import preparation",
+                        pending.adapter_kind
+                    )),
+                };
+                let current = completed.entry(result.kind.clone()).or_insert(0usize);
+                *current += 1;
+                progress(PreparePendingProgress::Completed {
+                    prepared: &result,
+                    prepared_file_index: *current,
+                    prepared_file_count: totals[&result.kind],
+                });
+                prepared.push(result);
+            }
             continue;
         };
         let concurrency = adapter.concurrency().normalized().prepare;
@@ -1291,13 +1363,23 @@ fn prepare_pending_imports(
             if should_cancel() {
                 break;
             }
-            prepared.extend(prepare_pending_import_batch(
+            let batch_prepared = prepare_pending_import_batch(
                 adapter,
                 context,
                 machine_id,
                 batch.to_vec(),
                 should_cancel,
-            )?);
+                |result| {
+                    let current = completed.entry(result.kind.clone()).or_insert(0usize);
+                    *current += 1;
+                    progress(PreparePendingProgress::Completed {
+                        prepared: result,
+                        prepared_file_index: *current,
+                        prepared_file_count: totals[&result.kind],
+                    });
+                },
+            )?;
+            prepared.extend(batch_prepared);
         }
     }
     prepared.sort_by_key(|prepared| prepared.order);
@@ -1310,43 +1392,43 @@ fn prepare_pending_import_batch(
     machine_id: &str,
     pending_imports: Vec<PendingImport>,
     should_cancel: &impl Fn() -> bool,
+    mut progress: impl FnMut(&PreparedPendingImport),
 ) -> Result<Vec<PreparedPendingImport>> {
     thread::scope(|scope| {
-        let handles = pending_imports
-            .into_iter()
-            .map(|pending| {
+        let expected = pending_imports.len();
+        let (sender, receiver) = mpsc::channel();
+        for pending in pending_imports {
+            let sender = sender.clone();
+            scope.spawn(move || {
                 let fallback = pending.clone();
-                (
-                    fallback,
-                    scope.spawn(move || {
-                        let result =
-                            adapter.prepare_import(&context, machine_id, &pending.candidate);
-                        PreparedPendingImport {
-                            order: pending.order,
-                            adapter_kind: pending.adapter_kind,
-                            kind: pending.kind,
-                            path: pending.path,
-                            result,
-                        }
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let mut prepared = Vec::with_capacity(handles.len());
-        for (fallback, handle) in handles {
-            if should_cancel() {
-                return Ok(prepared);
-            }
-            match handle.join() {
-                Ok(import) => prepared.push(import),
-                Err(_) => prepared.push(PreparedPendingImport {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let result = adapter.prepare_import(context, machine_id, &pending.candidate);
+                    PreparedPendingImport {
+                        order: pending.order,
+                        adapter_kind: pending.adapter_kind,
+                        kind: pending.kind,
+                        path: pending.path,
+                        result,
+                    }
+                }))
+                .unwrap_or_else(|_| PreparedPendingImport {
                     order: fallback.order,
                     adapter_kind: fallback.adapter_kind,
                     kind: fallback.kind,
                     path: fallback.path,
                     result: Err(anyhow::anyhow!("source import preparation worker panicked")),
-                }),
+                });
+                let _ = sender.send(result);
+            });
+        }
+        drop(sender);
+
+        let mut prepared = Vec::with_capacity(expected);
+        for result in receiver {
+            progress(&result);
+            prepared.push(result);
+            if prepared.len() == expected || should_cancel() {
+                break;
             }
         }
         Ok(prepared)
@@ -1633,7 +1715,27 @@ impl SourceAdapter for LocalTranscriptAdapter {
     ) -> Result<bool> {
         let cursor = local_transcript_checkpoint_cursor_for_candidate(candidate)?;
         let status = context.source_checkpoint_status(self.kind(), &candidate.identity, &cursor)?;
-        Ok(status.raw_current && !status.needs_workspace_refresh)
+        if status.raw_current {
+            return Ok(self.kind() == "hermes" || !status.needs_workspace_refresh);
+        }
+        if self.kind() == "opencode" {
+            if let Some(checkpoint) = context.store.source_checkpoint(self.kind(), &candidate.identity)? {
+                if checkpoint
+                    .cursor
+                    .as_deref()
+                    .is_some_and(|stored| legacy_opencode_cursor_matches(&cursor, stored))
+                {
+                    context.store.upsert_source_checkpoint(
+                        self.kind(),
+                        &candidate.identity,
+                        Some(&cursor),
+                        &checkpoint.metadata,
+                    )?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn prepare_import(
@@ -1808,8 +1910,19 @@ fn opencode_sqlite_fingerprint_paths(path: &Path) -> Vec<PathBuf> {
     vec![
         path.to_path_buf(),
         PathBuf::from(format!("{path_text}-wal")),
-        PathBuf::from(format!("{path_text}-shm")),
     ]
+}
+
+fn legacy_opencode_cursor_matches(current: &str, stored: &str) -> bool {
+    stored
+        .strip_prefix(current)
+        .and_then(|suffix| suffix.strip_prefix('|'))
+        .is_some_and(|component| {
+            !component.contains('|')
+                && component
+                    .split_once(':')
+                    .is_some_and(|(label, _)| label.ends_with("-shm"))
+        })
 }
 
 fn local_transcript_checkpoint_cursor_for_candidate(candidate: &SourceCandidate) -> Result<String> {
@@ -1855,7 +1968,7 @@ fn local_transcript_checkpoint_upsert(
     let cursor =
         local_transcript_checkpoint_cursor(kind, path, candidate.size, candidate.mtime_ms)?;
     let strategy = match kind {
-        "opencode" => "sqlite_file_trio_metadata_v1",
+        "opencode" => "sqlite_file_pair_metadata_v1",
         "claude_code" => CLAUDE_CODE_CHECKPOINT_STRATEGY,
         _ => "file_metadata_v1",
     };
@@ -4576,9 +4689,20 @@ mod tests {
         fs::write(&shm_path, b"shm").expect("write shm");
         let identity = db_path.to_string_lossy().to_string();
         let cursor = opencode_checkpoint_cursor(&db_path).expect("checkpoint cursor");
+        let shm_metadata = fs::metadata(&shm_path).expect("shm metadata");
+        let legacy_cursor = format!(
+            "{cursor}|opencode.db-shm:{}:{}",
+            shm_metadata.len(),
+            file_mtime_ms(&shm_metadata).expect("shm mtime")
+        );
         store
-            .upsert_source_checkpoint("opencode", &identity, Some(&cursor), &json!({}))
-            .expect("store checkpoint");
+            .upsert_source_checkpoint(
+                "opencode",
+                &identity,
+                Some(&legacy_cursor),
+                &json!({"kept": true}),
+            )
+            .expect("store legacy checkpoint");
         let adapter = LocalTranscriptAdapter {
             kind: "opencode",
             roots: Vec::new(),
@@ -4587,7 +4711,7 @@ mod tests {
         let candidate = SourceCandidate {
             adapter_kind: "opencode",
             kind: "opencode".to_string(),
-            identity,
+            identity: identity.clone(),
             path: Some(db_path.clone()),
             modified: 0,
             size: None,
@@ -4598,6 +4722,18 @@ mod tests {
         assert!(adapter
             .is_current(&context, &candidate)
             .expect("matching checkpoint"));
+
+        let migrated = store
+            .source_checkpoint("opencode", &identity)
+            .expect("load migrated checkpoint")
+            .expect("migrated checkpoint");
+        assert_eq!(migrated.cursor.as_deref(), Some(cursor.as_str()));
+        assert_eq!(migrated.metadata["kept"], true);
+
+        fs::write(&shm_path, b"shm changed").expect("change shm");
+        assert!(adapter
+            .is_current(&context, &candidate)
+            .expect("shm-only change"));
 
         fs::write(&wal_path, b"wal changed").expect("change wal");
         assert!(!adapter
@@ -4762,7 +4898,7 @@ mod tests {
     }
 
     #[test]
-    fn local_transcript_adapter_uses_cached_source_file_status() {
+    fn hermes_cached_checkpoint_ignores_unavailable_workspace_metadata() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = Store::open(temp.path()).expect("open store");
         let identity = temp.path().join("cached-status.json");
@@ -4786,7 +4922,7 @@ mod tests {
             identity,
             SourceFileStatus {
                 raw_current: true,
-                needs_workspace_refresh: false,
+                needs_workspace_refresh: true,
             },
         );
         let context = SourceSyncContext::new(&store).with_source_file_statuses(&statuses);
