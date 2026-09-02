@@ -2138,6 +2138,7 @@ impl Store {
         self.with_conn(skill_observation_projection_status)
     }
 
+    #[cfg(test)]
     pub fn rebuild_skill_observations(&self) -> Result<usize> {
         self.rebuild_skill_observations_with_progress(|_, _| {}, || false)
     }
@@ -2234,10 +2235,12 @@ impl Store {
         result
     }
 
+    #[cfg(test)]
     pub fn replace_skill_observations_for_sessions(&self, session_ids: &[String]) -> Result<usize> {
         self.replace_skill_observations_for_sessions_with_progress(session_ids, |_, _| {})
     }
 
+    #[cfg(test)]
     pub fn replace_skill_observations_for_sessions_with_progress(
         &self,
         session_ids: &[String],
@@ -2367,6 +2370,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn mark_skill_observation_projection_stale(&self) -> Result<()> {
         self.with_conn(|conn| mark_skill_projection_stale(conn, None))
     }
@@ -2402,6 +2406,7 @@ impl Store {
         self.with_conn(|conn| skill_usage_output(conn, filter))
     }
 
+    #[cfg(test)]
     pub fn skill_usage_aggregates(
         &self,
         filter: &SkillUsageFilter,
