@@ -2058,6 +2058,7 @@ fn prepare_file_import(
         parsed.with_context(|| format!("parsing {}", path.display()))?;
     if repaired_jsonl_records > 0 {
         tracing::warn!(
+            target: "historious",
             "repaired {repaired_jsonl_records} malformed JSONL record(s) in {} by replacing unpaired UTF-16 surrogate escapes",
             path.display()
         );
