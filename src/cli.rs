@@ -4,7 +4,9 @@ use crate::ingest;
 use crate::report;
 use crate::search;
 use crate::server;
-use crate::skill_usage::SkillMaintenanceMode;
+use crate::skill_usage::{
+    SkillMaintenanceMode, SkillProjectionState, SkillUsageFilter, SkillUsageOutput,
+};
 use crate::storage::{
     QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
     ThreadListOptions, ThreadSortMode,
@@ -883,6 +885,31 @@ pub enum ServiceCommand {
 pub enum SkillCommand {
     /// List packaged skills embedded in Historious.
     List,
+    /// Show machine-wide skills observed in indexed agent history.
+    Usage {
+        #[arg(
+            long,
+            value_name = "TIME",
+            help = "Include observations at or after this time"
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            value_name = "TIME",
+            help = "Include observations before this time"
+        )]
+        before: Option<String>,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Match workspace, repository, or locator"
+        )]
+        project: Option<String>,
+        #[arg(long, value_name = "TEXT", help = "Match skill name or locator")]
+        name: Option<String>,
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+    },
     /// Print packaged skill content.
     Emit {
         #[arg(help = "Skill name or 'all'")]
@@ -3000,7 +3027,7 @@ impl Cli {
                     write_stdout(&crate::skills::onboard_wrapper())?;
                 }
             }
-            Command::Skill { command } => run_skill_command(command)?,
+            Command::Skill { command } => run_skill_command(&store, command, robot)?,
             Command::Version { .. } => unreachable!("version returns before storage setup"),
             Command::SelfUpdate { .. } => unreachable!("self-update returns before storage setup"),
             Command::Config { .. } => unreachable!("config returns before storage setup"),
@@ -3040,6 +3067,9 @@ impl Command {
             Command::Config { .. } => "config",
             Command::Maintenance { .. } => "maintenance",
             Command::Onboard { .. } => "onboard",
+            Command::Skill {
+                command: SkillCommand::Usage { .. },
+            } => "skill usage",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
         }
@@ -3069,6 +3099,9 @@ impl Command {
                 }
                 | Command::Maintenance {
                     command: MaintenanceCommand::Compact { json: true, .. },
+                }
+                | Command::Skill {
+                    command: SkillCommand::Usage { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
                 | Command::Report {
@@ -3342,8 +3375,22 @@ fn approve_enrichment(preflight: &crate::annotate::EnrichmentPreflight, yes: boo
     Ok(())
 }
 
-fn run_skill_command(command: SkillCommand) -> Result<()> {
+fn run_skill_command(store: &Store, command: SkillCommand, robot: bool) -> Result<()> {
     match command {
+        SkillCommand::Usage {
+            after,
+            before,
+            project,
+            name,
+            json,
+        } => run_skill_usage_command(
+            store,
+            after.as_deref(),
+            before.as_deref(),
+            project,
+            name,
+            json || robot,
+        )?,
         SkillCommand::List => {
             println!("Packaged skills:");
             for skill in crate::skills::list_skills() {
@@ -3388,6 +3435,125 @@ fn run_skill_command(command: SkillCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_skill_usage_command(
+    store: &Store,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<String>,
+    name: Option<String>,
+    structured: bool,
+) -> Result<()> {
+    let (after, before) = search_time_bounds(false, after, before)?;
+    let filter = SkillUsageFilter {
+        after,
+        before,
+        project: normalized_skill_usage_filter(project),
+        name: normalized_skill_usage_filter(name),
+    };
+    let status = store.skill_observation_projection_status()?;
+    match status.state {
+        SkillProjectionState::Missing => {
+            bail!("skill usage data is missing; run 'histo update' to build it")
+        }
+        SkillProjectionState::Stale => {
+            bail!("skill usage data is stale; run 'histo update' to refresh it")
+        }
+        SkillProjectionState::Ready => {}
+    }
+    let output = store.skill_usage(&filter)?;
+    if structured {
+        crate::output::write_success("skill usage", output, Default::default())?;
+    } else {
+        print_skill_usage_output(&output);
+    }
+    Ok(())
+}
+
+fn normalized_skill_usage_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn print_skill_usage_output(output: &SkillUsageOutput) {
+    let locator_word = if output.totals.locators == 1 {
+        "locator"
+    } else {
+        "locators"
+    };
+    let load_word = if output.totals.loads == 1 {
+        "load"
+    } else {
+        "loads"
+    };
+    let session_word = if output.totals.unique_sessions == 1 {
+        "session"
+    } else {
+        "sessions"
+    };
+    println!(
+        "{} skill {}, {} {} across {} {}",
+        format_count(output.totals.locators),
+        locator_word,
+        format_count(output.totals.loads),
+        load_word,
+        format_count(output.totals.unique_sessions),
+        session_word
+    );
+    if output.records.is_empty() {
+        println!("No skill usage observations.");
+        return;
+    }
+    let rows = output
+        .records
+        .iter()
+        .map(|record| {
+            vec![
+                truncate_chars(&record.skill_name, 28),
+                truncate_chars(&record.locator, 64),
+                format_count(record.unique_sessions),
+                format_count(record.loads),
+                skill_usage_versions_cell(&record.versions),
+                format!(
+                    "{} high / {} medium",
+                    format_count(record.confidence.high),
+                    format_count(record.confidence.medium)
+                ),
+                format_thread_time_short(record.last_seen_at),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table_section(
+        "Observed skills",
+        &[
+            TableColumn::left("Name"),
+            TableColumn::left("Locator"),
+            TableColumn::right("Sessions"),
+            TableColumn::right("Loads"),
+            TableColumn::left("Versions"),
+            TableColumn::left("Confidence"),
+            TableColumn::left("Last seen"),
+        ],
+        &rows,
+        false,
+    );
+}
+
+fn skill_usage_versions_cell(versions: &[crate::skill_usage::SkillUsageVersion]) -> String {
+    let known = versions
+        .iter()
+        .filter(|version| version.content_hash.is_some())
+        .count();
+    let unknown = versions
+        .iter()
+        .any(|version| version.content_hash.is_none());
+    match (known, unknown) {
+        (0, true) => "unknown".to_string(),
+        (known, true) => format!("{} + unknown", format_count(known)),
+        (known, false) => format_count(known),
+    }
 }
 
 fn install_roots(
@@ -11302,6 +11468,84 @@ mod tests {
     fn similar_cell_marks_collapsed_duplicate_count() {
         assert_eq!(similar_cell(0), "-");
         assert_eq!(similar_cell(3), "+3 similar");
+    }
+
+    #[test]
+    fn skill_usage_command_parses_all_filters() {
+        let cli = Cli::try_parse_from([
+            "histo",
+            "skill",
+            "usage",
+            "--after",
+            "2026-01-01",
+            "--before",
+            "2026-02-01",
+            "--project",
+            "example/repo",
+            "--name",
+            "review",
+            "--json",
+        ])
+        .expect("parse skill usage");
+        assert_eq!(cli.command_name(), "skill usage");
+        assert!(cli.wants_structured_errors());
+        let Command::Skill {
+            command:
+                SkillCommand::Usage {
+                    after,
+                    before,
+                    project,
+                    name,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected skill usage command");
+        };
+        assert_eq!(after.as_deref(), Some("2026-01-01"));
+        assert_eq!(before.as_deref(), Some("2026-02-01"));
+        assert_eq!(project.as_deref(), Some("example/repo"));
+        assert_eq!(name.as_deref(), Some("review"));
+        assert!(json);
+    }
+
+    #[test]
+    fn skill_command_packaged_subcommands_still_parse() {
+        for args in [
+            vec!["histo", "skill", "list"],
+            vec!["histo", "skill", "emit", "all"],
+            vec!["histo", "skill", "install", "--claude"],
+        ] {
+            Cli::try_parse_from(args).expect("parse packaged skill command");
+        }
+    }
+
+    #[test]
+    fn skill_usage_command_requires_current_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let error = run_skill_usage_command(&store, None, None, None, None, false)
+            .expect_err("missing projection");
+        assert!(format!("{error:#}").contains("histo update"));
+
+        store
+            .maintain_skill_observations(
+                &crate::storage::ImportDelta::default(),
+                |_, _, _| {},
+                || false,
+            )
+            .expect("initialize empty projection");
+        run_skill_usage_command(&store, None, None, None, None, false)
+            .expect("current empty projection");
+
+        store
+            .mark_skill_observation_projection_stale()
+            .expect("mark projection stale");
+        let error = run_skill_usage_command(&store, None, None, None, None, false)
+            .expect_err("stale projection");
+        let message = format!("{error:#}");
+        assert!(message.contains("stale"));
+        assert!(message.contains("histo update"));
     }
 
     #[test]

@@ -96,6 +96,14 @@ pub struct SkillUsageFilter {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageTotals {
+    pub locators: usize,
+    pub skills: usize,
+    pub unique_sessions: usize,
+    pub loads: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillUsageConfidenceCounts {
     pub high: usize,
     pub medium: usize,
@@ -133,6 +141,13 @@ pub struct SkillUsageAggregate {
     pub confidence: SkillUsageConfidenceCounts,
     pub versions: Vec<SkillUsageVersion>,
     pub evidence: Vec<SkillUsageEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageOutput {
+    pub filters: SkillUsageFilter,
+    pub totals: SkillUsageTotals,
+    pub records: Vec<SkillUsageAggregate>,
 }
 
 impl SkillHashBasis {

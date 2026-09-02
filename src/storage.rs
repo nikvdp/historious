@@ -5,7 +5,8 @@ use crate::archive::{
 use crate::skill_usage::{
     detect_skill_observations, SkillHashBasis, SkillMaintenanceMode, SkillMaintenanceOutcome,
     SkillObservation, SkillProjectionState, SkillProjectionStatus, SkillUsageAggregate,
-    SkillUsageConfidenceCounts, SkillUsageEvidence, SkillUsageFilter, SkillUsageVersion,
+    SkillUsageConfidenceCounts, SkillUsageEvidence, SkillUsageFilter, SkillUsageOutput,
+    SkillUsageTotals, SkillUsageVersion,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
@@ -2157,7 +2158,9 @@ impl Store {
             let total_sessions = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
                 row.get::<_, i64>(0)
             })? as usize;
-            progress(0, total_sessions);
+            if total_sessions > 0 {
+                progress(0, total_sessions);
+            }
             let mut processed_sessions = 0usize;
             let mut last_session_id = String::new();
             loop {
@@ -2395,11 +2398,15 @@ impl Store {
         })
     }
 
+    pub fn skill_usage(&self, filter: &SkillUsageFilter) -> Result<SkillUsageOutput> {
+        self.with_conn(|conn| skill_usage_output(conn, filter))
+    }
+
     pub fn skill_usage_aggregates(
         &self,
         filter: &SkillUsageFilter,
     ) -> Result<Vec<SkillUsageAggregate>> {
-        self.with_conn(|conn| skill_usage_aggregates(conn, filter))
+        self.skill_usage(filter).map(|output| output.records)
     }
 
     pub fn history_items_for_event(&self, event_id: &str) -> Result<Vec<HistoryItemRecord>> {
@@ -4339,10 +4346,7 @@ struct SkillUsageAggregateBuilder {
     evidence: Vec<SkillUsageEvidence>,
 }
 
-fn skill_usage_aggregates(
-    conn: &Connection,
-    filter: &SkillUsageFilter,
-) -> Result<Vec<SkillUsageAggregate>> {
+fn skill_usage_output(conn: &Connection, filter: &SkillUsageFilter) -> Result<SkillUsageOutput> {
     let after = filter.after.map(|value| value.to_rfc3339());
     let before = filter.before.map(|value| value.to_rfc3339());
     let project = filter
@@ -4396,6 +4400,9 @@ fn skill_usage_aggregates(
     })?;
 
     let mut builders = BTreeMap::<String, SkillUsageAggregateBuilder>::new();
+    let mut skill_names = BTreeSet::new();
+    let mut sessions = BTreeSet::new();
+    let mut total_loads = 0usize;
     for row in rows {
         let (
             locator,
@@ -4412,6 +4419,9 @@ fn skill_usage_aggregates(
             event_id,
             result_event_id,
         ) = row?;
+        skill_names.insert(skill_name.clone());
+        sessions.insert(session_id.clone());
+        total_loads += 1;
         let observed_at = parse_opt_dt(observed_at);
         let builder = builders.entry(locator).or_default();
         *builder.names.entry(skill_name).or_default() += 1;
@@ -4521,7 +4531,16 @@ fn skill_usage_aggregates(
             .then_with(|| left.skill_name.cmp(&right.skill_name))
             .then_with(|| left.locator.cmp(&right.locator))
     });
-    Ok(aggregates)
+    Ok(SkillUsageOutput {
+        filters: filter.clone(),
+        totals: SkillUsageTotals {
+            locators: aggregates.len(),
+            skills: skill_names.len(),
+            unique_sessions: sessions.len(),
+            loads: total_loads,
+        },
+        records: aggregates,
+    })
 }
 
 fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<String>> {
@@ -11598,9 +11617,19 @@ mod tests {
             }
         );
 
-        let aggregates = store
-            .skill_usage_aggregates(&SkillUsageFilter::default())
+        let usage = store
+            .skill_usage(&SkillUsageFilter::default())
             .expect("aggregate observations");
+        assert_eq!(
+            usage.totals,
+            SkillUsageTotals {
+                locators: 2,
+                skills: 1,
+                unique_sessions: 4,
+                loads: 4,
+            }
+        );
+        let aggregates = usage.records;
         assert_eq!(aggregates.len(), 2);
         let shared = &aggregates[0];
         assert_eq!(shared.locator, "skill://shared");
@@ -11627,6 +11656,23 @@ mod tests {
             .versions
             .iter()
             .any(|version| version.content_hash == other.versions[0].content_hash));
+
+        let by_name = store
+            .skill_usage(&SkillUsageFilter {
+                name: Some("other".to_string()),
+                ..SkillUsageFilter::default()
+            })
+            .expect("filter by name");
+        assert_eq!(by_name.records.len(), 1);
+        assert_eq!(by_name.records[0].locator, "skill://other");
+
+        let by_project = store
+            .skill_usage(&SkillUsageFilter {
+                project: Some("example.invalid/repo".to_string()),
+                ..SkillUsageFilter::default()
+            })
+            .expect("filter by project");
+        assert_eq!(by_project.totals.loads, 4);
     }
 
     #[test]
