@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillHashBasis {
     ReturnedDocumentBytes,
@@ -13,21 +13,21 @@ pub enum SkillHashBasis {
     EmbeddedDocumentBytes,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCoverage {
     Complete,
     Partial,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillConfidence {
     High,
     Medium,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillLoadKind {
     NativeRead,
@@ -54,6 +54,117 @@ pub struct SkillObservation {
     pub workspace: Option<String>,
     pub repository: Option<String>,
     pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillProjectionState {
+    Missing,
+    Stale,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillProjectionStatus {
+    pub state: SkillProjectionState,
+    pub observation_count: usize,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageFilter {
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub project: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageConfidenceCounts {
+    pub high: usize,
+    pub medium: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageVersion {
+    pub content_hash: Option<String>,
+    pub loads: usize,
+    pub unique_sessions: usize,
+    pub hash_bases: Vec<SkillHashBasis>,
+    pub complete_loads: usize,
+    pub partial_loads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageEvidence {
+    pub session_id: String,
+    pub event_id: String,
+    pub result_event_id: String,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsageAggregate {
+    pub locator: String,
+    pub skill_name: String,
+    pub unique_sessions: usize,
+    pub loads: usize,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub source_kinds: Vec<String>,
+    pub workspaces: Vec<String>,
+    pub repositories: Vec<String>,
+    pub confidence: SkillUsageConfidenceCounts,
+    pub versions: Vec<SkillUsageVersion>,
+    pub evidence: Vec<SkillUsageEvidence>,
+}
+
+impl SkillHashBasis {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReturnedDocumentBytes => "returned_document_bytes",
+            Self::NormalizedToolOutput => "normalized_tool_output",
+            Self::EmbeddedDocumentBytes => "embedded_document_bytes",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "returned_document_bytes" => Some(Self::ReturnedDocumentBytes),
+            "normalized_tool_output" => Some(Self::NormalizedToolOutput),
+            "embedded_document_bytes" => Some(Self::EmbeddedDocumentBytes),
+            _ => None,
+        }
+    }
+}
+
+impl SkillCoverage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl SkillConfidence {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+        }
+    }
+}
+
+impl SkillLoadKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeRead => "native_read",
+            Self::ShellRead => "shell_read",
+            Self::EmbeddedContext => "embedded_context",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

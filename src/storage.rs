@@ -2,6 +2,11 @@ use crate::archive::{
     stable_hash, ArchiveRecord, EmbeddingRecord, EventRecord, MachineRecord, RawArtifact,
     SearchUnitRecord, SessionRecord, SourceRecord,
 };
+use crate::skill_usage::{
+    detect_skill_observations, SkillHashBasis, SkillObservation, SkillProjectionState,
+    SkillProjectionStatus, SkillUsageAggregate, SkillUsageConfidenceCounts, SkillUsageEvidence,
+    SkillUsageFilter, SkillUsageVersion,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{
@@ -11,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -26,6 +31,7 @@ const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 const HISTORY_ITEMS_PROJECTION: &str = "history_items_v2";
 const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v2";
+const SKILL_OBSERVATIONS_PROJECTION: &str = "skill_observations_v1";
 const SOURCE_STATUS_CONFIDENCE_APPROXIMATE: &str = "approximate";
 const SOURCE_STATUS_CONFIDENCE_EXACT: &str = "exact";
 const SOURCE_STATUS_CONFIDENCE_STALE: &str = "stale";
@@ -2112,6 +2118,151 @@ impl Store {
         self.with_conn(history_items_projection_health)
     }
 
+    pub fn skill_observation_projection_status(&self) -> Result<SkillProjectionStatus> {
+        self.with_conn(skill_observation_projection_status)
+    }
+
+    pub fn rebuild_skill_observations(&self) -> Result<usize> {
+        self.rebuild_skill_observations_with_progress(|_, _| {}, || false)
+    }
+
+    pub fn rebuild_skill_observations_with_progress(
+        &self,
+        mut progress: impl FnMut(usize, usize),
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<usize> {
+        let result = self.with_conn(|conn| {
+            mark_skill_projection_stale(conn, None)?;
+            with_immediate_write_tx(conn, |tx| {
+                tx.execute("DELETE FROM skill_observations_staging", [])?;
+                Ok(())
+            })?;
+
+            let session_ids = {
+                let mut stmt = conn.prepare("SELECT id FROM sessions ORDER BY id")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let total_sessions = session_ids.len();
+            progress(0, total_sessions);
+            for (index, session_id) in session_ids.iter().enumerate() {
+                if should_cancel() {
+                    bail!("skill observation rebuild interrupted");
+                }
+                let Some(session) = session_by_id(conn, session_id)? else {
+                    progress(index + 1, total_sessions);
+                    continue;
+                };
+                let events = events_for_session(conn, session_id)?;
+                let observations = detect_skill_observations(&session, &events);
+                if !observations.is_empty() {
+                    with_immediate_write_tx(conn, |tx| {
+                        for observation in &observations {
+                            insert_skill_observation(
+                                tx,
+                                "skill_observations_staging",
+                                observation,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                progress(index + 1, total_sessions);
+            }
+            if should_cancel() {
+                bail!("skill observation rebuild interrupted before commit");
+            }
+
+            with_immediate_write_tx(conn, |tx| {
+                tx.execute("DELETE FROM skill_observations", [])?;
+                tx.execute(
+                    "INSERT INTO skill_observations
+                     SELECT * FROM skill_observations_staging",
+                    [],
+                )?;
+                let observation_count =
+                    tx.query_row("SELECT COUNT(*) FROM skill_observations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })? as usize;
+                tx.execute("DELETE FROM skill_observations_staging", [])?;
+                update_projection_status(tx, SKILL_OBSERVATIONS_PROJECTION, observation_count)?;
+                Ok(observation_count)
+            })
+        });
+
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            let _ = self.with_conn(|conn| mark_skill_projection_stale(conn, Some(&message)));
+        }
+        result
+    }
+
+    pub fn replace_skill_observations_for_sessions(&self, session_ids: &[String]) -> Result<usize> {
+        let session_ids = normalized_ids(session_ids);
+        if session_ids.is_empty() {
+            return Ok(self
+                .skill_observation_projection_status()?
+                .observation_count);
+        }
+
+        let result = self.with_conn(|conn| {
+            if !projection_status_ready(conn, SKILL_OBSERVATIONS_PROJECTION)? {
+                bail!("skill observation projection is not ready");
+            }
+            let mut replacements = Vec::new();
+            for session_id in &session_ids {
+                let Some(session) = session_by_id(conn, session_id)? else {
+                    continue;
+                };
+                let events = events_for_session(conn, session_id)?;
+                replacements.extend(detect_skill_observations(&session, &events));
+            }
+
+            with_immediate_write_tx(conn, |tx| {
+                prepare_temp_id_scope(tx, "temp_skill_observation_sessions", &session_ids)?;
+                let replaced_count = tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM skill_observations
+                     WHERE session_id IN (
+                       SELECT id FROM temp_skill_observation_sessions
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+                tx.execute(
+                    "DELETE FROM skill_observations
+                     WHERE session_id IN (
+                       SELECT id FROM temp_skill_observation_sessions
+                     )",
+                    [],
+                )?;
+                for observation in &replacements {
+                    insert_skill_observation(tx, "skill_observations", observation)?;
+                }
+                let current_count = projection_status_count(tx, SKILL_OBSERVATIONS_PROJECTION)?
+                    .context("skill observation projection status is missing")?;
+                let observation_count = current_count
+                    .saturating_sub(replaced_count)
+                    .saturating_add(replacements.len());
+                update_projection_status(tx, SKILL_OBSERVATIONS_PROJECTION, observation_count)?;
+                Ok(observation_count)
+            })
+        });
+
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            let _ = self.with_conn(|conn| mark_skill_projection_stale(conn, Some(&message)));
+        }
+        result
+    }
+
+    pub fn skill_usage_aggregates(
+        &self,
+        filter: &SkillUsageFilter,
+    ) -> Result<Vec<SkillUsageAggregate>> {
+        self.with_conn(|conn| skill_usage_aggregates(conn, filter))
+    }
+
     pub fn history_items_for_event(&self, event_id: &str) -> Result<Vec<HistoryItemRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -3931,6 +4082,309 @@ fn with_immediate_write_tx<T>(
     Ok(value)
 }
 
+fn insert_skill_observation(
+    conn: &Connection,
+    table: &str,
+    observation: &SkillObservation,
+) -> Result<()> {
+    let sql = format!(
+        "INSERT OR REPLACE INTO {table}
+         (id, event_id, result_event_id, tool_call_id, session_id, machine_id,
+          source_kind, skill_name, locator, content_hash, hash_basis, coverage,
+          confidence, load_kind, workspace, repository, observed_at)
+         VALUES
+         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+          ?15, ?16, ?17)"
+    );
+    conn.execute(
+        &sql,
+        params![
+            observation.id,
+            observation.event_id,
+            observation.result_event_id,
+            observation.tool_call_id,
+            observation.session_id,
+            observation.machine_id,
+            observation.source_kind,
+            observation.skill_name,
+            observation.locator,
+            observation.content_hash,
+            observation.hash_basis.map(SkillHashBasis::as_str),
+            observation.coverage.as_str(),
+            observation.confidence.as_str(),
+            observation.load_kind.as_str(),
+            observation.workspace,
+            observation.repository,
+            observation.observed_at.map(|value| value.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn skill_observation_projection_status(conn: &Connection) -> Result<SkillProjectionStatus> {
+    let row = conn
+        .query_row(
+            "SELECT input_high_watermark, status, last_error, updated_at
+             FROM projection_status
+             WHERE projection_name = ?1",
+            params![SKILL_OBSERVATIONS_PROJECTION],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((watermark, status, last_error, updated_at)) = row else {
+        return Ok(SkillProjectionStatus {
+            state: SkillProjectionState::Missing,
+            observation_count: 0,
+            updated_at: None,
+            last_error: None,
+        });
+    };
+    Ok(SkillProjectionStatus {
+        state: if status == "ready" {
+            SkillProjectionState::Ready
+        } else {
+            SkillProjectionState::Stale
+        },
+        observation_count: watermark.parse().unwrap_or(0),
+        updated_at: parse_opt_dt(Some(updated_at)),
+        last_error,
+    })
+}
+
+fn mark_skill_projection_stale(conn: &Connection, error: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO projection_status
+         (projection_name, input_high_watermark, status, last_error, updated_at)
+         VALUES (?1, '', 'stale', ?2, ?3)
+         ON CONFLICT(projection_name) DO UPDATE SET
+           status = 'stale',
+           last_error = excluded.last_error,
+           updated_at = excluded.updated_at",
+        params![
+            SKILL_OBSERVATIONS_PROJECTION,
+            error,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct SkillUsageVersionBuilder {
+    loads: usize,
+    sessions: BTreeSet<String>,
+    hash_bases: BTreeSet<SkillHashBasis>,
+    complete_loads: usize,
+    partial_loads: usize,
+}
+
+#[derive(Default)]
+struct SkillUsageAggregateBuilder {
+    names: BTreeMap<String, usize>,
+    sessions: BTreeSet<String>,
+    loads: usize,
+    first_seen_at: Option<DateTime<Utc>>,
+    last_seen_at: Option<DateTime<Utc>>,
+    source_kinds: BTreeSet<String>,
+    workspaces: BTreeSet<String>,
+    repositories: BTreeSet<String>,
+    confidence: SkillUsageConfidenceCounts,
+    versions: BTreeMap<Option<String>, SkillUsageVersionBuilder>,
+    evidence: Vec<SkillUsageEvidence>,
+}
+
+fn skill_usage_aggregates(
+    conn: &Connection,
+    filter: &SkillUsageFilter,
+) -> Result<Vec<SkillUsageAggregate>> {
+    let after = filter.after.map(|value| value.to_rfc3339());
+    let before = filter.before.map(|value| value.to_rfc3339());
+    let project = filter
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let name = filter
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut stmt = conn.prepare(
+        "SELECT locator, skill_name, session_id, source_kind, workspace,
+                repository, content_hash, hash_basis, coverage, confidence,
+                observed_at, event_id, result_event_id
+         FROM skill_observations
+         WHERE (?1 IS NULL OR observed_at >= ?1)
+           AND (?2 IS NULL OR observed_at < ?2)
+           AND (
+             ?3 IS NULL
+             OR instr(lower(COALESCE(workspace, '')), lower(?3)) > 0
+             OR instr(lower(COALESCE(repository, '')), lower(?3)) > 0
+             OR instr(lower(locator), lower(?3)) > 0
+           )
+           AND (
+             ?4 IS NULL
+             OR instr(lower(skill_name), lower(?4)) > 0
+             OR instr(lower(locator), lower(?4)) > 0
+           )
+         ORDER BY locator, COALESCE(observed_at, ''), id",
+    )?;
+    let rows = stmt.query_map(params![after, before, project, name], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+        ))
+    })?;
+
+    let mut builders = BTreeMap::<String, SkillUsageAggregateBuilder>::new();
+    for row in rows {
+        let (
+            locator,
+            skill_name,
+            session_id,
+            source_kind,
+            workspace,
+            repository,
+            content_hash,
+            hash_basis,
+            coverage,
+            confidence,
+            observed_at,
+            event_id,
+            result_event_id,
+        ) = row?;
+        let observed_at = parse_opt_dt(observed_at);
+        let builder = builders.entry(locator).or_default();
+        *builder.names.entry(skill_name).or_default() += 1;
+        builder.sessions.insert(session_id.clone());
+        builder.loads += 1;
+        if let Some(observed_at) = observed_at {
+            builder.first_seen_at = Some(
+                builder
+                    .first_seen_at
+                    .map(|current| current.min(observed_at))
+                    .unwrap_or(observed_at),
+            );
+            builder.last_seen_at = Some(
+                builder
+                    .last_seen_at
+                    .map(|current| current.max(observed_at))
+                    .unwrap_or(observed_at),
+            );
+        }
+        builder.source_kinds.insert(source_kind);
+        if let Some(workspace) = workspace {
+            builder.workspaces.insert(workspace);
+        }
+        if let Some(repository) = repository {
+            builder.repositories.insert(repository);
+        }
+        match confidence.as_str() {
+            "high" => builder.confidence.high += 1,
+            "medium" => builder.confidence.medium += 1,
+            _ => {}
+        }
+        let version = builder.versions.entry(content_hash).or_default();
+        version.loads += 1;
+        version.sessions.insert(session_id.clone());
+        if let Some(hash_basis) = hash_basis.as_deref().and_then(SkillHashBasis::from_str) {
+            version.hash_bases.insert(hash_basis);
+        }
+        match coverage.as_str() {
+            "complete" => version.complete_loads += 1,
+            "partial" => version.partial_loads += 1,
+            _ => {}
+        }
+        builder.evidence.push(SkillUsageEvidence {
+            session_id,
+            event_id,
+            result_event_id,
+            observed_at,
+        });
+        if builder.evidence.len() > 5 {
+            builder.evidence.remove(0);
+        }
+    }
+
+    let mut aggregates = Vec::with_capacity(builders.len());
+    for (locator, builder) in builders {
+        let mut names: Vec<(String, usize)> = builder.names.into_iter().collect();
+        names.sort_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        let skill_name = names
+            .into_iter()
+            .next()
+            .map(|(name, _)| name)
+            .unwrap_or_default();
+        let mut versions: Vec<SkillUsageVersion> = builder
+            .versions
+            .into_iter()
+            .map(|(content_hash, version)| SkillUsageVersion {
+                content_hash,
+                loads: version.loads,
+                unique_sessions: version.sessions.len(),
+                hash_bases: version.hash_bases.into_iter().collect(),
+                complete_loads: version.complete_loads,
+                partial_loads: version.partial_loads,
+            })
+            .collect();
+        versions.sort_by(
+            |left, right| match (&left.content_hash, &right.content_hash) {
+                (Some(left), Some(right)) => left.cmp(right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+        );
+        aggregates.push(SkillUsageAggregate {
+            locator,
+            skill_name,
+            unique_sessions: builder.sessions.len(),
+            loads: builder.loads,
+            first_seen_at: builder.first_seen_at,
+            last_seen_at: builder.last_seen_at,
+            source_kinds: builder.source_kinds.into_iter().collect(),
+            workspaces: builder.workspaces.into_iter().collect(),
+            repositories: builder.repositories.into_iter().collect(),
+            confidence: builder.confidence,
+            versions,
+            evidence: builder.evidence,
+        });
+    }
+    aggregates.sort_by(|left, right| {
+        right
+            .unique_sessions
+            .cmp(&left.unique_sessions)
+            .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
+            .then_with(|| left.skill_name.cmp(&right.skill_name))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    Ok(aggregates)
+}
+
 fn prune_session_ids(conn: &Connection, filter: &PruneFilter) -> Result<Vec<String>> {
     let sources = normalized_string_set(&filter.session_filter.sources);
     let sessions = normalized_string_set(&filter.sessions);
@@ -5474,6 +5928,7 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
         | "temp_delta_event_ids"
         | "temp_delta_search_unit_ids"
         | "temp_history_item_event_ids"
+        | "temp_skill_observation_sessions"
         | "temp_prune_session_ids"
         | "temp_prune_event_ids"
         | "temp_prune_unit_ids"
@@ -5710,6 +6165,58 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_events_raw_artifact_hash
           ON events(raw_artifact_hash);
+
+        CREATE TABLE IF NOT EXISTS skill_observations (
+          id TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          result_event_id TEXT NOT NULL,
+          tool_call_id TEXT,
+          session_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          skill_name TEXT NOT NULL,
+          locator TEXT NOT NULL,
+          content_hash TEXT,
+          hash_basis TEXT,
+          coverage TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          load_kind TEXT NOT NULL,
+          workspace TEXT,
+          repository TEXT,
+          observed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_locator_time
+          ON skill_observations(locator, observed_at);
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_name_time
+          ON skill_observations(skill_name, observed_at);
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_session
+          ON skill_observations(session_id);
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_content_hash
+          ON skill_observations(content_hash);
+
+        CREATE TABLE IF NOT EXISTS skill_observations_staging (
+          id TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          result_event_id TEXT NOT NULL,
+          tool_call_id TEXT,
+          session_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          skill_name TEXT NOT NULL,
+          locator TEXT NOT NULL,
+          content_hash TEXT,
+          hash_basis TEXT,
+          coverage TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          load_kind TEXT NOT NULL,
+          workspace TEXT,
+          repository TEXT,
+          observed_at TEXT
+        );
 
         CREATE TABLE IF NOT EXISTS session_activity (
           session_id TEXT PRIMARY KEY,
@@ -10864,6 +11371,326 @@ mod tests {
             .position(|record| matches!(record, ArchiveRecord::Session(_)))
             .expect("session record");
         assert!(machine_position < session_position);
+    }
+
+    #[test]
+    fn skill_observation_projection_rebuilds_and_aggregates_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_skill_projection");
+        let sessions = [
+            skill_projection_session("session_shared_v1", &source.id),
+            skill_projection_session("session_shared_v2", &source.id),
+            skill_projection_session("session_shared_partial", &source.id),
+            skill_projection_session("session_other_v1", &source.id),
+        ];
+        let body_v1 = "---\nname: shared-skill\n---\n\nversion one\n";
+        let body_v2 = "---\nname: shared-skill\n---\n\nversion two\n";
+        let mut records = vec![ArchiveRecord::Source(source)];
+        for session in &sessions {
+            records.push(ArchiveRecord::Session(session.clone()));
+        }
+        records.extend(
+            skill_projection_events(&sessions[0], "shared-v1", "skill://shared", body_v1, false)
+                .into_iter()
+                .map(ArchiveRecord::Event),
+        );
+        records.extend(
+            skill_projection_events(&sessions[1], "shared-v2", "skill://shared", body_v2, false)
+                .into_iter()
+                .map(ArchiveRecord::Event),
+        );
+        records.extend(
+            skill_projection_events(
+                &sessions[2],
+                "shared-partial",
+                "skill://shared:1-2",
+                body_v1,
+                true,
+            )
+            .into_iter()
+            .map(ArchiveRecord::Event),
+        );
+        records.extend(
+            skill_projection_events(&sessions[3], "other-v1", "skill://other", body_v1, false)
+                .into_iter()
+                .map(ArchiveRecord::Event),
+        );
+        store
+            .import_records(&records)
+            .expect("import skill fixtures");
+
+        let mut progress = Vec::new();
+        let observation_count = store
+            .rebuild_skill_observations_with_progress(
+                |current, total| progress.push((current, total)),
+                || false,
+            )
+            .expect("rebuild observations");
+        assert_eq!(observation_count, 4);
+        assert_eq!(progress.first(), Some(&(0, 4)));
+        assert_eq!(progress.last(), Some(&(4, 4)));
+        assert_eq!(
+            store
+                .skill_observation_projection_status()
+                .expect("projection status"),
+            SkillProjectionStatus {
+                state: SkillProjectionState::Ready,
+                observation_count: 4,
+                updated_at: store
+                    .skill_observation_projection_status()
+                    .expect("projection status")
+                    .updated_at,
+                last_error: None,
+            }
+        );
+
+        let aggregates = store
+            .skill_usage_aggregates(&SkillUsageFilter::default())
+            .expect("aggregate observations");
+        assert_eq!(aggregates.len(), 2);
+        let shared = &aggregates[0];
+        assert_eq!(shared.locator, "skill://shared");
+        assert_eq!(shared.skill_name, "shared-skill");
+        assert_eq!(shared.unique_sessions, 3);
+        assert_eq!(shared.loads, 3);
+        assert_eq!(shared.versions.len(), 3);
+        assert_eq!(
+            shared
+                .versions
+                .iter()
+                .find(|version| version.content_hash.is_none())
+                .map(|version| (version.loads, version.partial_loads)),
+            Some((1, 1))
+        );
+        let other = &aggregates[1];
+        assert_eq!(other.locator, "skill://other");
+        assert_eq!(other.unique_sessions, 1);
+        assert_eq!(
+            other.versions[0].content_hash,
+            Some(crate::archive::blake3_hex(body_v1.as_bytes()))
+        );
+        assert!(shared
+            .versions
+            .iter()
+            .any(|version| version.content_hash == other.versions[0].content_hash));
+    }
+
+    #[test]
+    fn skill_observation_projection_replaces_sessions_idempotently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_skill_incremental");
+        let session = skill_projection_session("session_incremental", &source.id);
+        let initial_events = skill_projection_events(
+            &session,
+            "incremental",
+            "skill://initial",
+            "---\nname: initial\n---\n",
+            false,
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session.clone()),
+                ArchiveRecord::Event(initial_events[0].clone()),
+                ArchiveRecord::Event(initial_events[1].clone()),
+            ])
+            .expect("import initial observation");
+        store.rebuild_skill_observations().expect("initial rebuild");
+
+        let replacement_events = skill_projection_events(
+            &session,
+            "incremental",
+            "skill://replacement",
+            "---\nname: replacement\n---\n",
+            false,
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE events SET content = ?1, hash = ?2 WHERE id = ?3",
+                    params![
+                        replacement_events[0].content,
+                        replacement_events[0].hash,
+                        replacement_events[0].id
+                    ],
+                )?;
+                conn.execute(
+                    "UPDATE events SET content = ?1, hash = ?2 WHERE id = ?3",
+                    params![
+                        replacement_events[1].content,
+                        replacement_events[1].hash,
+                        replacement_events[1].id
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("replace source events");
+
+        let session_ids = vec![session.id.clone()];
+        assert_eq!(
+            store
+                .replace_skill_observations_for_sessions(&session_ids)
+                .expect("incremental replacement"),
+            1
+        );
+        let first = store
+            .skill_usage_aggregates(&SkillUsageFilter::default())
+            .expect("first aggregate");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].locator, "skill://replacement");
+        assert_eq!(
+            store
+                .replace_skill_observations_for_sessions(&session_ids)
+                .expect("repeat replacement"),
+            1
+        );
+        let second = store
+            .skill_usage_aggregates(&SkillUsageFilter::default())
+            .expect("second aggregate");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn skill_observation_projection_interruption_preserves_prior_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_skill_interruption");
+        let session = skill_projection_session("session_interruption", &source.id);
+        let old_events = skill_projection_events(
+            &session,
+            "interruption",
+            "skill://old",
+            "---\nname: old\n---\n",
+            false,
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session.clone()),
+                ArchiveRecord::Event(old_events[0].clone()),
+                ArchiveRecord::Event(old_events[1].clone()),
+            ])
+            .expect("import old observation");
+        store.rebuild_skill_observations().expect("initial rebuild");
+
+        let new_events = skill_projection_events(
+            &session,
+            "interruption",
+            "skill://new",
+            "---\nname: new\n---\n",
+            false,
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE events SET content = ?1, hash = ?2 WHERE id = ?3",
+                    params![new_events[0].content, new_events[0].hash, new_events[0].id],
+                )?;
+                conn.execute(
+                    "UPDATE events SET content = ?1, hash = ?2 WHERE id = ?3",
+                    params![new_events[1].content, new_events[1].hash, new_events[1].id],
+                )?;
+                Ok(())
+            })
+            .expect("replace source events");
+
+        let processed = std::cell::Cell::new(0usize);
+        let interrupted = store.rebuild_skill_observations_with_progress(
+            |current, _| processed.set(current),
+            || processed.get() > 0,
+        );
+        assert!(interrupted
+            .expect_err("rebuild should be interrupted")
+            .to_string()
+            .contains("interrupted"));
+        assert_eq!(
+            store
+                .skill_observation_projection_status()
+                .expect("stale status")
+                .state,
+            SkillProjectionState::Stale
+        );
+        let preserved = store
+            .skill_usage_aggregates(&SkillUsageFilter::default())
+            .expect("preserved aggregate");
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].locator, "skill://old");
+
+        store
+            .rebuild_skill_observations()
+            .expect("recovery rebuild");
+        let recovered = store
+            .skill_usage_aggregates(&SkillUsageFilter::default())
+            .expect("recovered aggregate");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].locator, "skill://new");
+    }
+
+    fn skill_projection_session(id: &str, source_id: &str) -> SessionRecord {
+        let mut session = fixture_session(id, source_id);
+        session.metadata = json!({
+            "cwd": "/tmp/repo",
+            "workspace_path": "/tmp/repo",
+            "workspace_root": "/tmp/repo",
+            "git_repo": "https://example.invalid/repo.git"
+        });
+        session
+    }
+
+    fn skill_projection_events(
+        session: &SessionRecord,
+        prefix: &str,
+        path: &str,
+        body: &str,
+        truncated: bool,
+    ) -> [EventRecord; 2] {
+        let call_id = format!("{prefix}-tool");
+        let call_content = json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "read_file",
+            "arguments": {"path": path}
+        });
+        let result_content = json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": body,
+            "truncated": truncated
+        });
+        [
+            EventRecord {
+                id: format!("{prefix}-call"),
+                session_id: session.id.clone(),
+                source_id: session.source_id.clone(),
+                machine_id: session.machine_id.clone(),
+                source_kind: session.source_kind.clone(),
+                ordinal: 0,
+                event_type: "function_call".to_string(),
+                role: None,
+                content: serde_json::to_string(&call_content).expect("serialize call"),
+                raw_artifact_hash: None,
+                occurred_at: Some(dt("2026-01-01T00:00:00Z")),
+                metadata: json!({}),
+                hash: stable_hash(&(prefix, "call", path)).expect("call hash"),
+            },
+            EventRecord {
+                id: format!("{prefix}-result"),
+                session_id: session.id.clone(),
+                source_id: session.source_id.clone(),
+                machine_id: session.machine_id.clone(),
+                source_kind: session.source_kind.clone(),
+                ordinal: 1,
+                event_type: "function_call_output".to_string(),
+                role: Some("tool".to_string()),
+                content: serde_json::to_string(&result_content).expect("serialize result"),
+                raw_artifact_hash: None,
+                occurred_at: Some(dt("2026-01-01T00:00:01Z")),
+                metadata: json!({}),
+                hash: stable_hash(&(prefix, "result", path, body)).expect("result hash"),
+            },
+        ]
     }
 
     fn record_id_exists(records: &[ArchiveRecord], id: &str) -> bool {
