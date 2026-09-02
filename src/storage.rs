@@ -3,9 +3,9 @@ use crate::archive::{
     SearchUnitRecord, SessionRecord, SourceRecord,
 };
 use crate::skill_usage::{
-    detect_skill_observations, SkillHashBasis, SkillObservation, SkillProjectionState,
-    SkillProjectionStatus, SkillUsageAggregate, SkillUsageConfidenceCounts, SkillUsageEvidence,
-    SkillUsageFilter, SkillUsageVersion,
+    detect_skill_observations, SkillHashBasis, SkillMaintenanceMode, SkillMaintenanceOutcome,
+    SkillObservation, SkillProjectionState, SkillProjectionStatus, SkillUsageAggregate,
+    SkillUsageConfidenceCounts, SkillUsageEvidence, SkillUsageFilter, SkillUsageVersion,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
@@ -373,6 +373,7 @@ pub struct ImportStats {
     pub inserted: usize,
     pub duplicates: usize,
     pub vectors_indexed: usize,
+    pub skill_observations: Option<SkillMaintenanceOutcome>,
     pub repaired_machine_sessions: usize,
     pub unresolved_machine_ids: usize,
     pub unresolved_machine_sessions: usize,
@@ -395,6 +396,7 @@ pub struct ImportDelta {
     pub touched_search_units: Vec<String>,
     pub touched_embeddings: Vec<String>,
     pub source_counts: BTreeMap<String, SourceDeltaCounts>,
+    pub skill_projection_incremental: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -426,6 +428,7 @@ impl ImportDelta {
         extend_unique(&mut self.repaired_events, other.repaired_events);
         extend_unique(&mut self.touched_search_units, other.touched_search_units);
         extend_unique(&mut self.touched_embeddings, other.touched_embeddings);
+        self.skill_projection_incremental |= other.skill_projection_incremental;
         for (source_kind, counts) in other.source_counts {
             self.source_counts
                 .entry(source_kind)
@@ -1210,6 +1213,9 @@ impl Store {
                         ),
                         params_from_iter(values()),
                     )?;
+                    if repaired > 0 && projection_status_ready(tx, SKILL_OBSERVATIONS_PROJECTION)? {
+                        mark_skill_projection_stale(tx, None)?;
+                    }
                     Ok(repaired)
                 })?;
                 repaired_sessions += repaired;
@@ -1276,6 +1282,9 @@ impl Store {
                      WHERE source_id = ?1 AND machine_id != ?2",
                     params![source_id, machine_id],
                 )?;
+                if repaired > 0 && projection_status_ready(tx, SKILL_OBSERVATIONS_PROJECTION)? {
+                    mark_skill_projection_stale(tx, None)?;
+                }
                 Ok(repaired)
             })
         })
@@ -1413,6 +1422,12 @@ impl Store {
                         stats.duplicates += 1;
                     }
                     record_delta(record, inserted, delta_mode, &mut stats.delta);
+                }
+                if !stats.delta.touched_sessions.is_empty()
+                    && projection_status_ready(tx, SKILL_OBSERVATIONS_PROJECTION)?
+                {
+                    stats.delta.skill_projection_incremental = true;
+                    mark_skill_projection_stale(tx, None)?;
                 }
                 Ok(stats)
             })
@@ -2131,6 +2146,7 @@ impl Store {
         mut progress: impl FnMut(usize, usize),
         mut should_cancel: impl FnMut() -> bool,
     ) -> Result<usize> {
+        progress(0, 0);
         let result = self.with_conn(|conn| {
             mark_skill_projection_stale(conn, None)?;
             with_immediate_write_tx(conn, |tx| {
@@ -2138,36 +2154,54 @@ impl Store {
                 Ok(())
             })?;
 
-            let session_ids = {
-                let mut stmt = conn.prepare("SELECT id FROM sessions ORDER BY id")?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let total_sessions = session_ids.len();
+            let total_sessions = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize;
             progress(0, total_sessions);
-            for (index, session_id) in session_ids.iter().enumerate() {
-                if should_cancel() {
-                    bail!("skill observation rebuild interrupted");
-                }
-                let Some(session) = session_by_id(conn, session_id)? else {
-                    progress(index + 1, total_sessions);
-                    continue;
+            let mut processed_sessions = 0usize;
+            let mut last_session_id = String::new();
+            loop {
+                let session_ids = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id
+                         FROM sessions
+                         WHERE id > ?1
+                         ORDER BY id
+                         LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![last_session_id, SQLITE_BIND_CHUNK_SIZE as i64],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                let events = events_for_session(conn, session_id)?;
-                let observations = detect_skill_observations(&session, &events);
-                if !observations.is_empty() {
-                    with_immediate_write_tx(conn, |tx| {
-                        for observation in &observations {
-                            insert_skill_observation(
-                                tx,
-                                "skill_observations_staging",
-                                observation,
-                            )?;
-                        }
-                        Ok(())
-                    })?;
+                if session_ids.is_empty() {
+                    break;
                 }
-                progress(index + 1, total_sessions);
+                for session_id in session_ids {
+                    if should_cancel() {
+                        bail!("skill observation rebuild interrupted");
+                    }
+                    if let Some(session) = session_by_id(conn, &session_id)? {
+                        let events = events_for_session(conn, &session_id)?;
+                        let observations = detect_skill_observations(&session, &events);
+                        if !observations.is_empty() {
+                            with_immediate_write_tx(conn, |tx| {
+                                for observation in &observations {
+                                    insert_skill_observation(
+                                        tx,
+                                        "skill_observations_staging",
+                                        observation,
+                                    )?;
+                                }
+                                Ok(())
+                            })?;
+                        }
+                    }
+                    processed_sessions += 1;
+                    progress(processed_sessions, total_sessions);
+                    last_session_id = session_id;
+                }
             }
             if should_cancel() {
                 bail!("skill observation rebuild interrupted before commit");
@@ -2198,7 +2232,30 @@ impl Store {
     }
 
     pub fn replace_skill_observations_for_sessions(&self, session_ids: &[String]) -> Result<usize> {
+        self.replace_skill_observations_for_sessions_with_progress(session_ids, |_, _| {})
+    }
+
+    pub fn replace_skill_observations_for_sessions_with_progress(
+        &self,
+        session_ids: &[String],
+        progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
+        self.replace_skill_observations_for_sessions_with_progress_and_cancel(
+            session_ids,
+            progress,
+            || false,
+        )
+    }
+
+    fn replace_skill_observations_for_sessions_with_progress_and_cancel(
+        &self,
+        session_ids: &[String],
+        mut progress: impl FnMut(usize, usize),
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<usize> {
         let session_ids = normalized_ids(session_ids);
+        let total_sessions = session_ids.len();
+        progress(0, total_sessions);
         if session_ids.is_empty() {
             return Ok(self
                 .skill_observation_projection_status()?
@@ -2206,16 +2263,19 @@ impl Store {
         }
 
         let result = self.with_conn(|conn| {
-            if !projection_status_ready(conn, SKILL_OBSERVATIONS_PROJECTION)? {
-                bail!("skill observation projection is not ready");
-            }
             let mut replacements = Vec::new();
-            for session_id in &session_ids {
-                let Some(session) = session_by_id(conn, session_id)? else {
-                    continue;
-                };
-                let events = events_for_session(conn, session_id)?;
-                replacements.extend(detect_skill_observations(&session, &events));
+            for (index, session_id) in session_ids.iter().enumerate() {
+                if should_cancel() {
+                    bail!("skill observation refresh interrupted");
+                }
+                if let Some(session) = session_by_id(conn, session_id)? {
+                    let events = events_for_session(conn, session_id)?;
+                    replacements.extend(detect_skill_observations(&session, &events));
+                }
+                progress(index + 1, total_sessions);
+            }
+            if should_cancel() {
+                bail!("skill observation refresh interrupted before commit");
             }
 
             with_immediate_write_tx(conn, |tx| {
@@ -2239,7 +2299,7 @@ impl Store {
                 for observation in &replacements {
                     insert_skill_observation(tx, "skill_observations", observation)?;
                 }
-                let current_count = projection_status_count(tx, SKILL_OBSERVATIONS_PROJECTION)?
+                let current_count = projection_status_watermark(tx, SKILL_OBSERVATIONS_PROJECTION)?
                     .context("skill observation projection status is missing")?;
                 let observation_count = current_count
                     .saturating_sub(replaced_count)
@@ -2254,6 +2314,85 @@ impl Store {
             let _ = self.with_conn(|conn| mark_skill_projection_stale(conn, Some(&message)));
         }
         result
+    }
+
+    pub fn maintain_skill_observations(
+        &self,
+        delta: &ImportDelta,
+        mut progress: impl FnMut(SkillMaintenanceMode, usize, usize),
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<SkillMaintenanceOutcome> {
+        let status = self.skill_observation_projection_status()?;
+        if status.state == SkillProjectionState::Missing
+            || (status.state == SkillProjectionState::Stale && !delta.skill_projection_incremental)
+        {
+            let mut processed_sessions = 0usize;
+            let mut total_sessions = 0usize;
+            let observation_count = self.rebuild_skill_observations_with_progress(
+                |processed, total| {
+                    processed_sessions = processed;
+                    total_sessions = total;
+                    progress(SkillMaintenanceMode::Rebuild, processed, total);
+                },
+                || should_cancel(),
+            )?;
+            return Ok(SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Rebuild,
+                processed_sessions,
+                total_sessions,
+                observation_count,
+            });
+        }
+
+        let session_ids = self.skill_observation_session_ids_for_delta(delta)?;
+        let total_sessions = session_ids.len();
+        let mut processed_sessions = 0usize;
+        let observation_count = self
+            .replace_skill_observations_for_sessions_with_progress_and_cancel(
+                &session_ids,
+                |processed, total| {
+                    processed_sessions = processed;
+                    progress(SkillMaintenanceMode::Incremental, processed, total);
+                },
+                || should_cancel(),
+            )?;
+        Ok(SkillMaintenanceOutcome {
+            mode: SkillMaintenanceMode::Incremental,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        })
+    }
+
+    pub fn mark_skill_observation_projection_stale(&self) -> Result<()> {
+        self.with_conn(|conn| mark_skill_projection_stale(conn, None))
+    }
+
+    fn skill_observation_session_ids_for_delta(&self, delta: &ImportDelta) -> Result<Vec<String>> {
+        let mut session_ids = normalized_ids(&delta.touched_sessions);
+        if delta.repaired_events.is_empty() {
+            return Ok(session_ids);
+        }
+        self.with_conn(|conn| {
+            for chunk in delta.repaired_events.chunks(SQLITE_BIND_CHUNK_SIZE) {
+                let sql = format!(
+                    "SELECT DISTINCT session_id
+                     FROM events
+                     WHERE id IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                for row in rows {
+                    push_unique(&mut session_ids, row?);
+                }
+            }
+            session_ids.sort_unstable();
+            Ok(session_ids)
+        })
     }
 
     pub fn skill_usage_aggregates(
@@ -8098,6 +8237,19 @@ fn history_items_missing_conversation_count(conn: &Connection) -> Result<u64> {
     Ok(count as u64)
 }
 
+fn projection_status_watermark(conn: &Connection, name: &str) -> Result<Option<usize>> {
+    let count = conn
+        .query_row(
+            "SELECT input_high_watermark
+             FROM projection_status
+             WHERE projection_name = ?1",
+            params![name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(count.and_then(|value| value.parse::<usize>().ok()))
+}
+
 fn projection_status_count(conn: &Connection, name: &str) -> Result<Option<usize>> {
     let count = conn
         .query_row(
@@ -11428,7 +11580,8 @@ mod tests {
             )
             .expect("rebuild observations");
         assert_eq!(observation_count, 4);
-        assert_eq!(progress.first(), Some(&(0, 4)));
+        assert_eq!(progress.first(), Some(&(0, 0)));
+        assert!(progress.contains(&(0, 4)));
         assert_eq!(progress.last(), Some(&(4, 4)));
         assert_eq!(
             store

@@ -1,6 +1,7 @@
 use crate::archive::{
     ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA, LEGACY_ARCHIVE_SCHEMA,
 };
+use crate::skill_usage::SkillMaintenanceMode;
 use crate::storage::{ArchiveExportFilter, ImportStats, Store};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -148,6 +149,12 @@ pub struct JsonlProgress {
 pub enum ImportProgress {
     Stream(JsonlProgress),
     HistoryItems { processed: usize, total: usize },
+    SkillObservations {
+        mode: SkillMaintenanceMode,
+        processed_sessions: usize,
+        total_sessions: usize,
+        observation_count: Option<usize>,
+    },
     VectorProjectionStarted { embeddings: usize },
     VectorProjectionFinished { vectors_indexed: usize },
 }
@@ -421,6 +428,25 @@ fn finalize_import_stats_with_options_and_progress(
     options: ImportOptions,
     mut progress: impl FnMut(ImportProgress),
 ) -> Result<()> {
+    let skill_observations = store.maintain_skill_observations(
+        &stats.delta,
+        |mode, processed_sessions, total_sessions| {
+            progress(ImportProgress::SkillObservations {
+                mode,
+                processed_sessions,
+                total_sessions,
+                observation_count: None,
+            });
+        },
+        || false,
+    )?;
+    progress(ImportProgress::SkillObservations {
+        mode: skill_observations.mode,
+        processed_sessions: skill_observations.processed_sessions,
+        total_sessions: skill_observations.total_sessions,
+        observation_count: Some(skill_observations.observation_count),
+    });
+    stats.skill_observations = Some(skill_observations);
     if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events_with_progress(
             &stats.delta.touched_events,
@@ -747,6 +773,102 @@ mod tests {
                 ArchiveRecord::Machine(MachineRecord { id, name, .. })
                     if id == machine_id && name == machine_name
             )));
+    }
+
+    #[test]
+    fn skill_observation_update_imports_jsonl_projection() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_store = Store::open(source_dir.path()).expect("open source store");
+        let source = fixture_source("source_skill_import");
+        let session = fixture_session(
+            "session_skill_import",
+            &source.id,
+            "/tmp/synthetic-workspace",
+        );
+        let mut call = fixture_event_with_text_kind(
+            "event_skill_call",
+            &session.id,
+            &source.id,
+            None,
+            &json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "read",
+                    "call_id": "skill-call",
+                    "arguments": "{\"path\":\"skill://import-skill\"}"
+                }
+            })
+            .to_string(),
+            "tool",
+        );
+        call.ordinal = 1;
+        let mut result = fixture_event_with_text_kind(
+            "event_skill_result",
+            &session.id,
+            &source.id,
+            None,
+            &json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "skill-call",
+                    "output": "---\nname: import-skill\n---\n# Synthetic skill"
+                }
+            })
+            .to_string(),
+            "tool",
+        );
+        result.ordinal = 2;
+        source_store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(call),
+                ArchiveRecord::Event(result),
+            ])
+            .expect("seed source archive");
+
+        let mut body = Vec::new();
+        export_jsonl(&source_store, &mut body).expect("export JSONL");
+        let imported_dir = tempfile::tempdir().expect("import tempdir");
+        let imported = Store::open(imported_dir.path()).expect("open imported store");
+        let mut progress = Vec::new();
+        let stats = import_jsonl_reader_with_import_progress(&imported, body.as_slice(), |event| {
+            progress.push(event)
+        })
+        .expect("import JSONL");
+
+        assert_eq!(
+            stats.skill_observations.expect("skill maintenance"),
+            crate::skill_usage::SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Rebuild,
+                processed_sessions: 1,
+                total_sessions: 1,
+                observation_count: 1,
+            }
+        );
+        let skill_progress = progress
+            .into_iter()
+            .filter_map(|event| match event {
+                ImportProgress::SkillObservations {
+                    mode,
+                    processed_sessions,
+                    total_sessions,
+                    observation_count,
+                } => Some((mode, processed_sessions, total_sessions, observation_count)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skill_progress,
+            vec![
+                (SkillMaintenanceMode::Rebuild, 0, 0, None),
+                (SkillMaintenanceMode::Rebuild, 0, 1, None),
+                (SkillMaintenanceMode::Rebuild, 1, 1, None),
+                (SkillMaintenanceMode::Rebuild, 1, 1, Some(1)),
+            ]
+        );
     }
 
     #[test]

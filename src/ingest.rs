@@ -2,6 +2,7 @@ use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, SessionRecord,
 };
 use crate::config::SourceConfigs;
+use crate::skill_usage::{SkillMaintenanceMode, SkillMaintenanceOutcome};
 use crate::source::{
     AdapterConcurrency, PreparedImport, SearchSegment, SemanticPolicy, SourceAdapter,
     SourceAdapterRegistry, SourceCandidate, SourceCheckpointUpsert, SourceSyncContext,
@@ -33,6 +34,7 @@ pub struct UpdateStats {
     pub duplicates: usize,
     pub errors: usize,
     pub repaired_machine_sessions: usize,
+    pub skill_observations: Option<SkillMaintenanceOutcome>,
     #[serde(skip)]
     pub delta: ImportDelta,
 }
@@ -861,6 +863,12 @@ pub enum UpdateProgress {
         source_file_count: usize,
         stats: UpdateStats,
     },
+    SkillObservations {
+        mode: SkillMaintenanceMode,
+        processed_sessions: usize,
+        total_sessions: usize,
+        observation_count: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1186,7 +1194,36 @@ pub fn update_local_with_progress_and_cancel(
             stats: stats.clone(),
         });
     }
+    maintain_skill_observations_after_update(store, &mut stats, &mut progress, &should_cancel)?;
     Ok(stats)
+}
+
+fn maintain_skill_observations_after_update(
+    store: &Store,
+    stats: &mut UpdateStats,
+    progress: &mut impl FnMut(&UpdateProgress),
+    should_cancel: &impl Fn() -> bool,
+) -> Result<()> {
+    let skill_observations = store.maintain_skill_observations(
+        &stats.delta,
+        |mode, processed_sessions, total_sessions| {
+            progress(&UpdateProgress::SkillObservations {
+                mode,
+                processed_sessions,
+                total_sessions,
+                observation_count: None,
+            });
+        },
+        should_cancel,
+    )?;
+    progress(&UpdateProgress::SkillObservations {
+        mode: skill_observations.mode,
+        processed_sessions: skill_observations.processed_sessions,
+        total_sessions: skill_observations.total_sessions,
+        observation_count: Some(skill_observations.observation_count),
+    });
+    stats.skill_observations = Some(skill_observations);
+    Ok(())
 }
 
 fn precompute_local_source_file_statuses(
@@ -1528,6 +1565,7 @@ pub fn update_source_path_with_progress_and_cancel(
         source_file_count: 1,
         stats: stats.clone(),
     });
+    maintain_skill_observations_after_update(store, &mut stats, &mut progress, &should_cancel)?;
     Ok(stats)
 }
 
@@ -3521,6 +3559,202 @@ fn file_mtime_ms(metadata: &fs::Metadata) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::storage::Store;
+
+    fn write_skill_update_log(path: &Path, read_count: usize) {
+        let mut rows = vec![json!({
+            "type": "session",
+            "sessionId": "synthetic-session",
+            "cwd": "/tmp/synthetic-workspace"
+        })];
+        for index in 0..read_count {
+            let call_id = format!("read-{index}");
+            rows.push(json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": call_id,
+                        "name": "read",
+                        "arguments": {"path": "skill://update-skill"}
+                    }]
+                }
+            }));
+            rows.push(json!({
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": call_id,
+                    "toolName": "read",
+                    "content": [{
+                        "type": "text",
+                        "text": "---\nname: update-skill\n---\n# Synthetic skill"
+                    }],
+                    "isError": false
+                }
+            }));
+        }
+        let text = rows
+            .into_iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{text}\n")).expect("write synthetic transcript");
+    }
+
+    #[test]
+    fn skill_observation_update_maintains_changed_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("data")).expect("open store");
+        let transcript = dir.path().join("session.jsonl");
+        write_skill_update_log(&transcript, 1);
+
+        let mut first_progress = Vec::new();
+        let first = update_source_path_with_progress_and_cancel(
+            &store,
+            "00000000-0000-4000-8000-000000000001",
+            "Synthetic Machine",
+            "omp",
+            &transcript,
+            |event| first_progress.push(event.clone()),
+            || false,
+        )
+        .expect("initial update");
+        let first_skill_progress = first_progress
+            .iter()
+            .filter_map(|event| match event {
+                UpdateProgress::SkillObservations {
+                    mode,
+                    processed_sessions,
+                    total_sessions,
+                    observation_count,
+                } => Some((
+                    *mode,
+                    *processed_sessions,
+                    *total_sessions,
+                    *observation_count,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_skill_progress,
+            vec![
+                (SkillMaintenanceMode::Rebuild, 0, 0, None),
+                (SkillMaintenanceMode::Rebuild, 0, 1, None),
+                (SkillMaintenanceMode::Rebuild, 1, 1, None),
+                (SkillMaintenanceMode::Rebuild, 1, 1, Some(1)),
+            ]
+        );
+        assert_eq!(
+            first.skill_observations.expect("initial maintenance"),
+            SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Rebuild,
+                processed_sessions: 1,
+                total_sessions: 1,
+                observation_count: 1,
+            }
+        );
+
+        let second = update_source_path_with_progress_and_cancel(
+            &store,
+            "00000000-0000-4000-8000-000000000001",
+            "Synthetic Machine",
+            "omp",
+            &transcript,
+            |_| {},
+            || false,
+        )
+        .expect("unchanged update");
+        assert_eq!(
+            second.skill_observations.expect("unchanged maintenance"),
+            SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Incremental,
+                processed_sessions: 0,
+                total_sessions: 0,
+                observation_count: 1,
+            }
+        );
+
+        write_skill_update_log(&transcript, 2);
+        let third = update_source_path_with_progress_and_cancel(
+            &store,
+            "00000000-0000-4000-8000-000000000001",
+            "Synthetic Machine",
+            "omp",
+            &transcript,
+            |_| {},
+            || false,
+        )
+        .expect("changed update");
+        assert_eq!(
+            third.skill_observations.expect("incremental maintenance"),
+            SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Incremental,
+                processed_sessions: 1,
+                total_sessions: 1,
+                observation_count: 2,
+            }
+        );
+        assert_eq!(
+            store
+                .skill_observation_projection_status()
+                .expect("projection status")
+                .state,
+            crate::skill_usage::SkillProjectionState::Ready
+        );
+
+        write_skill_update_log(&transcript, 3);
+        let cancel = std::cell::Cell::new(false);
+        let interrupted = update_source_path_with_progress_and_cancel(
+            &store,
+            "00000000-0000-4000-8000-000000000001",
+            "Synthetic Machine",
+            "omp",
+            &transcript,
+            |event| {
+                if matches!(
+                    event,
+                    UpdateProgress::SkillObservations {
+                        observation_count: None,
+                        ..
+                    }
+                ) {
+                    cancel.set(true);
+                }
+            },
+            || cancel.get(),
+        );
+        assert!(interrupted.is_err());
+        let interrupted_status = store
+            .skill_observation_projection_status()
+            .expect("interrupted projection status");
+        assert_eq!(
+            interrupted_status.state,
+            crate::skill_usage::SkillProjectionState::Stale
+        );
+        assert_eq!(interrupted_status.observation_count, 2);
+
+        let recovered = update_source_path_with_progress_and_cancel(
+            &store,
+            "00000000-0000-4000-8000-000000000001",
+            "Synthetic Machine",
+            "omp",
+            &transcript,
+            |_| {},
+            || false,
+        )
+        .expect("recovery update");
+        assert_eq!(
+            recovered.skill_observations.expect("recovery maintenance"),
+            SkillMaintenanceOutcome {
+                mode: SkillMaintenanceMode::Rebuild,
+                processed_sessions: 1,
+                total_sessions: 1,
+                observation_count: 3,
+            }
+        );
+    }
 
     #[test]
     fn classifies_codex_session_signals() {

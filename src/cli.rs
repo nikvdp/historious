@@ -4,6 +4,7 @@ use crate::ingest;
 use crate::report;
 use crate::search;
 use crate::server;
+use crate::skill_usage::SkillMaintenanceMode;
 use crate::storage::{
     QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
     ThreadListOptions, ThreadSortMode,
@@ -3864,11 +3865,16 @@ fn run_update_once_machine(
             )
         },
         |event, emission| {
-            if emission != ScopedProgressEmission::Event
+            if skill_observation_progress_is_boundary(event)
+                || emission != ScopedProgressEmission::Event
                 || last_scan_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
             {
                 write_update_progress(
-                    "scan",
+                    if matches!(event, ingest::UpdateProgress::SkillObservations { .. }) {
+                        "skill_observations"
+                    } else {
+                        "scan"
+                    },
                     update_progress_detail(event),
                     update_progress_payload(event),
                 );
@@ -4556,6 +4562,27 @@ fn import_progress_event(
                 "total": total,
             }),
         ),
+        transport::ImportProgress::SkillObservations {
+            mode,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        } => (
+            "skill_observations",
+            skill_observation_progress_detail(
+                mode,
+                processed_sessions,
+                total_sessions,
+                observation_count,
+            ),
+            serde_json::json!({
+                "status": if observation_count.is_some() { "finished" } else { "processing" },
+                "mode": mode,
+                "processed_sessions": processed_sessions,
+                "total_sessions": total_sessions,
+                "observation_count": observation_count,
+            }),
+        ),
         transport::ImportProgress::VectorProjectionStarted { embeddings } => (
             "vectors",
             format!(
@@ -4633,6 +4660,19 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
                     "projected {}/{} events into history items",
                     format_count(processed),
                     format_count(total)
+                ));
+            }
+            transport::ImportProgress::SkillObservations {
+                mode,
+                processed_sessions,
+                total_sessions,
+                observation_count,
+            } => {
+                import.update(skill_observation_progress_detail(
+                    mode,
+                    processed_sessions,
+                    total_sessions,
+                    observation_count,
                 ));
             }
             transport::ImportProgress::VectorProjectionStarted { embeddings } => {
@@ -6145,6 +6185,45 @@ fn embedding_progress_payload(event: &search::EmbeddingProgress) -> serde_json::
     }
 }
 
+fn skill_observation_progress_detail(
+    mode: SkillMaintenanceMode,
+    processed_sessions: usize,
+    total_sessions: usize,
+    observation_count: Option<usize>,
+) -> String {
+    let action = match (mode, observation_count.is_some()) {
+        (SkillMaintenanceMode::Rebuild, false) => "rebuilding",
+        (SkillMaintenanceMode::Rebuild, true) => "rebuilt",
+        (SkillMaintenanceMode::Incremental, false) => "refreshing",
+        (SkillMaintenanceMode::Incremental, true) => "refreshed",
+    };
+    let mut detail = format!(
+        "{action} {}/{} sessions for skill usage",
+        format_count(processed_sessions),
+        format_count(total_sessions)
+    );
+    if let Some(observation_count) = observation_count {
+        detail.push_str(&format!(
+            "; {} observations current",
+            format_count(observation_count)
+        ));
+    }
+    detail
+}
+
+fn skill_observation_progress_is_boundary(event: &ingest::UpdateProgress) -> bool {
+    matches!(
+        event,
+        ingest::UpdateProgress::SkillObservations {
+            processed_sessions: 0,
+            ..
+        } | ingest::UpdateProgress::SkillObservations {
+            observation_count: Some(_),
+            ..
+        }
+    )
+}
+
 fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
     match event {
         ingest::UpdateProgress::Discovering { sources } => {
@@ -6326,6 +6405,17 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             format_count(stats.skipped_unchanged),
             format_count(stats.errors)
         ),
+        ingest::UpdateProgress::SkillObservations {
+            mode,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        } => skill_observation_progress_detail(
+            *mode,
+            *processed_sessions,
+            *total_sessions,
+            *observation_count,
+        ),
     }
 }
 
@@ -6487,6 +6577,18 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "source_file_count": source_file_count,
             "stats": stats,
         }),
+        ingest::UpdateProgress::SkillObservations {
+            mode,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        } => serde_json::json!({
+            "status": if observation_count.is_some() { "finished" } else { "processing" },
+            "mode": mode,
+            "processed_sessions": processed_sessions,
+            "total_sessions": total_sessions,
+            "observation_count": observation_count,
+        }),
     }
 }
 
@@ -6498,6 +6600,7 @@ enum UpdateDisplayPhase {
     MachineAssignments,
     LocalLogs,
     ChangedLogs,
+    SkillObservations,
     SearchData,
     ReportData,
 }
@@ -6596,6 +6699,7 @@ impl UpdateProgressView {
     }
 
     fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
+        let force_render = skill_observation_progress_is_boundary(event);
         match event {
             ingest::UpdateProgress::Discovering { sources } => {
                 self.phase = UpdateDisplayPhase::LocalLogs;
@@ -6742,11 +6846,44 @@ impl UpdateProgressView {
                 };
                 row.current_path = None;
             }
+            ingest::UpdateProgress::SkillObservations {
+                mode,
+                processed_sessions,
+                total_sessions,
+                observation_count,
+            } => {
+                self.phase = UpdateDisplayPhase::SkillObservations;
+                self.data_rows.clear();
+                self.data_rows.insert(
+                    "skills".to_string(),
+                    UpdateDataProgress {
+                        state: if observation_count.is_some() {
+                            "current"
+                        } else if *mode == SkillMaintenanceMode::Rebuild {
+                            "rebuilding"
+                        } else {
+                            "refreshing"
+                        },
+                        current: Some(*processed_sessions),
+                        total: Some(*total_sessions),
+                        detail: skill_observation_progress_detail(
+                            *mode,
+                            *processed_sessions,
+                            *total_sessions,
+                            *observation_count,
+                        ),
+                    },
+                );
+            }
         }
-        self.render(false);
+        self.render(force_render);
     }
 
     fn finish_ingest(&mut self) {
+        if self.phase == UpdateDisplayPhase::SkillObservations {
+            self.render(true);
+            return;
+        }
         if self.sources.values().all(|row| row.changed_files == 0) {
             self.phase = UpdateDisplayPhase::LocalLogs;
             for row in self.sources.values_mut() {
@@ -7116,6 +7253,7 @@ impl UpdateProgressView {
             UpdateDisplayPhase::LocalLogs => self.source_lines("local logs: scanning", true),
             UpdateDisplayPhase::NativeTitles => self.native_title_lines(),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
+            UpdateDisplayPhase::SkillObservations => self.data_lines("skill usage: updating"),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
             UpdateDisplayPhase::ReportData => self.data_lines("report data: updating"),
         };
@@ -7246,7 +7384,9 @@ impl UpdateProgressView {
     fn data_lines(&self, heading: &str) -> Vec<String> {
         let mut lines = vec![heading.to_string()];
         let label_width = self.data_label_width();
-        let keys: &[&str] = &["startup", "search", "history", "report", "vectors"];
+        let keys: &[&str] = &[
+            "startup", "skills", "search", "history", "report", "vectors",
+        ];
         for key in keys {
             if let Some(row) = self.data_rows.get(*key) {
                 let meter = match (row.current, row.total) {
@@ -11187,6 +11327,49 @@ mod tests {
         assert_eq!(value["data"]["status"], "batch");
         assert_eq!(value["data"]["pending"], 128);
     }
+
+    #[test]
+    fn skill_observation_progress_keeps_meter_and_machine_counts_aligned() {
+        let event = ingest::UpdateProgress::SkillObservations {
+            mode: SkillMaintenanceMode::Incremental,
+            processed_sessions: 4,
+            total_sessions: 10,
+            observation_count: None,
+        };
+        assert_eq!(
+            update_progress_detail(&event),
+            "refreshing 4/10 sessions for skill usage"
+        );
+        assert_eq!(
+            update_progress_payload(&event),
+            json!({
+                "status": "processing",
+                "mode": "incremental",
+                "processed_sessions": 4,
+                "total_sessions": 10,
+                "observation_count": null,
+            })
+        );
+
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.ingest_event(&event);
+        let lines = view.lines();
+        assert!(lines[0].contains("skill usage: updating"));
+        assert!(lines[1].contains("4/10"));
+        assert!(lines[1].contains("refreshing 4/10 sessions for skill usage"));
+
+        view.ingest_event(&ingest::UpdateProgress::SkillObservations {
+            mode: SkillMaintenanceMode::Incremental,
+            processed_sessions: 10,
+            total_sessions: 10,
+            observation_count: Some(42),
+        });
+        let complete = view.lines();
+        assert!(complete[1].contains("10/10"));
+        assert!(complete[1].contains("42 observations current"));
+    }
+
     #[test]
     fn update_startup_progress_uses_truthful_meter_counts() {
         let mut view = UpdateProgressView::startup();

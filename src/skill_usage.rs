@@ -72,6 +72,21 @@ pub struct SkillProjectionStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillMaintenanceMode {
+    Rebuild,
+    Incremental,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMaintenanceOutcome {
+    pub mode: SkillMaintenanceMode,
+    pub processed_sessions: usize,
+    pub total_sessions: usize,
+    pub observation_count: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillUsageFilter {
     pub after: Option<DateTime<Utc>>,
