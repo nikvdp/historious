@@ -2047,14 +2047,21 @@ fn prepare_file_import(
         return prepare_opencode_db_import(machine_id, path, &path_text, &source_id, source_upsert);
     }
 
-    let lines = if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+    let parsed = if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         let text = String::from_utf8_lossy(&bytes);
-        parse_jsonl(&text)
+        parse_jsonl(&text, kind == "omp")
     } else {
         let text = String::from_utf8_lossy(&bytes);
-        parse_json_file(&text)
+        parse_json_file(&text).map(|lines| (lines, 0))
     };
-    let lines = lines.with_context(|| format!("parsing {}", path.display()))?;
+    let (lines, repaired_jsonl_records) =
+        parsed.with_context(|| format!("parsing {}", path.display()))?;
+    if repaired_jsonl_records > 0 {
+        tracing::warn!(
+            "repaired {repaired_jsonl_records} malformed JSONL record(s) in {} by replacing unpaired UTF-16 surrogate escapes",
+            path.display()
+        );
+    }
     let omp_identity = (kind == "omp").then(|| omp_session_identity(path, &lines));
     let external_session_id = omp_identity
         .as_ref()
@@ -3182,16 +3189,18 @@ fn looks_like_path(text: &str) -> bool {
     text.starts_with('/') || text.starts_with("~/")
 }
 
-fn parse_jsonl(text: &str) -> Result<Vec<ParsedLine>> {
-    parse_jsonl_with_start(text, 0, 0)
+fn parse_jsonl(text: &str, repair_unpaired_surrogates: bool) -> Result<(Vec<ParsedLine>, usize)> {
+    parse_jsonl_with_start(text, 0, 0, repair_unpaired_surrogates)
 }
 
 fn parse_jsonl_with_start(
     text: &str,
     starting_ordinal: i64,
     starting_byte_offset: usize,
-) -> Result<Vec<ParsedLine>> {
+    repair_unpaired_surrogates: bool,
+) -> Result<(Vec<ParsedLine>, usize)> {
     let mut out = Vec::new();
+    let mut repaired_records = 0;
     let mut offset = starting_byte_offset;
     for (idx, raw_line) in text.split_inclusive('\n').enumerate() {
         let byte_len = raw_line.len();
@@ -3200,8 +3209,28 @@ fn parse_jsonl_with_start(
             offset += byte_len;
             continue;
         }
-        let value: Value = serde_json::from_str(raw_line)
-            .with_context(|| format!("parsing JSONL line {}", idx + 1))?;
+        let value = match serde_json::from_str(raw_line) {
+            Ok(value) => value,
+            Err(original_error) if repair_unpaired_surrogates => {
+                let Some(repaired) = repair_unpaired_surrogate_escapes(raw_line) else {
+                    return Err(original_error)
+                        .with_context(|| format!("parsing JSONL line {}", idx + 1));
+                };
+                match serde_json::from_str(&repaired) {
+                    Ok(value) => {
+                        repaired_records += 1;
+                        value
+                    }
+                    Err(_) => {
+                        return Err(original_error)
+                            .with_context(|| format!("parsing JSONL line {}", idx + 1));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("parsing JSONL line {}", idx + 1));
+            }
+        };
         out.push(parsed_line(
             starting_ordinal.saturating_add(idx as i64),
             value,
@@ -3210,7 +3239,65 @@ fn parse_jsonl_with_start(
         ));
         offset += byte_len;
     }
-    Ok(out)
+    Ok((out, repaired_records))
+}
+
+fn repair_unpaired_surrogate_escapes(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut repaired = None::<String>;
+    let mut copy_from = 0;
+    let mut in_string = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                in_string = !in_string;
+                index += 1;
+            }
+            b'\\' if in_string => {
+                let Some(code) = json_unicode_escape(bytes, index) else {
+                    index = (index + 2).min(bytes.len());
+                    continue;
+                };
+                let paired = (0xD800..=0xDBFF).contains(&code)
+                    && json_unicode_escape(bytes, index + 6)
+                        .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low));
+                if paired {
+                    index += 12;
+                    continue;
+                }
+                if (0xD800..=0xDFFF).contains(&code) {
+                    let output = repaired.get_or_insert_with(|| String::with_capacity(raw.len()));
+                    output.push_str(&raw[copy_from..index]);
+                    output.push_str("\\ufffd");
+                    index += 6;
+                    copy_from = index;
+                } else {
+                    index += 6;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+
+    repaired.map(|mut output| {
+        output.push_str(&raw[copy_from..]);
+        output
+    })
+}
+
+fn json_unicode_escape(bytes: &[u8], index: usize) -> Option<u16> {
+    if bytes.get(index..index + 2)? != b"\\u" {
+        return None;
+    }
+    bytes
+        .get(index + 2..index + 6)?
+        .iter()
+        .try_fold(0u16, |value, byte| {
+            let digit = (*byte as char).to_digit(16)? as u16;
+            Some((value << 4) | digit)
+        })
 }
 
 fn parse_json_file(text: &str) -> Result<Vec<ParsedLine>> {
@@ -3600,6 +3687,70 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(path, format!("{text}\n")).expect("write synthetic transcript");
+    }
+
+    #[test]
+    fn omp_update_repairs_unpaired_surrogate_without_reprocessing_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("data")).expect("open store");
+        let transcript = dir.path().join("malformed.jsonl");
+        let text = concat!(
+            r#"{"type":"session","sessionId":"malformed-session","cwd":"/tmp/example"}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"user","content":"before \ud8f9 after"}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":"after repair"}}"#,
+            "\n"
+        );
+        fs::write(&transcript, text).expect("write malformed transcript");
+
+        let (parsed, repaired_records) =
+            parse_jsonl(text, true).expect("repair malformed transcript");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(repaired_records, 1);
+
+        let machine_id = "00000000-0000-4000-8000-000000000001";
+        store
+            .upsert_machine(machine_id, "Synthetic Machine")
+            .expect("store machine");
+        let metadata = fs::metadata(&transcript).expect("transcript metadata");
+        let path = transcript.to_string_lossy().to_string();
+        let candidate = SourceCandidate {
+            adapter_kind: "omp",
+            kind: "omp".to_string(),
+            identity: path.clone(),
+            path: Some(transcript.clone()),
+            modified: 0,
+            size: Some(metadata.len()),
+            mtime_ms: file_mtime_ms(&metadata),
+        };
+        let adapter = LocalTranscriptAdapter {
+            kind: "omp",
+            roots: Vec::new(),
+            native_titles: NativeTitleIndex::default(),
+        };
+        let context = SourceSyncContext::new(&store);
+        assert!(!adapter
+            .is_current(&context, &candidate)
+            .expect("initial source status"));
+        adapter
+            .prepare_import(&context, machine_id, &candidate)
+            .and_then(|prepared| prepared.commit(&store))
+            .expect("import repaired transcript");
+
+        let session_id = stable_id(&["session", "omp", &path, "malformed"]);
+        let events = store.events_for_session(&session_id).expect("load events");
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .any(|event| event.content.contains('\u{fffd}')));
+        assert!(events
+            .iter()
+            .any(|event| event.content.contains("after repair")));
+
+        assert!(adapter
+            .is_current(&SourceSyncContext::new(&store), &candidate)
+            .expect("unchanged source status"));
     }
 
     #[test]
