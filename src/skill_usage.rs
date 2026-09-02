@@ -150,6 +150,27 @@ pub struct SkillUsageOutput {
     pub records: Vec<SkillUsageAggregate>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillObservationFilter {
+    pub name: Option<String>,
+    pub locator: Option<String>,
+    pub content_hash: Option<String>,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub project: Option<String>,
+    pub source: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillObservationPage {
+    pub filters: SkillObservationFilter,
+    pub page_count: usize,
+    pub next_cursor: Option<String>,
+    pub records: Vec<SkillObservation>,
+}
+
 impl SkillHashBasis {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -176,6 +197,14 @@ impl SkillCoverage {
             Self::Partial => "partial",
         }
     }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "partial" => Some(Self::Partial),
+            _ => None,
+        }
+    }
 }
 
 impl SkillConfidence {
@@ -183,6 +212,14 @@ impl SkillConfidence {
         match self {
             Self::High => "high",
             Self::Medium => "medium",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            _ => None,
         }
     }
 }
@@ -193,6 +230,15 @@ impl SkillLoadKind {
             Self::NativeRead => "native_read",
             Self::ShellRead => "shell_read",
             Self::EmbeddedContext => "embedded_context",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "native_read" => Some(Self::NativeRead),
+            "shell_read" => Some(Self::ShellRead),
+            "embedded_context" => Some(Self::EmbeddedContext),
+            _ => None,
         }
     }
 }

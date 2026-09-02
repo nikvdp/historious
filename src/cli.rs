@@ -5,7 +5,8 @@ use crate::report;
 use crate::search;
 use crate::server;
 use crate::skill_usage::{
-    SkillMaintenanceMode, SkillProjectionState, SkillUsageFilter, SkillUsageOutput,
+    SkillMaintenanceMode, SkillObservationFilter, SkillObservationPage, SkillProjectionState,
+    SkillUsageFilter, SkillUsageOutput,
 };
 use crate::storage::{
     QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
@@ -34,6 +35,7 @@ const DEFAULT_THREAD_LIMIT: usize = 10;
 const DEFAULT_FZF_LIMIT: usize = 25;
 const DEFAULT_LIVE_SEARCH_LIMIT: usize = 50;
 const DEFAULT_TAIL_LINES: usize = 20;
+const DEFAULT_SKILL_OBSERVATION_LIMIT: usize = 100;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7391";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7391";
 const LIVE_SEARCH_RELOAD_DELAY_SECS: f32 = 0.35;
@@ -907,6 +909,75 @@ pub enum SkillCommand {
         project: Option<String>,
         #[arg(long, value_name = "TEXT", help = "Match skill name or locator")]
         name: Option<String>,
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+    },
+    /// Enumerate exact projected skill observations.
+    Observations {
+        #[arg(
+            long,
+            required_unless_present = "locator",
+            conflicts_with = "locator",
+            value_name = "NAME",
+            value_parser = parse_nonempty_skill_selector,
+            help = "Select one exact skill name across all matching locators"
+        )]
+        name: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "name",
+            conflicts_with = "name",
+            value_name = "LOCATOR",
+            value_parser = parse_nonempty_skill_selector,
+            help = "Select one exact skill locator"
+        )]
+        locator: Option<String>,
+        #[arg(
+            long = "hash",
+            value_name = "BLAKE3_HASH",
+            value_parser = parse_blake3_hash,
+            help = "Include only one complete BLAKE3 content version"
+        )]
+        content_hash: Option<String>,
+        #[arg(
+            long,
+            value_name = "TIME",
+            help = "Include observations at or after this time"
+        )]
+        after: Option<String>,
+        #[arg(
+            long,
+            value_name = "TIME",
+            help = "Include observations before this time"
+        )]
+        before: Option<String>,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Match workspace, repository, or locator"
+        )]
+        project: Option<String>,
+        #[arg(
+            long,
+            value_name = "KIND",
+            value_parser = parse_skill_observation_source,
+            help = "Include only one coding-agent source kind"
+        )]
+        source: Option<String>,
+        #[arg(
+            long,
+            default_value_t = DEFAULT_SKILL_OBSERVATION_LIMIT,
+            value_parser = parse_positive_skill_observation_limit,
+            help = "Maximum observations to return"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            value_name = "CURSOR",
+            value_parser = parse_nonempty_skill_cursor,
+            help = "Continue a prior observation page"
+        )]
+        cursor: Option<String>,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
@@ -3070,6 +3141,9 @@ impl Command {
             Command::Skill {
                 command: SkillCommand::Usage { .. },
             } => "skill usage",
+            Command::Skill {
+                command: SkillCommand::Observations { .. },
+            } => "skill observations",
             Command::Skill { .. } => "skill",
             Command::Completion { .. } => "completion",
         }
@@ -3101,7 +3175,8 @@ impl Command {
                     command: MaintenanceCommand::Compact { json: true, .. },
                 }
                 | Command::Skill {
-                    command: SkillCommand::Usage { json: true, .. },
+                    command: SkillCommand::Usage { json: true, .. }
+                        | SkillCommand::Observations { json: true, .. },
                 }
                 | Command::Status { json: true, .. }
                 | Command::Report {
@@ -3391,6 +3466,30 @@ fn run_skill_command(store: &Store, command: SkillCommand, robot: bool) -> Resul
             name,
             json || robot,
         )?,
+        SkillCommand::Observations {
+            name,
+            locator,
+            content_hash,
+            after,
+            before,
+            project,
+            source,
+            limit,
+            cursor,
+            json,
+        } => run_skill_observations_command(
+            store,
+            name,
+            locator,
+            content_hash,
+            after.as_deref(),
+            before.as_deref(),
+            project,
+            source,
+            limit,
+            cursor,
+            json || robot,
+        )?,
         SkillCommand::List => {
             println!("Packaged skills:");
             for skill in crate::skills::list_skills() {
@@ -3452,6 +3551,53 @@ fn run_skill_usage_command(
         project: normalized_skill_usage_filter(project),
         name: normalized_skill_usage_filter(name),
     };
+    require_current_skill_observation_projection(store)?;
+    let output = store.skill_usage(&filter)?;
+    if structured {
+        crate::output::write_success("skill usage", output, Default::default())?;
+    } else {
+        print_skill_usage_output(&output);
+    }
+    Ok(())
+}
+
+fn run_skill_observations_command(
+    store: &Store,
+    name: Option<String>,
+    locator: Option<String>,
+    content_hash: Option<String>,
+    after: Option<&str>,
+    before: Option<&str>,
+    project: Option<String>,
+    source: Option<String>,
+    limit: usize,
+    cursor: Option<String>,
+    structured: bool,
+) -> Result<()> {
+    let (after, before) = search_time_bounds(false, after, before)?;
+    let cursor = cursor.map(|value| value.trim().to_string());
+    let filter = SkillObservationFilter {
+        name,
+        locator,
+        content_hash,
+        after,
+        before,
+        project: normalized_skill_usage_filter(project),
+        source,
+        limit,
+        cursor,
+    };
+    require_current_skill_observation_projection(store)?;
+    let output = store.skill_observations(&filter)?;
+    if structured {
+        crate::output::write_success("skill observations", output, Default::default())?;
+    } else {
+        print_skill_observations_output(&output);
+    }
+    Ok(())
+}
+
+fn require_current_skill_observation_projection(store: &Store) -> Result<()> {
     let status = store.skill_observation_projection_status()?;
     match status.state {
         SkillProjectionState::Missing => {
@@ -3460,15 +3606,105 @@ fn run_skill_usage_command(
         SkillProjectionState::Stale => {
             bail!("skill usage data is stale; run 'histo update' to refresh it")
         }
-        SkillProjectionState::Ready => {}
+        SkillProjectionState::Ready => Ok(()),
     }
-    let output = store.skill_usage(&filter)?;
-    if structured {
-        crate::output::write_success("skill usage", output, Default::default())?;
+}
+
+fn parse_nonempty_skill_selector(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("skill selector must not be empty".to_string())
     } else {
-        print_skill_usage_output(&output);
+        Ok(value.to_string())
     }
-    Ok(())
+}
+
+fn parse_blake3_hash(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    let Some(hex) = value.strip_prefix("blake3:") else {
+        return Err("expected 'blake3:' followed by 64 hexadecimal characters".to_string());
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("expected 'blake3:' followed by 64 hexadecimal characters".to_string());
+    }
+    Ok(format!("blake3:{}", hex.to_ascii_lowercase()))
+}
+
+fn parse_skill_observation_source(value: &str) -> std::result::Result<String, String> {
+    let source = value.trim().to_ascii_lowercase();
+    if matches!(
+        source.as_str(),
+        "codex" | "claude_code" | "opencode" | "pi_agent" | "omp" | "hermes" | "openclaw"
+    ) {
+        Ok(source)
+    } else {
+        Err(format!(
+            "unknown coding-agent source '{value}'; expected codex, claude_code, opencode, \
+             pi_agent, omp, hermes, or openclaw"
+        ))
+    }
+}
+
+fn parse_positive_skill_observation_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be a positive integer".to_string())?;
+    if limit == 0 {
+        Err("limit must be a positive integer".to_string())
+    } else {
+        Ok(limit)
+    }
+}
+
+fn parse_nonempty_skill_cursor(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("skill observations cursor must not be empty".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn print_skill_observations_output(output: &SkillObservationPage) {
+    let noun = if output.page_count == 1 {
+        "observation"
+    } else {
+        "observations"
+    };
+    println!("{} skill {}", format_count(output.page_count), noun);
+    if output.records.is_empty() {
+        println!("No matching skill observations.");
+        return;
+    }
+    for record in &output.records {
+        println!("- {} | {}", record.skill_name, record.locator);
+        println!(
+            "  version: {} | {} | {}",
+            record.content_hash.as_deref().unwrap_or("unknown"),
+            record.coverage.as_str(),
+            record
+                .hash_basis
+                .map(|basis| basis.as_str())
+                .unwrap_or("unknown")
+        );
+        println!(
+            "  source: {} | confidence: {} | load: {} | observed: {}",
+            record.source_kind,
+            record.confidence.as_str(),
+            record.load_kind.as_str(),
+            record
+                .observed_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!(
+            "  session: {} | event: {} | result: {}",
+            record.session_id, record.event_id, record.result_event_id
+        );
+    }
+    if let Some(cursor) = output.next_cursor.as_ref() {
+        println!("Next cursor: {cursor}");
+    }
 }
 
 fn normalized_skill_usage_filter(value: Option<String>) -> Option<String> {
@@ -11507,6 +11743,210 @@ mod tests {
         assert_eq!(project.as_deref(), Some("example/repo"));
         assert_eq!(name.as_deref(), Some("review"));
         assert!(json);
+    }
+
+    #[test]
+    fn skill_observations_command_parses_normalized_filters() {
+        let hash = format!("blake3:{}", "A".repeat(64));
+        let cli = Cli::try_parse_from([
+            "histo",
+            "skill",
+            "observations",
+            "--name",
+            " shared-skill ",
+            "--hash",
+            &hash,
+            "--after",
+            "2026-01-01",
+            "--before",
+            "2026-02-01",
+            "--project",
+            "example/repo",
+            "--source",
+            "OMP",
+            "--limit",
+            "1",
+            "--cursor",
+            "cursor-value",
+            "--json",
+        ])
+        .expect("parse skill observations");
+        assert_eq!(cli.command_name(), "skill observations");
+        assert!(cli.wants_structured_errors());
+        let Command::Skill {
+            command:
+                SkillCommand::Observations {
+                    name,
+                    locator,
+                    content_hash,
+                    after,
+                    before,
+                    project,
+                    source,
+                    limit,
+                    cursor,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected skill observations command");
+        };
+        assert_eq!(name.as_deref(), Some("shared-skill"));
+        assert_eq!(locator, None);
+        assert_eq!(
+            content_hash.as_deref(),
+            Some(format!("blake3:{}", "a".repeat(64)).as_str())
+        );
+        assert_eq!(after.as_deref(), Some("2026-01-01"));
+        assert_eq!(before.as_deref(), Some("2026-02-01"));
+        assert_eq!(project.as_deref(), Some("example/repo"));
+        assert_eq!(source.as_deref(), Some("omp"));
+        assert_eq!(limit, 1);
+        assert_eq!(cursor.as_deref(), Some("cursor-value"));
+        assert!(json);
+    }
+
+    #[test]
+    fn skill_observations_command_requires_exactly_one_selector() {
+        let missing = Cli::try_parse_from(["histo", "skill", "observations"])
+            .expect_err("selector is required");
+        assert!(missing.to_string().contains("--name"));
+        assert!(missing.to_string().contains("--locator"));
+
+        let conflicting = Cli::try_parse_from([
+            "histo",
+            "skill",
+            "observations",
+            "--name",
+            "shared-skill",
+            "--locator",
+            "skill://shared",
+        ])
+        .expect_err("selectors conflict");
+        assert!(conflicting.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn skill_observations_command_rejects_invalid_hash_source_and_limit() {
+        for args in [
+            vec![
+                "histo",
+                "skill",
+                "observations",
+                "--name",
+                "shared-skill",
+                "--hash",
+                "blake3:abc",
+            ],
+            vec![
+                "histo",
+                "skill",
+                "observations",
+                "--name",
+                "shared-skill",
+                "--hash",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+            vec![
+                "histo",
+                "skill",
+                "observations",
+                "--name",
+                "shared-skill",
+                "--source",
+                "unknown",
+            ],
+            vec![
+                "histo",
+                "skill",
+                "observations",
+                "--name",
+                "shared-skill",
+                "--limit",
+                "0",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect_err("invalid observation filter");
+        }
+    }
+
+    #[test]
+    fn skill_observations_robot_and_json_select_structured_output() {
+        let robot = Cli::try_parse_from([
+            "histo",
+            "--robot",
+            "skill",
+            "observations",
+            "--locator",
+            "skill://shared",
+        ])
+        .expect("parse robot observations");
+        let robot_structured = match &robot.command {
+            Command::Skill {
+                command: SkillCommand::Observations { json, .. },
+            } => robot.robot || *json,
+            _ => false,
+        };
+        assert!(robot_structured);
+        assert!(robot.wants_structured_errors());
+
+        let json_cli = Cli::try_parse_from([
+            "histo",
+            "skill",
+            "observations",
+            "--locator",
+            "skill://shared",
+            "--json",
+        ])
+        .expect("parse JSON observations");
+        let json_structured = match &json_cli.command {
+            Command::Skill {
+                command: SkillCommand::Observations { json, .. },
+            } => json_cli.robot || *json,
+            _ => false,
+        };
+        assert!(json_structured);
+        assert!(json_cli.wants_structured_errors());
+    }
+
+    #[test]
+    fn skill_observations_command_requires_current_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let run = |store: &Store| {
+            run_skill_observations_command(
+                store,
+                Some("shared-skill".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                None,
+                false,
+            )
+        };
+        let error = run(&store).expect_err("missing projection");
+        assert!(format!("{error:#}").contains("histo update"));
+
+        store
+            .maintain_skill_observations(
+                &crate::storage::ImportDelta::default(),
+                |_, _, _| {},
+                || false,
+            )
+            .expect("initialize empty projection");
+        run(&store).expect("current empty projection");
+
+        store
+            .mark_skill_observation_projection_stale()
+            .expect("mark projection stale");
+        let error = run(&store).expect_err("stale projection");
+        let message = format!("{error:#}");
+        assert!(message.contains("stale"));
+        assert!(message.contains("histo update"));
     }
 
     #[test]

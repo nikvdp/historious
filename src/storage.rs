@@ -3,18 +3,20 @@ use crate::archive::{
     SearchUnitRecord, SessionRecord, SourceRecord,
 };
 use crate::skill_usage::{
-    detect_skill_observations, SkillHashBasis, SkillMaintenanceMode, SkillMaintenanceOutcome,
-    SkillObservation, SkillProjectionState, SkillProjectionStatus, SkillUsageAggregate,
+    detect_skill_observations, SkillConfidence, SkillCoverage, SkillHashBasis, SkillLoadKind,
+    SkillMaintenanceMode, SkillMaintenanceOutcome, SkillObservation, SkillObservationFilter,
+    SkillObservationPage, SkillProjectionState, SkillProjectionStatus, SkillUsageAggregate,
     SkillUsageConfidenceCounts, SkillUsageEvidence, SkillUsageFilter, SkillUsageOutput,
     SkillUsageTotals, SkillUsageVersion,
 };
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
     Transaction, TransactionBehavior,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2406,6 +2408,13 @@ impl Store {
         self.with_conn(|conn| skill_usage_output(conn, filter))
     }
 
+    pub fn skill_observations(
+        &self,
+        filter: &SkillObservationFilter,
+    ) -> Result<SkillObservationPage> {
+        self.with_conn(|conn| skill_observation_page(conn, filter))
+    }
+
     #[cfg(test)]
     pub fn skill_usage_aggregates(
         &self,
@@ -4325,6 +4334,242 @@ fn mark_skill_projection_stale(conn: &Connection, error: Option<&str>) -> Result
         ],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillObservationCursor {
+    observed_at: Option<String>,
+    observation_id: String,
+}
+
+struct StoredSkillObservation {
+    id: String,
+    event_id: String,
+    result_event_id: String,
+    tool_call_id: Option<String>,
+    session_id: String,
+    machine_id: String,
+    source_kind: String,
+    skill_name: String,
+    locator: String,
+    content_hash: Option<String>,
+    hash_basis: Option<String>,
+    coverage: String,
+    confidence: String,
+    load_kind: String,
+    workspace: Option<String>,
+    repository: Option<String>,
+    observed_at: Option<String>,
+}
+
+fn skill_observation_page(
+    conn: &Connection,
+    filter: &SkillObservationFilter,
+) -> Result<SkillObservationPage> {
+    if filter.limit == 0 {
+        bail!("skill observation page limit must be greater than zero");
+    }
+    let cursor = filter
+        .cursor
+        .as_deref()
+        .map(decode_skill_observation_cursor)
+        .transpose()?;
+    let query_limit = filter
+        .limit
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .context("skill observation page limit is too large")?;
+    let (sql, values) = skill_observation_page_query(filter, cursor.as_ref(), query_limit)?;
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+        Ok(StoredSkillObservation {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            result_event_id: row.get(2)?,
+            tool_call_id: row.get(3)?,
+            session_id: row.get(4)?,
+            machine_id: row.get(5)?,
+            source_kind: row.get(6)?,
+            skill_name: row.get(7)?,
+            locator: row.get(8)?,
+            content_hash: row.get(9)?,
+            hash_basis: row.get(10)?,
+            coverage: row.get(11)?,
+            confidence: row.get(12)?,
+            load_kind: row.get(13)?,
+            workspace: row.get(14)?,
+            repository: row.get(15)?,
+            observed_at: row.get(16)?,
+        })
+    })?;
+    let mut stored = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = stored.len() > filter.limit;
+    if has_more {
+        stored.truncate(filter.limit);
+    }
+    let next_cursor = if has_more {
+        stored
+            .last()
+            .map(|row| {
+                encode_skill_observation_cursor(&SkillObservationCursor {
+                    observed_at: row.observed_at.clone(),
+                    observation_id: row.id.clone(),
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let records = stored
+        .into_iter()
+        .map(StoredSkillObservation::into_observation)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SkillObservationPage {
+        filters: filter.clone(),
+        page_count: records.len(),
+        next_cursor,
+        records,
+    })
+}
+
+fn skill_observation_page_query(
+    filter: &SkillObservationFilter,
+    cursor: Option<&SkillObservationCursor>,
+    query_limit: i64,
+) -> Result<(String, Vec<SqlValue>)> {
+    let (selector_column, selector) = match (
+        filter.name.as_deref().filter(|value| !value.is_empty()),
+        filter.locator.as_deref().filter(|value| !value.is_empty()),
+    ) {
+        (Some(name), None) => ("skill_name", name),
+        (None, Some(locator)) => ("locator", locator),
+        _ => bail!("exactly one skill observation name or locator is required"),
+    };
+    let mut sql = format!(
+        "SELECT id, event_id, result_event_id, tool_call_id, session_id, machine_id,
+                source_kind, skill_name, locator, content_hash, hash_basis, coverage,
+                confidence, load_kind, workspace, repository, observed_at
+         FROM skill_observations
+         WHERE {selector_column} = ?"
+    );
+    let mut values = vec![SqlValue::Text(selector.to_string())];
+    if let Some(content_hash) = filter.content_hash.as_ref() {
+        sql.push_str(" AND content_hash = ? AND coverage = 'complete'");
+        values.push(SqlValue::Text(content_hash.clone()));
+    }
+    if let Some(after) = filter.after {
+        sql.push_str(" AND observed_at >= ?");
+        values.push(SqlValue::Text(after.to_rfc3339()));
+    }
+    if let Some(before) = filter.before {
+        sql.push_str(" AND observed_at < ?");
+        values.push(SqlValue::Text(before.to_rfc3339()));
+    }
+    if let Some(project) = filter.project.as_ref() {
+        sql.push_str(
+            " AND (
+                instr(lower(COALESCE(workspace, '')), lower(?)) > 0
+                OR instr(lower(COALESCE(repository, '')), lower(?)) > 0
+                OR instr(lower(locator), lower(?)) > 0
+              )",
+        );
+        values.extend([
+            SqlValue::Text(project.clone()),
+            SqlValue::Text(project.clone()),
+            SqlValue::Text(project.clone()),
+        ]);
+    }
+    if let Some(source) = filter.source.as_ref() {
+        sql.push_str(" AND source_kind = ?");
+        values.push(SqlValue::Text(source.clone()));
+    }
+    if let Some(cursor) = cursor {
+        if let Some(observed_at) = cursor.observed_at.as_ref() {
+            sql.push_str(" AND (observed_at > ? OR (observed_at = ? AND id > ?))");
+            values.extend([
+                SqlValue::Text(observed_at.clone()),
+                SqlValue::Text(observed_at.clone()),
+                SqlValue::Text(cursor.observation_id.clone()),
+            ]);
+        } else {
+            sql.push_str(" AND ((observed_at IS NULL AND id > ?) OR observed_at IS NOT NULL)");
+            values.push(SqlValue::Text(cursor.observation_id.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY observed_at, id LIMIT ?");
+    values.push(SqlValue::Integer(query_limit));
+    Ok((sql, values))
+}
+
+fn encode_skill_observation_cursor(cursor: &SkillObservationCursor) -> Result<String> {
+    let bytes = serde_json::to_vec(cursor)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_skill_observation_cursor(value: &str) -> Result<SkillObservationCursor> {
+    if value.len() > 4_096 {
+        bail!("invalid skill observations cursor");
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| anyhow::anyhow!("invalid skill observations cursor"))?;
+    let cursor: SkillObservationCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid skill observations cursor"))?;
+    if cursor.observation_id.is_empty()
+        || cursor
+            .observed_at
+            .as_deref()
+            .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_err())
+    {
+        bail!("invalid skill observations cursor");
+    }
+    Ok(cursor)
+}
+
+impl StoredSkillObservation {
+    fn into_observation(self) -> Result<SkillObservation> {
+        let observed_at = self
+            .observed_at
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .context("invalid skill observation timestamp")?
+            .map(|value| value.with_timezone(&Utc));
+        let hash_basis = self
+            .hash_basis
+            .as_deref()
+            .map(|value| {
+                SkillHashBasis::from_str(value)
+                    .with_context(|| format!("invalid skill observation hash basis '{value}'"))
+            })
+            .transpose()?;
+        let coverage = SkillCoverage::from_str(&self.coverage)
+            .with_context(|| format!("invalid skill observation coverage '{}'", self.coverage))?;
+        let confidence = SkillConfidence::from_str(&self.confidence).with_context(|| {
+            format!("invalid skill observation confidence '{}'", self.confidence)
+        })?;
+        let load_kind = SkillLoadKind::from_str(&self.load_kind)
+            .with_context(|| format!("invalid skill observation load kind '{}'", self.load_kind))?;
+        Ok(SkillObservation {
+            id: self.id,
+            session_id: self.session_id,
+            event_id: self.event_id,
+            result_event_id: self.result_event_id,
+            tool_call_id: self.tool_call_id,
+            machine_id: self.machine_id,
+            source_kind: self.source_kind,
+            skill_name: self.skill_name,
+            locator: self.locator,
+            content_hash: self.content_hash,
+            hash_basis,
+            coverage,
+            confidence,
+            load_kind,
+            workspace: self.workspace,
+            repository: self.repository,
+            observed_at,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -6354,6 +6599,12 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_skill_observations_name_time
           ON skill_observations(skill_name, observed_at);
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_locator_hash_time
+          ON skill_observations(locator, content_hash, observed_at, id);
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_name_hash_time
+          ON skill_observations(skill_name, content_hash, observed_at, id);
 
         CREATE INDEX IF NOT EXISTS idx_skill_observations_session
           ON skill_observations(session_id);
@@ -11547,6 +11798,322 @@ mod tests {
             .position(|record| matches!(record, ArchiveRecord::Session(_)))
             .expect("session record");
         assert!(machine_position < session_position);
+    }
+
+    #[test]
+    fn skill_observations_filter_page_and_follow_exact_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut records = Vec::new();
+        for (source_id, source_kind) in [
+            ("source-skill-codex", "codex"),
+            ("source-skill-omp", "omp"),
+            ("source-skill-hermes", "hermes"),
+        ] {
+            let mut source = fixture_source(source_id);
+            source.kind = source_kind.to_string();
+            records.push(ArchiveRecord::Source(source));
+        }
+        let body_v1 = "---\nname: shared-skill\n---\nversion one\n";
+        let body_v2 = "---\nname: shared-skill\n---\nversion two\n";
+        let hash_v1 = crate::archive::blake3_hex(body_v1.as_bytes());
+        let hash_v2 = crate::archive::blake3_hex(body_v2.as_bytes());
+        let cases = [
+            (
+                "obs-a",
+                "shared-skill",
+                "skill://shared",
+                Some(hash_v1.clone()),
+                SkillCoverage::Complete,
+                "codex",
+                "/work/alpha",
+                "https://example.invalid/alpha.git",
+                "2026-01-01T00:00:00Z",
+                body_v1,
+            ),
+            (
+                "obs-b",
+                "shared-skill",
+                "/work/beta/skills/shared/SKILL.md",
+                Some(hash_v1.clone()),
+                SkillCoverage::Complete,
+                "omp",
+                "/work/beta",
+                "https://example.invalid/beta.git",
+                "2026-01-01T00:00:00Z",
+                body_v1,
+            ),
+            (
+                "obs-c",
+                "shared-skill",
+                "skill://shared",
+                Some(hash_v2.clone()),
+                SkillCoverage::Complete,
+                "codex",
+                "/work/alpha",
+                "https://example.invalid/alpha.git",
+                "2026-01-01T00:00:01Z",
+                body_v2,
+            ),
+            (
+                "obs-d",
+                "shared-skill",
+                "skill://shared",
+                None,
+                SkillCoverage::Partial,
+                "hermes",
+                "/work/gamma",
+                "https://example.invalid/gamma.git",
+                "2026-01-01T00:00:02Z",
+                body_v1,
+            ),
+            (
+                "obs-e",
+                "other-skill",
+                "skill://other",
+                Some(hash_v1.clone()),
+                SkillCoverage::Complete,
+                "codex",
+                "/work/other",
+                "https://example.invalid/other.git",
+                "2026-01-01T00:00:03Z",
+                body_v1,
+            ),
+        ];
+        let mut observations = Vec::new();
+        for (
+            id,
+            skill_name,
+            locator,
+            content_hash,
+            coverage,
+            source_kind,
+            workspace,
+            repository,
+            observed_at,
+            body,
+        ) in cases
+        {
+            let source_id = format!("source-skill-{source_kind}");
+            let session_id = format!("session-{id}");
+            let mut session = fixture_session(&session_id, &source_id);
+            session.source_kind = source_kind.to_string();
+            session.metadata = json!({
+                "cwd": workspace,
+                "workspace_path": workspace,
+                "workspace_root": workspace,
+                "git_repo": repository,
+            });
+            let events = skill_projection_events(&session, id, locator, body, false);
+            records.push(ArchiveRecord::Session(session.clone()));
+            records.extend(events.iter().cloned().map(ArchiveRecord::Event));
+            observations.push(SkillObservation {
+                id: id.to_string(),
+                session_id: session.id,
+                event_id: events[0].id.clone(),
+                result_event_id: events[1].id.clone(),
+                tool_call_id: Some(format!("{id}-tool")),
+                machine_id: session.machine_id,
+                source_kind: source_kind.to_string(),
+                skill_name: skill_name.to_string(),
+                locator: locator.to_string(),
+                content_hash,
+                hash_basis: (coverage == SkillCoverage::Complete)
+                    .then_some(SkillHashBasis::ReturnedDocumentBytes),
+                coverage,
+                confidence: if coverage == SkillCoverage::Complete {
+                    SkillConfidence::High
+                } else {
+                    SkillConfidence::Medium
+                },
+                load_kind: SkillLoadKind::NativeRead,
+                workspace: Some(workspace.to_string()),
+                repository: Some(repository.to_string()),
+                observed_at: Some(dt(observed_at)),
+            });
+        }
+        store
+            .import_records(&records)
+            .expect("import observation corpus");
+        store
+            .with_conn(|conn| {
+                with_immediate_write_tx(conn, |tx| {
+                    for observation in &observations {
+                        insert_skill_observation(tx, "skill_observations", observation)?;
+                    }
+                    update_projection_status(tx, SKILL_OBSERVATIONS_PROJECTION, observations.len())
+                })
+            })
+            .expect("materialize observation corpus");
+
+        let named_filter = || SkillObservationFilter {
+            name: Some("shared-skill".to_string()),
+            locator: None,
+            content_hash: None,
+            after: None,
+            before: None,
+            project: None,
+            source: None,
+            limit: 100,
+            cursor: None,
+        };
+        let named = store
+            .skill_observations(&named_filter())
+            .expect("observations by name");
+        assert_eq!(named.page_count, 4);
+        assert_eq!(
+            named
+                .records
+                .iter()
+                .map(|record| record.locator.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert!(named
+            .records
+            .iter()
+            .any(|record| record.content_hash.is_none()));
+
+        let mut locator_filter = named_filter();
+        locator_filter.name = None;
+        locator_filter.locator = Some("skill://shared".to_string());
+        assert_eq!(
+            store
+                .skill_observations(&locator_filter)
+                .expect("observations by locator")
+                .page_count,
+            3
+        );
+
+        let mut version_filter = named_filter();
+        version_filter.content_hash = Some(hash_v1.clone());
+        let version = store
+            .skill_observations(&version_filter)
+            .expect("observations by version");
+        assert_eq!(version.page_count, 2);
+        assert!(version
+            .records
+            .iter()
+            .all(|record| record.content_hash.as_deref() == Some(hash_v1.as_str())));
+        assert_eq!(
+            version.records.iter().find(|record| record.id == "obs-b"),
+            Some(&observations[1])
+        );
+        for record in &version.records {
+            assert!(store
+                .session_by_id(&record.session_id)
+                .expect("load referenced session")
+                .is_some());
+            let event_ids = store
+                .events_for_session(&record.session_id)
+                .expect("load referenced transcript")
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<BTreeSet<_>>();
+            assert!(event_ids.contains(&record.event_id));
+            assert!(event_ids.contains(&record.result_event_id));
+        }
+
+        let mut intersection = version_filter.clone();
+        intersection.after = Some(dt("2026-01-01T00:00:00Z"));
+        intersection.project = Some("BETA".to_string());
+        intersection.source = Some("omp".to_string());
+        assert_eq!(
+            store
+                .skill_observations(&intersection)
+                .expect("intersect observation filters")
+                .records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["obs-b"]
+        );
+
+        let mut after = named_filter();
+        after.after = Some(dt("2026-01-01T00:00:01Z"));
+        assert_eq!(
+            store
+                .skill_observations(&after)
+                .expect("observations after time")
+                .page_count,
+            2
+        );
+        let mut before = named_filter();
+        before.before = Some(dt("2026-01-01T00:00:01Z"));
+        assert_eq!(
+            store
+                .skill_observations(&before)
+                .expect("observations before time")
+                .page_count,
+            2
+        );
+
+        let mut zero_match = named_filter();
+        zero_match.name = Some("missing-skill".to_string());
+        let zero = store
+            .skill_observations(&zero_match)
+            .expect("valid zero-match observation query");
+        assert_eq!(zero.page_count, 0);
+        assert!(zero.records.is_empty());
+        assert_eq!(zero.next_cursor, None);
+
+        let expected_ids = named
+            .records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let mut paged_ids = Vec::new();
+        let mut cursor = None;
+        loop {
+            let mut page_filter = named_filter();
+            page_filter.limit = 1;
+            page_filter.cursor = cursor;
+            let page = store
+                .skill_observations(&page_filter)
+                .expect("page observations");
+            assert_eq!(page.page_count, 1);
+            paged_ids.push(page.records[0].id.clone());
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(paged_ids, expected_ids);
+
+        store
+            .with_conn(|conn| {
+                for (mut filter, expected_index) in [
+                    (
+                        version_filter.clone(),
+                        "idx_skill_observations_name_hash_time",
+                    ),
+                    (
+                        {
+                            let mut filter = version_filter.clone();
+                            filter.name = None;
+                            filter.locator = Some("skill://shared".to_string());
+                            filter
+                        },
+                        "idx_skill_observations_locator_hash_time",
+                    ),
+                ] {
+                    filter.after = Some(dt("2026-01-01T00:00:00Z"));
+                    let (sql, values) = skill_observation_page_query(&filter, None, 2)?;
+                    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let details = stmt
+                        .query_map(params_from_iter(values.iter()), |row| {
+                            row.get::<_, String>(3)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert!(details.iter().any(|detail| detail.contains(expected_index)));
+                    assert!(!details
+                        .iter()
+                        .any(|detail| detail.contains("SCAN skill_observations")));
+                }
+                Ok(())
+            })
+            .expect("indexed observation query plans");
     }
 
     #[test]
