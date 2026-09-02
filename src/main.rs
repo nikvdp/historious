@@ -15,6 +15,7 @@ mod self_update;
 mod service;
 mod server;
 mod skills;
+mod skill_usage;
 mod source;
 mod storage;
 mod topics;
