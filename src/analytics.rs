@@ -154,7 +154,7 @@ pub(crate) enum RebuildProgress {
     },
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn rebuild_all(
     store: &Store,
     mut progress: impl FnMut(&'static str, usize, usize),
