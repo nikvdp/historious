@@ -2073,30 +2073,6 @@ pub(crate) fn horizontal_bar(value: f64, maximum: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-#[allow(dead_code)] // The enrichment ticket consumes this neutral sentiment primitive.
-pub(crate) fn neutral_bar(value: f64, maximum: f64, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut cells = vec![' '; width];
-    let center = width / 2;
-    cells[center] = '│';
-    if maximum > 0.0 {
-        let reach = center.min(width.saturating_sub(center + 1));
-        let filled = ((value.abs() / maximum).clamp(0.0, 1.0) * reach as f64).round() as usize;
-        if value < 0.0 {
-            for cell in &mut cells[center.saturating_sub(filled)..center] {
-                *cell = '█';
-            }
-        } else {
-            for cell in &mut cells[center + 1..(center + 1 + filled).min(width)] {
-                *cell = '█';
-            }
-        }
-    }
-    cells.into_iter().collect()
-}
-
 pub(crate) fn compact_heatmap(values: &[u64], width: usize) -> String {
     let values = sampled_values(values, width);
     let maximum = values.iter().copied().max().unwrap_or(0);
@@ -3618,8 +3594,6 @@ mod tests {
     fn terminal_primitives_bound_width_and_handle_empty_or_flat_values() {
         assert_eq!(horizontal_bar(5.0, 10.0, 6).chars().count(), 6);
         assert_eq!(horizontal_bar(5.0, 0.0, 4), "░░░░");
-        assert_eq!(neutral_bar(-0.5, 1.0, 9).chars().count(), 9);
-        assert!(neutral_bar(0.0, 1.0, 9).contains('│'));
 
         assert_eq!(compact_heatmap(&[], 8), "");
         assert_eq!(compact_heatmap(&[0, 1, 2, 3], 4), "░▒▓█");
