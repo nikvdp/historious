@@ -2153,11 +2153,15 @@ impl Store {
         progress(0, 0);
         let result = self.with_conn(|conn| {
             mark_skill_projection_stale(conn, None)?;
-            with_immediate_write_tx(conn, |tx| {
-                tx.execute("DELETE FROM skill_observations_staging", [])?;
-                Ok(())
-            })?;
-
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS temp.skill_observations_rebuild_staging;
+                 CREATE TEMP TABLE skill_observations_rebuild_staging AS
+                 SELECT * FROM main.skill_observations WHERE 0;",
+            )?;
+            let input_event_watermark =
+                conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
             let total_sessions = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
                 row.get::<_, i64>(0)
             })? as usize;
@@ -2190,18 +2194,12 @@ impl Store {
                     }
                     if let Some(session) = session_by_id(conn, &session_id)? {
                         let events = events_for_session(conn, &session_id)?;
-                        let observations = detect_skill_observations(&session, &events);
-                        if !observations.is_empty() {
-                            with_immediate_write_tx(conn, |tx| {
-                                for observation in &observations {
-                                    insert_skill_observation(
-                                        tx,
-                                        "skill_observations_staging",
-                                        observation,
-                                    )?;
-                                }
-                                Ok(())
-                            })?;
+                        for observation in detect_skill_observations(&session, &events) {
+                            insert_skill_observation(
+                                conn,
+                                "temp.skill_observations_rebuild_staging",
+                                &observation,
+                            )?;
                         }
                     }
                     processed_sessions += 1;
@@ -2214,17 +2212,23 @@ impl Store {
             }
 
             with_immediate_write_tx(conn, |tx| {
+                let current_event_watermark =
+                    tx.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                if current_event_watermark != input_event_watermark {
+                    bail!("skill observation rebuild input changed before commit");
+                }
                 tx.execute("DELETE FROM skill_observations", [])?;
                 tx.execute(
                     "INSERT INTO skill_observations
-                     SELECT * FROM skill_observations_staging",
+                     SELECT * FROM temp.skill_observations_rebuild_staging",
                     [],
                 )?;
                 let observation_count =
                     tx.query_row("SELECT COUNT(*) FROM skill_observations", [], |row| {
                         row.get::<_, i64>(0)
                     })? as usize;
-                tx.execute("DELETE FROM skill_observations_staging", [])?;
                 update_projection_status(tx, SKILL_OBSERVATIONS_PROJECTION, observation_count)?;
                 Ok(observation_count)
             })
@@ -12248,6 +12252,77 @@ mod tests {
             })
             .expect("filter by project");
         assert_eq!(by_project.totals.loads, 4);
+    }
+
+    #[test]
+    fn concurrent_skill_observation_rebuilds_keep_committed_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_skill_concurrent_rebuild");
+        let session = skill_projection_session("session_concurrent_rebuild", &source.id);
+        let events = skill_projection_events(
+            &session,
+            "concurrent-rebuild",
+            "skill://concurrent",
+            "---\nname: concurrent\n---\n",
+            false,
+        );
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(events[0].clone()),
+                ArchiveRecord::Event(events[1].clone()),
+            ])
+            .expect("import observation");
+        assert_eq!(
+            store
+                .rebuild_skill_observations()
+                .expect("initial rebuild"),
+            1
+        );
+
+        let staged = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_store = store.clone();
+        let first_staged = staged.clone();
+        let first_release = release.clone();
+        let first = std::thread::spawn(move || {
+            first_store.rebuild_skill_observations_with_progress(
+                move |current, total| {
+                    if current == 1 && total == 1 {
+                        first_staged.wait();
+                        first_release.wait();
+                    }
+                },
+                || false,
+            )
+        });
+
+        staged.wait();
+        assert_eq!(
+            store
+                .rebuild_skill_observations()
+                .expect("overlapping rebuild"),
+            1
+        );
+        release.wait();
+        assert_eq!(first.join().expect("first rebuild thread").unwrap(), 1);
+
+        let status = store
+            .skill_observation_projection_status()
+            .expect("projection status");
+        assert_eq!(status.state, SkillProjectionState::Ready);
+        assert!(status.has_snapshot);
+        assert_eq!(status.observation_count, 1);
+        assert_eq!(
+            store
+                .skill_usage(&SkillUsageFilter::default())
+                .expect("skill usage")
+                .totals
+                .loads,
+            1
+        );
     }
 
     #[test]
