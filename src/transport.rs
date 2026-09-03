@@ -373,24 +373,6 @@ fn import_jsonl_reader_records_with_options_and_progress(
     Ok(stats)
 }
 
-#[allow(dead_code)]
-fn finalize_import_stats(store: &Store, stats: &mut ImportStats) -> Result<()> {
-    finalize_import_stats_with_progress(store, stats, |_| {})
-}
-
-fn finalize_import_stats_with_progress(
-    store: &Store,
-    stats: &mut ImportStats,
-    progress: impl FnMut(ImportProgress),
-) -> Result<()> {
-    finalize_import_stats_with_options_and_progress(
-        store,
-        stats,
-        ImportOptions::default(),
-        progress,
-    )
-}
-
 fn finalize_import_stats_with_options_and_progress(
     store: &Store,
     stats: &mut ImportStats,
