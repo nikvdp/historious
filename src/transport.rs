@@ -217,37 +217,6 @@ fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
-#[allow(dead_code)]
-pub fn import_jsonl_path(store: &Store, path: &str) -> Result<ImportStats> {
-    import_jsonl_path_with_import_progress(store, path, |_| {})
-}
-
-#[allow(dead_code)]
-pub fn import_jsonl_path_with_progress(
-    store: &Store,
-    path: &str,
-    mut progress: impl FnMut(JsonlProgress),
-) -> Result<ImportStats> {
-    import_jsonl_path_with_import_progress(store, path, |event| {
-        if let ImportProgress::Stream(state) = event {
-            progress(state);
-        }
-    })
-}
-
-pub fn import_jsonl_path_with_import_progress(
-    store: &Store,
-    path: &str,
-    progress: impl FnMut(ImportProgress),
-) -> Result<ImportStats> {
-    import_jsonl_path_with_options_and_import_progress(
-        store,
-        path,
-        ImportOptions::default(),
-        progress,
-    )
-}
-
 pub fn import_jsonl_path_with_options_and_import_progress(
     store: &Store,
     path: &str,
