@@ -4301,17 +4301,20 @@ fn skill_observation_projection_status(conn: &Connection) -> Result<SkillProject
     let Some((watermark, status, last_error, updated_at)) = row else {
         return Ok(SkillProjectionStatus {
             state: SkillProjectionState::Missing,
+            has_snapshot: false,
             observation_count: 0,
             updated_at: None,
             last_error: None,
         });
     };
+    let has_snapshot = !watermark.is_empty();
     Ok(SkillProjectionStatus {
         state: if status == "ready" {
             SkillProjectionState::Ready
         } else {
             SkillProjectionState::Stale
         },
+        has_snapshot,
         observation_count: watermark.parse().unwrap_or(0),
         updated_at: parse_opt_dt(Some(updated_at)),
         last_error,
@@ -4325,8 +4328,7 @@ fn mark_skill_projection_stale(conn: &Connection, error: Option<&str>) -> Result
          VALUES (?1, '', 'stale', ?2, ?3)
          ON CONFLICT(projection_name) DO UPDATE SET
            status = 'stale',
-           last_error = excluded.last_error,
-           updated_at = excluded.updated_at",
+           last_error = excluded.last_error",
         params![
             SKILL_OBSERVATIONS_PROJECTION,
             error,
@@ -12180,6 +12182,7 @@ mod tests {
                 .expect("projection status"),
             SkillProjectionStatus {
                 state: SkillProjectionState::Ready,
+                has_snapshot: true,
                 observation_count: 4,
                 updated_at: store
                     .skill_observation_projection_status()

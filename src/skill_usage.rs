@@ -67,6 +67,7 @@ pub enum SkillProjectionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillProjectionStatus {
     pub state: SkillProjectionState,
+    pub has_snapshot: bool,
     pub observation_count: usize,
     pub updated_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,

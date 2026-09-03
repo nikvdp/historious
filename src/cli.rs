@@ -6,7 +6,7 @@ use crate::search;
 use crate::server;
 use crate::skill_usage::{
     SkillMaintenanceMode, SkillObservationFilter, SkillObservationPage, SkillProjectionState,
-    SkillUsageFilter, SkillUsageOutput,
+    SkillProjectionStatus, SkillUsageFilter, SkillUsageOutput,
 };
 use crate::storage::{
     QuickStatusCounts, RecentResultRefInput, SourceDeltaCounts, SourceStatusCounts, Store,
@@ -3536,6 +3536,13 @@ fn run_skill_command(store: &Store, command: SkillCommand, robot: bool) -> Resul
     Ok(())
 }
 
+#[derive(Serialize)]
+struct SkillProjectionOutput<'a, T> {
+    projection: &'a SkillProjectionStatus,
+    #[serde(flatten)]
+    output: &'a T,
+}
+
 fn run_skill_usage_command(
     store: &Store,
     after: Option<&str>,
@@ -3551,11 +3558,19 @@ fn run_skill_usage_command(
         project: normalized_skill_usage_filter(project),
         name: normalized_skill_usage_filter(name),
     };
-    require_current_skill_observation_projection(store)?;
+    let projection = require_servable_skill_observation_projection(store)?;
     let output = store.skill_usage(&filter)?;
     if structured {
-        crate::output::write_success("skill usage", output, Default::default())?;
+        crate::output::write_success(
+            "skill usage",
+            SkillProjectionOutput {
+                projection: &projection,
+                output: &output,
+            },
+            Default::default(),
+        )?;
     } else {
+        warn_if_skill_projection_stale(&projection);
         print_skill_usage_output(&output);
     }
     Ok(())
@@ -3587,27 +3602,51 @@ fn run_skill_observations_command(
         limit,
         cursor,
     };
-    require_current_skill_observation_projection(store)?;
+    let projection = require_servable_skill_observation_projection(store)?;
     let output = store.skill_observations(&filter)?;
     if structured {
-        crate::output::write_success("skill observations", output, Default::default())?;
+        crate::output::write_success(
+            "skill observations",
+            SkillProjectionOutput {
+                projection: &projection,
+                output: &output,
+            },
+            Default::default(),
+        )?;
     } else {
+        warn_if_skill_projection_stale(&projection);
         print_skill_observations_output(&output);
     }
     Ok(())
 }
 
-fn require_current_skill_observation_projection(store: &Store) -> Result<()> {
+fn require_servable_skill_observation_projection(store: &Store) -> Result<SkillProjectionStatus> {
     let status = store.skill_observation_projection_status()?;
     match status.state {
         SkillProjectionState::Missing => {
             bail!("skill usage data is missing; run 'histo update' to build it")
         }
-        SkillProjectionState::Stale => {
-            bail!("skill usage data is stale; run 'histo update' to refresh it")
+        SkillProjectionState::Stale if !status.has_snapshot => {
+            bail!("skill usage data has no committed snapshot; run 'histo update' to build it")
         }
-        SkillProjectionState::Ready => Ok(()),
+        SkillProjectionState::Ready if !status.has_snapshot => {
+            bail!("skill usage data has no committed snapshot; run 'histo update' to rebuild it")
+        }
+        SkillProjectionState::Stale | SkillProjectionState::Ready => Ok(status),
     }
+}
+
+fn warn_if_skill_projection_stale(status: &SkillProjectionStatus) {
+    if status.state != SkillProjectionState::Stale {
+        return;
+    }
+    let updated_at = status
+        .updated_at
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "unknown time".to_string());
+    eprintln!(
+        "Warning: skill usage projection is stale; serving the committed snapshot from {updated_at}"
+    );
 }
 
 fn parse_nonempty_skill_selector(value: &str) -> std::result::Result<String, String> {
@@ -11910,7 +11949,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_observations_command_requires_current_projection() {
+    fn skill_observations_command_requires_a_committed_projection() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let run = |store: &Store| {
@@ -11931,6 +11970,14 @@ mod tests {
         let error = run(&store).expect_err("missing projection");
         assert!(format!("{error:#}").contains("histo update"));
 
+        let building_dir = tempfile::tempdir().expect("building tempdir");
+        let building = Store::open(building_dir.path()).expect("open building store");
+        building
+            .mark_skill_observation_projection_stale()
+            .expect("mark initial projection stale");
+        let error = run(&building).expect_err("stale projection without snapshot");
+        assert!(format!("{error:#}").contains("no committed snapshot"));
+
         store
             .maintain_skill_observations(
                 &crate::storage::ImportDelta::default(),
@@ -11943,10 +11990,12 @@ mod tests {
         store
             .mark_skill_observation_projection_stale()
             .expect("mark projection stale");
-        let error = run(&store).expect_err("stale projection");
-        let message = format!("{error:#}");
-        assert!(message.contains("stale"));
-        assert!(message.contains("histo update"));
+        run(&store).expect("committed stale projection");
+        let status = store
+            .skill_observation_projection_status()
+            .expect("stale projection status");
+        assert_eq!(status.state, SkillProjectionState::Stale);
+        assert!(status.has_snapshot);
     }
 
     #[test]
@@ -11961,7 +12010,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_usage_command_requires_current_projection() {
+    fn skill_usage_command_requires_a_committed_projection() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let error = run_skill_usage_command(&store, None, None, None, None, false)
@@ -11981,11 +12030,22 @@ mod tests {
         store
             .mark_skill_observation_projection_stale()
             .expect("mark projection stale");
-        let error = run_skill_usage_command(&store, None, None, None, None, false)
-            .expect_err("stale projection");
-        let message = format!("{error:#}");
-        assert!(message.contains("stale"));
-        assert!(message.contains("histo update"));
+        run_skill_usage_command(&store, None, None, None, None, false)
+            .expect("committed stale projection");
+        let status = store
+            .skill_observation_projection_status()
+            .expect("stale projection status");
+        let output = store
+            .skill_usage(&SkillUsageFilter::default())
+            .expect("stale skill usage");
+        let structured = serde_json::to_value(SkillProjectionOutput {
+            projection: &status,
+            output: &output,
+        })
+        .expect("serialize stale projection output");
+        assert_eq!(structured["projection"]["state"], "stale");
+        assert_eq!(structured["projection"]["has_snapshot"], true);
+        assert_eq!(structured["totals"]["loads"], 0);
     }
 
     #[test]
@@ -12473,9 +12533,9 @@ mod tests {
         .expect("scoped progress result");
 
         let observations = observations.into_inner();
-        assert!(observations
-            .iter()
-            .any(|(emission, current)| *emission == ScopedProgressEmission::Heartbeat && *current > 0));
+        assert!(observations.iter().any(|(emission, current)| *emission
+            == ScopedProgressEmission::Heartbeat
+            && *current > 0));
     }
 
     #[test]
