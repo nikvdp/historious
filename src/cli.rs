@@ -3305,26 +3305,14 @@ fn run_config_command(
 ) -> Result<()> {
     let data_dir = crate::config::resolve_data_dir(data_dir)?;
     let path = crate::config::config_path(&data_dir);
-    match command {
-        ConfigCommand::Show => {
-            let output = config_output(&data_dir, &path)?;
-            if robot {
-                crate::output::write_success("config show", output, Default::default())?;
-            } else {
-                print_config_output(&output);
-            }
-        }
+    let (command_name, path) = match command {
+        ConfigCommand::Show => ("config show", path),
         ConfigCommand::Machine { name } => {
             let path = match name {
                 Some(name) => crate::config::set_machine_name(&data_dir, &name)?,
                 None => path,
             };
-            let output = config_output(&data_dir, &path)?;
-            if robot {
-                crate::output::write_success("config machine", output, Default::default())?;
-            } else {
-                print_config_output(&output);
-            }
+            ("config machine", path)
         }
         ConfigCommand::Embeddings { state } => {
             let path = match state {
@@ -3334,12 +3322,7 @@ fn run_config_command(
                 }
                 ConfigEmbeddingState::Status => path,
             };
-            let output = config_output(&data_dir, &path)?;
-            if robot {
-                crate::output::write_success("config embeddings", output, Default::default())?;
-            } else {
-                print_config_output(&output);
-            }
+            ("config embeddings", path)
         }
         ConfigCommand::Treechat { state } => {
             let path = match state {
@@ -3347,12 +3330,7 @@ fn run_config_command(
                 ConfigSourceState::Off => crate::config::set_treechat_enabled(&data_dir, false)?,
                 ConfigSourceState::Status => path,
             };
-            let output = config_output(&data_dir, &path)?;
-            if robot {
-                crate::output::write_success("config treechat", output, Default::default())?;
-            } else {
-                print_config_output(&output);
-            }
+            ("config treechat", path)
         }
         ConfigCommand::Enrichment {
             provider,
@@ -3367,13 +3345,14 @@ fn run_config_command(
                 &api_key,
                 &model,
             )?;
-            let output = config_output(&data_dir, &path)?;
-            if robot {
-                crate::output::write_success("config enrichment", output, Default::default())?;
-            } else {
-                print_config_output(&output);
-            }
+            ("config enrichment", path)
         }
+    };
+    let output = config_output(&data_dir, &path)?;
+    if robot {
+        crate::output::write_success(command_name, output, Default::default())?;
+    } else {
+        print_config_output(&output);
     }
     Ok(())
 }
