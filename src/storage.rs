@@ -7001,6 +7001,7 @@ fn migrate(conn: &Connection) -> Result<()> {
           USING vec0(embedding float[384]);
         ",
     )?;
+    crate::commit_provenance::store::migrate(conn)?;
     ensure_column(
         conn,
         "enrichment_runs",

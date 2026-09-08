@@ -1,6 +1,7 @@
 use crate::archive::{
     blake3_hex, stable_hash, stable_id, ArchiveRecord, EventRecord, SessionRecord,
 };
+use crate::commit_provenance::store as commit_store;
 use crate::config::SourceConfigs;
 use crate::skill_usage::{SkillMaintenanceMode, SkillMaintenanceOutcome};
 use crate::source::{
@@ -35,6 +36,7 @@ pub struct UpdateStats {
     pub errors: usize,
     pub repaired_machine_sessions: usize,
     pub skill_observations: Option<SkillMaintenanceOutcome>,
+    pub commit_evidence: Option<commit_store::MaintenanceOutcome>,
     #[serde(skip)]
     pub delta: ImportDelta,
 }
@@ -869,6 +871,7 @@ pub enum UpdateProgress {
         total_sessions: usize,
         observation_count: Option<usize>,
     },
+    CommitEvidence(commit_store::Progress),
 }
 
 #[derive(Debug, Clone)]
@@ -1224,6 +1227,12 @@ fn maintain_skill_observations_after_update(
         observation_count: Some(skill_observations.observation_count),
     });
     stats.skill_observations = Some(skill_observations);
+    let outcome = commit_store::maintain(
+        store,
+        |event| progress(&UpdateProgress::CommitEvidence(event)),
+        || should_cancel(),
+    )?;
+    stats.commit_evidence = Some(outcome);
     Ok(())
 }
 

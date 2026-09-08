@@ -1,6 +1,5 @@
-use crate::archive::{
-    ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA, LEGACY_ARCHIVE_SCHEMA,
-};
+use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA, LEGACY_ARCHIVE_SCHEMA};
+use crate::commit_provenance::store as commit_store;
 use crate::skill_usage::SkillMaintenanceMode;
 use crate::storage::{ArchiveExportFilter, ImportStats, Store};
 use anyhow::{bail, Context, Result};
@@ -145,18 +144,26 @@ pub struct JsonlProgress {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum ImportProgress {
     Stream(JsonlProgress),
-    HistoryItems { processed: usize, total: usize },
+    HistoryItems {
+        processed: usize,
+        total: usize,
+    },
     SkillObservations {
         mode: SkillMaintenanceMode,
         processed_sessions: usize,
         total_sessions: usize,
         observation_count: Option<usize>,
     },
-    VectorProjectionStarted { embeddings: usize },
-    VectorProjectionFinished { vectors_indexed: usize },
+    CommitEvidence(commit_store::Progress),
+    VectorProjectionStarted {
+        embeddings: usize,
+    },
+    VectorProjectionFinished {
+        vectors_indexed: usize,
+    },
 }
 
 fn write_jsonl_records(records: Vec<ArchiveRecord>, writer: &mut impl Write) -> Result<usize> {
@@ -398,6 +405,11 @@ fn finalize_import_stats_with_options_and_progress(
         observation_count: Some(skill_observations.observation_count),
     });
     stats.skill_observations = Some(skill_observations);
+    commit_store::maintain(
+        store,
+        |event| progress(ImportProgress::CommitEvidence(event)),
+        || false,
+    )?;
     if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events_with_progress(
             &stats.delta.touched_events,
@@ -681,10 +693,11 @@ mod tests {
         let machine_id = "33333333-3333-4333-8333-333333333333";
         let machine_name = "source-host";
         let source = fixture_source("source_machine_round_trip");
-        let mut session =
-            fixture_session("session_machine_round_trip", &source.id, "/tmp/project");
+        let mut session = fixture_session("session_machine_round_trip", &source.id, "/tmp/project");
         session.machine_id = machine_id.to_string();
-        store.upsert_machine(machine_id, machine_name).expect("machine");
+        store
+            .upsert_machine(machine_id, machine_name)
+            .expect("machine");
         store
             .import_records(&[
                 ArchiveRecord::Source(source),

@@ -1,4 +1,5 @@
 use crate::analytics;
+use crate::commit_provenance::store as commit_store;
 use crate::config::AppConfig;
 use crate::ingest;
 use crate::report;
@@ -1671,6 +1672,27 @@ impl Cli {
                     "total": UpdateStartupProgress::TOTAL,
                 }),
             );
+            (config, store, None)
+        } else if let Command::Import { json, .. } = &command {
+            let (config, store) = if *json || robot {
+                load_update_resources_with_progress(data_dir, |event, _| {
+                    write_machine_progress(
+                        "import", "startup", update_startup_progress_detail(*event),
+                        serde_json::json!({
+                            "status": "starting", "stage": event.stage(),
+                            "current": event.completed(), "total": UpdateStartupProgress::TOTAL,
+                        }),
+                    );
+                })?
+            } else {
+                let ui = ProgressUi::new();
+                let mut opening = ui.phase("Opening history archive");
+                let resources = load_update_resources_with_progress(data_dir, |event, _| {
+                    opening.update(update_startup_progress_detail(*event));
+                })?;
+                opening.finish(update_startup_completion_detail());
+                resources
+            };
             (config, store, None)
         } else {
             let config = AppConfig::load(data_dir)?;
@@ -4286,12 +4308,15 @@ fn run_update_once_machine(
         },
         |event, emission| {
             if skill_observation_progress_is_boundary(event)
+                || commit_evidence_progress_is_boundary(event)
                 || emission != ScopedProgressEmission::Event
                 || last_scan_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
             {
                 write_update_progress(
                     if matches!(event, ingest::UpdateProgress::SkillObservations { .. }) {
                         "skill_observations"
+                    } else if matches!(event, ingest::UpdateProgress::CommitEvidence(_)) {
+                        "commit_evidence"
                     } else {
                         "scan"
                     },
@@ -5003,6 +5028,17 @@ fn import_progress_event(
                 "observation_count": observation_count,
             }),
         ),
+        transport::ImportProgress::CommitEvidence(state) => (
+            "commit_evidence",
+            commit_evidence_progress_detail(state),
+            serde_json::json!({
+                "status": state.phase,
+                "phase": state.phase,
+                "current": state.current,
+                "total": state.total,
+                "evidence": state.evidence,
+            }),
+        ),
         transport::ImportProgress::VectorProjectionStarted { embeddings } => (
             "vectors",
             format!(
@@ -5027,13 +5063,27 @@ fn import_progress_event(
 
 fn run_import_once(store: &Store, _config: &AppConfig, input: &str) -> Result<ImportOutput> {
     let import_options = import_options_for_config(_config);
-    let stats = transport::import_jsonl_path_with_options_and_import_progress(
-        store,
-        input,
-        import_options,
-        |event| {
-            let (phase, detail, data) = import_progress_event(event);
-            write_machine_progress("import", phase, detail, data);
+    let mut last_import_emit = Instant::now() - UPDATE_PROGRESS_HEARTBEAT_INTERVAL;
+    let stats = run_scoped_progress_with_timeout(
+        transport::ImportProgress::Stream(transport::JsonlProgress::default()),
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            transport::import_jsonl_path_with_options_and_import_progress(
+                store,
+                input,
+                import_options,
+                |event| send(event),
+            )
+        },
+        |event, emission| {
+            if import_commit_evidence_progress_is_boundary(*event)
+                || emission != ScopedProgressEmission::Event
+                || last_import_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
+            {
+                let (phase, detail, data) = import_progress_event(*event);
+                write_machine_progress("import", phase, detail, data);
+                last_import_emit = Instant::now();
+            }
         },
     )?;
     let projected = refresh_import_search_index_with_progress(
@@ -5065,53 +5115,36 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
     let progress = ProgressUi::new();
     let mut import = progress.phase("Importing history stream");
     let mut last = transport::JsonlProgress::default();
+    let mut last_commit_evidence = None;
     let import_options = import_options_for_config(_config);
-    let stats = transport::import_jsonl_path_with_options_and_import_progress(
-        store,
-        input,
-        import_options,
-        |event| match event {
-            transport::ImportProgress::Stream(state) => {
-                last = state;
-                import.update(jsonl_progress_detail(state));
+    let stats = run_scoped_progress_with_timeout(
+        transport::ImportProgress::Stream(transport::JsonlProgress::default()),
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        |send| {
+            transport::import_jsonl_path_with_options_and_import_progress(
+                store,
+                input,
+                import_options,
+                |event| send(event),
+            )
+        },
+        |event, _emission| {
+            if let transport::ImportProgress::CommitEvidence(state) = *event {
+                last_commit_evidence = Some(state);
             }
-            transport::ImportProgress::HistoryItems { processed, total } => {
-                import.update(format!(
-                    "projected {}/{} events into history items",
-                    format_count(processed),
-                    format_count(total)
-                ));
-            }
-            transport::ImportProgress::SkillObservations {
-                mode,
-                processed_sessions,
-                total_sessions,
-                observation_count,
-            } => {
-                import.update(skill_observation_progress_detail(
-                    mode,
-                    processed_sessions,
-                    total_sessions,
-                    observation_count,
-                ));
-            }
-            transport::ImportProgress::VectorProjectionStarted { embeddings } => {
-                import.update(format!(
-                    "refreshing vector projection for {} embeddings",
-                    format_count(embeddings)
-                ));
-            }
-            transport::ImportProgress::VectorProjectionFinished { vectors_indexed } => {
-                import.update(format!("{} vectors indexed", format_count(vectors_indexed)));
-            }
+            import.update(human_import_progress_detail(*event, &mut last));
         },
     )?;
+    let commit_detail = last_commit_evidence
+        .map(|state| format!("{} commit evidence", format_count(state.evidence)))
+        .unwrap_or_else(|| "commit evidence unchanged".to_string());
     import.finish(format!(
-        "{} new records, {} duplicates, read {} records, {}; {} machine sessions repaired; {} unresolved machine ids across {} sessions",
+        "{} new records, {} duplicates, read {} records, {}; {}; {} machine sessions repaired; {} unresolved machine ids across {} sessions",
         format_count(stats.inserted),
         format_count(stats.duplicates),
         format_count(last.records),
         format_bytes(last.bytes),
+        commit_detail,
         format_count(stats.repaired_machine_sessions),
         format_count(stats.unresolved_machine_ids),
         format_count(stats.unresolved_machine_sessions),
@@ -5143,6 +5176,42 @@ fn run_import_once_human(store: &Store, _config: &AppConfig, input: &str) -> Res
         },
         embeddings,
     })
+}
+
+fn human_import_progress_detail(
+    event: transport::ImportProgress,
+    last: &mut transport::JsonlProgress,
+) -> String {
+    match event {
+        transport::ImportProgress::Stream(state) => {
+            *last = state;
+            jsonl_progress_detail(state)
+        }
+        transport::ImportProgress::HistoryItems { processed, total } => format!(
+            "projected {}/{} events into history items",
+            format_count(processed),
+            format_count(total)
+        ),
+        transport::ImportProgress::SkillObservations {
+            mode,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        } => skill_observation_progress_detail(
+            mode,
+            processed_sessions,
+            total_sessions,
+            observation_count,
+        ),
+        transport::ImportProgress::CommitEvidence(state) => commit_evidence_progress_detail(state),
+        transport::ImportProgress::VectorProjectionStarted { embeddings } => format!(
+            "refreshing vector projection for {} embeddings",
+            format_count(embeddings)
+        ),
+        transport::ImportProgress::VectorProjectionFinished { vectors_indexed } => {
+            format!("{} vectors indexed", format_count(vectors_indexed))
+        }
+    }
 }
 
 fn import_options_for_config(config: &AppConfig) -> transport::ImportOptions {
@@ -6630,6 +6699,47 @@ fn skill_observation_progress_detail(
     }
     detail
 }
+fn commit_evidence_progress_detail(state: commit_store::Progress) -> String {
+    let unit = if state.phase == "publishing" {
+        "publication"
+    } else {
+        "sessions"
+    };
+    format!(
+        "commit evidence {} {}/{} {}; {} evidence",
+        state.phase,
+        format_count(state.current),
+        format_count(state.total),
+        unit,
+        format_count(state.evidence),
+    )
+}
+
+fn commit_evidence_progress_state(phase: &str) -> &'static str {
+    match phase {
+        "starting" => "starting",
+        "sessions" => "processing",
+        "publishing" => "publishing",
+        "complete" => "current",
+        _ => "processing",
+    }
+}
+
+fn commit_evidence_progress_is_boundary(event: &ingest::UpdateProgress) -> bool {
+    matches!(
+        event,
+        ingest::UpdateProgress::CommitEvidence(state)
+            if matches!(state.phase, "starting" | "complete")
+    )
+}
+
+fn import_commit_evidence_progress_is_boundary(event: transport::ImportProgress) -> bool {
+    matches!(
+        event,
+        transport::ImportProgress::CommitEvidence(state)
+            if matches!(state.phase, "starting" | "complete")
+    )
+}
 
 fn skill_observation_progress_is_boundary(event: &ingest::UpdateProgress) -> bool {
     matches!(
@@ -6836,6 +6946,7 @@ fn update_progress_detail(event: &ingest::UpdateProgress) -> String {
             *total_sessions,
             *observation_count,
         ),
+        ingest::UpdateProgress::CommitEvidence(state) => commit_evidence_progress_detail(*state),
     }
 }
 
@@ -7009,6 +7120,13 @@ fn update_progress_payload(event: &ingest::UpdateProgress) -> serde_json::Value 
             "total_sessions": total_sessions,
             "observation_count": observation_count,
         }),
+        ingest::UpdateProgress::CommitEvidence(state) => serde_json::json!({
+            "status": state.phase,
+            "phase": state.phase,
+            "current": state.current,
+            "total": state.total,
+            "evidence": state.evidence,
+        }),
     }
 }
 
@@ -7021,6 +7139,7 @@ enum UpdateDisplayPhase {
     LocalLogs,
     ChangedLogs,
     SkillObservations,
+    CommitEvidence,
     SearchData,
     ReportData,
 }
@@ -7119,7 +7238,8 @@ impl UpdateProgressView {
     }
 
     fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
-        let force_render = skill_observation_progress_is_boundary(event);
+        let force_render = skill_observation_progress_is_boundary(event)
+            || commit_evidence_progress_is_boundary(event);
         match event {
             ingest::UpdateProgress::Discovering { sources } => {
                 self.phase = UpdateDisplayPhase::LocalLogs;
@@ -7295,12 +7415,28 @@ impl UpdateProgressView {
                     },
                 );
             }
+            ingest::UpdateProgress::CommitEvidence(state) => {
+                self.phase = UpdateDisplayPhase::CommitEvidence;
+                self.data_rows.clear();
+                self.data_rows.insert(
+                    "commits".to_string(),
+                    UpdateDataProgress {
+                        state: commit_evidence_progress_state(state.phase),
+                        current: Some(state.current),
+                        total: Some(state.total),
+                        detail: commit_evidence_progress_detail(*state),
+                    },
+                );
+            }
         }
         self.render(force_render);
     }
 
     fn finish_ingest(&mut self) {
-        if self.phase == UpdateDisplayPhase::SkillObservations {
+        if matches!(
+            self.phase,
+            UpdateDisplayPhase::SkillObservations | UpdateDisplayPhase::CommitEvidence
+        ) {
             self.render(true);
             return;
         }
@@ -7674,6 +7810,7 @@ impl UpdateProgressView {
             UpdateDisplayPhase::NativeTitles => self.native_title_lines(),
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SkillObservations => self.data_lines("skill usage: updating"),
+            UpdateDisplayPhase::CommitEvidence => self.data_lines("commit evidence: updating"),
             UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
             UpdateDisplayPhase::ReportData => self.data_lines("report data: updating"),
         };
@@ -7805,7 +7942,7 @@ impl UpdateProgressView {
         let mut lines = vec![heading.to_string()];
         let label_width = self.data_label_width();
         let keys: &[&str] = &[
-            "startup", "skills", "search", "history", "report", "vectors",
+            "startup", "skills", "commits", "search", "history", "report", "vectors",
         ];
         for key in keys {
             if let Some(row) = self.data_rows.get(*key) {
@@ -11540,17 +11677,26 @@ async fn run_daemon(
     let progress = ProgressUi::new();
     loop {
         let mut scan = progress.phase("Scanning local agent logs");
-        let stats = ingest::update_local_with_progress(
-            store,
-            machine_id,
-            machine_name,
-            ingest::UpdateOptions {
-                max_files,
-                source_selection: source_selection.clone(),
-                sources: source_configs.clone(),
-                repair_machine_assignments: false,
+        let stats = run_scoped_progress_with_timeout(
+            ingest::UpdateProgress::Discovering {
+                sources: Vec::new(),
             },
-            |event| scan.update(update_progress_detail(event)),
+            UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+            |send| {
+                ingest::update_local_with_progress(
+                    store,
+                    machine_id,
+                    machine_name,
+                    ingest::UpdateOptions {
+                        max_files,
+                        source_selection: source_selection.clone(),
+                        sources: source_configs.clone(),
+                        repair_machine_assignments: false,
+                    },
+                    |event| send(event.clone()),
+                )
+            },
+            |event, _emission| scan.update(update_progress_detail(event)),
         )?;
         scan.finish(format!(
             "{} files, {} new records, {} unchanged, {} errors",

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 mod commands;
+pub(crate) mod store;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CommitEvidence {
@@ -208,13 +209,8 @@ fn begin_call(
                     );
                 }
                 commands::Action::Commit { cwd, message } => {
-                    let cwd = cwd.or_else(|| call_cwd.clone());
-                    let message = snapshot_message(
-                        message,
-                        writes,
-                        cwd.as_deref().or(call_cwd.as_deref()),
-                        event.id.as_str(),
-                    );
+                    let message =
+                        snapshot_message(message, writes, cwd.as_deref(), event.id.as_str());
                     commits.push(PendingCommit {
                         call_event_id: event.id.clone(),
                         call_id: call_id.to_string(),
@@ -607,9 +603,10 @@ fn effective_cwd(session_cwd: &Option<String>, arguments: &Value) -> Option<Stri
         .iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str))
     });
-    requested
-        .and_then(|cwd| resolve_path(cwd, session_cwd.as_deref()))
-        .or_else(|| session_cwd.clone())
+    match requested {
+        Some(cwd) => resolve_path(cwd, session_cwd.as_deref()),
+        None => session_cwd.clone(),
+    }
 }
 
 fn session_cwd(session: &SessionRecord) -> Option<String> {
@@ -1006,6 +1003,25 @@ mod tests {
         assert_eq!(evidence.len(), 2);
         assert_eq!(evidence[0].message.as_deref(), Some("First subject"));
         assert_eq!(evidence[1].message.as_deref(), Some("Second subject"));
+    }
+
+    #[test]
+    fn commit_evidence_dynamic_git_directory_is_not_the_session_repository() {
+        let session = session("unknown-repository");
+        let evidence = detect(
+            &session,
+            &[
+                shell_call(
+                    &session,
+                    "commit",
+                    0,
+                    "git -C \"$TARGET\" commit -m 'Subject'",
+                ),
+                shell_result(&session, "commit", 1, "[main abc1234] Subject", false),
+            ],
+        );
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].cwd.is_none());
     }
 
     #[test]
