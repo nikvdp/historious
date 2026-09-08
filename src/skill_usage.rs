@@ -1,4 +1,5 @@
 use crate::archive::{blake3_hex, stable_id, EventRecord, SessionRecord};
+use crate::tool_events::{normalize, RecoveredText, ToolSignal, ToolStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -260,27 +261,6 @@ struct PendingRead {
     confidence: SkillConfidence,
 }
 
-#[derive(Debug)]
-enum ToolSignal {
-    Call {
-        call_id: String,
-        name: String,
-        arguments: Value,
-    },
-    Result {
-        call_id: String,
-        success: bool,
-        text: Option<RecoveredText>,
-        truncated: bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct RecoveredText {
-    text: String,
-    basis: SkillHashBasis,
-}
-
 pub fn detect_skill_observations(
     session: &SessionRecord,
     events: &[EventRecord],
@@ -299,10 +279,10 @@ pub fn detect_skill_observations(
 
         detect_embedded_documents(session, event, &value, &mut observations);
 
-        for signal in tool_signals(&value) {
-            match signal {
+        for signal in normalize(event) {
+            match signal.signal {
                 ToolSignal::Call {
-                    call_id,
+                    call_id: Some(call_id),
                     name,
                     arguments,
                 } => {
@@ -315,9 +295,10 @@ pub fn detect_skill_observations(
                         pending.insert(call_id, read);
                     }
                 }
+                ToolSignal::Call { call_id: None, .. } => {}
                 ToolSignal::Result {
-                    call_id,
-                    success,
+                    call_id: Some(call_id),
+                    status,
                     text,
                     truncated,
                 } => {
@@ -328,13 +309,16 @@ pub fn detect_skill_observations(
                         continue;
                     };
                     completed.insert(call_id);
-                    if !success || (read.load_kind == SkillLoadKind::ShellRead && text.is_none()) {
+                    if status != ToolStatus::Success
+                        || (read.load_kind == SkillLoadKind::ShellRead && text.is_none())
+                    {
                         continue;
                     }
                     observations.push(observation_from_result(
                         session, event, read, text, truncated,
                     ));
                 }
+                ToolSignal::Result { call_id: None, .. } => {}
             }
         }
     }
@@ -403,7 +387,11 @@ fn observation_from_result(
             .map(|recovered| {
                 (
                     Some(blake3_hex(recovered.text.as_bytes())),
-                    Some(recovered.basis),
+                    Some(if recovered.normalized {
+                        SkillHashBasis::NormalizedToolOutput
+                    } else {
+                        SkillHashBasis::ReturnedDocumentBytes
+                    }),
                 )
             })
             .unwrap_or((None, None))
@@ -473,7 +461,7 @@ fn detect_embedded_documents(
         let (Some(path), Some(content)) = (path, content) else {
             return;
         };
-        if object_is_truncated(object) {
+        if embedded_document_is_truncated(object) {
             return;
         }
         let Some(target) = skill_target(session, path) else {
@@ -513,242 +501,16 @@ fn detect_embedded_documents(
     });
 }
 
-fn tool_signals(value: &Value) -> Vec<ToolSignal> {
-    let mut signals = Vec::new();
-    collect_tool_signals(value, &mut signals);
-    signals
-}
-
-fn collect_tool_signals(value: &Value, signals: &mut Vec<ToolSignal>) {
-    match value {
-        Value::Object(object) => {
-            if let Some(call) = tool_call_signal(object) {
-                signals.push(call);
-            } else if let Some(result) = tool_result_signal(object) {
-                signals.push(result);
-            }
-            for child in object.values() {
-                collect_tool_signals(child, signals);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_tool_signals(item, signals);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn tool_call_signal(object: &Map<String, Value>) -> Option<ToolSignal> {
-    let event_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let nested_function = object.get("function").and_then(Value::as_object);
-    let is_call = event_type.contains("toolcall")
-        || event_type.contains("tool_call")
-        || event_type == "tool_use"
-        || event_type == "function_call"
-        || event_type == "custom_tool_call"
-        || (event_type == "function" && nested_function.is_some() && object.contains_key("id"));
-    if !is_call {
-        return None;
-    }
-
-    let source = nested_function.unwrap_or(object);
-    let name = source.get("name")?.as_str()?.to_string();
-    let call_id = object
-        .get("call_id")
-        .or_else(|| object.get("id"))?
-        .as_str()?
-        .to_string();
-    let arguments = source
-        .get("arguments")
-        .or_else(|| source.get("input"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let arguments = parse_json_string(arguments);
-    Some(ToolSignal::Call {
-        call_id,
-        name,
-        arguments,
-    })
-}
-
-fn tool_result_signal(object: &Map<String, Value>) -> Option<ToolSignal> {
-    let event_type = object
-        .get("type")
-        .or_else(|| object.get("role"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let is_result = event_type.contains("tool_result")
-        || event_type.contains("toolresult")
-        || event_type.contains("function_call_output")
-        || event_type.contains("custom_tool_call_output")
-        || event_type == "mcp_tool_call_end"
-        || event_type == "tool";
-    if !is_result {
-        return None;
-    }
-
-    let call_id = object
-        .get("call_id")
-        .or_else(|| object.get("toolCallId"))
-        .or_else(|| object.get("tool_use_id"))
-        .or_else(|| object.get("tool_call_id"))?
-        .as_str()?
-        .to_string();
-    let text = recover_result_text(object);
-    let truncated = object_is_truncated(object)
-        || text
-            .as_ref()
-            .is_some_and(|recovered| text_has_truncation_marker(&recovered.text));
-    Some(ToolSignal::Result {
-        call_id,
-        success: !object_failed(object),
-        text,
-        truncated,
-    })
-}
-
-fn recover_result_text(object: &Map<String, Value>) -> Option<RecoveredText> {
-    if let Some(text) =
-        value_at(object, &["details", "displayContent", "text"]).and_then(Value::as_str)
-    {
-        return Some(RecoveredText {
-            text: text.to_string(),
-            basis: SkillHashBasis::ReturnedDocumentBytes,
-        });
-    }
-    if let Some(text) = value_at(object, &["details", "cells"])
-        .and_then(Value::as_array)
-        .and_then(|cells| cells.last())
-        .and_then(|cell| cell.get("output"))
-        .and_then(Value::as_str)
-    {
-        return Some(RecoveredText {
-            text: text.to_string(),
-            basis: SkillHashBasis::ReturnedDocumentBytes,
-        });
-    }
-    if let Some(text) = object.get("stdout").and_then(Value::as_str) {
-        return Some(RecoveredText {
-            text: text.to_string(),
-            basis: SkillHashBasis::ReturnedDocumentBytes,
-        });
-    }
-    if let Some(text) = value_at(object, &["result", "Ok", "content"])
-        .and_then(text_from_value)
-        .or_else(|| object.get("output").and_then(text_from_value))
-        .or_else(|| object.get("content").and_then(text_from_value))
-    {
-        return Some(normalize_tool_output(text));
-    }
-    None
-}
-
-fn normalize_tool_output(text: String) -> RecoveredText {
-    let lines: Vec<&str> = text.lines().collect();
-    let anchored = lines.first().is_some_and(|line| {
-        let line = line.trim();
-        line.starts_with('[') && line.ends_with(']') && line.contains('#')
-    });
-    let content_lines = if anchored { &lines[1..] } else { &lines[..] };
-    let numbered = !content_lines.is_empty()
-        && content_lines
-            .iter()
-            .filter(|line| !line.is_empty())
-            .all(|line| strip_numbered_prefix(line).is_some());
-    if !anchored && !numbered {
-        return RecoveredText {
-            text,
-            basis: SkillHashBasis::ReturnedDocumentBytes,
-        };
-    }
-
-    let mut normalized = String::new();
-    for (index, line) in content_lines.iter().enumerate() {
-        if index > 0 {
-            normalized.push('\n');
-        }
-        normalized.push_str(strip_numbered_prefix(line).unwrap_or(line));
-    }
-    if text.ends_with('\n') {
-        normalized.push('\n');
-    }
-    RecoveredText {
-        text: normalized,
-        basis: SkillHashBasis::NormalizedToolOutput,
-    }
-}
-
-fn strip_numbered_prefix(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digit_count == 0 {
-        return None;
-    }
-    let rest = &trimmed[digit_count..];
-    rest.strip_prefix(':').or_else(|| rest.strip_prefix('→'))
-}
-
-fn text_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            let parts: Vec<&str> = items
-                .iter()
-                .filter_map(|item| {
-                    item.as_str()
-                        .or_else(|| item.get("text").and_then(Value::as_str))
-                })
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
-        }
-        Value::Object(object) => object
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-fn object_failed(object: &Map<String, Value>) -> bool {
-    if object
-        .get("is_error")
-        .or_else(|| object.get("isError"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return true;
-    }
-    if object.get("success").and_then(Value::as_bool) == Some(false) {
-        return true;
-    }
-    if object
-        .get("exit_code")
-        .or_else(|| object.get("exitCode"))
-        .and_then(Value::as_i64)
-        .is_some_and(|code| code != 0)
-    {
-        return true;
-    }
-    if object.get("Err").is_some() {
-        return true;
-    }
-    object.values().any(|value| match value {
-        Value::Object(child) => object_failed(child),
-        Value::Array(items) => items.iter().filter_map(Value::as_object).any(object_failed),
-        _ => false,
-    })
-}
-
-fn object_is_truncated(object: &Map<String, Value>) -> bool {
-    if object.get("truncated").and_then(Value::as_bool) == Some(true)
-        || object.get("content_compacted").and_then(Value::as_bool) == Some(true)
+fn embedded_document_is_truncated(object: &Map<String, Value>) -> bool {
+    if [
+        "truncated",
+        "content_compacted",
+        "partial",
+        "incomplete",
+        "isPartial",
+    ]
+    .iter()
+    .any(|key| object.get(*key).and_then(Value::as_bool) == Some(true))
     {
         return true;
     }
@@ -760,35 +522,8 @@ fn object_is_truncated(object: &Map<String, Value>) -> bool {
         .get("outputBytes")
         .or_else(|| object.get("output_bytes"))
         .and_then(Value::as_u64);
-    if matches!((total, output), (Some(total), Some(output)) if output < total) {
-        return true;
-    }
-    if object.values().any(|value| match value {
-        Value::Object(child) => object_is_truncated(child),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(Value::as_object)
-            .any(object_is_truncated),
-        _ => false,
-    }) {
-        return true;
-    }
-    false
+    matches!((total, output), (Some(total), Some(output)) if output < total)
 }
-
-fn text_has_truncation_marker(text: &str) -> bool {
-    let tail = text
-        .trim_end()
-        .rsplit_once('\n')
-        .map(|(_, tail)| tail)
-        .unwrap_or(text)
-        .trim()
-        .to_ascii_lowercase();
-    tail.starts_with("[output truncated")
-        || tail.starts_with("[truncated")
-        || tail.ends_with("lines omitted]")
-}
-
 fn skill_target(session: &SessionRecord, raw_path: &str) -> Option<SkillTarget> {
     let (path, selector_partial) = split_read_selector(raw_path.trim());
     if let Some(name) = skill_uri_name(path) {
@@ -1010,21 +745,6 @@ fn argument_string<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a str> {
     let object = arguments.as_object()?;
     keys.iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str))
-}
-
-fn parse_json_string(value: Value) -> Value {
-    match value {
-        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        other => other,
-    }
-}
-
-fn value_at<'a>(object: &'a Map<String, Value>, path: &[&str]) -> Option<&'a Value> {
-    let mut value = object.get(*path.first()?)?;
-    for key in &path[1..] {
-        value = value.get(*key)?;
-    }
-    Some(value)
 }
 
 fn frontmatter_name(content: &str) -> Option<String> {

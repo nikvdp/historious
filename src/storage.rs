@@ -9,6 +9,7 @@ use crate::skill_usage::{
     SkillUsageConfidenceCounts, SkillUsageEvidence, SkillUsageFilter, SkillUsageOutput,
     SkillUsageTotals, SkillUsageVersion,
 };
+use crate::tool_events::{normalize, ToolSignal, ToolStatus};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
@@ -32,9 +33,10 @@ const SQLITE_BIND_CHUNK_SIZE: usize = 500;
 const MACHINE_REPAIR_SOURCE_CHUNK_SIZE: usize = 50;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
-const HISTORY_ITEMS_PROJECTION: &str = "history_items_v2";
-const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v2";
-const SKILL_OBSERVATIONS_PROJECTION: &str = "skill_observations_v1";
+const TOOL_HISTORY_SUBORDINAL_BASE: i64 = 10;
+const HISTORY_ITEMS_PROJECTION: &str = "history_items_v3";
+const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v3";
+const SKILL_OBSERVATIONS_PROJECTION: &str = "skill_observations_v2";
 const SOURCE_STATUS_CONFIDENCE_APPROXIMATE: &str = "approximate";
 const SOURCE_STATUS_CONFIDENCE_EXACT: &str = "exact";
 const SOURCE_STATUS_CONFIDENCE_STALE: &str = "stale";
@@ -1145,7 +1147,8 @@ impl Store {
                     .map(String::as_str)
                     .chain(std::iter::once(machine_id));
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
+                let rows =
+                    stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
                 for row in rows {
                     out.insert(row?);
                 }
@@ -8574,7 +8577,7 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
             "required",
             serde_json::json!({
                 "derived_from": "event.search_text",
-                "projector": "history_items_v2"
+                "projector": HISTORY_ITEMS_PROJECTION
             }),
         )?);
     }
@@ -8582,19 +8585,62 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
     let content_compacted = event_content_compacted(event);
 
     if !content_compacted {
-        if let Some((kind, text)) = tool_history_text(event) {
+        for tool_event in normalize(event) {
+            let source_subordinal = tool_event.subordinal;
+            let subordinal = TOOL_HISTORY_SUBORDINAL_BASE
+                .checked_add(source_subordinal)
+                .context("normalized tool history subordinal overflow")?;
+            let (kind, text, metadata) = match tool_event.signal {
+                ToolSignal::Call {
+                    call_id,
+                    name,
+                    arguments,
+                } => (
+                    "tool_call",
+                    format!("{name}\n{}", arguments),
+                    serde_json::json!({
+                        "derived_from": "event.content",
+                        "projector": HISTORY_ITEMS_PROJECTION,
+                        "signal": "call",
+                        "subordinal": source_subordinal,
+                        "call_id": call_id,
+                    }),
+                ),
+                ToolSignal::Result {
+                    call_id,
+                    status,
+                    text,
+                    truncated,
+                } => {
+                    let (text, normalized) = match text {
+                        Some(recovered) => (recovered.text, recovered.normalized),
+                        None => (String::new(), false),
+                    };
+                    (
+                        "tool_result",
+                        text,
+                        serde_json::json!({
+                            "derived_from": "event.content",
+                            "projector": HISTORY_ITEMS_PROJECTION,
+                            "signal": "result",
+                            "subordinal": source_subordinal,
+                            "call_id": call_id,
+                            "status": tool_status_name(status),
+                            "truncated": truncated,
+                            "normalized": normalized,
+                        }),
+                    )
+                }
+            };
             items.push(build_history_item(
                 event,
-                10,
+                subordinal,
                 "tool",
-                &kind,
+                kind,
                 &text,
                 true,
                 "opportunistic",
-                serde_json::json!({
-                    "derived_from": "event.content",
-                    "projector": "history_items_v2"
-                }),
+                metadata,
             )?);
         }
     }
@@ -8611,7 +8657,7 @@ fn history_items_from_event(event: &EventRecord) -> Result<Vec<HistoryItemRecord
             "never",
             serde_json::json!({
                 "derived_from": "event.content",
-                "projector": "history_items_v2"
+                "projector": HISTORY_ITEMS_PROJECTION
             }),
         )?);
     }
@@ -8665,126 +8711,12 @@ fn conversation_history_text(event: &EventRecord) -> Option<(String, &str)> {
     }
 }
 
-fn tool_history_text(event: &EventRecord) -> Option<(String, String)> {
-    let text = event.content.trim();
-    if text.is_empty() || is_encrypted_payload_text(text) {
-        return None;
+fn tool_status_name(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Failure => "failure",
+        ToolStatus::Unknown => "unknown",
     }
-    let event_can_have_tool_history = event_can_have_tool_history(event);
-    if let Some(value) = parse_json_value(text) {
-        if event_can_have_tool_history || json_has_explicit_tool_history(&value) {
-            if let Some((kind, text)) =
-                tool_history_text_from_json(&value, event_can_have_tool_history)
-            {
-                return Some((kind, text));
-            }
-        }
-    }
-    if text.starts_with("Chunk ID:") && text.contains("\nOutput:") {
-        return Some(("tool_result".to_string(), text.to_string()));
-    }
-    None
-}
-
-fn event_can_have_tool_history(event: &EventRecord) -> bool {
-    let event_type = event.event_type.to_ascii_lowercase();
-    let role = event
-        .role
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    role == "tool"
-        || event_type.contains("tool")
-        || event_type.contains("function_call")
-        || event_type.contains("exec")
-}
-
-fn json_has_explicit_tool_history(value: &Value) -> bool {
-    let payload = value.get("payload").unwrap_or(value);
-    let Some(map) = payload.as_object() else {
-        return false;
-    };
-    let kind = map
-        .get("type")
-        .or_else(|| map.get("name"))
-        .or_else(|| map.get("tool"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    kind.contains("tool")
-        || kind.contains("function")
-        || kind.contains("exec")
-        || kind == "bash"
-        || map.contains_key("arguments")
-        || map.contains_key("input")
-        || map.contains_key("command")
-        || map.contains_key("stdout")
-        || map.contains_key("stderr")
-        || map.contains_key("output")
-        || map.contains_key("result")
-        || map.contains_key("tool_use_id")
-        || map.contains_key("toolUseResult")
-}
-
-fn tool_history_text_from_json(
-    value: &Value,
-    allow_content_result: bool,
-) -> Option<(String, String)> {
-    let payload = value.get("payload").unwrap_or(value);
-    let name = payload
-        .get("name")
-        .or_else(|| payload.get("tool"))
-        .and_then(Value::as_str);
-    let arguments = payload
-        .get("arguments")
-        .or_else(|| payload.get("input"))
-        .or_else(|| payload.get("command"));
-    if let Some(arguments) = arguments {
-        let mut text = String::new();
-        if let Some(name) = name {
-            text.push_str(name);
-            text.push('\n');
-        }
-        if let Some(arguments) = arguments.as_str() {
-            text.push_str(arguments.trim());
-        } else {
-            text.push_str(&arguments.to_string());
-        }
-        let text = text.trim();
-        if !text.is_empty() {
-            return Some(("tool_call".to_string(), text.to_string()));
-        }
-    }
-
-    for key in ["stdout", "stderr", "output", "result"] {
-        if let Some(value) = payload.get(key) {
-            let text = value
-                .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| value.to_string());
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(("tool_result".to_string(), text.to_string()));
-            }
-        }
-    }
-    if allow_content_result {
-        if let Some(value) = payload.get("content") {
-            let text = value
-                .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| value.to_string());
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(("tool_result".to_string(), text.to_string()));
-            }
-        }
-    }
-    None
-}
-
-fn parse_json_value(text: &str) -> Option<Value> {
-    serde_json::from_str(text).ok()
 }
 
 fn raw_history_kind(event: &EventRecord) -> String {
@@ -8794,10 +8726,6 @@ fn raw_history_kind(event: &EventRecord) -> String {
         .or(Some(event.event_type.as_str()))
         .unwrap_or("raw")
         .to_ascii_lowercase()
-}
-
-fn is_encrypted_payload_text(text: &str) -> bool {
-    text.contains("\"encrypted_content\"")
 }
 
 fn is_instruction_text(event: &EventRecord, text: &str) -> bool {
@@ -10450,6 +10378,133 @@ mod tests {
             tier_kinds(&history_items_from_event(&encrypted).expect("encrypted")),
             vec![("raw", "response_item")]
         );
+    }
+
+    #[test]
+    fn normalized_tool_history_projects_nested_omp_evidence_searchably() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut source = fixture_source("source_normalized_tool_omp");
+        source.kind = "omp".to_string();
+        let mut session = fixture_session("session_normalized_tool_omp", &source.id);
+        session.source_kind = "omp".to_string();
+        let mut event = fixture_event(
+            "event_normalized_tool_omp",
+            &session.id,
+            &source.id,
+            1,
+            None,
+            "event_hash_normalized_tool_omp",
+        );
+        event.source_kind = "omp".to_string();
+        event.event_type = "message".to_string();
+        event.role = None;
+        event.content = json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "omp-call",
+                        "name": "read",
+                        "arguments": {"path": "unique_omp_argument_marker"}
+                    },
+                    {
+                        "type": "toolResult",
+                        "toolCallId": "omp-call",
+                        "toolName": "read",
+                        "content": [{"type": "text", "text": "unique_omp_result_marker"}],
+                        "details": {
+                            "displayContent": {"text": "unique_omp_result_marker"}
+                        },
+                        "isError": false
+                    }
+                ]
+            }
+        })
+        .to_string();
+        event.metadata = json!({
+            "search_indexable": false,
+            "search_kind": "none",
+            "search_text": ""
+        });
+
+        let event_id = event.id.clone();
+        store
+            .import_records(&[
+                ArchiveRecord::Source(source),
+                ArchiveRecord::Session(session),
+                ArchiveRecord::Event(event),
+            ])
+            .expect("import nested OMP tool event");
+        store
+            .refresh_history_items()
+            .expect("refresh nested OMP tool history");
+
+        let items = store
+            .history_items_for_event(&event_id)
+            .expect("load nested OMP tool history");
+        let tool_items = items
+            .iter()
+            .filter(|item| item.tier == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(tool_items.len(), 2);
+        assert_eq!(tool_items[0].kind, "tool_call");
+        assert!(tool_items[0].text.contains("read"));
+        assert!(tool_items[0].text.contains("unique_omp_argument_marker"));
+        assert_eq!(tool_items[0].metadata["call_id"], json!("omp-call"));
+        assert_eq!(tool_items[1].kind, "tool_result");
+        assert_eq!(tool_items[1].text, "unique_omp_result_marker");
+        assert_eq!(tool_items[1].metadata["call_id"], json!("omp-call"));
+        assert_eq!(tool_items[1].metadata["status"], json!("success"));
+        assert_eq!(tool_items[1].metadata["truncated"], json!(false));
+        assert_ne!(tool_items[0].id, tool_items[1].id);
+        assert_ne!(tool_items[0].subordinal, 0);
+        assert_ne!(tool_items[0].subordinal, 100);
+        assert_ne!(tool_items[1].subordinal, 0);
+        assert_ne!(tool_items[1].subordinal, 100);
+        assert!(tool_items.iter().all(|item| item.event_id == event_id));
+
+        let call_hits = store
+            .search_fts(
+                "unique_omp_argument_marker",
+                &["tool"],
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search normalized tool call");
+        assert_eq!(call_hits.len(), 1);
+        assert_eq!(call_hits[0].event_id, event_id);
+        assert_eq!(call_hits[0].search_kind, "tool_call");
+        assert_eq!(
+            call_hits[0].history_item_id.as_deref(),
+            Some(tool_items[0].id.as_str())
+        );
+
+        let result_hits = store
+            .search_fts(
+                "unique_omp_result_marker",
+                &["tool"],
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search normalized tool result");
+        assert_eq!(result_hits.len(), 1);
+        assert_eq!(result_hits[0].event_id, event_id);
+        assert_eq!(
+            result_hits[0].history_item_id.as_deref(),
+            Some(tool_items[1].id.as_str())
+        );
+        assert_eq!(result_hits[0].search_kind, "tool_result");
     }
 
     #[test]
@@ -12276,9 +12331,7 @@ mod tests {
             ])
             .expect("import observation");
         assert_eq!(
-            store
-                .rebuild_skill_observations()
-                .expect("initial rebuild"),
+            store.rebuild_skill_observations().expect("initial rebuild"),
             1
         );
 
