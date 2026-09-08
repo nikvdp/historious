@@ -3,6 +3,7 @@ mod analytics;
 mod annotate;
 mod archive;
 mod cli;
+mod commit_provenance;
 mod config;
 mod embed;
 mod ingest;
