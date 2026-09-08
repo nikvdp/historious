@@ -23,7 +23,6 @@ pub(super) struct GitFile {
 #[derive(Debug, Clone)]
 pub(super) struct GitLine {
     pub(super) line: usize,
-    pub(super) original_line: usize,
     pub(super) original_path: String,
     pub(super) sha: Option<String>,
 }
@@ -482,7 +481,7 @@ fn parse_blame(
             bail!("Git blame returned a malformed line header");
         }
         let (sha, zero_sha) = parse_blame_hash(fields[0])?;
-        let original_line = parse_usize(fields[1], "original line")?;
+        parse_usize(fields[1], "original line")?;
         let final_line = parse_usize(fields[2], "final line")?;
         let group_lines = if let Some(field) = fields.get(3) {
             parse_usize(field, "blame group length")?
@@ -513,7 +512,6 @@ fn parse_blame(
         }
         lines.push(GitLine {
             line: final_line,
-            original_line,
             original_path,
             sha: (!zero_sha).then(|| sha.clone()),
         });
@@ -1076,7 +1074,6 @@ mod file_provenance_git_tests {
         let report = inspect(&new, None, &mut progress).expect("inspect rename");
         assert_eq!(report.lines.len(), 1);
         assert_eq!(report.lines[0].original_path, "old name \"quoted\".txt");
-        assert_eq!(report.lines[0].original_line, 1);
     }
 
     #[test]
