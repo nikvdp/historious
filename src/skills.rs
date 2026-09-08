@@ -29,6 +29,9 @@ Use a Historious-only workflow unless it fails:
 
 If you use a backend raw-log fallback, say so explicitly and name the Historious failure that required it.
 
+For a code-origin question that names a file or line range, start with
+`histo --robot blame <file> --lines START:END` instead of guessing search keywords.
+
 ## Core Rules
 
 - Prefer `histo --robot` for agent usage. It emits stable JSON envelopes and disables interactive behavior.
@@ -142,6 +145,30 @@ histo --robot transcript <session_id> --at <ref>
 ```
 
 The JSON payload has ordered `.data.events[]` with exact content, roles, event ids, metadata, and target index.
+
+## Find sessions behind code
+
+Use `blame` when the input is a tracked Git file or a current line range:
+
+```bash
+histo --robot blame src/main.rs
+histo --robot blame src/main.rs --lines 1:20
+```
+
+Read `.data.sessions`, `.data.coverage`, `.data.ambiguous`, and
+`.data.unresolved`. Follow `.data.next_commands` to inspect exact tool evidence;
+these commands preserve `--data-dir` and use `--full`.
+
+An exact recorded SHA is stronger than a message match. Full-message,
+subject-only, and fuzzy candidates do not prove rewrite lineage or every
+contributor's authorship. Keep ambiguity and unresolved lines visible in your
+answer. Missing historical directories have explicitly weaker evidence.
+
+Blame reads the committed local evidence snapshot without refreshing it or
+scanning native logs. An explicit, authorized `histo update` builds or refreshes
+that snapshot. Matching is scoped to the current installation's machine identity
+and repository/worktrees. Opaque scripts or absent tool records may remain
+unattributed.
 
 ## History Exchange
 
@@ -328,6 +355,7 @@ Preferred agent pattern:
 histo --robot status
 histo --robot threads --all --today
 histo --robot search sqlite --mode lexical --limit 20
+histo --robot blame src/main.rs --lines 1:20
 histo --robot show <ref> --before 5 --after 8
 histo --robot transcript <session_id> --at <ref>
 ```
@@ -343,6 +371,9 @@ Rules:
 - Group search hits by `session_id`.
 - Use returned `ref` values for `show` and `transcript` follow-ups.
 - Use `transcript` JSON when exact wording, commands, or file paths matter.
+- For file or line-origin questions, use `blame` and follow its exact `--full` event citations.
+- Keep message-based candidates, ambiguity, and unresolved lines distinct from exact recorded SHA matches.
+- `blame` does not refresh history; run an explicit, authorized `histo update` when its snapshot needs maintenance.
 - Redact secrets found in transcripts.
 - Do not add a separate search command; the canonical entry point is `histo search`.
 - Use `threads --all --today`, `--after`, or `--project` for timeline-style discovery.
@@ -416,7 +447,8 @@ histo skill install search-agent-history-historious --codex
 
 const SKILLS: &[PackagedSkill] = &[PackagedSkill {
     name: "search-agent-history-historious",
-    description: "Search coding-agent history with short lexical keywords through Historious robot JSON.",
+    description:
+        "Search coding-agent history with short lexical keywords through Historious robot JSON.",
     skill_md: SEARCH_AGENT_HISTORY_HISTORIOUS,
 }];
 

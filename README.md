@@ -216,6 +216,42 @@ for `--last-answer`. Use `--no-timestamps` to omit timestamps from Markdown
 headings for compact exports. Use `--full` to see raw event payloads instead
 of clean conversation items.
 
+## Find sessions behind code
+
+Use `blame` to find indexed agent sessions connected to the current lines of a
+tracked Git file. Build or refresh the commit-evidence index with `update`, then
+select a file or an inclusive, 1-based line range:
+
+```bash
+histo update
+histo blame src/main.rs
+histo --robot blame src/main.rs --lines 1:20
+```
+
+Results group matching commits by session and include current line ranges,
+original filenames, evidence strength, and exact transcript citations.
+`--robot` and `--json` return the same result data. Follow-up commands preserve
+the selected data directory and use `--full` to retrieve the actual tool events.
+
+Exact recorded commit hashes take precedence. Complete messages from `-m` or
+recoverable `-F` message-file writes support matching after hashes change.
+Message similarity, subject-only matches, and unavailable historical directories
+remain weaker candidates. Ambiguous matches, unmatched lines, and uncommitted
+lines are reported separately.
+
+This identifies recorded committing sessions, not every contributor who edited
+the code. Message equality does not prove a rebase or squash relationship.
+Opaque scripts, missing tool records, and missing message-file contents can
+limit coverage. Matching is scoped to this installation's machine identity and
+the selected repository or worktrees; identical paths on other machines are not
+treated as repository proof.
+
+`blame` is read-only and does not use embeddings or model APIs. It never scans
+native logs or rebuilds an index during lookup. Missing or incompatible evidence
+snapshots require an explicit `histo update`; stale compatible snapshots remain
+readable with a warning. The first update backfills stored history, and later
+updates maintain changed sessions.
+
 ## Local TUI
 
 `histo tui` is a local terminal UI built on `fzf`. If you already have `fzf` on
