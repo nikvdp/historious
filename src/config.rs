@@ -146,6 +146,26 @@ pub fn resolve_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+pub(crate) fn read_query_context(data_dir: Option<PathBuf>) -> Result<(PathBuf, String)> {
+    let data_dir = match data_dir {
+        Some(path) => expand_home(path),
+        None => default_data_dir()?,
+    };
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()?.join(data_dir)
+    };
+    let machine_id = load_file_config(&data_dir)?
+        .machine
+        .id
+        .context("local machine identity is unavailable; run `histo update` first")?;
+    let machine_id = uuid::Uuid::parse_str(&machine_id)
+        .context("invalid local machine identity in Historious configuration")?
+        .to_string();
+    Ok((data_dir, machine_id))
+}
+
 pub fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("config.toml")
 }

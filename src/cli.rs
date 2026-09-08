@@ -1,4 +1,5 @@
 use crate::analytics;
+use crate::commit_provenance::query::{self as blame_query, BlameReport, LineRange};
 use crate::commit_provenance::store as commit_store;
 use crate::config::AppConfig;
 use crate::ingest;
@@ -70,6 +71,19 @@ pub struct Cli {
 pub enum Command {
     /// Print the histo version.
     Version {
+        #[arg(long, help = "Print a structured JSON result")]
+        json: bool,
+    },
+    /// Find agent sessions behind a tracked file or selected current lines.
+    Blame {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        #[arg(
+            long,
+            value_name = "START:END",
+            help = "Select an inclusive, 1-based line range"
+        )]
+        lines: Option<String>,
         #[arg(long, help = "Print a structured JSON result")]
         json: bool,
     },
@@ -1531,6 +1545,9 @@ impl Cli {
         let robot = self.robot;
         let data_dir = self.data_dir;
         let command = self.command;
+        if let Command::Blame { file, lines, json } = command {
+            return run_blame_command(data_dir, file, lines, json || robot);
+        }
         if let Command::Completion { shell } = command {
             print_completion(shell);
             return Ok(());
@@ -1677,7 +1694,9 @@ impl Cli {
             let (config, store) = if *json || robot {
                 load_update_resources_with_progress(data_dir, |event, _| {
                     write_machine_progress(
-                        "import", "startup", update_startup_progress_detail(*event),
+                        "import",
+                        "startup",
+                        update_startup_progress_detail(*event),
                         serde_json::json!({
                             "status": "starting", "stage": event.stage(),
                             "current": event.completed(), "total": UpdateStartupProgress::TOTAL,
@@ -3122,6 +3141,7 @@ impl Cli {
             }
             Command::Skill { command } => run_skill_command(&store, command, robot)?,
             Command::Version { .. } => unreachable!("version returns before storage setup"),
+            Command::Blame { .. } => unreachable!("blame returns before mutable storage setup"),
             Command::SelfUpdate { .. } => unreachable!("self-update returns before storage setup"),
             Command::Config { .. } => unreachable!("config returns before storage setup"),
             Command::Service { .. } => unreachable!("service returns before storage setup"),
@@ -3138,6 +3158,7 @@ impl Command {
     fn name(&self) -> &'static str {
         match self {
             Command::Version { .. } => "version",
+            Command::Blame { .. } => "blame",
             Command::Update { .. } => "update",
             Command::SelfUpdate { .. } => "self-update",
             Command::Search { .. } => "search",
@@ -3175,6 +3196,7 @@ impl Command {
         matches!(
             self,
             Command::Version { json: true }
+                | Command::Blame { json: true, .. }
                 | Command::Update { json: true, .. }
                 | Command::SelfUpdate { json: true, .. }
                 | Command::Search { json: true, .. }
@@ -3207,6 +3229,230 @@ impl Command {
                     ..
                 }
         )
+    }
+}
+
+#[derive(Serialize)]
+struct BlameOutput {
+    #[serde(flatten)]
+    report: BlameReport,
+    next_commands: Vec<String>,
+}
+
+fn parse_blame_lines(value: &str) -> Result<(usize, usize)> {
+    let Some((start, end)) = value.split_once(':') else {
+        bail!("--lines expects START:END, with positive 1-based line numbers");
+    };
+    let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) else {
+        bail!("--lines expects START:END, with positive 1-based line numbers");
+    };
+    if start == 0 || start > end {
+        bail!("--lines requires 1 <= START <= END");
+    }
+    Ok((start, end))
+}
+
+fn run_blame_command(
+    data_dir: Option<PathBuf>,
+    file: PathBuf,
+    lines: Option<String>,
+    machine_output: bool,
+) -> Result<()> {
+    let range = lines.as_deref().map(parse_blame_lines).transpose()?;
+    let started = Instant::now();
+    let mut last_emit = started;
+    let ui = ProgressUi::new();
+    let mut phase: Option<ProgressPhase> = None;
+    let (report, data_dir) = run_scoped_progress_with_timeout(
+        commit_store::Progress {
+            phase: "starting",
+            current: 0,
+            total: 0,
+            evidence: 0,
+        },
+        UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
+        move |send| {
+            let (data_dir, machine_id) = crate::config::read_query_context(data_dir)?;
+            let report = blame_query::query(
+                &data_dir.join("historious.db"),
+                &machine_id,
+                &file,
+                range,
+                |event| send(event),
+            )?;
+            Ok((report, data_dir))
+        },
+        |state, _| {
+            if started.elapsed() < UPDATE_PROGRESS_HEARTBEAT_INTERVAL
+                || (last_emit.elapsed() < UPDATE_PROGRESS_HEARTBEAT_INTERVAL
+                    && state.phase != "complete")
+            {
+                return;
+            }
+            let detail = if state.total == 0 {
+                state.phase.replace('-', " ")
+            } else {
+                format!(
+                    "{} {}/{}",
+                    state.phase.replace('-', " "),
+                    format_count(state.current),
+                    format_count(state.total)
+                )
+            };
+            if machine_output {
+                write_machine_progress(
+                    "blame",
+                    state.phase,
+                    detail,
+                    serde_json::json!({
+                        "current": state.current, "total": state.total, "evidence": state.evidence,
+                    }),
+                );
+            } else {
+                phase
+                    .get_or_insert_with(|| ui.phase("Finding agent sessions"))
+                    .update(detail);
+            }
+            last_emit = Instant::now();
+        },
+    )?;
+    if let Some(phase) = phase {
+        phase.finish(format!("{} sessions found", report.sessions.len()));
+    }
+    let prefix = format!(
+        "histo --data-dir {}",
+        shell_quote(&data_dir.to_string_lossy())
+    );
+    let mut next_commands = Vec::new();
+    for session in &report.sessions {
+        if let Some(citation) = session
+            .commits
+            .first()
+            .and_then(|commit| commit.citations.first())
+        {
+            next_commands.push(format!(
+                "{prefix} show {} --full --json --before 3 --after 3",
+                shell_quote(&citation.event_id),
+            ));
+            next_commands.push(format!(
+                "{prefix} transcript {} --at {} --full --json",
+                shell_quote(&session.session_id),
+                shell_quote(&citation.event_id),
+            ));
+        }
+    }
+    let output = BlameOutput {
+        report,
+        next_commands,
+    };
+    if machine_output {
+        crate::output::write_success(
+            "blame",
+            output,
+            crate::output::EnvelopeOptions {
+                started_at: Some(started),
+                ..Default::default()
+            },
+        )?;
+    } else {
+        print_blame_output(&output);
+    }
+    Ok(())
+}
+
+fn blame_ranges(ranges: &[LineRange]) -> String {
+    ranges
+        .iter()
+        .map(|range| {
+            if range.start == range.end {
+                range.start.to_string()
+            } else {
+                format!("{}-{}", range.start, range.end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_blame_output(output: &BlameOutput) {
+    let report = &output.report;
+    let coverage = &report.coverage;
+    let probable = coverage.exact_message_lines
+        + coverage.whitespace_normalized_message_lines
+        + coverage.fuzzy_message_lines
+        + coverage.scoped_sha_lines
+        + coverage.scoped_exact_message_lines
+        + coverage.scoped_whitespace_normalized_message_lines;
+    if coverage.selected_lines == 0 {
+        println!("{} (empty tracked file)", report.file.escape_debug());
+    } else {
+        println!(
+            "{} (lines {}-{})",
+            report.file.escape_debug(),
+            report.selected_start,
+            report.selected_end
+        );
+    }
+    println!(
+        "{} selected lines: {} direct, {} likely, {} ambiguous, {} without evidence, {} uncommitted",
+        coverage.selected_lines, coverage.exact_sha_lines, probable, coverage.ambiguous_lines,
+        coverage.unresolved_lines, coverage.uncommitted_lines,
+    );
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
+    for session in &report.sessions {
+        println!(
+            "\nSession {}: {} selected lines",
+            session.session_id.escape_debug(),
+            session.covered_lines
+        );
+        println!("  Lines: {}", blame_ranges(&session.ranges));
+        if session.ambiguous_lines > 0 {
+            println!(
+                "  Competing attribution on lines: {}",
+                blame_ranges(&session.ambiguous_ranges)
+            );
+        }
+        for commit in &session.commits {
+            println!(
+                "  {}  {}",
+                &commit.current_sha[..12],
+                commit.current_subject.escape_debug()
+            );
+            println!("    Lines: {}", blame_ranges(&commit.ranges));
+            println!("    {}", commit.reason);
+            println!(
+                "    Original paths: {}",
+                commit.original_paths.join(", ").escape_debug()
+            );
+            for citation in &commit.citations {
+                println!(
+                    "    Evidence: {} -> {}",
+                    citation.event_id.escape_debug(),
+                    citation.result_event_id.escape_debug()
+                );
+            }
+        }
+    }
+    for unresolved in &report.unresolved {
+        println!(
+            "\nLines {}: {}",
+            blame_ranges(std::slice::from_ref(&unresolved.range)),
+            unresolved.reason
+        );
+    }
+    if !output.next_commands.is_empty() {
+        println!("\nInspect the recorded work:");
+        for command in &output.next_commands {
+            if command.chars().any(char::is_control) {
+                println!(
+                    "  Use --json to retrieve the command containing escaped control characters."
+                );
+            } else {
+                println!("  {command}");
+            }
+        }
     }
 }
 
