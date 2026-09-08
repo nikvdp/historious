@@ -37,7 +37,15 @@ pub(crate) struct RecoveredText {
 }
 
 pub(crate) fn normalize(event: &EventRecord) -> Vec<ToolEvent> {
-    if event.metadata.get("content_format").and_then(Value::as_str) == Some("conversation_text") {
+    if event.metadata.get("content_format").and_then(Value::as_str) == Some("conversation_text")
+        || (event
+            .metadata
+            .get("search_provenance")
+            .and_then(Value::as_str)
+            == Some("message_text")
+            && event.metadata.get("search_text").and_then(Value::as_str)
+                == Some(event.content.as_str()))
+    {
         return Vec::new();
     }
     let mut collector = Collector::default();
@@ -908,6 +916,17 @@ mod tests {
             metadata: json!({}),
             hash: "hash".to_string(),
         }
+    }
+
+    #[test]
+    fn normalized_tool_legacy_conversation_json_is_not_an_operation() {
+        let mut record = event(json!({
+            "type":"toolCall", "id":"quoted", "name":"bash",
+            "arguments":{"command":"git commit -m quoted"}
+        }));
+        record.role = Some("user".to_string());
+        record.metadata = json!({"search_provenance":"message_text","search_text":record.content});
+        assert!(normalize(&record).is_empty());
     }
 
     #[test]

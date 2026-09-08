@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 mod commands;
+pub(crate) mod query;
 pub(crate) mod store;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
