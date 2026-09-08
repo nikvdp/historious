@@ -37,6 +37,9 @@ pub(crate) struct RecoveredText {
 }
 
 pub(crate) fn normalize(event: &EventRecord) -> Vec<ToolEvent> {
+    if event.metadata.get("content_format").and_then(Value::as_str) == Some("conversation_text") {
+        return Vec::new();
+    }
     let mut collector = Collector::default();
     if let Ok(value) = serde_json::from_str::<Value>(&event.content) {
         collect_root(&value, &mut collector);
@@ -63,6 +66,12 @@ pub(crate) fn normalize(event: &EventRecord) -> Vec<ToolEvent> {
             signal,
         })
         .collect()
+}
+
+pub(crate) fn contains_operations(value: &Value) -> bool {
+    let mut collector = Collector::default();
+    collect_root(value, &mut collector);
+    !collector.signals.is_empty()
 }
 
 fn event_allows_untyped_payload(event: &EventRecord) -> bool {

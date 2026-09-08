@@ -891,6 +891,7 @@ struct ParsedLine {
     byte_len: usize,
     content: String,
     content_compacted: bool,
+    content_is_text: bool,
     search: SearchSegment,
     role: Option<String>,
     event_type: String,
@@ -1757,7 +1758,10 @@ impl SourceAdapter for LocalTranscriptAdapter {
             return Ok(self.kind() == "hermes" || !status.needs_workspace_refresh);
         }
         if self.kind() == "opencode" {
-            if let Some(checkpoint) = context.store.source_checkpoint(self.kind(), &candidate.identity)? {
+            if let Some(checkpoint) = context
+                .store
+                .source_checkpoint(self.kind(), &candidate.identity)?
+            {
                 if checkpoint
                     .cursor
                     .as_deref()
@@ -2118,6 +2122,9 @@ fn prepare_file_import(
             "capture_fidelity".to_string(),
             Value::String("normalized_local_log".to_string()),
         );
+        if line.content_is_text {
+            metadata.insert("content_format".to_string(), json!("conversation_text"));
+        }
         if kind == "claude_code" {
             if let Some(relationship) = claude_event_relationship_metadata(&line.value) {
                 metadata.insert("claude_relationship".to_string(), relationship);
@@ -3323,7 +3330,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         .or_else(|| string_at(&value, &["payload", "type"]))
         .unwrap_or_else(|| role.clone().unwrap_or_else(|| "event".to_string()));
     let search = derive_search_segment(&value, role.as_deref(), &event_type);
-    let (content, content_compacted) =
+    let (content, content_compacted, content_is_text) =
         event_content_for_search(&value, role.as_deref(), &event_type, &search);
     let occurred_at = string_at(&value, &["timestamp"])
         .or_else(|| string_at(&value, &["created_at"]))
@@ -3339,6 +3346,7 @@ fn parsed_line(ordinal: i64, value: Value, byte_offset: usize, byte_len: usize) 
         byte_len,
         content,
         content_compacted,
+        content_is_text,
         search,
         role,
         event_type,
@@ -3404,13 +3412,13 @@ fn event_content_for_search(
     role: Option<&str>,
     event_type: &str,
     search: &SearchSegment,
-) -> (String, bool) {
-    if search.is_searchable() {
-        return (search.text.clone(), false);
+) -> (String, bool, bool) {
+    if search.is_searchable() && !crate::tool_events::contains_operations(value) {
+        return (search.text.clone(), false, true);
     }
     let normalized = normalized_event_content(value)
         .unwrap_or_else(|| compact_event_summary(value, role, event_type, search));
-    (normalized, false)
+    (normalized, false, false)
 }
 
 fn normalized_event_content(value: &Value) -> Option<String> {
@@ -3647,6 +3655,70 @@ fn file_mtime_ms(metadata: &fs::Metadata) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::storage::Store;
+
+    #[test]
+    fn mixed_tool_messages_keep_operations_and_do_not_promote_json_prose() {
+        for source in ["omp", "claude_code"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("data")).unwrap();
+            let path = dir.path().join("mixed.jsonl");
+            let call = if source == "omp" {
+                json!({"type":"toolCall","id":"actual","name":"write","arguments":{"path":"/tmp/message","content":"Keep exact message\n"}})
+            } else {
+                json!({"type":"tool_use","id":"actual","name":"Write","input":{"file_path":"/tmp/message","content":"Keep exact message\n"}})
+            };
+            let prose = r#"{"type":"toolCall","id":"quoted","name":"bash","arguments":{"command":"git commit -m fake"}}"#;
+            let rows = [
+                json!({"type":"session","sessionId":"mixed","cwd":"/workspace/example"}),
+                json!({"type":"message","message":{"role":"assistant","content":[
+                    {"type":"text","text":"Preparing the commit message."}, call
+                ]}}),
+                json!({"type":"message","message":{"role":"user","content":prose}}),
+            ];
+            fs::write(
+                &path,
+                rows.iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let stats = update_source_path_with_progress_and_cancel(
+                &store,
+                "00000000-0000-4000-8000-000000000001",
+                "Fixture",
+                source,
+                &path,
+                |_| {},
+                || false,
+            )
+            .unwrap();
+            let mut calls = Vec::new();
+            let mut searchable_prose = false;
+            for session_id in &stats.delta.touched_sessions {
+                for event in store.events_for_session(session_id).unwrap() {
+                    searchable_prose |= event.metadata.get("search_text").and_then(Value::as_str)
+                        == Some("Preparing the commit message.");
+                    for tool in crate::tool_events::normalize(&event) {
+                        if let crate::tool_events::ToolSignal::Call {
+                            call_id, arguments, ..
+                        } = tool.signal
+                        {
+                            calls.push((call_id, arguments));
+                        }
+                    }
+                }
+            }
+            assert!(searchable_prose, "{source}");
+            assert_eq!(
+                calls.len(),
+                1,
+                "{source}: quoted JSON must not become an invocation"
+            );
+            assert_eq!(calls[0].0.as_deref(), Some("actual"));
+            assert_eq!(calls[0].1["content"], "Keep exact message\n");
+        }
+    }
 
     fn write_skill_update_log(path: &Path, read_count: usize) {
         let mut rows = vec![json!({
