@@ -50,6 +50,7 @@ struct PendingCommit {
     call_id: String,
     cwd: Option<String>,
     message: MessageSnapshot,
+    followed_by_command: bool,
 }
 #[derive(Debug, Clone)]
 enum PendingKind {
@@ -209,7 +210,11 @@ fn begin_call(
                         },
                     );
                 }
-                commands::Action::Commit { cwd, message } => {
+                commands::Action::Commit {
+                    cwd,
+                    message,
+                    followed_by_command,
+                } => {
                     let message =
                         snapshot_message(message, writes, cwd.as_deref(), event.id.as_str());
                     commits.push(PendingCommit {
@@ -217,6 +222,7 @@ fn begin_call(
                         call_id: call_id.to_string(),
                         cwd,
                         message,
+                        followed_by_command,
                     });
                 }
                 commands::Action::InvalidateWrites => invalidate_writes(writes, write_generation),
@@ -347,6 +353,9 @@ fn finish_call(
                 };
                 used.insert(index);
                 let commit = &commits[index];
+                if status == ToolStatus::Failure && !commit.followed_by_command {
+                    continue;
+                }
                 let mut message = commit.message.clone();
                 if message.content.is_some()
                     && message.message_result_event_id.is_none()
@@ -960,6 +969,45 @@ mod tests {
             ],
         );
         assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn commit_evidence_failed_standalone_header_is_not_creation_proof() {
+        let session = session("failed-header");
+        let failed = detect(
+            &session,
+            &[
+                shell_call(
+                    &session,
+                    "single",
+                    0,
+                    "git commit -m 'Subject && condition'",
+                ),
+                shell_result(
+                    &session,
+                    "single",
+                    1,
+                    "[main abc1234] Subject && condition\nfatal: rejected",
+                    true,
+                ),
+            ],
+        );
+        assert!(failed.is_empty());
+        let trailing_failure = detect(
+            &session,
+            &[
+                shell_call(&session, "chain", 0, "git commit -m 'Subject' && false"),
+                shell_result(
+                    &session,
+                    "chain",
+                    1,
+                    "[main abc1234] Subject\nlater command failed",
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(trailing_failure.len(), 1);
+        assert_eq!(trailing_failure[0].sha, "abc1234");
     }
 
     #[test]

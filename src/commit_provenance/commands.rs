@@ -9,6 +9,7 @@ pub(super) enum Action {
     Commit {
         cwd: Option<String>,
         message: MessageSource,
+        followed_by_command: bool,
     },
     InvalidateWrites,
 }
@@ -87,13 +88,18 @@ pub(super) fn analyze(command: &str, cwd: Option<&str>) -> Vec<Action> {
     for segment in segments {
         let start = actions.len();
         analyze_segment(&segment.items, &mut shell_cwd, &mut actions);
-        if segment.next == Some(Separator::Sequence) {
-            for action in &mut actions[start..] {
-                if let Action::Write { content, .. } = action {
-                    // A semicolon/newline chain can execute the commit even if
-                    // this preceding write failed; preserve the path, not bytes.
+        for action in &mut actions[start..] {
+            match action {
+                Action::Write { content, .. } if segment.next == Some(Separator::Sequence) => {
                     *content = None;
                 }
+                Action::Commit {
+                    followed_by_command,
+                    ..
+                } => {
+                    *followed_by_command = segment.next.is_some();
+                }
+                _ => {}
             }
         }
     }
@@ -565,6 +571,7 @@ fn analyze_git(
             actions.push(Action::Commit {
                 cwd: commit_cwd,
                 message,
+                followed_by_command: false,
             });
         }
         "add" | "status" | "diff" | "log" | "show" | "rev-parse" => {}
@@ -1065,6 +1072,7 @@ mod tests {
                 Action::Commit {
                     cwd: Some("/repo".to_string()),
                     message: MessageSource::File("/repo/message file".to_string()),
+                    followed_by_command: false,
                 },
             ]
         );
@@ -1081,6 +1089,7 @@ mod tests {
             vec![Action::Commit {
                 cwd: Some("/repo".to_string()),
                 message: MessageSource::Inline("first && paragraph\n\nsecond".to_string()),
+                followed_by_command: false,
             }]
         );
     }
@@ -1101,6 +1110,7 @@ mod tests {
                 Action::Commit {
                     cwd: Some("/workspace/project".to_string()),
                     message: MessageSource::Inline("done".to_string()),
+                    followed_by_command: false,
                 },
             ]
         );
@@ -1122,6 +1132,7 @@ mod tests {
                 Action::Commit {
                     cwd: Some("/repo".to_string()),
                     message: MessageSource::File("/repo/msg".to_string()),
+                    followed_by_command: false,
                 },
             ]
         );
@@ -1140,6 +1151,7 @@ mod tests {
                 Action::Commit {
                     cwd: Some("/repo".to_string()),
                     message: MessageSource::File("/repo/msg".to_string()),
+                    followed_by_command: false,
                 },
             ]
         );
@@ -1162,6 +1174,7 @@ mod tests {
                 Action::Commit {
                     cwd: Some("/repo".to_string()),
                     message: MessageSource::File("/repo/msg".to_string()),
+                    followed_by_command: false,
                 },
             ]
         );
@@ -1175,6 +1188,7 @@ mod tests {
             vec![Action::Commit {
                 cwd: Some("/repo".to_string()),
                 message: MessageSource::Unknown,
+                followed_by_command: false,
             }]
         );
     }

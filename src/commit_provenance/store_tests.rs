@@ -243,3 +243,36 @@ fn commit_projection_concurrent_mutation_rejects_publication_without_writer_lock
     .records
     .is_empty());
 }
+
+#[test]
+fn commit_projection_old_detector_revision_requires_explicit_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    seed(&store, "first", "abc1234", "Preserve context");
+    refresh(&store);
+    store
+        .with_conn(|conn| {
+            let watermark: String = conn.query_row(
+                "SELECT input_high_watermark FROM projection_status WHERE projection_name=?",
+                [PROJECTION_NAME],
+                |row| row.get(0),
+            )?;
+            let old = watermark.split(':').take(2).collect::<Vec<_>>().join(":");
+            conn.execute(
+                "UPDATE projection_status SET input_high_watermark=? WHERE projection_name=?",
+                params![old, PROJECTION_NAME],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let old = store.with_conn(status).unwrap();
+    assert_eq!(old.state, ProjectionState::Missing);
+    assert!(!old.has_snapshot);
+    let rebuilt = refresh(&store);
+    assert_eq!(rebuilt.processed_sessions, 1);
+    assert_eq!(rebuilt.evidence_count, 1);
+    assert_eq!(
+        store.with_conn(status).unwrap().state,
+        ProjectionState::Ready
+    );
+}

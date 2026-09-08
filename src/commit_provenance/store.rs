@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 const PROJECTION_NAME: &str = "commit_evidence_v1";
+const DETECTOR_REVISION: &str = "1";
 const MAX_SHA_LEN: usize = 64;
 const MIN_SHA_LEN: usize = 4;
 
@@ -293,8 +294,9 @@ pub(crate) fn status(conn: &Connection) -> Result<ProjectionStatus> {
         .as_ref()
         .and_then(|(watermark, _, _)| {
             watermark
-                .split_once(':')
-                .and_then(|(_, count)| count.parse::<usize>().ok())
+                .split(':')
+                .nth(1)
+                .and_then(|count| count.parse::<usize>().ok())
         })
         .unwrap_or(0);
     let Some((watermark, status, updated_at)) = row else {
@@ -305,13 +307,16 @@ pub(crate) fn status(conn: &Connection) -> Result<ProjectionStatus> {
             updated_at: None,
         });
     };
+    let compatible = watermark.split(':').nth(2) == Some(DETECTOR_REVISION);
     Ok(ProjectionStatus {
-        state: if status == "ready" {
+        state: if !compatible {
+            ProjectionState::Missing
+        } else if status == "ready" {
             ProjectionState::Ready
         } else {
             ProjectionState::Stale
         },
-        has_snapshot: !watermark.is_empty(),
+        has_snapshot: compatible,
         evidence_count,
         updated_at: (!updated_at.is_empty()).then_some(updated_at),
     })
@@ -558,7 +563,7 @@ fn publish(
            updated_at = excluded.updated_at",
         params![
             PROJECTION_NAME,
-            format!("{input_revision_at_start}:{evidence_count}"),
+            format!("{input_revision_at_start}:{evidence_count}:{DETECTOR_REVISION}"),
             now
         ],
     )?;
