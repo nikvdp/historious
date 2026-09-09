@@ -1,6 +1,6 @@
 # Repository Agent Rules
 
-These rules apply to changes involving update, report, indexing, analytics, and projection code.
+These rules apply throughout the app, including every command, background operation with a user-facing status, and shared progress component. Update, report, indexing, analytics, import, and projection code are not exceptions.
 
 ## Keep Personal Data Out of Repository Artifacts
 
@@ -20,17 +20,23 @@ These rules apply to changes involving update, report, indexing, analytics, and 
 - Prefer an existing code path over a parallel implementation or new abstraction.
 - Establish correct behavior and its checks before undertaking a broader performance rewrite.
 
-## Progress Must Stay Alive
+## Progress Must Explain the Whole Operation
 
-- Emit an initial progress state immediately before slow work begins.
-- Drive meters from real active-work units such as files, rows, events, sessions, or bytes.
-- A meter and its adjacent text MUST use the same numerator and denominator. If work is hierarchical, label overall and active-phase progress separately.
-- Counts MUST be monotonic within a phase. Make phase transitions explicit before resetting a count.
+- Progress is an app-wide product requirement, not a cosmetic feature or an `update`-only rule. See `vision.md`.
+- Before slow work starts, show the operation's full phase plan, current phase number and total, and remaining work. Keep this scope visible throughout the operation.
+- Every multi-phase operation MUST have a persistent overall meter in addition to any phase-local meters. Overall progress MUST never reset or move backward when phases, sources, batches, or nested tasks change.
+- Keep the overall denominator stable. Include conditional work in the plan and explicitly mark skipped work. Never silently append another expensive phase after the meter fills.
+- Label overall units honestly. A count of completed phases is not a percentage of elapsed time or total data. Do not sum unlike units or invent equal-duration weights.
+- Help users judge the remaining wait. Show elapsed time, measured work and remaining phases. Show a remaining-time estimate only when measured throughput or comparable timings support it; otherwise say the estimate is unavailable. A spinner or seconds ticker is liveness, not work progress.
+- Drive phase meters from real active-work units such as files, rows, events, sessions, or bytes. A meter and its adjacent text MUST use the same numerator and denominator.
+- Counts MUST be monotonic within a phase. Label phase-local resets explicitly and keep the overall meter visible. Repeated passes MUST have distinct names or pass numbers and appear in the operation's scope.
 - Combine work-unit thresholds with elapsed-time thresholds. While slow work continues, update visible liveness at least once per second even when the measured count has not changed; never fabricate completed work.
-- Do not leave long SQL queries, scans, transactions, or batches unobservable. Chunk them, instrument them, or provide truthful liveness until measured progress resumes.
-- For report maintenance, reuse the native `histo update` progress semantics and terminal style, not merely its row renderer. Feed the view the active operation's real `current` and `total` values.
-- Interactive progress updates in place. Redirected output emits bounded periodic lines. Machine events retain a stable schema from start through completion.
-- Emit completion only after the represented work is durably complete.
+- A long-running stage with only an animated spinner or elapsed ticker is not acceptable. Expose measured subwork with bounded batches or instrumentation. During an indivisible operation, name the actual operation, its last measured boundary, and what remains; do not leave a stale label from earlier work.
+- Preparation, index construction, SQL aggregation, replacement, flushing, and commit are work. Include them in the plan and report their own progress; never hide them behind a full meter or a generic `projecting` label.
+- Emit phase completion only after the represented work is durably complete. If row processing reaches its total before finalization, label it as row processing and visibly enter the planned finalization phase. Overall completion requires successful finalization; failure or interruption MUST NOT appear complete.
+- Reuse shared progress semantics across commands, not just a row renderer. For report maintenance, feed the view the active operation's real `current` and `total` values.
+- Interactive progress updates in place. Redirected output emits bounded periodic lines. Both MUST communicate the same overall scope and actual work. Preserve the overall meter and phase coordinates on narrow terminals.
+- Machine events retain a stable schema from start through completion, with separate overall and phase-local coordinates.
 
 ## Preserve Report and Update Fast Paths
 
@@ -61,7 +67,8 @@ These rules apply to changes involving update, report, indexing, analytics, and 
 - Exercise the exact command and output mode that changed, not only an internal helper or renderer.
 - Cover the relevant states: new or empty database, current snapshot, missing snapshot, stale snapshot, forced refresh, skipped refresh, and failed/interrupted refresh.
 - Use production-shaped scale when query performance or progress cadence is part of the requirement; tiny fixtures cannot validate either.
-- Check time to first progress, maximum silent interval, monotonicity, meter/text agreement, phase transitions, total runtime, warm-path runtime, writer-lock duration, rollback, and machine-event shape as applicable.
+- Check time to first progress, maximum silent interval, measured-work gaps, stable overall denominator, monotonic overall and phase-local counts, remaining phase counts, meter/text agreement, phase transitions, total runtime, warm-path runtime, writer-lock duration, rollback, and machine-event shape as applicable.
 - Capture real interactive and redirected command output when terminal behavior changes.
 - Treat any observed stall, timeout, memory failure, misleading meter, or unexplained regression as a failed acceptance check even if the command eventually succeeds.
+- Specifically exercise the transition after a phase meter fills. A full meter followed by an unexplained reset, another unnamed pass, or prolonged ticker-only work fails acceptance.
 - Never claim a progress or performance fix from eventual completion alone.
