@@ -32,10 +32,12 @@ These rules apply throughout the app, including every command, background operat
 - Counts MUST be monotonic within a phase. Label phase-local resets explicitly and keep the overall meter visible. Repeated passes MUST have distinct names or pass numbers and appear in the operation's scope.
 - Combine work-unit thresholds with elapsed-time thresholds. While slow work continues, update visible liveness at least once per second even when the measured count has not changed; never fabricate completed work.
 - A long-running stage with only an animated spinner or elapsed ticker is not acceptable. Expose measured subwork with bounded batches or instrumentation. During an indivisible operation, name the actual operation, its last measured boundary, and what remains; do not leave a stale label from earlier work.
+- During indivisible storage operations, show measured I/O when available. Label read/write totals as I/O, not unique input bytes or logical completion. A changing clock alone is insufficient.
 - Preparation, index construction, SQL aggregation, replacement, flushing, and commit are work. Include them in the plan and report their own progress; never hide them behind a full meter or a generic `projecting` label.
 - Emit phase completion only after the represented work is durably complete. If row processing reaches its total before finalization, label it as row processing and visibly enter the planned finalization phase. Overall completion requires successful finalization; failure or interruption MUST NOT appear complete.
 - Reuse shared progress semantics across commands, not just a row renderer. For report maintenance, feed the view the active operation's real `current` and `total` values.
 - Interactive progress updates in place. Redirected output emits bounded periodic lines. Both MUST communicate the same overall scope and actual work. Preserve the overall meter and phase coordinates on narrow terminals.
+- Never truncate a progress numerator or denominator to preserve descriptive text. Compact the row or omit its local bar on narrow terminals; keep complete counts and the overall scope readable.
 - Machine events retain a stable schema from start through completion, with separate overall and phase-local coordinates.
 
 ## Preserve Report and Update Fast Paths
@@ -50,6 +52,8 @@ These rules apply throughout the app, including every command, background operat
 
 - Measure the observed slow path first, then inspect query plans and indexes before redesigning it.
 - Avoid N+1 queries, repeated database opens, repeated full-table scans, offset pagination on large tables, and per-row or unnecessarily small transactions.
+- Reuse unchanged derived rows and index entries during version upgrades. A per-row projector version is a creation stamp, not a content change. Compare semantic fields without that stamp; track the verified projection version separately.
+- Do not repeatedly fetch large payload rows just to compare small metadata fields. Use bounded metadata staging and facts already loaded into the active batch.
 - Stream or batch through indexed ranges with bounded memory and temporary-disk use.
 - Keep primary-database writer transactions short. Long reads, classification, staging, and progress calculation must not hold the main writer lock.
 - Build large replacement projections in bounded staging storage, then swap them in one short atomic transaction.
