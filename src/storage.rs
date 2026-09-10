@@ -10853,6 +10853,289 @@ mod tests {
     }
 
     #[test]
+    fn history_upgrade_reuses_unchanged_search_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.import_records(&fixture_archive_records()).unwrap();
+        store.refresh_history_items().unwrap();
+        let event = fixture_archive_records()
+            .into_iter()
+            .find_map(|record| {
+                if let ArchiveRecord::Event(event) = record {
+                    Some(event)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        for item in store.history_items_for_event(&event.id).unwrap() {
+            let mut metadata = item.metadata.clone();
+            metadata["projector"] = json!("history_items_v2");
+            let legacy = build_history_item(
+                &event,
+                item.subordinal,
+                &item.tier,
+                &item.kind,
+                &item.text,
+                item.lexical_indexable,
+                &item.semantic_policy,
+                metadata,
+            )
+            .unwrap();
+            assert_eq!(legacy.id, item.id);
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE history_items SET metadata_json = ?1, hash = ?2 WHERE id = ?3",
+                        params![legacy.metadata.to_string(), legacy.hash, legacy.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE history_items_fts SET rowid = rowid + 1000;
+                 UPDATE history_items_conversation_fts SET rowid = rowid + 1000;
+                 DELETE FROM history_item_index_rows;",
+                )?;
+                conn.execute(
+                    "DELETE FROM projection_status WHERE projection_name = ?1",
+                    [HISTORY_INDEX_ROWS_PROJECTION],
+                )?;
+                conn.execute(
+                    "UPDATE projection_status SET projection_name = 'history_items_v2'
+                 WHERE projection_name = ?1",
+                    [HISTORY_ITEMS_PROJECTION],
+                )?;
+                conn.execute(
+                "UPDATE projection_status SET projection_name = 'history_items_conversation_fts_v2'
+                 WHERE projection_name = ?1", [HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION],
+            )?;
+                Ok(())
+            })
+            .unwrap();
+        let original_rows = || {
+            store
+                .with_conn(|conn| {
+                    let mut rows = conn.prepare(
+                        "SELECT rowid, item_id FROM history_items_fts
+                     WHERE event_id = 'event_vector' ORDER BY rowid",
+                    )?;
+                    let result = rows
+                        .query_map([], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(result)
+                })
+                .unwrap()
+        };
+        let before = original_rows();
+        assert!(!before.is_empty());
+        let mut added = fixture_archive_records()
+            .into_iter()
+            .find_map(|record| {
+                if let ArchiveRecord::Event(event) = record {
+                    Some(event)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        added.id = "upgrade-added".to_string();
+        added.hash = "upgrade-added-hash".to_string();
+        added.ordinal += 1;
+        added.content = "newwords".to_string();
+        added.metadata["search_text"] = json!("newwords");
+        store
+            .import_records(&[ArchiveRecord::Event(added)])
+            .unwrap();
+        let interrupted = store.refresh_history_items_with_progress(|event| {
+            if event.phase == "projecting" && event.current == event.total && event.total > 0 {
+                store
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE events SET content = 'latestwords',
+                         metadata_json = json_set(metadata_json, '$.search_text', 'latestwords')
+                         WHERE id = 'upgrade-added'",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        assert!(interrupted.is_err());
+        assert_eq!(original_rows(), before);
+        assert!(!store.history_items_projection_status_ready().unwrap());
+        store
+            .refresh_history_items_with_progress(|event| {
+                if event.phase == "projecting" && event.current == 0 {
+                    store
+                        .with_conn(|conn| {
+                            conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
+                            Ok(())
+                        })
+                        .expect("classification does not hold the primary writer lock");
+                }
+            })
+            .unwrap();
+        assert_eq!(original_rows(), before);
+        assert!(store.history_items_projection_status_ready().unwrap());
+        store.with_conn(|conn| {
+            let found: String = conn.query_row(
+                "SELECT DISTINCT event_id FROM history_items_fts WHERE history_items_fts MATCH 'latestwords'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(found, "upgrade-added");
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn history_rebuild_keeps_searchable_projection_until_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .import_records(&fixture_archive_records())
+            .expect("import records");
+        store.refresh_history_items().expect("initial projection");
+        let matches = || {
+            store
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT item_id FROM history_items_fts
+                     WHERE history_items_fts MATCH 'distributed' ORDER BY item_id",
+                    )?;
+                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .expect("search committed history")
+        };
+        let before = matches();
+        assert!(!before.is_empty());
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.rebuild_history_items_with_progress(|event| {
+                if event.phase == "projecting" && event.current == 0 {
+                    panic!("interrupt after replacement tables were created");
+                }
+            });
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(matches(), before);
+        assert!(store.history_items_projection_status_ready().unwrap());
+        let mut added = fixture_archive_records()
+            .into_iter()
+            .find_map(|record| match record {
+                ArchiveRecord::Event(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        added.id = "new-visible-event".to_string();
+        added.hash = "new-visible-event-hash".to_string();
+        added.ordinal += 1;
+        added.content = "freshneedle".to_string();
+        added.metadata["search_text"] = json!("freshneedle");
+        store
+            .import_records(&[ArchiveRecord::Event(added)])
+            .unwrap();
+
+        let mut events = Vec::new();
+        store
+            .rebuild_history_items_with_progress(|event| {
+                if event.phase == "finalizing" && event.current == event.total {
+                    assert_eq!(matches(), before);
+                    let visible: i64 = store
+                        .with_conn(|conn| {
+                            Ok(conn.query_row(
+                                "SELECT COUNT(DISTINCT event_id) FROM history_items_fts
+                             WHERE history_items_fts MATCH 'freshneedle'",
+                                [],
+                                |row| row.get(0),
+                            )?)
+                        })
+                        .expect("read newly committed projection from another connection");
+                    assert_eq!(visible, 1);
+                }
+                events.push(event);
+            })
+            .expect("rebuild after interruption");
+        assert_eq!(events.last().unwrap().phase, "complete");
+        let committing = events
+            .iter()
+            .position(|event| event.detail == "committing history projection")
+            .expect("visible commit boundary");
+        assert!(events[committing].current < events[committing].total);
+        assert_eq!(events[committing + 1].current, events[committing + 1].total);
+        assert_eq!(matches(), before);
+    }
+
+    #[test]
+    fn history_delta_after_vacuum_preserves_other_search_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let source = fixture_source("source_history_delta");
+        let session = fixture_session("session_history_delta", &source.id);
+        let mut records = vec![
+            ArchiveRecord::Source(source.clone()),
+            ArchiveRecord::Session(session.clone()),
+        ];
+        for index in 1..=3 {
+            records.push(ArchiveRecord::Event(fixture_event_with_text_kind(
+                &format!("delta-{index}"),
+                &session.id,
+                &source.id,
+                index,
+                None,
+                &format!("hash-{index}"),
+                "needle",
+                "user",
+            )));
+        }
+        store.import_records(&records).expect("import records");
+        store.refresh_history_items().expect("full projection");
+        store
+            .refresh_history_items_for_events(&["delta-1".to_string()])
+            .expect("create rowid gaps");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("VACUUM")?;
+                conn.execute(
+                    "UPDATE events SET content = 'replacement',
+                 metadata_json = json_set(metadata_json, '$.search_text', 'replacement')
+                 WHERE id = 'delta-2'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("vacuum and repair event text");
+        store
+            .refresh_history_items_for_events(&["delta-2".to_string()])
+            .expect("incremental projection");
+        store
+            .with_conn(|conn| {
+                for table in ["history_items_fts", "history_items_conversation_fts"] {
+                    let mut statement = conn.prepare(&format!(
+                    "SELECT DISTINCT event_id FROM {table} WHERE {table} MATCH ?1 ORDER BY event_id"
+                ))?;
+                    let original = statement
+                        .query_map(["needle"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let replacement = statement
+                        .query_map(["replacement"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert_eq!(original, vec!["delta-1", "delta-3"]);
+                    assert_eq!(replacement, vec!["delta-2"]);
+                }
+                Ok(())
+            })
+            .expect("search both history indexes");
+    }
+
+    #[test]
     fn history_items_projection_health_detects_missing_conversation_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");

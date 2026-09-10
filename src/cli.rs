@@ -13482,6 +13482,27 @@ mod tests {
         assert_ne!(initial[1], advanced[1]);
     }
     #[test]
+    fn history_progress_keeps_full_counts_on_narrow_terminals() {
+        let mut view = UpdateProgressView::new();
+        view.interactive = false;
+        view.search_detail(history_progress_detail(
+            crate::storage::HistoryItemsProgress {
+                phase: "caching",
+                current: 1_234_567,
+                total: 5_678_901,
+                detail: "copying comparison metadata; transcript text stays in place",
+            },
+        ));
+        for columns in [48, 140] {
+            let lines = view.lines_for_terminal(columns);
+            assert!(lines
+                .iter()
+                .any(|line| line.contains("1,234,567/5,678,901")));
+            assert!(lines.iter().all(|line| line.chars().count() <= columns));
+        }
+    }
+
+    #[test]
     fn update_heartbeat_changes_heading_without_changing_counts() {
         let mut view = UpdateProgressView::new();
         view.interactive = false;
