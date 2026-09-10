@@ -34,12 +34,71 @@ const MACHINE_REPAIR_SOURCE_CHUNK_SIZE: usize = 50;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 4_000;
 const SEMANTIC_EMBEDDING_MIN_TEXT_CHARS: usize = 80;
 const TOOL_HISTORY_SUBORDINAL_BASE: i64 = 10;
-const HISTORY_ITEMS_PROJECTION: &str = "history_items_v3";
-const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v3";
+const HISTORY_ITEMS_PROJECTION: &str = "history_items_v5";
+const HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION: &str = "history_items_conversation_fts_v5";
+const HISTORY_INDEX_ROWS_PROJECTION: &str = "history_index_rows_v1";
 const SKILL_OBSERVATIONS_PROJECTION: &str = "skill_observations_v2";
 const SOURCE_STATUS_CONFIDENCE_APPROXIMATE: &str = "approximate";
 const SOURCE_STATUS_CONFIDENCE_EXACT: &str = "exact";
 const SOURCE_STATUS_CONFIDENCE_STALE: &str = "stale";
+
+const HISTORY_ITEMS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS history_items (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  machine_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  subordinal INTEGER NOT NULL,
+  tier TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  occurred_at TEXT,
+  lexical_indexable INTEGER NOT NULL,
+  semantic_policy TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS history_item_index_rows (
+  item_id TEXT PRIMARY KEY,
+  all_rowid INTEGER,
+  conversation_rowid INTEGER
+) WITHOUT ROWID;
+";
+const HISTORY_ITEMS_INDEXES: [(&str, &str); 5] = [
+    (
+        "building event lookup index",
+        "CREATE INDEX IF NOT EXISTS idx_history_items_event
+         ON history_items(event_id, subordinal)",
+    ),
+    (
+        "building session order index",
+        "CREATE INDEX IF NOT EXISTS idx_history_items_session_order
+         ON history_items(session_id, ordinal, subordinal)",
+    ),
+    (
+        "building history kind index",
+        "CREATE INDEX IF NOT EXISTS idx_history_items_tier_kind
+         ON history_items(tier, kind)",
+    ),
+    (
+        "building text hash index",
+        "CREATE INDEX IF NOT EXISTS idx_history_items_text_hash
+         ON history_items(text_hash)",
+    ),
+    (
+        "building embedding lookup index",
+        "CREATE INDEX IF NOT EXISTS idx_history_items_required_embedding_order
+         ON history_items(
+           tier, semantic_policy, COALESCE(occurred_at, ''),
+           session_id, ordinal, subordinal, id
+         )
+         WHERE tier = 'conversation' AND semantic_policy = 'required'",
+    ),
+];
 
 pub(crate) const REPORT_SQL_PROFILE_ENV: &str = "HISTO_REPORT_SQL_PROFILE";
 
@@ -490,6 +549,14 @@ pub struct SourceStatusCounts {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryItemsProgress {
+    pub phase: &'static str,
+    pub current: usize,
+    pub total: usize,
+    pub detail: &'static str,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HistoryItemsProjectionHealth {
     pub ready: bool,
@@ -685,7 +752,7 @@ pub struct EventForProjection {
     pub fts_indexed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryItemRecord {
     pub id: String,
     pub event_id: String,
@@ -1974,60 +2041,403 @@ impl Store {
     }
 
     pub fn refresh_history_items(&self) -> Result<usize> {
-        self.refresh_history_items_with_progress(|_, _| {})
+        self.refresh_history_items_with_progress(|_| {})
     }
 
     pub fn refresh_history_items_with_progress(
         &self,
-        mut progress: impl FnMut(usize, usize),
+        mut progress: impl FnMut(HistoryItemsProgress),
     ) -> Result<usize> {
-        self.with_conn(|conn| {
+        let prior_projection = self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projection_status
+                 WHERE projection_name GLOB 'history_items_v*' AND status = 'ready')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })?;
+        if !prior_projection {
+            return self.rebuild_history_items_with_progress(progress);
+        }
+        struct ExistingItem {
+            source_rowid: i64,
+            hash: String,
+            metadata: String,
+            lexical_indexable: bool,
+            semantic_policy: String,
+            all: bool,
+            conversation: bool,
+            session_id: String,
+            source_id: String,
+            machine_id: String,
+            source_kind: String,
+            ordinal: i64,
+            occurred_at: Option<String>,
+        }
+        let mut finalizing_total = 0;
+        let count = self.with_conn(|conn| {
+            configure_history_cache(conn)?;
+            let snapshot = conn.unchecked_transaction()?;
+            let total = count(&snapshot, "events")? as usize;
+            let end: i64 = snapshot.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |row| row.get(0))?;
+            let version: i64 = snapshot.pragma_query_value(None, "data_version", |row| row.get(0))?;
+            snapshot.commit()?;
+            progress(HistoryItemsProgress {
+                phase: "planning", current: 0, total,
+                detail: "link index rows → cache metadata → index comparisons → stage changes → publish → commit",
+            });
+            ensure_history_index_rows(conn, &mut progress)?;
+            cache_history_comparisons(conn, version, &mut progress)?;
+            conn.execute_batch(
+                "CREATE TEMP TABLE history_reconcile_changes (
+                   id TEXT NOT NULL UNIQUE, record TEXT NOT NULL
+                 );
+                 CREATE TEMP TABLE history_reconcile_remove (
+                   source_rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE
+                 );",
+            )?;
+            let mut cursor = 0i64;
+            let mut processed = 0;
+            let mut projected_items = 0;
+            let mut insertions = 0;
+            let mut removals = 0;
+            let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+            progress(HistoryItemsProgress {
+                phase: "projecting", current: 0, total,
+                detail: "staging changes; unchanged history and indexes retained",
+            });
+            loop {
+                let current_version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
+                if current_version != version {
+                    bail!("archive changed during history refresh; retry update");
+                }
+                let batch = conn.prepare_cached(
+                    "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
+                            event_type, role, content, raw_artifact_hash, occurred_at,
+                            metadata_json, hash, rowid
+                     FROM events WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 500",
+                )?.query_map(params![cursor, end], |row| {
+                    Ok((row.get::<_, i64>(13)?, row_event(row)?))
+                })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let Some((last, _)) = batch.last() else { break };
+                cursor = *last;
+                let event_ids = batch.iter().map(|(_, event)| event.id.clone()).collect::<Vec<_>>();
+                prepare_temp_id_scope(conn, "temp_history_item_event_ids", &event_ids)?;
+                let mut existing: HashMap<String, ExistingItem> = conn.prepare_cached(
+                    "SELECT h.id, h.hash, h.all_rowid, h.conversation_rowid,
+                            h.session_id, h.source_id, h.machine_id, h.source_kind,
+                            h.ordinal, h.occurred_at, h.metadata_json,
+                            h.lexical_indexable, h.semantic_policy, h.source_rowid
+                     FROM temp_history_item_event_ids scope
+                     CROSS JOIN history_reconcile_existing h
+                     WHERE h.event_id = scope.id",
+                )?.query_map([], |row| {
+                    Ok((row.get(0)?, ExistingItem {
+                        source_rowid: row.get(13)?,
+                        hash: row.get(1)?,
+                        all: row.get::<_, Option<i64>>(2)?.is_some(),
+                        conversation: row.get::<_, Option<i64>>(3)?.is_some(),
+                        session_id: row.get(4)?,
+                        source_id: row.get(5)?,
+                        machine_id: row.get(6)?,
+                        source_kind: row.get(7)?,
+                        ordinal: row.get(8)?,
+                        occurred_at: row.get(9)?,
+                        metadata: row.get(10)?,
+                        lexical_indexable: row.get(11)?,
+                        semantic_policy: row.get(12)?,
+                    }))
+                })?.collect::<rusqlite::Result<_>>()?;
+                let stage = conn.unchecked_transaction()?;
+                processed += batch.len();
+                for (_, event) in batch {
+                    for mut item in history_items_from_event(&event)? {
+                        projected_items += 1;
+                        if let Some(count) = by_source.get_mut(&item.source_kind) {
+                            *count += 1;
+                        } else {
+                            by_source.insert(item.source_kind.clone(), 1);
+                        }
+                        let old = existing.remove(&item.id);
+                        let source_rowid = old.as_ref().map(|old| old.source_rowid);
+                        let unchanged = if let Some(old) = old {
+                            let same_fields = old.session_id == item.session_id
+                                && old.source_id == item.source_id
+                                && old.machine_id == item.machine_id
+                                && old.source_kind == item.source_kind
+                                && old.ordinal == item.ordinal
+                                && old.occurred_at == opt_dt(item.occurred_at)
+                                && old.lexical_indexable == item.lexical_indexable
+                                && old.semantic_policy == item.semantic_policy
+                                && old.all == item.lexical_indexable
+                                && old.conversation == (item.lexical_indexable && item.tier == "conversation");
+                            if same_fields && old.hash == item.hash {
+                                true
+                            } else if same_fields {
+                                // A generation stamp is provenance, not a reason to reindex equal content.
+                                let mut metadata: Value = serde_json::from_str(&old.metadata)?;
+                                if let Some(fields) = metadata.as_object_mut() {
+                                    fields.remove("projector");
+                                }
+                                let stamp = item.metadata.as_object_mut()
+                                    .and_then(|fields| fields.remove("projector"));
+                                let same_metadata = metadata == item.metadata;
+                                if !same_metadata {
+                                    if let (Some(stamp), Some(fields)) = (stamp, item.metadata.as_object_mut()) {
+                                        fields.insert("projector".to_string(), stamp);
+                                    }
+                                }
+                                same_metadata
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !unchanged {
+                            if let Some(source_rowid) = source_rowid {
+                                removals += stage.prepare_cached(
+                                    "INSERT OR IGNORE INTO history_reconcile_remove (source_rowid, id) VALUES (?1, ?2)",
+                                )?.execute(params![source_rowid, item.id])?;
+                            }
+                            insertions += stage.prepare_cached(
+                                "INSERT OR IGNORE INTO history_reconcile_changes (id, record) VALUES (?1, ?2)",
+                            )?.execute(params![item.id, serde_json::to_string(&item)?])?;
+                        }
+                    }
+                }
+                for (id, old) in existing {
+                    removals += stage.prepare_cached(
+                        "INSERT OR IGNORE INTO history_reconcile_remove (source_rowid, id) VALUES (?1, ?2)",
+                    )?.execute(params![old.source_rowid, id])?;
+                }
+                stage.commit()?;
+                tracing::debug!(processed, insertions, removals, "history reconciliation staging");
+                progress(HistoryItemsProgress {
+                    phase: "projecting", current: processed, total,
+                    detail: "staging changes; unchanged history and indexes retained",
+                });
+            }
             with_immediate_write_tx(conn, |tx| {
-                tx.execute("DELETE FROM history_items_fts", [])?;
-                tx.execute("DELETE FROM history_items_conversation_fts", [])?;
-                tx.execute("DELETE FROM history_items", [])?;
+                let current_version: i64 = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+                if current_version != version {
+                    bail!("archive changed before history publication; retry update");
+                }
+                let total = removals + insertions;
+                let mut current = 0;
+                let mut removal_cursor = 0i64;
+                progress(HistoryItemsProgress {
+                    phase: "publishing", current, total,
+                    detail: "removing replaced history items",
+                });
+                loop {
+                    let rows = tx.prepare_cached(
+                        "SELECT source_rowid, id FROM history_reconcile_remove
+                         WHERE source_rowid > ?1 ORDER BY source_rowid LIMIT 500",
+                    )?.query_map([removal_cursor], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let Some((last, _)) = rows.last() else { break };
+                    removal_cursor = *last;
+                    let ids = rows.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+                    delete_history_item_ids(tx, &ids)?;
+                    current += ids.len();
+                    progress(HistoryItemsProgress {
+                        phase: "publishing", current, total,
+                        detail: "removing replaced history items",
+                    });
+                }
+                let mut record_cursor = 0i64;
+                loop {
+                    let records = tx.prepare_cached(
+                        "SELECT rowid, record FROM history_reconcile_changes
+                         WHERE rowid > ?1 ORDER BY rowid LIMIT 500",
+                    )?.query_map([record_cursor], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let Some((last, _)) = records.last() else { break };
+                    record_cursor = *last;
+                    for (_, record) in records {
+                        insert_history_item(tx, &serde_json::from_str::<HistoryItemRecord>(&record)?)?;
+                        current += 1;
+                    }
+                    progress(HistoryItemsProgress {
+                        phase: "publishing", current, total,
+                        detail: "inserting changed history items",
+                    });
+                }
+                finalizing_total = finalize_history_projection(
+                    tx, projected_items, by_source, &mut progress,
+                )?;
+                Ok(projected_items)
+            })
+        })?;
+        progress(HistoryItemsProgress {
+            phase: "finalizing",
+            current: finalizing_total,
+            total: finalizing_total,
+            detail: "history projection committed",
+        });
+        progress(HistoryItemsProgress {
+            phase: "complete",
+            current: 1,
+            total: 1,
+            detail: "history projection committed",
+        });
+        Ok(count)
+    }
+
+    pub fn rebuild_history_items_with_progress(
+        &self,
+        mut progress: impl FnMut(HistoryItemsProgress),
+    ) -> Result<usize> {
+        let mut finalizing_total = 0usize;
+        let count = self.with_conn(|conn| {
+            progress(HistoryItemsProgress {
+                phase: "preparing",
+                current: 0,
+                total: 4,
+                detail: "counting input events",
+            });
+            configure_history_cache(conn)?;
+            with_immediate_write_tx(conn, |tx| {
                 let total_events = count(tx, "events")? as usize;
-                progress(0, total_events);
+                progress(HistoryItemsProgress {
+                    phase: "planning",
+                    current: 0,
+                    total: total_events,
+                    detail: "replace old storage → project events → build lookup indexes → commit",
+                });
+                for (index, (table, detail)) in [
+                    ("history_items_fts", "replacing history search index"),
+                    (
+                        "history_items_conversation_fts",
+                        "replacing conversation search index",
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    progress(HistoryItemsProgress {
+                        phase: "preparing",
+                        current: index + 1,
+                        total: 4,
+                        detail,
+                    });
+                    let schema: String = tx.query_row(
+                        "SELECT sql FROM sqlite_schema WHERE name = ?1",
+                        [table],
+                        |row| row.get(0),
+                    )?;
+                    tx.execute_batch(&format!("DROP TABLE {table}; {schema};"))?;
+                }
+                tx.execute("DELETE FROM history_item_index_rows", [])?;
+                progress(HistoryItemsProgress {
+                    phase: "preparing",
+                    current: 3,
+                    total: 4,
+                    detail: "clearing replaced history rows",
+                });
+                tx.execute_batch("DROP TABLE history_items;")?;
+                tx.execute_batch(HISTORY_ITEMS_SCHEMA)?;
+                progress(HistoryItemsProgress {
+                    phase: "preparing",
+                    current: 4,
+                    total: 4,
+                    detail: "history storage prepared",
+                });
+
+                progress(HistoryItemsProgress {
+                    phase: "projecting",
+                    current: 0,
+                    total: total_events,
+                    detail: "processing events; finalization follows",
+                });
                 let mut stmt = tx.prepare(
                     "SELECT id, session_id, source_id, machine_id, source_kind, ordinal,
                             event_type, role, content, raw_artifact_hash, occurred_at,
                             metadata_json, hash
                      FROM events
-                     ORDER BY session_id, ordinal, id",
+                     ORDER BY rowid",
                 )?;
                 let rows = stmt.query_map([], row_event)?;
                 let mut processed_events = 0usize;
+                let mut projected_items = 0usize;
+                let mut projected_by_source = BTreeMap::new();
+                let mut last_progress = Instant::now();
                 for row in rows {
                     processed_events += 1;
                     for item in history_items_from_event(&row?)? {
-                        insert_history_item(&tx, &item)?;
+                        if insert_history_item(&tx, &item)? {
+                            projected_items += 1;
+                            *projected_by_source
+                                .entry(item.source_kind.clone())
+                                .or_insert(0) += 1;
+                        }
                     }
-                    if processed_events % 1_000 == 0 {
-                        progress(processed_events, total_events);
+                    if processed_events % 1_000 == 0
+                        || processed_events == total_events
+                        || last_progress.elapsed() >= Duration::from_secs(1)
+                    {
+                        progress(HistoryItemsProgress {
+                            phase: "projecting",
+                            current: processed_events,
+                            total: total_events,
+                            detail: "processing events; finalization follows",
+                        });
+                        last_progress = Instant::now();
                     }
-                }
-                if total_events > 0 || processed_events > 0 {
-                    progress(processed_events, total_events);
                 }
                 drop(stmt);
-                let count = count(tx, "history_items")? as usize;
-                update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
-                update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
-                refresh_source_status_counts_exact(tx)?;
-                Ok(count)
+                for (index, (detail, sql)) in HISTORY_ITEMS_INDEXES.iter().enumerate() {
+                    progress(HistoryItemsProgress {
+                        phase: "indexing",
+                        current: index,
+                        total: HISTORY_ITEMS_INDEXES.len(),
+                        detail,
+                    });
+                    tx.execute_batch(sql)?;
+                }
+                progress(HistoryItemsProgress {
+                    phase: "indexing",
+                    current: HISTORY_ITEMS_INDEXES.len(),
+                    total: HISTORY_ITEMS_INDEXES.len(),
+                    detail: "history lookup indexes built",
+                });
+
+                finalizing_total = finalize_history_projection(
+                    tx,
+                    projected_items,
+                    projected_by_source,
+                    &mut progress,
+                )?;
+                Ok(projected_items)
             })
-        })
+        })?;
+        progress(HistoryItemsProgress {
+            phase: "finalizing",
+            current: finalizing_total,
+            total: finalizing_total,
+            detail: "history projection committed",
+        });
+        progress(HistoryItemsProgress {
+            phase: "complete",
+            current: 1,
+            total: 1,
+            detail: "history projection committed",
+        });
+        Ok(count)
     }
 
     #[allow(dead_code)]
     pub fn refresh_history_items_for_events(&self, event_ids: &[String]) -> Result<usize> {
-        self.refresh_history_items_for_events_with_progress(event_ids, |_, _| {})
+        self.refresh_history_items_for_events_with_progress(event_ids, |_| {})
     }
 
     pub fn refresh_history_items_for_events_with_progress(
         &self,
         event_ids: &[String],
-        mut progress: impl FnMut(usize, usize),
+        mut progress: impl FnMut(HistoryItemsProgress),
     ) -> Result<usize> {
         let event_ids = normalized_ids(event_ids);
         if event_ids.is_empty() {
@@ -2039,7 +2449,15 @@ impl Store {
                 }
             });
         }
-        self.with_conn(|conn| {
+        let mut finalizing_total = 0usize;
+        let count = self.with_conn(|conn| {
+            progress(HistoryItemsProgress {
+                phase: "preparing",
+                current: 0,
+                total: 3,
+                detail: "preparing changed history events",
+            });
+            configure_history_cache(conn)?;
             with_immediate_write_tx(conn, |tx| {
                 prepare_temp_id_scope(tx, "temp_history_item_event_ids", &event_ids)?;
                 let total_events: usize = tx.query_row(
@@ -2050,7 +2468,6 @@ impl Store {
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
-                progress(0, total_events);
                 let replaced_count: usize = tx.query_row(
                     "SELECT COUNT(*)
                      FROM history_items
@@ -2060,23 +2477,34 @@ impl Store {
                 )? as usize;
                 let replaced_by_source =
                     source_history_item_counts_for_event_scope(tx, "temp_history_item_event_ids")?;
+                progress(HistoryItemsProgress {
+                    phase: "preparing",
+                    current: 1,
+                    total: 3,
+                    detail: "preparing changed history events",
+                });
                 if replaced_count > 0 {
-                    tx.execute(
-                        "DELETE FROM history_items_fts
-                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                        [],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM history_items_conversation_fts
-                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                        [],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM history_items
-                         WHERE event_id IN (SELECT id FROM temp_history_item_event_ids)",
-                        [],
-                    )?;
+                    let ids = tx
+                        .prepare(
+                            "SELECT h.id FROM temp_history_item_event_ids scope
+                         CROSS JOIN history_items h WHERE h.event_id = scope.id",
+                        )?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    delete_history_item_ids(tx, &ids)?;
                 }
+                progress(HistoryItemsProgress {
+                    phase: "preparing",
+                    current: 2,
+                    total: 3,
+                    detail: "preparing changed history events",
+                });
+                progress(HistoryItemsProgress {
+                    phase: "projecting",
+                    current: 0,
+                    total: total_events,
+                    detail: "processing events; finalization follows",
+                });
                 let mut stmt = tx.prepare(
                     "SELECT e.id, e.session_id, e.source_id, e.machine_id, e.source_kind,
                             e.ordinal, e.event_type, e.role, e.content, e.raw_artifact_hash,
@@ -2090,6 +2518,7 @@ impl Store {
                 let mut inserted_count = 0usize;
                 let mut inserted_by_source = BTreeMap::new();
                 let mut processed_events = 0usize;
+                let mut last_progress = Instant::now();
                 for row in rows {
                     processed_events += 1;
                     for item in history_items_from_event(&row?)? {
@@ -2100,29 +2529,83 @@ impl Store {
                                 .or_insert(0) += 1;
                         }
                     }
-                    if processed_events % 1_000 == 0 {
-                        progress(processed_events, total_events);
+                    if processed_events % 1_000 == 0
+                        || processed_events == total_events
+                        || last_progress.elapsed() >= Duration::from_secs(1)
+                    {
+                        progress(HistoryItemsProgress {
+                            phase: "projecting",
+                            current: processed_events,
+                            total: total_events,
+                            detail: "processing events; finalization follows",
+                        });
+                        last_progress = Instant::now();
                     }
                 }
-                if total_events > 0 || processed_events > 0 {
-                    progress(processed_events, total_events);
-                }
-                drop(stmt);
-                let count = if let Some(current_count) =
-                    projection_status_count(tx, HISTORY_ITEMS_PROJECTION)?
-                {
+                let current_count = projection_status_count(tx, HISTORY_ITEMS_PROJECTION)?;
+                finalizing_total = if current_count.is_some() { 4 } else { 5 };
+                let mut finalizing_current = 0usize;
+                progress(HistoryItemsProgress {
+                    phase: "finalizing",
+                    current: finalizing_current,
+                    total: finalizing_total,
+                    detail: "saving history projection metadata",
+                });
+                let count = if let Some(current_count) = current_count {
                     current_count
                         .saturating_sub(replaced_count)
                         .saturating_add(inserted_count)
                 } else {
-                    count(tx, "history_items")? as usize
+                    let count = count(tx, "history_items")? as usize;
+                    finalizing_current += 1;
+                    progress(HistoryItemsProgress {
+                        phase: "finalizing",
+                        current: finalizing_current,
+                        total: finalizing_total,
+                        detail: "saving history projection metadata",
+                    });
+                    count
                 };
                 update_projection_status(tx, HISTORY_ITEMS_PROJECTION, count)?;
+                finalizing_current += 1;
+                progress(HistoryItemsProgress {
+                    phase: "finalizing",
+                    current: finalizing_current,
+                    total: finalizing_total,
+                    detail: "saving history projection metadata",
+                });
                 update_projection_status(tx, HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION, count)?;
+                finalizing_current += 1;
+                progress(HistoryItemsProgress {
+                    phase: "finalizing",
+                    current: finalizing_current,
+                    total: finalizing_total,
+                    detail: "saving history projection metadata",
+                });
                 apply_source_history_item_count_delta(tx, replaced_by_source, inserted_by_source)?;
+                finalizing_current += 1;
+                progress(HistoryItemsProgress {
+                    phase: "finalizing",
+                    current: finalizing_current,
+                    total: finalizing_total,
+                    detail: "committing history projection",
+                });
                 Ok(count)
             })
-        })
+        })?;
+        progress(HistoryItemsProgress {
+            phase: "finalizing",
+            current: finalizing_total,
+            total: finalizing_total,
+            detail: "history projection committed",
+        });
+        progress(HistoryItemsProgress {
+            phase: "complete",
+            current: 1,
+            total: 1,
+            detail: "history projection committed",
+        });
+        Ok(count)
     }
 
     #[cfg(test)]
@@ -5003,6 +5486,13 @@ fn delete_prune_scope(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
+        "DELETE FROM history_item_index_rows WHERE item_id IN (
+           SELECT id FROM history_items
+           WHERE session_id IN (SELECT id FROM temp_prune_session_ids)
+         )",
+        [],
+    )?;
+    conn.execute(
         "DELETE FROM history_items
          WHERE session_id IN (SELECT id FROM temp_prune_session_ids)",
         [],
@@ -6345,6 +6835,7 @@ fn prepare_temp_id_scope(conn: &Connection, table: &str, ids: &[String]) -> Resu
         | "temp_delta_event_ids"
         | "temp_delta_search_unit_ids"
         | "temp_history_item_event_ids"
+        | "temp_history_item_ids"
         | "temp_skill_observation_sessions"
         | "temp_prune_session_ids"
         | "temp_prune_event_ids"
@@ -6650,50 +7141,6 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_session_activity_last_event
           ON session_activity(last_event_at);
-
-        CREATE TABLE IF NOT EXISTS history_items (
-          id TEXT PRIMARY KEY,
-          event_id TEXT NOT NULL,
-          session_id TEXT NOT NULL,
-          source_id TEXT NOT NULL,
-          machine_id TEXT NOT NULL,
-          source_kind TEXT NOT NULL,
-          ordinal INTEGER NOT NULL,
-          subordinal INTEGER NOT NULL,
-          tier TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          text TEXT NOT NULL,
-          text_hash TEXT NOT NULL,
-          occurred_at TEXT,
-          lexical_indexable INTEGER NOT NULL,
-          semantic_policy TEXT NOT NULL,
-          metadata_json TEXT NOT NULL,
-          hash TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_history_items_event
-          ON history_items(event_id, subordinal);
-
-        CREATE INDEX IF NOT EXISTS idx_history_items_session_order
-          ON history_items(session_id, ordinal, subordinal);
-
-        CREATE INDEX IF NOT EXISTS idx_history_items_tier_kind
-          ON history_items(tier, kind);
-
-        CREATE INDEX IF NOT EXISTS idx_history_items_text_hash
-          ON history_items(text_hash);
-
-        CREATE INDEX IF NOT EXISTS idx_history_items_required_embedding_order
-          ON history_items(
-            tier,
-            semantic_policy,
-            COALESCE(occurred_at, ''),
-            session_id,
-            ordinal,
-            subordinal,
-            id
-          )
-          WHERE tier = 'conversation' AND semantic_policy = 'required';
 
         CREATE VIRTUAL TABLE IF NOT EXISTS history_items_fts USING fts5(
           item_id UNINDEXED,
@@ -7001,6 +7448,10 @@ fn migrate(conn: &Connection) -> Result<()> {
           USING vec0(embedding float[384]);
         ",
     )?;
+    conn.execute_batch(HISTORY_ITEMS_SCHEMA)?;
+    for (_, sql) in HISTORY_ITEMS_INDEXES {
+        conn.execute_batch(sql)?;
+    }
     crate::commit_provenance::store::migrate(conn)?;
     ensure_column(
         conn,
@@ -7572,14 +8023,15 @@ fn update_session_activity_for_event(conn: &Connection, event: &EventRecord) -> 
 }
 
 fn insert_history_item(conn: &Connection, item: &HistoryItemRecord) -> Result<bool> {
-    ensure_same_hash(conn, "history_items", "id", &item.id, &item.hash)?;
-    let changed = conn.execute(
-        "INSERT OR IGNORE INTO history_items
-         (id, event_id, session_id, source_id, machine_id, source_kind, ordinal, subordinal,
-          tier, kind, text, text_hash, occurred_at, lexical_indexable, semantic_policy,
-          metadata_json, hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        params![
+    let changed = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO history_items
+             (id, event_id, session_id, source_id, machine_id, source_kind, ordinal, subordinal,
+              tier, kind, text, text_hash, occurred_at, lexical_indexable, semantic_policy,
+              metadata_json, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        )?
+        .execute(params![
             item.id,
             item.event_id,
             item.session_id,
@@ -7597,36 +8049,306 @@ fn insert_history_item(conn: &Connection, item: &HistoryItemRecord) -> Result<bo
             item.semantic_policy,
             item.metadata.to_string(),
             item.hash
-        ],
-    )?;
-    if changed > 0 && item.lexical_indexable {
-        conn.execute(
+        ])?;
+    if changed == 0 {
+        ensure_same_hash(conn, "history_items", "id", &item.id, &item.hash)?;
+    } else if item.lexical_indexable {
+        conn.prepare_cached(
             "INSERT INTO history_items_fts (item_id, event_id, session_id, tier, kind, text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                item.id,
-                item.event_id,
-                item.session_id,
-                item.tier,
-                item.kind,
-                item.text
-            ],
-        )?;
-        if item.tier == "conversation" {
-            conn.execute(
+        )?
+        .execute(params![
+            item.id,
+            item.event_id,
+            item.session_id,
+            item.tier,
+            item.kind,
+            item.text
+        ])?;
+        let all_rowid = conn.last_insert_rowid();
+        let conversation_rowid = if item.tier == "conversation" {
+            conn.prepare_cached(
                 "INSERT INTO history_items_conversation_fts (item_id, event_id, session_id, kind, text)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    item.id,
-                    item.event_id,
-                    item.session_id,
-                    item.kind,
-                    item.text
-                ],
-            )?;
-        }
+            )?
+            .execute(params![
+                item.id, item.event_id, item.session_id, item.kind, item.text
+            ])?;
+            Some(conn.last_insert_rowid())
+        } else {
+            None
+        };
+        conn.prepare_cached(
+            "INSERT INTO history_item_index_rows (item_id, all_rowid, conversation_rowid)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id) DO UPDATE SET
+               all_rowid = excluded.all_rowid,
+               conversation_rowid = excluded.conversation_rowid",
+        )?
+        .execute(params![item.id, all_rowid, conversation_rowid])?;
     }
     Ok(changed > 0)
+}
+
+fn configure_history_cache(conn: &Connection) -> Result<()> {
+    let memory = crate::memory::sample_memory().unwrap_or_default();
+    let temp_limit = 256 * 1024 * 1024;
+    let mut bytes = memory
+        .total_bytes
+        .map(|total| total / 16)
+        .unwrap_or(temp_limit)
+        .min(4 * 1024 * 1024 * 1024);
+    if let Some(available) = memory.available_bytes {
+        bytes = bytes.min((available / 2).saturating_sub(temp_limit));
+    }
+    bytes = bytes.max(2 * 1024 * 1024);
+    conn.pragma_update(None, "cache_size", -((bytes / 1024) as i64))?;
+    conn.pragma_update(
+        Some(rusqlite::DatabaseName::Temp),
+        "cache_size",
+        -((bytes.min(temp_limit) / 1024) as i64),
+    )?;
+    tracing::debug!(cache_bytes = bytes, "history maintenance cache budget");
+    Ok(())
+}
+
+fn cache_history_comparisons(
+    conn: &Connection,
+    version: i64,
+    progress: &mut impl FnMut(HistoryItemsProgress),
+) -> Result<()> {
+    progress(HistoryItemsProgress {
+        phase: "caching",
+        current: 0,
+        total: 0,
+        detail: "counting history items for comparison",
+    });
+    let snapshot = conn.unchecked_transaction()?;
+    let total = count(&snapshot, "history_items")? as usize;
+    let end: i64 = snapshot.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM history_items",
+        [],
+        |row| row.get(0),
+    )?;
+    snapshot.commit()?;
+    conn.pragma_update(Some(rusqlite::DatabaseName::Temp), "journal_mode", "MEMORY")?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE history_reconcile_existing (
+           source_rowid INTEGER PRIMARY KEY,
+           id TEXT, event_id TEXT, hash TEXT, metadata_json TEXT,
+           lexical_indexable INTEGER, semantic_policy TEXT,
+           session_id TEXT, source_id TEXT, machine_id TEXT, source_kind TEXT,
+           ordinal INTEGER, occurred_at TEXT,
+           all_rowid INTEGER, conversation_rowid INTEGER
+         );",
+    )?;
+    let mut copy = conn.prepare(
+        "INSERT INTO history_reconcile_existing
+         SELECT h.rowid, h.id, h.event_id, h.hash, h.metadata_json,
+                h.lexical_indexable, h.semantic_policy,
+                h.session_id, h.source_id, h.machine_id, h.source_kind,
+                h.ordinal, h.occurred_at, r.all_rowid, r.conversation_rowid
+         FROM history_items h
+         LEFT JOIN history_item_index_rows r ON r.item_id = h.id
+         WHERE h.rowid > ?1 AND h.rowid <= ?2 ORDER BY h.rowid LIMIT 5000
+         RETURNING source_rowid",
+    )?;
+    let mut cursor = 0i64;
+    let mut current = 0;
+    loop {
+        let current_version: i64 =
+            conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if current_version != version {
+            bail!("archive changed while caching history metadata; retry update");
+        }
+        let mut batch = 0;
+        for row in copy.query_map(params![cursor, end], |row| row.get::<_, i64>(0))? {
+            cursor = cursor.max(row?);
+            batch += 1;
+        }
+        if batch == 0 {
+            break;
+        }
+        current += batch;
+        progress(HistoryItemsProgress {
+            phase: "caching",
+            current,
+            total,
+            detail: "copying comparison metadata; transcript text stays in place",
+        });
+    }
+    drop(copy);
+    progress(HistoryItemsProgress {
+        phase: "indexing",
+        current: 0,
+        total: 1,
+        detail: "indexing the temporary comparison cache",
+    });
+    conn.execute_batch(
+        "CREATE INDEX history_reconcile_existing_event
+         ON history_reconcile_existing(event_id);",
+    )?;
+    progress(HistoryItemsProgress {
+        phase: "indexing",
+        current: 1,
+        total: 1,
+        detail: "comparison cache ready",
+    });
+    Ok(())
+}
+
+fn ensure_history_index_rows(
+    conn: &Connection,
+    progress: &mut impl FnMut(HistoryItemsProgress),
+) -> Result<()> {
+    if projection_status_ready(conn, HISTORY_INDEX_ROWS_PROJECTION)? {
+        return Ok(());
+    }
+    let version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
+    progress(HistoryItemsProgress {
+        phase: "mapping",
+        current: 0,
+        total: 0,
+        detail: "counting existing index rows",
+    });
+    let total = (count(conn, "history_items_fts_docsize")?
+        + count(conn, "history_items_conversation_fts_docsize")?) as usize;
+    conn.execute("DELETE FROM history_item_index_rows", [])?;
+    let mut current = 0;
+    for (table, column) in [
+        ("history_items_fts", "all_rowid"),
+        ("history_items_conversation_fts", "conversation_rowid"),
+    ] {
+        // The FTS cursor reads text too; its content-table keys avoid that extra I/O.
+        let mut insert = conn.prepare(&format!(
+            "INSERT INTO history_item_index_rows (item_id, {column})
+             SELECT c0, id FROM {table}_content WHERE id > ?1 ORDER BY id LIMIT 1000
+             ON CONFLICT(item_id) DO UPDATE SET {column} = excluded.{column}
+             RETURNING {column}"
+        ))?;
+        let mut cursor = 0i64;
+        loop {
+            let mut batch = 0;
+            let mut next = cursor;
+            for row in insert.query_map([cursor], |row| row.get::<_, i64>(0))? {
+                next = next.max(row?);
+                batch += 1;
+            }
+            if batch == 0 {
+                break;
+            }
+            cursor = next;
+            current += batch;
+            progress(HistoryItemsProgress {
+                phase: "mapping",
+                current,
+                total,
+                detail: "linking existing index rows without reindexing text",
+            });
+        }
+    }
+    with_immediate_write_tx(conn, |tx| {
+        let current_version: i64 = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if current_version != version {
+            bail!("archive changed while linking history indexes; retry update");
+        }
+        update_projection_status(tx, HISTORY_INDEX_ROWS_PROJECTION, current)
+    })?;
+    progress(HistoryItemsProgress {
+        phase: "mapping",
+        current,
+        total,
+        detail: "existing index rows linked",
+    });
+    Ok(())
+}
+
+fn delete_history_item_ids(conn: &Connection, ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    prepare_temp_id_scope(conn, "temp_history_item_ids", ids)?;
+    conn.execute(
+        "DELETE FROM history_items_fts WHERE rowid IN (
+           SELECT r.all_rowid FROM temp_history_item_ids scope
+           CROSS JOIN history_item_index_rows r WHERE r.item_id = scope.id
+         )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_items_conversation_fts WHERE rowid IN (
+           SELECT r.conversation_rowid FROM temp_history_item_ids scope
+           CROSS JOIN history_item_index_rows r WHERE r.item_id = scope.id
+         )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_item_index_rows WHERE item_id IN (SELECT id FROM temp_history_item_ids)", [],
+    )?;
+    conn.execute(
+        "DELETE FROM history_items WHERE id IN (SELECT id FROM temp_history_item_ids)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn finalize_history_projection(
+    conn: &Connection,
+    items: usize,
+    by_source: BTreeMap<String, usize>,
+    progress: &mut impl FnMut(HistoryItemsProgress),
+) -> Result<usize> {
+    let total = 5 + by_source.len();
+    let mut current = 0;
+    for projection in [
+        HISTORY_ITEMS_PROJECTION,
+        HISTORY_ITEMS_CONVERSATION_FTS_PROJECTION,
+        HISTORY_INDEX_ROWS_PROJECTION,
+    ] {
+        progress(HistoryItemsProgress {
+            phase: "finalizing",
+            current,
+            total,
+            detail: "saving history projection metadata",
+        });
+        update_projection_status(conn, projection, items)?;
+        current += 1;
+    }
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE source_status_counts SET history_items = 0, updated_at = ?1",
+        [&updated_at],
+    )?;
+    current += 1;
+    let mut statement = conn.prepare(
+        "INSERT INTO source_status_counts
+         (source_kind, sessions, events, history_items, search_units, embeddings, confidence, updated_at)
+         VALUES (?1, 0, 0, ?2, 0, 0, ?3, ?4)
+         ON CONFLICT(source_kind) DO UPDATE SET
+           history_items = excluded.history_items, updated_at = excluded.updated_at",
+    )?;
+    for (source, count) in by_source {
+        progress(HistoryItemsProgress {
+            phase: "finalizing",
+            current,
+            total,
+            detail: "saving history source counts",
+        });
+        statement.execute(params![
+            source,
+            count as i64,
+            SOURCE_STATUS_CONFIDENCE_APPROXIMATE,
+            updated_at
+        ])?;
+        current += 1;
+    }
+    progress(HistoryItemsProgress {
+        phase: "finalizing",
+        current,
+        total,
+        detail: "committing history projection",
+    });
+    Ok(total)
 }
 
 fn insert_search_unit(conn: &Connection, unit: &SearchUnitRecord) -> Result<bool> {

@@ -1653,8 +1653,10 @@ impl Cli {
         };
         let update_human = matches!(&command, Command::Update { json: false, .. }) && !robot;
         let update_machine = matches!(&command, Command::Update { .. }) && !update_human;
-        let (mut config, store, mut update_progress) = if update_human {
-            let mut progress = UpdateProgressView::startup();
+        let update_repair = matches!(&command, Command::Update { repair: true, .. });
+        let (mut config, store, mut update_progress, mut update_machine_progress) = if update_human
+        {
+            let mut progress = UpdateProgressView::startup_with_plan(update_repair);
             let (config, store) =
                 load_update_resources_with_progress(data_dir, |event, emission| match emission {
                     ScopedProgressEmission::Initial | ScopedProgressEmission::Event => {
@@ -1664,32 +1666,16 @@ impl Cli {
                     ScopedProgressEmission::Heartbeat => progress.heartbeat(),
                 })?;
             progress.finish_startup();
-            (config, store, Some(progress))
+            (config, store, Some(progress), None)
         } else if update_machine {
+            let mut progress = UpdateMachineProgress::new(update_repair);
             let (config, store) =
                 load_update_resources_with_progress(data_dir, |event, _emission| {
-                    write_update_progress(
-                        "scan",
-                        update_startup_progress_detail(*event),
-                        serde_json::json!({
-                            "status": "starting",
-                            "stage": event.stage(),
-                            "completed": event.completed(),
-                            "total": UpdateStartupProgress::TOTAL,
-                        }),
-                    );
+                    progress.startup_event(*event);
                 })?;
-            write_update_progress(
-                "scan",
-                update_startup_completion_detail(),
-                serde_json::json!({
-                    "status": "ready",
-                    "stage": "database",
-                    "completed": UpdateStartupProgress::TOTAL,
-                    "total": UpdateStartupProgress::TOTAL,
-                }),
-            );
-            (config, store, None)
+            progress.finish_startup();
+            progress.startup_ready();
+            (config, store, None, Some(progress))
         } else if let Command::Import { json, .. } = &command {
             let (config, store) = if *json || robot {
                 load_update_resources_with_progress(data_dir, |event, _| {
@@ -1712,11 +1698,11 @@ impl Cli {
                 opening.finish(update_startup_completion_detail());
                 resources
             };
-            (config, store, None)
+            (config, store, None, None)
         } else {
             let config = AppConfig::load(data_dir)?;
             let store = Store::open(&config.data_dir)?;
-            (config, store, None)
+            (config, store, None, None)
         };
         match command {
             Command::Update {
@@ -1729,8 +1715,16 @@ impl Cli {
             } => {
                 apply_embeddings_override(&mut config, embeddings, no_embeddings);
                 if json || robot {
-                    let output =
-                        run_update_once_machine(&store, &config, max_files, source, repair)?;
+                    let output = run_update_once_machine(
+                        &store,
+                        &config,
+                        max_files,
+                        source,
+                        repair,
+                        update_machine_progress
+                            .take()
+                            .expect("machine update progress initialized"),
+                    )?;
                     crate::output::write_success("update", output, Default::default())?;
                 } else {
                     let output = run_update_once_human(
@@ -4530,7 +4524,9 @@ fn run_update_once_machine(
     max_files: Option<usize>,
     source: Vec<String>,
     repair: bool,
+    mut progress: UpdateMachineProgress,
 ) -> Result<UpdateOutput> {
+    progress.set_embeddings_disabled(config.embedder.is_disabled());
     let source_selection = ingest::SourceSelection::parse(source)?;
     let mut last_scan_emit = Instant::now() - UPDATE_PROGRESS_HEARTBEAT_INTERVAL;
     let ingest = run_scoped_progress_with_timeout(
@@ -4558,22 +4554,13 @@ fn run_update_once_machine(
                 || emission != ScopedProgressEmission::Event
                 || last_scan_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
             {
-                write_update_progress(
-                    if matches!(event, ingest::UpdateProgress::SkillObservations { .. }) {
-                        "skill_observations"
-                    } else if matches!(event, ingest::UpdateProgress::CommitEvidence(_)) {
-                        "commit_evidence"
-                    } else {
-                        "scan"
-                    },
-                    update_progress_detail(event),
-                    update_progress_payload(event),
-                );
+                progress.ingest_event(event);
                 last_scan_emit = Instant::now();
             }
         },
     )?;
-    write_update_progress(
+    progress.finish_ingest(repair);
+    progress.emit(
         "scan",
         format!(
             "{} files, {} new records, {} unchanged, {} errors",
@@ -4593,22 +4580,12 @@ fn run_update_once_machine(
     );
 
     let prior_report_hashes = if repair {
-        Some(analytics::report_refresh_prior_hashes(
-            store,
-            &ingest.delta,
-            |completed, total| {
-                let detail = prior_hash_progress_detail(completed, total);
-                write_update_progress(
-                    "report",
-                    detail,
-                    serde_json::json!({
-                        "status": "preparing",
-                        "completed": completed,
-                        "total": total,
-                    }),
-                );
-            },
-        )?)
+        let hashes =
+            analytics::report_refresh_prior_hashes(store, &ingest.delta, |completed, total| {
+                progress.repair_preparation(completed, total)
+            })?;
+        progress.finish_repair_preparation();
+        Some(hashes)
     } else {
         None
     };
@@ -4617,6 +4594,8 @@ fn run_update_once_machine(
     } else {
         "updating search index".to_string()
     };
+    let mut last_search_emit = Instant::now() - UPDATE_PROGRESS_HEARTBEAT_INTERVAL;
+    let mut last_history_stage = None;
     let projected = run_scoped_progress_with_timeout(
         initial_search_detail,
         UPDATE_PROGRESS_HEARTBEAT_INTERVAL,
@@ -4629,58 +4608,38 @@ fn run_update_once_machine(
                 send,
             )
         },
-        |detail, _emission| {
-            write_update_progress(
-                "search_index",
-                detail.clone(),
-                serde_json::json!({ "detail": detail }),
-            );
+        |detail, emission| {
+            let stage = detail
+                .starts_with("history ")
+                .then(|| history_detail_state(detail.split_whitespace().nth(1).unwrap_or("")));
+            let boundary = stage != last_history_stage || detail.contains(" ready: ");
+            if boundary
+                || emission != ScopedProgressEmission::Event
+                || last_search_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL
+            {
+                progress.search_detail(detail.clone());
+                last_search_emit = Instant::now();
+            }
+            last_history_stage = stage;
         },
     )?;
-    write_update_progress(
-        "search_index",
-        format!("{} events indexed", format_count(projected)),
-        serde_json::json!({
-            "status": "finished",
-            "indexed_events": projected,
-        }),
-    );
+    progress.finish_search_index(projected);
 
     let report = if let Some(prior_report_hashes) = &prior_report_hashes {
         let report = analytics::refresh_report_after_update_with_prior_hashes(
             store,
             &ingest.delta,
             prior_report_hashes,
-            |event| {
-                write_update_progress(
-                    "report",
-                    event.detail.clone(),
-                    report_progress_payload(
-                        &event,
-                        "refreshing",
-                        "incremental",
-                        Duration::ZERO,
-                        None,
-                    ),
-                );
-            },
+            |event| progress.report_event(&event),
         )?;
-        write_update_progress(
-            "report",
-            report_completion_detail(&report),
-            serde_json::json!({
-                "status": if report.refreshed { "refreshed" } else { "skipped" },
-                "mode": report_refresh_mode(&report),
-                "affected_sessions": report.affected_sessions,
-                "affected_events": report.affected_events,
-            }),
-        );
+        progress.finish_report(&report);
         Some(report)
     } else {
         None
     };
 
     let embeddings = if config.embedder.is_disabled() {
+        progress.skip_embeddings();
         search::EmbeddingRefresh::disabled()
     } else {
         let embeddings = refresh_embeddings_after_update_with_progress(
@@ -4688,31 +4647,12 @@ fn run_update_once_machine(
             config,
             &ingest.delta,
             repair,
-            |event| {
-                write_update_progress(
-                    "embeddings",
-                    embedding_progress_detail(event),
-                    embedding_progress_payload(event),
-                );
-            },
+            |event| progress.embedding_event(event),
         )?;
-        write_update_progress(
-            "embeddings",
-            embedding_phase_detail(&embeddings),
-            serde_json::json!({
-                "status": "finished",
-                "embedded": embeddings.embedded,
-                "pending": embeddings.pending,
-                "vectors_indexed": embeddings.vectors_indexed,
-                "disabled": embeddings.disabled,
-                "degraded_reason": embeddings.degraded_reason,
-                "deferred_reason": embeddings.deferred_reason,
-                "batch_size_reductions": embeddings.batch_size_reductions,
-                "final_batch_size": embeddings.final_batch_size,
-            }),
-        );
+        progress.finish_embeddings(&embeddings);
         embeddings
     };
+    progress.finish_all();
 
     Ok(UpdateOutput {
         sources: source_delta_outputs(&ingest.delta.source_counts),
@@ -4733,6 +4673,7 @@ fn run_update_once_human(
     repair: bool,
     mut progress: UpdateProgressView,
 ) -> Result<UpdateOutput> {
+    progress.set_embeddings_disabled(config.embedder.is_disabled());
     let source_selection = ingest::SourceSelection::parse(source)?;
     let ingest = run_scoped_progress_with_timeout(
         ingest::UpdateProgress::Discovering {
@@ -4766,11 +4707,12 @@ fn run_update_once_human(
 
     progress.start_search_data(repair, config.embedder.is_disabled());
     let prior_report_hashes = if repair {
-        Some(analytics::report_refresh_prior_hashes(
-            store,
-            &ingest.delta,
-            |completed, total| progress.report_preparation(completed, total),
-        )?)
+        let hashes =
+            analytics::report_refresh_prior_hashes(store, &ingest.delta, |completed, total| {
+                progress.report_preparation(completed, total)
+            })?;
+        progress.finish_repair_preparation();
+        Some(hashes)
     } else {
         None
     };
@@ -4844,7 +4786,6 @@ fn run_update_once_human(
         embeddings,
     })
 }
-
 fn refresh_search_after_update_with_progress(
     store: &Store,
     delta: &crate::storage::ImportDelta,
@@ -4859,15 +4800,20 @@ fn refresh_search_after_update_with_progress(
         } else {
             refresh_search_index_repair_with_progress(store, &mut progress)?
         };
-        progress("projecting history items".to_string());
-        store.refresh_history_items_with_progress(|processed, total| {
-            progress(format!(
-                "projected {}/{} events into history items",
-                format_count(processed),
-                format_count(total)
-            ));
-        })?;
-        progress("refreshing source status counts".to_string());
+        progress(format!(
+            "search ready: {} events indexed",
+            format_count(indexed)
+        ));
+        let history_count = store.rebuild_history_items_with_progress(
+            |event: crate::storage::HistoryItemsProgress| {
+                progress(history_progress_detail(event));
+            },
+        )?;
+        progress(format!(
+            "history ready: {} items",
+            format_count(history_count)
+        ));
+        progress("repairing source status counts".to_string());
         store.refresh_source_status_counts_exact()?;
         rebuild_analytics_after_event_repairs(store, delta, &mut progress)?;
         Ok(indexed)
@@ -4941,34 +4887,36 @@ fn refresh_search_after_update_with_progress(
         } else {
             Ok(indexed)
         }?;
+        progress("checking source status counts".to_string());
+        store.seed_source_status_counts_approximate_if_empty()?;
+        progress(format!(
+            "search ready: {} events indexed",
+            format_count(indexed)
+        ));
         progress("checking history projection status".to_string());
-        if store.history_items_projection_status_ready()? {
+        let history_count = if store.history_items_projection_status_ready()? {
             progress(format!(
                 "projecting changed history items for {} events",
                 format_count(delta.touched_events.len())
             ));
             store.refresh_history_items_for_events_with_progress(
                 &delta.touched_events,
-                |processed, total| {
-                    progress(format!(
-                        "projected {}/{} changed events into history items",
-                        format_count(processed),
-                        format_count(total)
-                    ));
+                |event: crate::storage::HistoryItemsProgress| {
+                    progress(history_progress_detail(event));
                 },
-            )?;
+            )?
         } else {
             progress("projecting history items".to_string());
-            store.refresh_history_items_with_progress(|processed, total| {
-                progress(format!(
-                    "projected {}/{} events into history items",
-                    format_count(processed),
-                    format_count(total)
-                ));
-            })?;
-        }
-        progress("checking source status counts".to_string());
-        store.seed_source_status_counts_approximate_if_empty()?;
+            store.refresh_history_items_with_progress(
+                |event: crate::storage::HistoryItemsProgress| {
+                    progress(history_progress_detail(event));
+                },
+            )?
+        };
+        progress(format!(
+            "history ready: {} items",
+            format_count(history_count)
+        ));
         Ok(indexed)
     }
 }
@@ -5240,17 +5188,15 @@ fn import_progress_event(
                 "bytes": state.bytes,
             }),
         ),
-        transport::ImportProgress::HistoryItems { processed, total } => (
+        transport::ImportProgress::HistoryItems { progress } => (
             "history_items",
-            format!(
-                "projected {}/{} events into history items",
-                format_count(processed),
-                format_count(total)
-            ),
+            import_history_progress_detail(progress),
             serde_json::json!({
-                "status": "projecting",
-                "processed": processed,
-                "total": total,
+                "status": progress.phase,
+                "phase": progress.phase,
+                "current": progress.current,
+                "total": progress.total,
+                "processed": progress.current,
             }),
         ),
         transport::ImportProgress::SkillObservations {
@@ -5433,11 +5379,9 @@ fn human_import_progress_detail(
             *last = state;
             jsonl_progress_detail(state)
         }
-        transport::ImportProgress::HistoryItems { processed, total } => format!(
-            "projected {}/{} events into history items",
-            format_count(processed),
-            format_count(total)
-        ),
+        transport::ImportProgress::HistoryItems { progress } => {
+            import_history_progress_detail(progress)
+        }
         transport::ImportProgress::SkillObservations {
             mode,
             processed_sessions,
@@ -6411,6 +6355,457 @@ struct MachineProgressEvent {
     data: serde_json::Value,
 }
 
+const UPDATE_PLAN_TOTAL: usize = 9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdatePlanPhase {
+    Startup,
+    SourceSync,
+    SkillUsage,
+    CommitProvenance,
+    RepairPreparation,
+    SearchIndex,
+    HistoryItems,
+    RepairAnalytics,
+    Embeddings,
+}
+
+impl UpdatePlanPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::SourceSync => "source sync",
+            Self::SkillUsage => "skill usage",
+            Self::CommitProvenance => "commit provenance",
+            Self::RepairPreparation => "repair preparation",
+            Self::SearchIndex => "search index",
+            Self::HistoryItems => "history items",
+            Self::RepairAnalytics => "repair analytics",
+            Self::Embeddings => "embeddings",
+        }
+    }
+}
+
+const UPDATE_PLAN_PHASES: [UpdatePlanPhase; UPDATE_PLAN_TOTAL] = [
+    UpdatePlanPhase::Startup,
+    UpdatePlanPhase::SourceSync,
+    UpdatePlanPhase::SkillUsage,
+    UpdatePlanPhase::CommitProvenance,
+    UpdatePlanPhase::RepairPreparation,
+    UpdatePlanPhase::SearchIndex,
+    UpdatePlanPhase::HistoryItems,
+    UpdatePlanPhase::RepairAnalytics,
+    UpdatePlanPhase::Embeddings,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdatePlanState {
+    Pending,
+    Active,
+    Complete,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UpdateOverallCoordinates {
+    phase: usize,
+    total: usize,
+    completed: usize,
+    remaining: usize,
+    phase_name: &'static str,
+    upcoming: Vec<&'static str>,
+    skipped: Vec<&'static str>,
+    eta: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateProgressPlan {
+    states: [UpdatePlanState; UPDATE_PLAN_TOTAL],
+    current: usize,
+    repair: bool,
+    embeddings_disabled: bool,
+}
+
+impl UpdateProgressPlan {
+    fn new(repair: bool) -> Self {
+        let mut states = [UpdatePlanState::Pending; UPDATE_PLAN_TOTAL];
+        states[0] = UpdatePlanState::Active;
+        if !repair {
+            states[Self::index(UpdatePlanPhase::RepairPreparation)] = UpdatePlanState::Skipped;
+            states[Self::index(UpdatePlanPhase::RepairAnalytics)] = UpdatePlanState::Skipped;
+        }
+        Self {
+            states,
+            current: 0,
+            repair,
+            embeddings_disabled: false,
+        }
+    }
+
+    fn set_embeddings_disabled(&mut self, disabled: bool) {
+        self.embeddings_disabled = disabled;
+        if disabled {
+            self.skip(UpdatePlanPhase::Embeddings);
+        }
+    }
+
+    fn index(phase: UpdatePlanPhase) -> usize {
+        UPDATE_PLAN_PHASES
+            .iter()
+            .position(|candidate| *candidate == phase)
+            .expect("update plan phase is present")
+    }
+
+    fn begin(&mut self, phase: UpdatePlanPhase) {
+        let index = Self::index(phase);
+        self.current = index;
+        if self.states[index] == UpdatePlanState::Pending {
+            self.states[index] = UpdatePlanState::Active;
+        }
+    }
+
+    fn complete(&mut self, phase: UpdatePlanPhase) {
+        let index = Self::index(phase);
+        self.states[index] = UpdatePlanState::Complete;
+    }
+
+    fn skip(&mut self, phase: UpdatePlanPhase) {
+        let index = Self::index(phase);
+        self.states[index] = UpdatePlanState::Skipped;
+    }
+
+    fn complete_count(&self) -> usize {
+        self.states
+            .iter()
+            .filter(|state| matches!(state, UpdatePlanState::Complete | UpdatePlanState::Skipped))
+            .count()
+    }
+
+    fn coordinates(&self) -> UpdateOverallCoordinates {
+        let completed = self.complete_count();
+        UpdateOverallCoordinates {
+            phase: self.current + 1,
+            total: UPDATE_PLAN_TOTAL,
+            completed,
+            remaining: UPDATE_PLAN_TOTAL.saturating_sub(completed),
+            phase_name: UPDATE_PLAN_PHASES[self.current].label(),
+            upcoming: UPDATE_PLAN_PHASES
+                .iter()
+                .enumerate()
+                .skip(self.current + 1)
+                .filter_map(|(index, phase)| {
+                    (self.states[index] == UpdatePlanState::Pending).then_some(phase.label())
+                })
+                .collect(),
+            skipped: UPDATE_PLAN_PHASES
+                .iter()
+                .enumerate()
+                .filter_map(|(index, phase)| {
+                    (self.states[index] == UpdatePlanState::Skipped).then_some(phase.label())
+                })
+                .collect(),
+            eta: "unavailable",
+        }
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        serde_json::to_value(self.coordinates()).expect("update progress coordinates serialize")
+    }
+
+    fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
+        match event {
+            ingest::UpdateProgress::SkillObservations { .. } => {
+                self.complete(UpdatePlanPhase::SourceSync);
+                self.begin(UpdatePlanPhase::SkillUsage);
+            }
+            ingest::UpdateProgress::CommitEvidence(_) => {
+                self.complete(UpdatePlanPhase::SkillUsage);
+                self.begin(UpdatePlanPhase::CommitProvenance);
+            }
+            _ => self.begin(UpdatePlanPhase::SourceSync),
+        }
+    }
+
+    fn finish_startup(&mut self) {
+        self.complete(UpdatePlanPhase::Startup);
+        self.begin(UpdatePlanPhase::SourceSync);
+    }
+
+    fn finish_ingest(&mut self) {
+        self.complete(UpdatePlanPhase::CommitProvenance);
+    }
+
+    fn start_derived_work(&mut self, repair: bool) {
+        if repair {
+            self.begin(UpdatePlanPhase::RepairPreparation);
+        } else {
+            self.skip(UpdatePlanPhase::RepairPreparation);
+            self.begin(UpdatePlanPhase::SearchIndex);
+        }
+    }
+
+    fn finish_repair_preparation(&mut self) {
+        self.complete(UpdatePlanPhase::RepairPreparation);
+        self.begin(UpdatePlanPhase::SearchIndex);
+    }
+
+    fn search_ready(&mut self) {
+        self.complete(UpdatePlanPhase::SearchIndex);
+        self.begin(UpdatePlanPhase::HistoryItems);
+    }
+
+    fn history_ready(&mut self) {
+        self.complete(UpdatePlanPhase::HistoryItems);
+        if self.repair {
+            self.begin(UpdatePlanPhase::RepairAnalytics);
+        } else {
+            self.skip(UpdatePlanPhase::RepairAnalytics);
+            self.begin(UpdatePlanPhase::Embeddings);
+        }
+    }
+
+    fn repair_ready(&mut self) {
+        self.complete(UpdatePlanPhase::RepairAnalytics);
+        self.begin(UpdatePlanPhase::Embeddings);
+    }
+
+    fn embeddings_ready(&mut self) {
+        if self.embeddings_disabled {
+            self.skip(UpdatePlanPhase::Embeddings);
+        } else {
+            self.complete(UpdatePlanPhase::Embeddings);
+        }
+    }
+
+    fn finish(&mut self) {
+        self.embeddings_ready();
+    }
+}
+
+struct UpdateMachineProgress {
+    plan: UpdateProgressPlan,
+}
+
+impl UpdateMachineProgress {
+    fn new(repair: bool) -> Self {
+        Self {
+            plan: UpdateProgressPlan::new(repair),
+        }
+    }
+
+    fn emit(&self, phase: &'static str, detail: String, data: serde_json::Value) {
+        write_update_progress_with_plan(&self.plan, phase, detail, data);
+    }
+
+    fn set_embeddings_disabled(&mut self, disabled: bool) {
+        self.plan.set_embeddings_disabled(disabled);
+    }
+
+    fn startup_event(&mut self, event: UpdateStartupProgress) {
+        self.emit(
+            "scan",
+            update_startup_progress_detail(event),
+            serde_json::json!({
+                "status": "starting",
+                "stage": event.stage(),
+                "completed": event.completed(),
+                "total": UpdateStartupProgress::TOTAL,
+            }),
+        );
+    }
+
+    fn finish_startup(&mut self) {
+        self.plan.finish_startup();
+    }
+
+    fn startup_ready(&mut self) {
+        self.emit(
+            "scan",
+            update_startup_completion_detail(),
+            serde_json::json!({
+                "status": "ready",
+                "stage": "database",
+                "completed": UpdateStartupProgress::TOTAL,
+                "total": UpdateStartupProgress::TOTAL,
+            }),
+        );
+    }
+
+    fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
+        self.plan.ingest_event(event);
+        self.emit(
+            if matches!(event, ingest::UpdateProgress::SkillObservations { .. }) {
+                "skill_observations"
+            } else if matches!(event, ingest::UpdateProgress::CommitEvidence(_)) {
+                "commit_evidence"
+            } else {
+                "scan"
+            },
+            update_progress_detail(event),
+            update_progress_payload(event),
+        );
+    }
+
+    fn finish_ingest(&mut self, repair: bool) {
+        self.plan.finish_ingest();
+        self.plan.start_derived_work(repair);
+    }
+
+    fn repair_preparation(&mut self, completed: usize, total: usize) {
+        self.emit(
+            "report",
+            prior_hash_progress_detail(completed, total),
+            serde_json::json!({
+                "status": "preparing",
+                "completed": completed,
+                "total": total,
+            }),
+        );
+    }
+
+    fn finish_repair_preparation(&mut self) {
+        self.plan.finish_repair_preparation();
+    }
+
+    fn search_detail(&mut self, detail: String) {
+        if let Some(indexed) = detail
+            .strip_prefix("search ready: ")
+            .and_then(parse_first_count)
+        {
+            self.plan.search_ready();
+            self.emit(
+                "search_index",
+                detail,
+                serde_json::json!({
+                    "status": "ready",
+                    "indexed_events": indexed,
+                }),
+            );
+        } else if let Some(count) = detail
+            .strip_prefix("history ready: ")
+            .and_then(parse_first_count)
+        {
+            self.plan.history_ready();
+            self.emit(
+                "history_items",
+                detail,
+                serde_json::json!({
+                    "status": "ready",
+                    "processed": count,
+                    "total": count,
+                }),
+            );
+        } else if detail.starts_with("history ") {
+            let (phase, current, total) = history_detail_coordinates(&detail);
+            let data = serde_json::json!({
+                "status": phase,
+                "phase": phase,
+                "current": current,
+                "total": total,
+                "processed": current,
+            });
+            self.emit("history_items", detail, data);
+        } else {
+            let phase = if self.plan.coordinates().phase_name == "repair analytics" {
+                "repair"
+            } else {
+                "search_index"
+            };
+            self.emit(
+                phase,
+                detail.clone(),
+                serde_json::json!({ "detail": detail }),
+            );
+        }
+    }
+
+    fn finish_search_index(&mut self, indexed: usize) {
+        self.emit(
+            "search_index",
+            format!("{} events indexed", format_count(indexed)),
+            serde_json::json!({
+                "status": "finished",
+                "indexed_events": indexed,
+            }),
+        );
+    }
+
+    fn report_event(&mut self, event: &analytics::ReportRefreshProgress) {
+        self.emit(
+            "report",
+            event.detail.clone(),
+            report_progress_payload(event, "refreshing", "incremental", Duration::ZERO, None),
+        );
+    }
+
+    fn finish_report(&mut self, report: &analytics::ReportRefreshOutcome) {
+        self.plan.repair_ready();
+        self.emit(
+            "report",
+            report_completion_detail(report),
+            serde_json::json!({
+                "status": if report.refreshed { "refreshed" } else { "skipped" },
+                "mode": report_refresh_mode(report),
+                "affected_sessions": report.affected_sessions,
+                "affected_events": report.affected_events,
+            }),
+        );
+    }
+
+    fn embedding_event(&mut self, event: &search::EmbeddingProgress) {
+        self.plan.begin(UpdatePlanPhase::Embeddings);
+        self.emit(
+            "embeddings",
+            embedding_progress_detail(event),
+            embedding_progress_payload(event),
+        );
+    }
+
+    fn finish_embeddings(&mut self, embeddings: &search::EmbeddingRefresh) {
+        self.plan.set_embeddings_disabled(embeddings.disabled);
+        self.plan.embeddings_ready();
+        self.emit(
+            "embeddings",
+            embedding_phase_detail(embeddings),
+            serde_json::json!({
+                "status": if embeddings.disabled { "skipped" } else { "finished" },
+                "embedded": embeddings.embedded,
+                "pending": embeddings.pending,
+                "vectors_indexed": embeddings.vectors_indexed,
+                "disabled": embeddings.disabled,
+                "degraded_reason": embeddings.degraded_reason,
+                "deferred_reason": embeddings.deferred_reason,
+                "batch_size_reductions": embeddings.batch_size_reductions,
+                "final_batch_size": embeddings.final_batch_size,
+            }),
+        );
+    }
+
+    fn skip_embeddings(&mut self) {
+        self.plan.embeddings_disabled = true;
+        self.plan.embeddings_ready();
+        self.emit(
+            "embeddings",
+            "embeddings skipped: disabled".to_string(),
+            serde_json::json!({
+                "status": "skipped",
+                "disabled": true,
+            }),
+        );
+    }
+
+    fn finish_all(&mut self) {
+        self.plan.finish();
+        self.emit(
+            "complete",
+            "update complete".to_string(),
+            serde_json::json!({
+                "status": "complete",
+            }),
+        );
+    }
+}
+
 const UPDATE_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(900);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6871,12 +7266,42 @@ fn write_update_progress(phase: &'static str, detail: String, data: serde_json::
     write_machine_progress("update", phase, detail, data);
 }
 
-fn write_machine_progress(
-    command: &'static str,
+fn write_update_progress_with_plan(
+    plan: &UpdateProgressPlan,
     phase: &'static str,
     detail: String,
     data: serde_json::Value,
 ) {
+    let overall = plan.payload();
+    let data = match data {
+        serde_json::Value::Object(mut object) => {
+            object.insert("overall".to_string(), overall);
+            serde_json::Value::Object(object)
+        }
+        value => serde_json::json!({
+            "value": value,
+            "overall": overall,
+        }),
+    };
+    write_update_progress(phase, detail, data);
+}
+
+fn write_machine_progress(
+    command: &'static str,
+    phase: &'static str,
+    detail: String,
+    mut data: serde_json::Value,
+) {
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "disk_io".to_string(),
+            process_disk_io()
+                .map(|(read_bytes, written_bytes)| {
+                    serde_json::json!({ "read_bytes": read_bytes, "written_bytes": written_bytes })
+                })
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
     let event = MachineProgressEvent {
         event_type: "progress",
         command,
@@ -7411,9 +7836,13 @@ struct UpdateDataProgress {
 
 struct UpdateProgressView {
     interactive: bool,
+    plan: Option<UpdateProgressPlan>,
     phase: UpdateDisplayPhase,
     sources: BTreeMap<String, UpdateSourceProgress>,
     data_rows: BTreeMap<String, UpdateDataProgress>,
+    history_plan: Option<String>,
+    history_stage_started: Instant,
+    history_stage_start_count: usize,
     status_checked_files: usize,
     status_total_files: usize,
     refreshed_titles: usize,
@@ -7444,6 +7873,18 @@ impl UpdateProgressView {
         view
     }
 
+    fn startup_with_plan(repair: bool) -> Self {
+        let mut view = Self::startup();
+        view.plan = Some(UpdateProgressPlan::new(repair));
+        view
+    }
+
+    fn set_embeddings_disabled(&mut self, disabled: bool) {
+        if let Some(plan) = &mut self.plan {
+            plan.set_embeddings_disabled(disabled);
+        }
+    }
+
     fn startup_event(&mut self, event: &UpdateStartupProgress) {
         self.phase = UpdateDisplayPhase::Startup;
         let row = self.data_rows.entry("startup".to_string()).or_default();
@@ -7454,6 +7895,9 @@ impl UpdateProgressView {
     }
 
     fn finish_startup(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.finish_startup();
+        }
         let row = self.data_rows.entry("startup".to_string()).or_default();
         row.state = "ready";
         row.current = Some(UpdateStartupProgress::TOTAL);
@@ -7465,9 +7909,13 @@ impl UpdateProgressView {
     fn new() -> Self {
         Self {
             interactive: std::io::stderr().is_terminal(),
+            plan: None,
             phase: UpdateDisplayPhase::LocalLogs,
             sources: BTreeMap::new(),
             data_rows: BTreeMap::new(),
+            history_plan: None,
+            history_stage_started: Instant::now(),
+            history_stage_start_count: 0,
             report_phase_rows: Vec::new(),
             refreshed_titles: 0,
             total_titles: 0,
@@ -7482,8 +7930,12 @@ impl UpdateProgressView {
             last_emit: Instant::now(),
         }
     }
-
+}
+impl UpdateProgressView {
     fn ingest_event(&mut self, event: &ingest::UpdateProgress) {
+        if let Some(plan) = &mut self.plan {
+            plan.ingest_event(event);
+        }
         let force_render = skill_observation_progress_is_boundary(event)
             || commit_evidence_progress_is_boundary(event);
         match event {
@@ -7679,6 +8131,9 @@ impl UpdateProgressView {
     }
 
     fn finish_ingest(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.finish_ingest();
+        }
         if matches!(
             self.phase,
             UpdateDisplayPhase::SkillObservations | UpdateDisplayPhase::CommitEvidence
@@ -7706,6 +8161,10 @@ impl UpdateProgressView {
 
     fn start_search_data(&mut self, repair: bool, embeddings_disabled: bool) {
         self.phase = UpdateDisplayPhase::SearchData;
+        if let Some(plan) = &mut self.plan {
+            plan.set_embeddings_disabled(embeddings_disabled);
+            plan.start_derived_work(repair);
+        }
         self.data_rows.clear();
         self.report_phase_rows.clear();
         self.data_rows.insert(
@@ -7760,9 +8219,75 @@ impl UpdateProgressView {
         self.render(completed == 0);
     }
 
+    fn finish_repair_preparation(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.finish_repair_preparation();
+        }
+        self.render(true);
+    }
+
     fn search_detail(&mut self, detail: String) {
         self.phase = UpdateDisplayPhase::SearchData;
-        if detail.contains("history") || detail.contains("project") {
+        if let Some(indexed) = detail
+            .strip_prefix("search ready: ")
+            .and_then(parse_first_count)
+        {
+            self.search_ready(indexed);
+            return;
+        }
+        if let Some(count) = detail
+            .strip_prefix("history ready: ")
+            .and_then(parse_first_count)
+        {
+            self.history_ready(count);
+            return;
+        }
+        let mut boundary = false;
+        if detail.starts_with("history ") {
+            let (phase, current, total) = history_detail_coordinates(&detail);
+            if phase == "planning" {
+                self.history_plan = Some(format!(
+                    "{} input events · {}",
+                    format_count(total),
+                    detail
+                        .split_once('·')
+                        .map_or(detail.as_str(), |(_, plan)| plan.trim())
+                ));
+                self.render(true);
+                return;
+            }
+            let row = self.data_rows.entry("history".to_string()).or_default();
+            let state = history_detail_state(phase);
+            boundary = row.state != state;
+            if boundary || row.total != Some(total) {
+                self.history_stage_started = Instant::now();
+                self.history_stage_start_count = current;
+            }
+            row.state = state;
+            row.current = Some(current);
+            row.total = Some(total);
+            row.detail = detail
+                .strip_prefix("history ")
+                .unwrap_or(&detail)
+                .to_string();
+        } else if self
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.coordinates().phase_name == "repair analytics")
+        {
+            let (current, total) = parse_progress_fraction(&detail).unwrap_or((0, 0));
+            let row = self.data_rows.entry("report".to_string()).or_default();
+            row.state = if detail.contains("checking") {
+                "checking"
+            } else {
+                "repairing"
+            };
+            if total > 0 {
+                row.current = Some(current);
+                row.total = Some(total);
+            }
+            row.detail = detail;
+        } else if detail.contains("history") || detail.contains("project") {
             let (current, total) = parse_progress_fraction(&detail).unwrap_or((0, 0));
             let row = self.data_rows.entry("history".to_string()).or_default();
             row.state = if detail.contains("checking") {
@@ -7791,15 +8316,52 @@ impl UpdateProgressView {
             }
             row.detail = detail;
         }
-        self.render(false);
+        self.render(boundary);
+    }
+
+    fn search_ready(&mut self, indexed: usize) {
+        let row = self.data_rows.entry("search".to_string()).or_default();
+        row.state = "ready";
+        row.current = Some(indexed);
+        row.total = Some(indexed);
+        row.detail = format!("{} events indexed", format_count(indexed));
+        if let Some(plan) = &mut self.plan {
+            if plan.coordinates().phase_name == "search index" {
+                plan.search_ready();
+            }
+        }
+        self.render(true);
+    }
+
+    fn history_ready(&mut self, count: usize) {
+        let row = self.data_rows.entry("history".to_string()).or_default();
+        row.state = "ready";
+        row.current = Some(count);
+        row.total = Some(count);
+        row.detail = format!("{} history items ready", format_count(count));
+        if let Some(plan) = &mut self.plan {
+            if plan.coordinates().phase_name == "history items" {
+                plan.history_ready();
+            }
+        }
+        self.render(true);
     }
 
     fn finish_search_index(&mut self, projected: usize) {
         let row = self.data_rows.entry("search".to_string()).or_default();
-        row.state = "indexed";
+        row.state = if self.plan.is_some() {
+            "ready"
+        } else {
+            "indexed"
+        };
         row.current = Some(projected);
         row.total = Some(projected);
         row.detail = format!("{} events indexed", format_count(projected));
+        if let Some(plan) = &mut self.plan {
+            if plan.coordinates().phase_name == "search index" {
+                plan.search_ready();
+            }
+        }
         self.render(true);
     }
 
@@ -7941,10 +8503,16 @@ impl UpdateProgressView {
         };
         // The last worker event owns the truthful phase-local count.
         row.detail = report_completion_detail(report);
+        if let Some(plan) = &mut self.plan {
+            plan.repair_ready();
+        }
         self.render(true);
     }
 
     fn embedding_event(&mut self, event: &search::EmbeddingProgress) {
+        if let Some(plan) = &mut self.plan {
+            plan.begin(UpdatePlanPhase::Embeddings);
+        }
         self.phase = UpdateDisplayPhase::SearchData;
         let row = self.data_rows.entry("vectors".to_string()).or_default();
         match event {
@@ -7990,6 +8558,10 @@ impl UpdateProgressView {
                 format_count(embeddings.vectors_indexed)
             );
         }
+        if let Some(plan) = &mut self.plan {
+            plan.set_embeddings_disabled(embeddings.disabled);
+            plan.embeddings_ready();
+        }
         self.render(true);
     }
 
@@ -7999,6 +8571,10 @@ impl UpdateProgressView {
     }
 
     fn finish_all(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.finish();
+            self.render(true);
+        }
         self.settle_rendering();
     }
 
@@ -8012,9 +8588,13 @@ impl UpdateProgressView {
         if !force && self.last_emit.elapsed() < UPDATE_PROGRESS_HEARTBEAT_INTERVAL {
             return;
         }
+        let disk_io = disk_io_detail();
         if self.interactive {
             let columns = terminal_columns();
-            let lines = self.lines_for_terminal(columns);
+            let mut lines = self.lines_for_terminal(columns);
+            if let Some(detail) = disk_io {
+                lines.push(fit_terminal_line(&detail, columns));
+            }
             self.clear_rendered_block();
             for line in &lines {
                 eprint!("\r\x1b[2K{line}");
@@ -8024,6 +8604,9 @@ impl UpdateProgressView {
         } else {
             for line in self.lines() {
                 eprintln!("{line}");
+            }
+            if let Some(detail) = disk_io {
+                eprintln!("{detail}");
             }
             eprintln!();
         }
@@ -8042,9 +8625,6 @@ impl UpdateProgressView {
                 eprint!("\x1b[1E");
             }
         }
-        if self.drawn_rows > 1 {
-            eprint!("\x1b[{}F", self.drawn_rows - 1);
-        }
     }
 
     fn lines(&self) -> Vec<String> {
@@ -8057,12 +8637,60 @@ impl UpdateProgressView {
             UpdateDisplayPhase::ChangedLogs => self.source_lines("changed logs: reading", false),
             UpdateDisplayPhase::SkillObservations => self.data_lines("skill usage: updating"),
             UpdateDisplayPhase::CommitEvidence => self.data_lines("commit evidence: updating"),
-            UpdateDisplayPhase::SearchData => self.data_lines("search data: updating"),
+            UpdateDisplayPhase::SearchData => self.data_lines(
+                if self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.coordinates().phase_name == "repair preparation")
+                {
+                    "repair preparation: updating"
+                } else if self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.coordinates().phase_name == "repair analytics")
+                {
+                    "repair analytics: updating"
+                } else {
+                    "search data: updating"
+                },
+            ),
             UpdateDisplayPhase::ReportData => self.data_lines("report data: updating"),
         };
+        if let Some(plan) = &self.plan {
+            let coordinates = plan.coordinates();
+            let upcoming = if coordinates.upcoming.is_empty() {
+                "none".to_string()
+            } else {
+                coordinates.upcoming.join(" → ")
+            };
+            let skipped = if coordinates.skipped.is_empty() {
+                String::new()
+            } else {
+                format!(" · skipped: {}", coordinates.skipped.join(", "))
+            };
+            let mut scope = vec![
+                format!(
+                    "phase {}/{} · {} · {} remaining",
+                    coordinates.phase,
+                    coordinates.total,
+                    coordinates.phase_name,
+                    coordinates.remaining
+                ),
+                format!(
+                    "overall phases {}/{} {} · done or skipped",
+                    coordinates.completed,
+                    coordinates.total,
+                    progress_meter(coordinates.completed, coordinates.total, 20)
+                ),
+                format!("upcoming: {upcoming}{skipped} · ETA unavailable"),
+            ];
+            scope.append(&mut lines);
+            lines = scope;
+        }
         if self.interactive {
             let frames = ["-", "\\", "|", "/"];
-            lines[0].push_str(&format!(
+            let heading = if self.plan.is_some() { 3 } else { 0 };
+            lines[heading].push_str(&format!(
                 "  {} {}s elapsed",
                 frames[self.heartbeat_frame % frames.len()],
                 self.started.elapsed().as_secs()
@@ -8074,8 +8702,137 @@ impl UpdateProgressView {
     fn lines_for_terminal(&self, columns: usize) -> Vec<String> {
         self.lines()
             .into_iter()
-            .map(|line| fit_terminal_line(&line, columns))
+            .enumerate()
+            .map(|(index, mut line)| {
+                if self.plan.is_some() && index < 3 {
+                    return self.scope_line_for_terminal(index, columns);
+                }
+                if columns < 80 && line.starts_with("  ") {
+                    if let Some(key) = line.split_whitespace().next() {
+                        let row = self.data_rows.get(key).or_else(|| {
+                            self.report_phase_rows
+                                .iter()
+                                .find(|(phase, _)| report_phase_label(phase) == key)
+                                .map(|(_, row)| row)
+                        });
+                        if let Some(row) = row {
+                            line = if let (Some(current), Some(total)) = (row.current, row.total) {
+                                format!(
+                                    "  {key} {}/{} {}",
+                                    format_count(current),
+                                    format_count(total),
+                                    row.state
+                                )
+                            } else {
+                                format!(
+                                    "  {key} {}",
+                                    if row.detail.is_empty() {
+                                        row.state
+                                    } else {
+                                        &row.detail
+                                    }
+                                )
+                            };
+                        } else if let Some(row) = self.sources.get(key) {
+                            let (current, total) = if self.phase == UpdateDisplayPhase::LocalLogs {
+                                (row.checked_files, row.total_files)
+                            } else if matches!(row.state, "preparing" | "prepared") {
+                                (row.prepared_files, row.changed_files)
+                            } else {
+                                (row.imported_files, row.changed_files)
+                            };
+                            line = format!(
+                                "  {key} {}/{} {}",
+                                format_count(current),
+                                format_count(total),
+                                row.state
+                            );
+                        } else {
+                            let counts = match (key, self.phase) {
+                                ("checkpoints", UpdateDisplayPhase::CheckpointStatus) => {
+                                    Some((self.status_checked_files, self.status_total_files))
+                                }
+                                ("titles", UpdateDisplayPhase::NativeTitles) => {
+                                    Some((self.refreshed_titles, self.total_titles))
+                                }
+                                ("machines", UpdateDisplayPhase::MachineAssignments) => Some((
+                                    self.repaired_machine_sources,
+                                    self.total_machine_sources,
+                                )),
+                                _ => None,
+                            };
+                            if let Some((current, total)) = counts {
+                                line = format!(
+                                    "  {key} {}/{}",
+                                    format_count(current),
+                                    format_count(total)
+                                );
+                            }
+                        }
+                    }
+                }
+                if line.chars().count() > columns {
+                    let mut clipped = line
+                        .chars()
+                        .take(columns.saturating_sub(3))
+                        .collect::<String>();
+                    clipped.push_str(&"..."[..columns.min(3)]);
+                    clipped
+                } else {
+                    line
+                }
+            })
             .collect()
+    }
+
+    fn scope_line_for_terminal(&self, index: usize, columns: usize) -> String {
+        let Some(plan) = &self.plan else {
+            return String::new();
+        };
+        let coordinates = plan.coordinates();
+        if columns < 80 {
+            return match index {
+                0 => format!(
+                    "phase {}/{} · {} remaining",
+                    coordinates.phase, coordinates.total, coordinates.remaining
+                ),
+                1 => {
+                    let width = columns.saturating_sub(12).clamp(1, 12);
+                    let line = format!(
+                        "overall {} {}/{}",
+                        progress_meter(coordinates.completed, coordinates.total, width),
+                        coordinates.completed,
+                        coordinates.total
+                    );
+                    if line.chars().count() <= columns {
+                        line
+                    } else {
+                        format!(
+                            "o{} {}/{}",
+                            progress_meter(coordinates.completed, coordinates.total, width),
+                            coordinates.completed,
+                            coordinates.total
+                        )
+                    }
+                }
+                _ => {
+                    let skipped = coordinates
+                        .skipped
+                        .first()
+                        .copied()
+                        .map(|phase| format!(" · skip {phase}"))
+                        .unwrap_or_default();
+                    fit_terminal_line(
+                        &format!(
+                            "next {}{skipped}",
+                            coordinates.upcoming.first().copied().unwrap_or("none")
+                        ),
+                        columns,
+                    )
+                }
+            };
+        }
+        fit_terminal_line(&self.lines()[index], columns)
     }
 
     fn native_title_lines(&self) -> Vec<String> {
@@ -8200,6 +8957,27 @@ impl UpdateProgressView {
                     "  {key:<label_width$}  {:<10} {meter}  {}",
                     row.state, row.detail
                 ));
+                if *key == "history" {
+                    if let Some(plan) = &self.history_plan {
+                        lines.push(format!("  plan: {plan}"));
+                    }
+                    if matches!(row.state, "projecting" | "mapping" | "caching") {
+                        let elapsed = self.history_stage_started.elapsed().as_secs_f64();
+                        if let (Some(current), Some(total)) = (row.current, row.total) {
+                            let measured = current.saturating_sub(self.history_stage_start_count);
+                            if elapsed >= 2.0 && measured > 0 && current < total {
+                                let rate = measured as f64 / elapsed;
+                                let remaining = ((total - current) as f64 / rate).ceil() as u64;
+                                lines.push(format!(
+                                    "  phase rate: {}/s · ~{}m {}s remaining in this phase",
+                                    format_count(rate.round() as usize),
+                                    remaining / 60,
+                                    remaining % 60
+                                ));
+                            }
+                        }
+                    }
+                }
                 if *key == "report" {
                     for (phase, row) in &self.report_phase_rows {
                         let meter = match (row.current, row.total) {
@@ -8345,6 +9123,55 @@ fn parse_progress_fraction(detail: &str) -> Option<(usize, usize)> {
     Some((left.parse().ok()?, right.parse().ok()?))
 }
 
+fn parse_first_count(value: &str) -> Option<usize> {
+    value
+        .split_whitespace()
+        .next()?
+        .replace(',', "")
+        .parse()
+        .ok()
+}
+
+fn history_progress_detail(progress: crate::storage::HistoryItemsProgress) -> String {
+    let unit = match progress.phase {
+        "planning" | "projecting" => "events",
+        "mapping" => "index rows",
+        "caching" => "history items",
+        _ => "steps",
+    };
+    format!(
+        "history {} {}/{} {unit} · {}",
+        progress.phase,
+        format_count(progress.current),
+        format_count(progress.total),
+        progress.detail
+    )
+}
+
+fn import_history_progress_detail(progress: crate::storage::HistoryItemsProgress) -> String {
+    history_progress_detail(progress)
+}
+
+fn history_detail_coordinates(detail: &str) -> (&str, usize, usize) {
+    let phase = detail.split_whitespace().nth(1).unwrap_or("projecting");
+    let (current, total) = parse_progress_fraction(detail).unwrap_or((0, 0));
+    (phase, current, total)
+}
+
+fn history_detail_state(phase: &str) -> &'static str {
+    match phase {
+        "preparing" => "preparing",
+        "planning" => "planning",
+        "projecting" => "projecting",
+        "indexing" => "indexing",
+        "mapping" => "mapping",
+        "caching" => "caching",
+        "publishing" => "publishing",
+        "finalizing" => "finalizing",
+        "complete" => "complete",
+        _ => "updating",
+    }
+}
 fn compact_path(path: &Path) -> String {
     let text = path.to_string_lossy();
     let home = std::env::var("HOME").ok();
@@ -8588,6 +9415,56 @@ fn include_raw_artifact_records(mode: RawArtifactExportMode, no_raw_artifacts: b
     !no_raw_artifacts && !matches!(mode, RawArtifactExportMode::Omit)
 }
 
+fn process_disk_io() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+        // The selected flavor writes rusage_info_v2; inspect it only on success.
+        let result = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::pid_t,
+                libc::RUSAGE_INFO_V2,
+                usage.as_mut_ptr().cast(),
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        Some((usage.ri_diskio_bytesread, usage.ri_diskio_byteswritten))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let io = std::fs::read_to_string("/proc/self/io").ok()?;
+        let mut read = None;
+        let mut written = None;
+        for line in io.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                match name {
+                    "read_bytes" => read = value.trim().parse().ok(),
+                    "write_bytes" => written = value.trim().parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+        Some((read?, written?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+fn disk_io_detail() -> Option<String> {
+    process_disk_io().map(|(read, written)| {
+        format!(
+            "disk I/O: {} read · {} written",
+            format_bytes(read),
+            format_bytes(written)
+        )
+    })
+}
+
 struct ProgressUi {
     interactive: bool,
 }
@@ -8627,12 +9504,24 @@ impl ProgressPhase {
             let handle = thread::spawn(move || {
                 let frames = ["-", "\\", "|", "/"];
                 let mut idx = 0usize;
+                let mut last_io = Instant::now() - UPDATE_PROGRESS_HEARTBEAT_INTERVAL;
+                let mut disk_io = None;
                 loop {
-                    let detail = detail_for_thread
+                    let mut detail = detail_for_thread
                         .lock()
                         .ok()
                         .map(|detail| detail.clone())
                         .unwrap_or_default();
+                    if last_io.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL {
+                        disk_io = disk_io_detail();
+                        last_io = Instant::now();
+                    }
+                    if let Some(io) = &disk_io {
+                        if !detail.is_empty() {
+                            detail.push_str(" · ");
+                        }
+                        detail.push_str(io);
+                    }
                     let detail =
                         fit_progress_detail(&label_for_thread, &detail, terminal_columns());
                     let suffix = if detail.is_empty() {
@@ -8687,9 +9576,13 @@ impl ProgressPhase {
             }
         }
         if !self.interactive
-            && (!self.emitted_update || self.last_update_emit.elapsed() >= Duration::from_secs(2))
+            && (!self.emitted_update
+                || self.last_update_emit.elapsed() >= UPDATE_PROGRESS_HEARTBEAT_INTERVAL)
         {
-            eprintln!("{}: {}", self.label, detail);
+            let io = disk_io_detail()
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default();
+            eprintln!("{}: {}{io}", self.label, detail);
             self.last_update_emit = Instant::now();
             self.emitted_update = true;
         }

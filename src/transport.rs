@@ -1,7 +1,7 @@
 use crate::archive::{ArchiveEnvelope, ArchiveRecord, ARCHIVE_SCHEMA, LEGACY_ARCHIVE_SCHEMA};
 use crate::commit_provenance::store as commit_store;
 use crate::skill_usage::SkillMaintenanceMode;
-use crate::storage::{ArchiveExportFilter, ImportStats, Store};
+use crate::storage::{ArchiveExportFilter, HistoryItemsProgress, ImportStats, Store};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -148,8 +148,7 @@ pub struct JsonlProgress {
 pub enum ImportProgress {
     Stream(JsonlProgress),
     HistoryItems {
-        processed: usize,
-        total: usize,
+        progress: HistoryItemsProgress,
     },
     SkillObservations {
         mode: SkillMaintenanceMode,
@@ -413,13 +412,17 @@ fn finalize_import_stats_with_options_and_progress(
     if store.history_items_projection_status_ready()? {
         store.refresh_history_items_for_events_with_progress(
             &stats.delta.touched_events,
-            |processed, total| {
-                progress(ImportProgress::HistoryItems { processed, total });
+            |progress_state| {
+                progress(ImportProgress::HistoryItems {
+                    progress: progress_state,
+                });
             },
         )?;
     } else {
-        store.refresh_history_items_with_progress(|processed, total| {
-            progress(ImportProgress::HistoryItems { processed, total });
+        store.refresh_history_items_with_progress(|progress_state| {
+            progress(ImportProgress::HistoryItems {
+                progress: progress_state,
+            });
         })?;
     }
     if options.refresh_vector_projection {
