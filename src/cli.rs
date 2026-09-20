@@ -8600,7 +8600,7 @@ impl UpdateProgressView {
                 eprint!("\r\x1b[2K{line}");
                 eprintln!();
             }
-            self.drawn_rows = terminal_rows_for_lines(&lines, columns);
+            self.drawn_rows = lines.len();
         } else {
             for line in self.lines() {
                 eprintln!("{line}");
@@ -8618,13 +8618,7 @@ impl UpdateProgressView {
         if self.drawn_rows == 0 {
             return;
         }
-        eprint!("\x1b[{}F", self.drawn_rows);
-        for idx in 0..self.drawn_rows {
-            eprint!("\r\x1b[2K");
-            if idx + 1 < self.drawn_rows {
-                eprint!("\x1b[1E");
-            }
-        }
+        eprint!("{}", progress_block_clear_ansi(self.drawn_rows));
     }
 
     fn lines(&self) -> Vec<String> {
@@ -8771,16 +8765,7 @@ impl UpdateProgressView {
                         }
                     }
                 }
-                if line.chars().count() > columns {
-                    let mut clipped = line
-                        .chars()
-                        .take(columns.saturating_sub(3))
-                        .collect::<String>();
-                    clipped.push_str(&"..."[..columns.min(3)]);
-                    clipped
-                } else {
-                    line
-                }
+                fit_terminal_line(&line, columns)
             })
             .collect()
     }
@@ -8790,30 +8775,20 @@ impl UpdateProgressView {
             return String::new();
         };
         let coordinates = plan.coordinates();
-        if columns < 80 {
-            return match index {
+        let line = if columns < 80 {
+            match index {
                 0 => format!(
                     "phase {}/{} · {} remaining",
                     coordinates.phase, coordinates.total, coordinates.remaining
                 ),
                 1 => {
                     let width = columns.saturating_sub(12).clamp(1, 12);
-                    let line = format!(
+                    format!(
                         "overall {} {}/{}",
                         progress_meter(coordinates.completed, coordinates.total, width),
                         coordinates.completed,
                         coordinates.total
-                    );
-                    if line.chars().count() <= columns {
-                        line
-                    } else {
-                        format!(
-                            "o{} {}/{}",
-                            progress_meter(coordinates.completed, coordinates.total, width),
-                            coordinates.completed,
-                            coordinates.total
-                        )
-                    }
+                    )
                 }
                 _ => {
                     let skipped = coordinates
@@ -8822,17 +8797,16 @@ impl UpdateProgressView {
                         .copied()
                         .map(|phase| format!(" · skip {phase}"))
                         .unwrap_or_default();
-                    fit_terminal_line(
-                        &format!(
-                            "next {}{skipped}",
-                            coordinates.upcoming.first().copied().unwrap_or("none")
-                        ),
-                        columns,
+                    format!(
+                        "next {}{skipped}",
+                        coordinates.upcoming.first().copied().unwrap_or("none")
                     )
                 }
-            };
-        }
-        fit_terminal_line(&self.lines()[index], columns)
+            }
+        } else {
+            self.lines()[index].clone()
+        };
+        fit_terminal_line(&line, columns)
     }
 
     fn native_title_lines(&self) -> Vec<String> {
@@ -9194,19 +9168,32 @@ fn compact_path(path: &Path) -> String {
 
 fn fit_terminal_line(line: &str, columns: usize) -> String {
     let budget = terminal_line_budget(columns);
-    ellipsize_middle(line, budget)
-}
-
-fn terminal_rows_for_lines(lines: &[String], columns: usize) -> usize {
-    let columns = terminal_line_budget(columns);
-    lines
-        .iter()
-        .map(|line| line.chars().count().max(1).div_ceil(columns))
-        .sum()
+    if line.contains(" current ") {
+        ellipsize_middle(line, budget)
+    } else {
+        ellipsize_end(line, budget)
+    }
 }
 
 fn terminal_line_budget(columns: usize) -> usize {
     columns.saturating_sub(1).max(1)
+}
+
+fn progress_block_clear_ansi(drawn_rows: usize) -> String {
+    if drawn_rows == 0 {
+        return String::new();
+    }
+    let mut out = format!("\x1b[{drawn_rows}F");
+    for idx in 0..drawn_rows {
+        out.push_str("\r\x1b[2K");
+        if idx + 1 < drawn_rows {
+            out.push_str("\x1b[1E");
+        }
+    }
+    if drawn_rows > 1 {
+        out.push_str(&format!("\x1b[{}F", drawn_rows - 1));
+    }
+    out
 }
 
 fn format_count(value: usize) -> String {
@@ -9635,6 +9622,22 @@ fn fit_progress_detail(label: &str, detail: &str, columns: usize) -> String {
     let base_width = frame_width + separators_width + label.chars().count() + trailing_space_width;
     let budget = columns.saturating_sub(base_width).saturating_sub(1);
     ellipsize_middle(detail, budget)
+}
+
+fn ellipsize_end(value: &str, max_chars: usize) -> String {
+    let total = value.chars().count();
+    if total <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut clipped: String = value.chars().take(max_chars - 3).collect();
+    clipped.push_str("...");
+    clipped
 }
 
 fn ellipsize_middle(value: &str, max_chars: usize) -> String {
@@ -13498,7 +13501,9 @@ mod tests {
             assert!(lines
                 .iter()
                 .any(|line| line.contains("1,234,567/5,678,901")));
-            assert!(lines.iter().all(|line| line.chars().count() <= columns));
+            assert!(lines
+                .iter()
+                .all(|line| line.chars().count() <= terminal_line_budget(columns)));
         }
     }
 
@@ -13521,6 +13526,100 @@ mod tests {
         assert!(heartbeat[1].contains("5/10 files"));
     }
 
+    #[test]
+    fn progress_redraw_returns_to_the_first_cleared_row() {
+        assert_eq!(progress_block_clear_ansi(0), "");
+        assert_eq!(progress_block_clear_ansi(1), "\x1b[1F\r\x1b[2K");
+        let block = progress_block_clear_ansi(13);
+        assert!(block.starts_with("\x1b[13F"), "{block:?}");
+        assert!(block.ends_with("\x1b[12F"), "{block:?}");
+        assert_eq!(block.matches("\r\x1b[2K").count(), 13);
+    }
+
+    #[test]
+    fn update_progress_fits_each_terminal_line_to_one_row() {
+        let mut view = UpdateProgressView::startup_with_plan(false);
+        view.interactive = true;
+        view.ingest_event(&ingest::UpdateProgress::Discovered {
+            sources: vec![
+                ingest::UpdateSourceSummary {
+                    kind: "claude_code".to_string(),
+                    found_files: 4,
+                    selected_files: 4,
+                },
+                ingest::UpdateSourceSummary {
+                    kind: "codex".to_string(),
+                    found_files: 810,
+                    selected_files: 810,
+                },
+                ingest::UpdateSourceSummary {
+                    kind: "omp".to_string(),
+                    found_files: 103,
+                    selected_files: 103,
+                },
+            ],
+            selected_files: 917,
+        });
+        view.ingest_event(&ingest::UpdateProgress::PreparingImports {
+            changed_files: 917,
+            sources: vec![
+                ingest::UpdateChangedSourceSummary {
+                    kind: "claude_code".to_string(),
+                    changed_files: 4,
+                },
+                ingest::UpdateChangedSourceSummary {
+                    kind: "codex".to_string(),
+                    changed_files: 810,
+                },
+                ingest::UpdateChangedSourceSummary {
+                    kind: "omp".to_string(),
+                    changed_files: 103,
+                },
+            ],
+            stats: ingest::UpdateStats::default(),
+        });
+        view.ingest_event(&ingest::UpdateProgress::PreparedFile {
+            kind: "claude_code".to_string(),
+            path: PathBuf::from("/private/tmp/f4438f68-84c9-43ff-bd0e-a51f51810dbb.jsonl"),
+            prepared_file_index: 4,
+            prepared_file_count: 4,
+            stats: ingest::UpdateStats::default(),
+        });
+        view.ingest_event(&ingest::UpdateProgress::PreparedFile {
+            kind: "codex".to_string(),
+            path: PathBuf::from(
+                "/tmp/rollout-2026-06-23T23-59-20-019ef56c-0ef7-7ba2-8291-242508cccf0c.jsonl",
+            ),
+            prepared_file_index: 810,
+            prepared_file_count: 810,
+            stats: ingest::UpdateStats::default(),
+        });
+        view.ingest_event(&ingest::UpdateProgress::ImportingFile {
+            adapter_kind: "omp".to_string(),
+            kind: "omp".to_string(),
+            path: PathBuf::from(
+                "/Users/example/.local/share/omp/projects/0000-b438-eaa7f63d240d/Side-cdbfb30a-d813-426a-800b-36ed00c78757.jsonl",
+            ),
+            changed_file_index: 22,
+            changed_file_count: 103,
+            stats: ingest::UpdateStats::default(),
+        });
+
+        for columns in [48, 80, 100, 140] {
+            let mut lines = view.lines_for_terminal(columns);
+            lines.push(fit_terminal_line(
+                "disk I/O: 5.6 GiB read · 3.7 GiB written",
+                columns,
+            ));
+            let budget = terminal_line_budget(columns);
+            assert!(
+                lines.iter().all(|line| line.chars().count() <= budget),
+                "wrapped at {columns}: {lines:?}"
+            );
+            assert!(lines.iter().any(|line| line.contains("4/4")));
+            assert!(lines.iter().any(|line| line.contains("810/810")));
+        }
+    }
     #[test]
     fn default_update_progress_omits_report_work() {
         let mut view = UpdateProgressView::new();
@@ -13587,11 +13686,9 @@ mod tests {
         );
         let terminal_lines = view.lines_for_terminal(48);
         assert_eq!(terminal_lines.len(), 5);
-        assert!(terminal_lines.iter().all(|line| line.chars().count() < 48));
-        assert_eq!(
-            terminal_rows_for_lines(&terminal_lines, 48),
-            terminal_lines.len()
-        );
+        assert!(terminal_lines
+            .iter()
+            .all(|line| line.chars().count() <= terminal_line_budget(48)));
 
         assert_eq!(
             report_progress_payload(
@@ -13740,7 +13837,9 @@ mod tests {
         );
         let terminal_lines = view.lines_for_terminal(48);
         assert_eq!(terminal_lines.len(), 4);
-        assert!(terminal_lines.iter().all(|line| line.chars().count() < 48));
+        assert!(terminal_lines
+            .iter()
+            .all(|line| line.chars().count() <= terminal_line_budget(48)));
     }
 
     #[test]
